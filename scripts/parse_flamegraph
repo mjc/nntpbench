@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+OUT="$PROJECT_DIR/target/profiling/parse_flamegraph"
+
+mkdir -p "$(dirname "$OUT")"
+rustc "$SCRIPT_DIR/parse_flamegraph.rs" -O -o "$OUT"
+exec "$OUT" "$@"

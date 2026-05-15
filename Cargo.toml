@@ -25,3 +25,20 @@ harness = false
 [[bench]]
 name = "server_callgrind"
 harness = false
+
+[profile.release]
+debug = false
+strip = true
+lto = "thin"
+codegen-units = 1
+overflow-checks = true
+
+[profile.profiling]
+inherits = "release"
+debug = 2
+strip = false
+
+[profile.bench]
+inherits = "release"
+debug = 2
+strip = false

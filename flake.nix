@@ -77,6 +77,10 @@
             pkgs.cargo-llvm-cov
           ]
           ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+            pkgs.heaptrack
+            pkgs.inferno
+            pkgs.perf
+            pkgs.strace
             pkgs.valgrind
           ];
 
@@ -95,6 +99,9 @@
           echo "  cargo llvm-cov --fail-under-lines 100 --summary-only"
           echo "  cargo bench --bench server_roundtrip"
           echo "  cargo bench --bench server_callgrind"
+          echo "  ./scripts/profile.sh"
+          echo "  ./scripts/profile-mem.sh"
+          echo "  ./scripts/profile-latency.sh strace"
         '';
       };
 
