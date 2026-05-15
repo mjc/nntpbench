@@ -36,6 +36,7 @@ supported! {
             body_bytes,
             article_bytes,
             max_connections: 4096,
+            threads: 1,
             max_pipeline_depth: 64,
             backlog: 8192,
             reuse_port: false,
