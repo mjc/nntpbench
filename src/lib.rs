@@ -571,13 +571,13 @@ where
     command_batch[0] = parse_command_buf(command_buf);
 
     while len < command_batch.len() {
-        if memchr::memchr(b'\n', reader.buffer()).is_none() {
+        let buffer = reader.buffer();
+        let Some(relative_lf) = memchr::memchr(b'\n', buffer) else {
             break;
-        }
-
-        command_buf.clear();
-        reader.read_until(b'\n', command_buf).await?;
-        command_batch[len] = parse_command_buf(command_buf);
+        };
+        let end = relative_lf + 1;
+        command_batch[len] = CommandLine::parse(trim_line_slice(&buffer[..end]));
+        reader.consume(end);
         len += 1;
     }
 
