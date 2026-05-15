@@ -9,5 +9,19 @@ memchr = "2.7.4"
 socket2 = "0.6.3"
 tokio = { version = "1.45.0", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 
+[dev-dependencies]
+divan = "0.1"
+
+[target.'cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))'.dev-dependencies]
+iai-callgrind = "0.16.1"
+
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage_nightly)"] }
+
+[[bench]]
+name = "server_roundtrip"
+harness = false
+
+[[bench]]
+name = "server_callgrind"
+harness = false

@@ -71,10 +71,14 @@
       formatter = pkgs.alejandra;
 
       devShells.default = pkgs.mkShell {
-        packages = [
-          rustToolchain
-          pkgs.cargo-llvm-cov
-        ];
+        packages =
+          [
+            rustToolchain
+            pkgs.cargo-llvm-cov
+          ]
+          ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+            pkgs.valgrind
+          ];
 
         RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";
 
@@ -89,6 +93,8 @@
           echo "  cargo fmt --check"
           echo "  cargo clippy --all-targets -- -D warnings"
           echo "  cargo llvm-cov --fail-under-lines 100 --summary-only"
+          echo "  cargo bench --bench server_roundtrip"
+          echo "  cargo bench --bench server_callgrind"
         '';
       };
 
