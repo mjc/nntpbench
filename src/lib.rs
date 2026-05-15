@@ -1,18 +1,16 @@
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
-use std::cell::UnsafeCell;
 use std::io;
-use std::mem::MaybeUninit;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::Semaphore;
 use tokio::time;
 
 pub const CRLF: &[u8] = b"\r\n";
@@ -137,14 +135,10 @@ async fn serve_session_inner(
     session_stats: &mut SessionStats,
 ) -> io::Result<()> {
     let (reader, mut writer) = stream.into_split();
-    let command_queue = Arc::new(CommandQueue::with_capacity(
-        config.max_pipeline_depth.saturating_mul(2).max(1),
-    ));
-    let reader_task = tokio::spawn(read_commands(
-        reader,
-        command_queue.clone(),
-        config.max_pipeline_depth,
-    ));
+    let mut reader = BufReader::with_capacity(16 * 1024, reader);
+    let mut command_buf = [0; MAX_COMMAND_LINE_BYTES];
+    let mut command_batch = [ParsedCommand::Unknown; 1024];
+    let max_pipeline_depth = config.max_pipeline_depth.min(command_batch.len());
     let mut pending_write = PendingWrite::new();
 
     writer.write_all(GREETING).await?;
@@ -153,34 +147,40 @@ async fn serve_session_inner(
         writer.flush().await?;
     }
 
-    while let Some(command) = command_queue.recv().await {
-        session_stats.pipeline_batches += u64::from(command.starts_pipeline_batch);
-
-        let should_close = handle_command(
-            &command.command,
-            &config,
-            session_stats,
-            &mut writer,
-            &mut pending_write,
+    loop {
+        let batch_len = read_command_batch_array(
+            &mut reader,
+            &mut command_buf,
+            &mut command_batch[..max_pipeline_depth],
         )
         .await?;
 
-        if should_close {
-            flush_pending(&mut writer, &mut pending_write).await?;
-            if config.flush {
-                writer.flush().await?;
-            }
-            reader_task.abort();
-            command_queue.close();
-            return Ok(());
+        if batch_len == 0 {
+            break;
         }
 
-        if command.ends_read_batch {
-            flush_pending(&mut writer, &mut pending_write).await?;
-
-            if config.flush {
-                writer.flush().await?;
+        session_stats.pipeline_batches += u64::from(batch_len > 1);
+        for command in &command_batch[..batch_len] {
+            let should_close = handle_command(
+                command,
+                &config,
+                session_stats,
+                &mut writer,
+                &mut pending_write,
+            )
+            .await?;
+            if should_close {
+                flush_pending(&mut writer, &mut pending_write).await?;
+                if config.flush {
+                    writer.flush().await?;
+                }
+                return Ok(());
             }
+        }
+
+        flush_pending(&mut writer, &mut pending_write).await?;
+        if config.flush {
+            writer.flush().await?;
         }
     }
 
@@ -189,18 +189,7 @@ async fn serve_session_inner(
         writer.flush().await?;
     }
 
-    finish_reader_task(reader_task).await
-}
-
-#[cfg_attr(coverage_nightly, coverage(off))]
-async fn finish_reader_task(
-    reader_task: tokio::task::JoinHandle<io::Result<()>>,
-) -> io::Result<()> {
-    match reader_task.await {
-        Ok(result) => result,
-        Err(err) if err.is_cancelled() => Ok(()),
-        Err(err) => Err(io::Error::other(err)),
-    }
+    Ok(())
 }
 
 async fn handle_command<W>(
@@ -269,124 +258,6 @@ where
             )
             .await?;
             Ok(false)
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct QueuedCommand {
-    command: ParsedCommand,
-    starts_pipeline_batch: bool,
-    ends_read_batch: bool,
-}
-
-struct CommandQueue {
-    slots: Box<[UnsafeCell<MaybeUninit<QueuedCommand>>]>,
-    head: AtomicUsize,
-    tail: AtomicUsize,
-    closed: AtomicBool,
-    readable: Notify,
-    writable: Notify,
-}
-
-// SPSC only: the read task owns writes, the session task owns reads. Slot access is
-// sequenced by head/tail atomics, so no slot is read while it is being written.
-unsafe impl Sync for CommandQueue {}
-
-impl CommandQueue {
-    fn with_capacity(capacity: usize) -> Self {
-        assert!(capacity > 0);
-        let mut slots = Box::<[UnsafeCell<MaybeUninit<QueuedCommand>>]>::new_uninit_slice(capacity);
-        for slot in slots.iter_mut() {
-            slot.write(UnsafeCell::new(MaybeUninit::uninit()));
-        }
-        let slots = unsafe { slots.assume_init() };
-
-        Self {
-            slots,
-            head: AtomicUsize::new(0),
-            tail: AtomicUsize::new(0),
-            closed: AtomicBool::new(false),
-            readable: Notify::new(),
-            writable: Notify::new(),
-        }
-    }
-
-    #[cfg_attr(coverage_nightly, coverage(off))]
-    async fn send(&self, mut command: QueuedCommand) -> Result<(), ()> {
-        loop {
-            if self.closed.load(Ordering::Acquire) {
-                return Err(());
-            }
-
-            match self.try_send(command) {
-                Ok(()) => return Ok(()),
-                Err(value) => command = value,
-            }
-
-            self.writable.notified().await;
-        }
-    }
-
-    fn try_send(&self, command: QueuedCommand) -> Result<(), QueuedCommand> {
-        let tail = self.tail.load(Ordering::Relaxed);
-        let head = self.head.load(Ordering::Acquire);
-        if tail.wrapping_sub(head) == self.slots.len() {
-            return Err(command);
-        }
-
-        unsafe {
-            (*self.slots[tail % self.slots.len()].get()).write(command);
-        }
-        self.tail.store(tail.wrapping_add(1), Ordering::Release);
-        self.readable.notify_one();
-        Ok(())
-    }
-
-    #[cfg_attr(coverage_nightly, coverage(off))]
-    async fn recv(&self) -> Option<QueuedCommand> {
-        loop {
-            if let Some(command) = self.try_recv() {
-                return Some(command);
-            }
-
-            if self.closed.load(Ordering::Acquire) {
-                return None;
-            }
-
-            self.readable.notified().await;
-        }
-    }
-
-    fn try_recv(&self) -> Option<QueuedCommand> {
-        let head = self.head.load(Ordering::Relaxed);
-        let tail = self.tail.load(Ordering::Acquire);
-        if head == tail {
-            return None;
-        }
-
-        let command = unsafe { (*self.slots[head % self.slots.len()].get()).assume_init_read() };
-        self.head.store(head.wrapping_add(1), Ordering::Release);
-        self.writable.notify_one();
-        Some(command)
-    }
-
-    fn close(&self) {
-        self.closed.store(true, Ordering::Release);
-        self.readable.notify_waiters();
-        self.writable.notify_waiters();
-    }
-}
-
-impl Drop for CommandQueue {
-    fn drop(&mut self) {
-        let mut head = self.head.load(Ordering::Relaxed);
-        let tail = self.tail.load(Ordering::Relaxed);
-        while head != tail {
-            unsafe {
-                (*self.slots[head % self.slots.len()].get()).assume_init_drop();
-            }
-            head = head.wrapping_add(1);
         }
     }
 }
@@ -784,56 +655,6 @@ where
     Ok(true)
 }
 
-async fn read_commands<R>(
-    reader: R,
-    command_queue: Arc<CommandQueue>,
-    max_pipeline_depth: usize,
-) -> io::Result<()>
-where
-    R: tokio::io::AsyncRead + Unpin,
-{
-    let mut reader = BufReader::with_capacity(16 * 1024, reader);
-    let mut command_buf = [0; MAX_COMMAND_LINE_BYTES];
-    let mut command_batch = [ParsedCommand::Unknown; 1024];
-    let max_pipeline_depth = max_pipeline_depth.min(command_batch.len());
-
-    loop {
-        let batch_len = match read_command_batch_array(
-            &mut reader,
-            &mut command_buf,
-            &mut command_batch[..max_pipeline_depth],
-        )
-        .await
-        {
-            Ok(batch_len) => batch_len,
-            Err(err) => {
-                command_queue.close();
-                return Err(err);
-            }
-        };
-
-        if batch_len == 0 {
-            command_queue.close();
-            return Ok(());
-        }
-
-        let is_pipeline_batch = batch_len > 1;
-        for (index, command) in command_batch[..batch_len].iter().copied().enumerate() {
-            if command_queue
-                .send(QueuedCommand {
-                    command,
-                    starts_pipeline_batch: is_pipeline_batch && index == 0,
-                    ends_read_batch: index + 1 == batch_len,
-                })
-                .await
-                .is_err()
-            {
-                return Ok(());
-            }
-        }
-    }
-}
-
 async fn read_command_batch_array<R>(
     reader: &mut BufReader<R>,
     command_buf: &mut [u8; MAX_COMMAND_LINE_BYTES],
@@ -1094,105 +915,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(batch_len, 0);
-
-        let (mut tx_client, rx_server) = tokio::io::duplex(64);
-        tx_client.write_all(b"ARTICLE 1\r\n").await.unwrap();
-        drop(tx_client);
-        let queue = Arc::new(CommandQueue::with_capacity(1));
-        queue.close();
-        read_commands(rx_server, queue, 4).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn command_queue_waits_for_room_and_items() {
-        let queue = Arc::new(CommandQueue::with_capacity(1));
-        queue
-            .send(QueuedCommand {
-                command: ParsedCommand::Article,
-                starts_pipeline_batch: false,
-                ends_read_batch: false,
-            })
-            .await
-            .unwrap();
-
-        let sender = tokio::spawn({
-            let queue = queue.clone();
-            async move {
-                queue
-                    .send(QueuedCommand {
-                        command: ParsedCommand::Body,
-                        starts_pipeline_batch: true,
-                        ends_read_batch: true,
-                    })
-                    .await
-            }
-        });
-        tokio::task::yield_now().await;
-
-        assert_eq!(queue.recv().await.unwrap().command, ParsedCommand::Article);
-        sender.await.unwrap().unwrap();
-        let queued = queue.recv().await.unwrap();
-        assert_eq!(queued.command, ParsedCommand::Body);
-        assert!(queued.starts_pipeline_batch);
-        assert!(queued.ends_read_batch);
-
-        let receiver = tokio::spawn({
-            let queue = queue.clone();
-            async move { queue.recv().await.unwrap().command }
-        });
-        tokio::task::yield_now().await;
-        queue
-            .send(QueuedCommand {
-                command: ParsedCommand::Quit,
-                starts_pipeline_batch: false,
-                ends_read_batch: true,
-            })
-            .await
-            .unwrap();
-        assert_eq!(receiver.await.unwrap(), ParsedCommand::Quit);
-    }
-
-    #[tokio::test]
-    async fn command_queue_closes_and_drops_queued_items() {
-        let queue = CommandQueue::with_capacity(1);
-        queue
-            .try_send(QueuedCommand {
-                command: ParsedCommand::Unknown,
-                starts_pipeline_batch: false,
-                ends_read_batch: false,
-            })
-            .unwrap();
-        assert!(
-            queue
-                .try_send(QueuedCommand {
-                    command: ParsedCommand::Date,
-                    starts_pipeline_batch: false,
-                    ends_read_batch: false,
-                })
-                .is_err()
-        );
-        queue.close();
-        assert!(
-            queue
-                .send(QueuedCommand {
-                    command: ParsedCommand::Date,
-                    starts_pipeline_batch: false,
-                    ends_read_batch: false,
-                })
-                .await
-                .is_err()
-        );
-    }
-
-    #[tokio::test]
-    async fn read_commands_closes_queue_on_read_error() {
-        let queue = Arc::new(CommandQueue::with_capacity(1));
-        let err = read_commands(ErrorRead, queue.clone(), 4)
-            .await
-            .unwrap_err();
-
-        assert_eq!(err.kind(), io::ErrorKind::Other);
-        assert!(queue.closed.load(Ordering::Acquire));
     }
 
     #[derive(Default)]
@@ -1223,18 +945,6 @@ mod tests {
 
         fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
             Poll::Ready(Ok(()))
-        }
-    }
-
-    struct ErrorRead;
-
-    impl tokio::io::AsyncRead for ErrorRead {
-        fn poll_read(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-            _buf: &mut tokio::io::ReadBuf<'_>,
-        ) -> Poll<io::Result<()>> {
-            Poll::Ready(Err(io::Error::other("read failure")))
         }
     }
 
