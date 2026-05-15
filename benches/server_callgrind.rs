@@ -41,6 +41,8 @@ supported! {
             backlog: 8192,
             reuse_port: false,
             nodelay: true,
+            socket_recv_buffer: 0,
+            socket_send_buffer: 0,
             stats_interval_secs: 0,
             flush: false,
         }

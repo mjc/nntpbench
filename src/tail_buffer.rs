@@ -1,7 +1,6 @@
 //! Tail buffer for tracking the last few bytes of streamed data.
 //!
-//! Copied from nntp-proxy and kept as the single terminator detector for
-//! streamed multiline NNTP responses.
+//! Kept as the single terminator detector for streamed multiline NNTP responses.
 
 pub const TERMINATOR_TAIL_SIZE: usize = 5;
 

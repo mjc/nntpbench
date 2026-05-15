@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
-use socket2::{Domain, Protocol, Socket, Type};
+use socket2::{Domain, Protocol, SockRef, Socket, Type};
 use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
@@ -24,8 +24,15 @@ pub const GREETING: &[u8] = b"201 nntpbench mock server ready\r\n";
 pub const MODE_READER_RESPONSE: &[u8] = b"201 posting not permitted\r\n";
 pub const DATE_RESPONSE: &[u8] = b"111 20260515120000\r\n";
 const MAX_COMMAND_LINE_BYTES: usize = 1024;
+const SERVER_READER_CAPACITY: usize = 64 * 1024;
 const MAX_PENDING_WRITE_BYTES: usize = 64 * 1024;
 const MAX_CLIENT_COMMAND_BYTES: usize = 64;
+const HIGH_THROUGHPUT_SOCKET_BUFFER: usize = 16 * 1024 * 1024;
+const TCP_LINGER_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(target_os = "linux")]
+const TCP_USER_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(target_os = "linux")]
+const TOS_THROUGHPUT: u32 = 0x08;
 
 #[derive(Debug, Parser, Clone)]
 pub struct ServerArgs {
@@ -65,6 +72,14 @@ pub struct ServerArgs {
     #[arg(long, default_value_t = true)]
     pub nodelay: bool,
 
+    /// Socket receive buffer size for accepted sockets. Use 0 to leave the OS default.
+    #[arg(long, default_value_t = HIGH_THROUGHPUT_SOCKET_BUFFER)]
+    pub socket_recv_buffer: usize,
+
+    /// Socket send buffer size for accepted sockets. Use 0 to leave the OS default.
+    #[arg(long, default_value_t = HIGH_THROUGHPUT_SOCKET_BUFFER)]
+    pub socket_send_buffer: usize,
+
     /// Print benchmark statistics at this interval. Use 0 to disable periodic output.
     #[arg(long, default_value_t = 1)]
     pub stats_interval_secs: u64,
@@ -95,7 +110,7 @@ pub async fn run_server(args: ServerArgs) -> io::Result<()> {
         tokio::select! {
             result = listener.accept() => {
                 let (stream, peer_addr) = result?;
-                stream.set_nodelay(config.nodelay)?;
+                optimize_server_socket(&stream, &config)?;
                 let Ok(permit) = limiter.clone().try_acquire_owned() else {
                     stats.refused_connections.fetch_add(1, Ordering::Relaxed);
                     continue;
@@ -622,6 +637,28 @@ fn optimize_client_socket(
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
+fn optimize_server_socket(stream: &TcpStream, config: &ServerConfig) -> io::Result<()> {
+    stream.set_nodelay(config.nodelay)?;
+
+    let socket = SockRef::from(stream);
+    if config.socket_recv_buffer != 0 {
+        socket.set_recv_buffer_size(config.socket_recv_buffer)?;
+    }
+    if config.socket_send_buffer != 0 {
+        socket.set_send_buffer_size(config.socket_send_buffer)?;
+    }
+    socket.set_linger(Some(TCP_LINGER_TIMEOUT))?;
+
+    #[cfg(target_os = "linux")]
+    {
+        let _ = socket.set_tcp_user_timeout(Some(TCP_USER_TIMEOUT));
+        let _ = socket.set_tos_v4(TOS_THROUGHPUT);
+    }
+
+    Ok(())
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
 fn process_cpu_ticks() -> Option<u64> {
     let stat = fs::read_to_string("/proc/self/stat").ok()?;
     let rest = stat.rsplit_once(") ")?.1;
@@ -866,10 +903,10 @@ async fn serve_session_inner(
     session_stats: &mut SessionStats,
 ) -> io::Result<()> {
     let (reader, mut writer) = stream.into_split();
-    let mut reader = BufReader::with_capacity(16 * 1024, reader);
-    let mut command_buf = [0; MAX_COMMAND_LINE_BYTES];
-    let mut command_batch = [ParsedCommand::Unknown; 1024];
-    let max_pipeline_depth = config.max_pipeline_depth.min(command_batch.len());
+    let mut reader = BufReader::with_capacity(SERVER_READER_CAPACITY, reader);
+    let max_pipeline_depth = config.max_pipeline_depth;
+    let mut command_buf = Vec::with_capacity(MAX_COMMAND_LINE_BYTES);
+    let mut command_batch = Vec::with_capacity(max_pipeline_depth);
     let mut pending_write = PendingWrite::new();
 
     writer.write_all(GREETING).await?;
@@ -882,19 +919,19 @@ async fn serve_session_inner(
     }
 
     loop {
-        let batch_len = read_command_batch_array(
+        if !read_command_batch(
             &mut reader,
             &mut command_buf,
-            &mut command_batch[..max_pipeline_depth],
+            &mut command_batch,
+            max_pipeline_depth,
         )
-        .await?;
-
-        if batch_len == 0 {
+        .await?
+        {
             break;
         }
 
-        session_stats.pipeline_batches += u64::from(batch_len > 1);
-        for command in &command_batch[..batch_len] {
+        session_stats.pipeline_batches += u64::from(command_batch.len() > 1);
+        for command in &command_batch {
             let should_close = handle_command(
                 command,
                 &config,
@@ -1142,6 +1179,8 @@ pub struct ServerConfig {
     pub stats_interval: Duration,
     pub flush: bool,
     pub nodelay: bool,
+    pub socket_recv_buffer: usize,
+    pub socket_send_buffer: usize,
     body: Box<[u8]>,
     article: Box<[u8]>,
 }
@@ -1159,6 +1198,8 @@ impl ServerConfig {
             stats_interval: Duration::from_secs(args.stats_interval_secs),
             flush: args.flush,
             nodelay: args.nodelay,
+            socket_recv_buffer: args.socket_recv_buffer,
+            socket_send_buffer: args.socket_send_buffer,
             body,
             article,
         }
@@ -1403,74 +1444,6 @@ where
     Ok(true)
 }
 
-#[cfg_attr(coverage_nightly, coverage(off))]
-async fn read_command_batch_array<R>(
-    reader: &mut BufReader<R>,
-    command_buf: &mut [u8; MAX_COMMAND_LINE_BYTES],
-    command_batch: &mut [ParsedCommand],
-) -> io::Result<usize>
-where
-    R: tokio::io::AsyncRead + Unpin,
-{
-    let Some(first) = read_one_command(reader, command_buf).await? else {
-        return Ok(0);
-    };
-    command_batch[0] = first;
-
-    let mut len = 1;
-    while len < command_batch.len() {
-        let buffer = reader.buffer();
-        let Some(relative_lf) = memchr::memchr(b'\n', buffer) else {
-            break;
-        };
-        let end = relative_lf + 1;
-        command_batch[len] = CommandLine::parse(trim_line_slice(&buffer[..end]));
-        reader.consume(end);
-        len += 1;
-    }
-
-    Ok(len)
-}
-
-async fn read_one_command<R>(
-    reader: &mut BufReader<R>,
-    command_buf: &mut [u8; MAX_COMMAND_LINE_BYTES],
-) -> io::Result<Option<ParsedCommand>>
-where
-    R: tokio::io::AsyncRead + Unpin,
-{
-    let mut buffered = 0;
-
-    loop {
-        let available = reader.fill_buf().await?;
-        if available.is_empty() {
-            return Ok(None);
-        }
-
-        if let Some(relative_lf) = memchr::memchr(b'\n', available) {
-            let end = relative_lf + 1;
-            let command = if buffered == 0 {
-                CommandLine::parse(trim_line_slice(&available[..end]))
-            } else {
-                let copy_len = end.min(command_buf.len().saturating_sub(buffered));
-                command_buf[buffered..buffered + copy_len].copy_from_slice(&available[..copy_len]);
-                buffered += copy_len;
-                CommandLine::parse(trim_line_slice(&command_buf[..buffered]))
-            };
-            reader.consume(end);
-            return Ok(Some(command));
-        }
-
-        let copy_len = available
-            .len()
-            .min(command_buf.len().saturating_sub(buffered));
-        command_buf[buffered..buffered + copy_len].copy_from_slice(&available[..copy_len]);
-        buffered += copy_len;
-        let consumed = available.len();
-        reader.consume(consumed);
-    }
-}
-
 fn push_command(command_buf: &mut Vec<u8>, command_batch: &mut Vec<ParsedCommand>) {
     command_batch.push(parse_command_buf(command_buf));
 }
@@ -1576,6 +1549,8 @@ mod tests {
             backlog: 128,
             reuse_port: false,
             nodelay: true,
+            socket_recv_buffer: 0,
+            socket_send_buffer: 0,
             stats_interval_secs: 0,
             flush: false,
         }
@@ -1713,20 +1688,22 @@ mod tests {
     async fn fixed_command_reader_handles_split_line_and_closed_sender() {
         let server = ChunkedRead::new(&[b"ART".as_slice(), b"ICLE 1\r\nBODY 2\r\n".as_slice()]);
         let mut reader = BufReader::with_capacity(32, server);
-        let mut command_buf = [0; MAX_COMMAND_LINE_BYTES];
-        let mut command_batch = [ParsedCommand::Unknown; 4];
-        let batch_len = read_command_batch_array(&mut reader, &mut command_buf, &mut command_batch)
-            .await
-            .unwrap();
-        assert_eq!(batch_len, 2);
-        assert_eq!(
-            command_batch[..batch_len],
-            [ParsedCommand::Article, ParsedCommand::Body]
+        let mut command_buf = Vec::with_capacity(MAX_COMMAND_LINE_BYTES);
+        let mut command_batch = Vec::with_capacity(4);
+        assert!(
+            read_command_batch(&mut reader, &mut command_buf, &mut command_batch, 4)
+                .await
+                .unwrap()
         );
-        let batch_len = read_command_batch_array(&mut reader, &mut command_buf, &mut command_batch)
-            .await
-            .unwrap();
-        assert_eq!(batch_len, 0);
+        assert_eq!(
+            command_batch,
+            vec![ParsedCommand::Article, ParsedCommand::Body]
+        );
+        assert!(
+            !read_command_batch(&mut reader, &mut command_buf, &mut command_batch, 4)
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -1943,8 +1920,12 @@ mod tests {
 
         let mut high = test_args();
         high.max_pipeline_depth = 4096;
+        high.socket_recv_buffer = 4096;
+        high.socket_send_buffer = 8192;
         let config = ServerConfig::from_args(high);
         assert_eq!(config.max_pipeline_depth, 1024);
+        assert_eq!(config.socket_recv_buffer, 4096);
+        assert_eq!(config.socket_send_buffer, 8192);
     }
 
     #[test]
@@ -2160,6 +2141,30 @@ mod tests {
 
         optimize_client_socket(&client, true, 4096, 4096).unwrap();
         optimize_client_socket(&client, false, 0, 0).unwrap();
+    }
+
+    #[tokio::test]
+    async fn optimize_server_socket_accepts_high_throughput_buffers() {
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr);
+        let accepted = listener.accept();
+        let (client, accepted) = tokio::join!(client, accepted);
+        let _client = client.unwrap();
+        let (server, _) = accepted.unwrap();
+
+        let mut args = test_args();
+        args.socket_recv_buffer = 4096;
+        args.socket_send_buffer = 4096;
+        let config = ServerConfig::from_args(args);
+        optimize_server_socket(&server, &config).unwrap();
+
+        let mut args = test_args();
+        args.nodelay = false;
+        args.socket_recv_buffer = 0;
+        args.socket_send_buffer = 0;
+        let config = ServerConfig::from_args(args);
+        optimize_server_socket(&server, &config).unwrap();
     }
 
     #[tokio::test]
@@ -2534,7 +2539,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn serve_session_supports_proxy_backend_negotiation_commands() {
+    async fn serve_session_supports_backend_negotiation_commands() {
         let (output, stats) =
             run_session_with_input(test_config(), b"MODE READER\r\nDATE\r\nQUIT\r\n").await;
 
