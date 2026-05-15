@@ -3,7 +3,8 @@
 use std::io;
 
 use clap::Parser;
-use nntpbench::{ServerArgs, run_server};
+use nntpbench::{ClientArgs, ServerArgs, run_client, run_server};
+use tokio::runtime::{Builder, Runtime};
 
 #[derive(Debug, Parser)]
 #[command(author, version, about = "Small async mock NNTP benchmark server")]
@@ -14,16 +15,32 @@ struct Args {
 
 #[derive(Debug, clap::Subcommand)]
 enum Command {
+    /// Run the benchmark NNTP client.
+    Client(ClientArgs),
+
     /// Run the mock NNTP server.
     Server(ServerArgs),
 }
 
-#[tokio::main]
 #[cfg_attr(coverage_nightly, coverage(off))]
-async fn main() -> io::Result<()> {
+fn main() -> io::Result<()> {
     let args = Args::parse();
 
     match args.command {
-        Command::Server(args) => run_server(args).await,
+        Command::Client(args) => build_runtime(args.threads)?.block_on(run_client(args)),
+        Command::Server(args) => build_runtime(args.threads)?.block_on(run_server(args)),
     }
+}
+
+fn build_runtime(threads: usize) -> io::Result<Runtime> {
+    let threads = threads.max(1);
+    let mut builder = if threads == 1 {
+        Builder::new_current_thread()
+    } else {
+        let mut builder = Builder::new_multi_thread();
+        builder.worker_threads(threads);
+        builder
+    };
+
+    builder.enable_all().build()
 }

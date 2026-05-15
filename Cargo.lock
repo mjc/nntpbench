@@ -278,6 +278,7 @@ dependencies = [
  "clap",
  "divan",
  "iai-callgrind",
+ "libc",
  "memchr",
  "socket2",
  "tokio",

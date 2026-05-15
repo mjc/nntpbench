@@ -28,6 +28,7 @@ fn server_args(body_bytes: usize, article_bytes: usize) -> ServerArgs {
         body_bytes,
         article_bytes,
         max_connections: 4096,
+        threads: 1,
         max_pipeline_depth: 64,
         backlog: 8192,
         reuse_port: false,
