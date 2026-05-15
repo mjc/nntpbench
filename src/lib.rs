@@ -123,7 +123,7 @@ pub async fn serve_session(
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::with_capacity(16 * 1024, reader);
     let mut command_buf = Vec::with_capacity(1024);
-    let mut command_batch = Vec::with_capacity(config.max_pipeline_depth);
+    let mut command_batch = [ParsedCommand::Unknown; 1024];
     let mut pending_write = Vec::with_capacity(config.max_pipeline_depth.saturating_mul(64));
 
     writer.write_all(GREETING).await?;
@@ -135,23 +135,22 @@ pub async fn serve_session(
     }
 
     loop {
-        command_batch.clear();
-        if !read_command_batch(
+        let batch_len = read_command_batch_array(
             &mut reader,
             &mut command_buf,
-            &mut command_batch,
-            config.max_pipeline_depth,
+            &mut command_batch[..config.max_pipeline_depth],
         )
-        .await?
-        {
+        .await?;
+
+        if batch_len == 0 {
             return Ok(());
         }
 
         stats
             .pipeline_batches
-            .fetch_add((command_batch.len() > 1) as u64, Ordering::Relaxed);
+            .fetch_add((batch_len > 1) as u64, Ordering::Relaxed);
 
-        for command in &command_batch {
+        for command in &command_batch[..batch_len] {
             let should_close =
                 handle_command(command, &config, &stats, &mut writer, &mut pending_write).await?;
 
@@ -554,9 +553,44 @@ where
     Ok(true)
 }
 
+async fn read_command_batch_array<R>(
+    reader: &mut BufReader<R>,
+    command_buf: &mut Vec<u8>,
+    command_batch: &mut [ParsedCommand],
+) -> io::Result<usize>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    command_buf.clear();
+    let read = reader.read_until(b'\n', command_buf).await?;
+    if read == 0 {
+        return Ok(0);
+    }
+
+    let mut len = 1;
+    command_batch[0] = parse_command_buf(command_buf);
+
+    while len < command_batch.len() {
+        if memchr::memchr(b'\n', reader.buffer()).is_none() {
+            break;
+        }
+
+        command_buf.clear();
+        reader.read_until(b'\n', command_buf).await?;
+        command_batch[len] = parse_command_buf(command_buf);
+        len += 1;
+    }
+
+    Ok(len)
+}
+
 fn push_command(command_buf: &mut Vec<u8>, command_batch: &mut Vec<ParsedCommand>) {
+    command_batch.push(parse_command_buf(command_buf));
+}
+
+fn parse_command_buf(command_buf: &mut Vec<u8>) -> ParsedCommand {
     trim_command_line(command_buf);
-    command_batch.push(CommandLine::parse(command_buf));
+    CommandLine::parse(command_buf)
 }
 
 fn split_once_space(line: &[u8]) -> Option<(&[u8], &[u8])> {
