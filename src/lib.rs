@@ -29,7 +29,7 @@ pub const DATE_RESPONSE: &[u8] = b"111 20260515120000\r\n";
 const MAX_COMMAND_LINE_BYTES: usize = 1024;
 const MAX_SERVER_PIPELINE_DEPTH: usize = 1024;
 const SERVER_READER_CAPACITY: usize = 256 * 1024;
-const CLIENT_READER_CAPACITY: usize = 1024 * 1024;
+const CLIENT_READER_CAPACITY: usize = 256 * 1024;
 const MAX_PENDING_WRITE_BYTES: usize = 64 * 1024;
 const MAX_CLIENT_COMMAND_BYTES: usize = 64;
 const HIGH_THROUGHPUT_SOCKET_BUFFER: usize = 16 * 1024 * 1024;
@@ -891,20 +891,28 @@ struct MultilineScanner {
 
 impl MultilineScanner {
     fn count_terminators(&mut self, input: &[u8]) -> usize {
-        let mut count = 0;
-        let mut remaining = input;
+        if input.is_empty() {
+            return 0;
+        }
 
-        while !remaining.is_empty() {
-            match self.tail.detect_terminator(remaining) {
-                tail_buffer::TerminatorStatus::FoundAt(end) => {
-                    count += 1;
-                    self.tail = tail_buffer::TailBuffer::default();
-                    remaining = &remaining[end..];
-                }
-                tail_buffer::TerminatorStatus::NotFound => {
-                    self.tail.update(remaining);
-                    break;
-                }
+        let mut count = 0;
+        let mut last_end = 0;
+        if let Some(end) = self.tail.find_spanning_terminator(input) {
+            count += 1;
+            last_end = end;
+        }
+
+        for start in memchr::memmem::find_iter(&input[last_end..], TERMINATOR) {
+            count += 1;
+            last_end += start + TERMINATOR.len();
+        }
+
+        if count == 0 {
+            self.tail.update(input);
+        } else {
+            self.tail = tail_buffer::TailBuffer::default();
+            if last_end < input.len() {
+                self.tail.update(&input[last_end..]);
             }
         }
         count
@@ -3041,5 +3049,18 @@ BODY <bench.4@nntpbench.local>\r\n"
         assert_eq!(scanner.count_terminators(b"222 body\r\npayload\r"), 0);
         assert_eq!(scanner.count_terminators(b"\n.\r"), 0);
         assert_eq!(scanner.count_terminators(b"\n220 article\r\n.\r\n"), 2);
+    }
+
+    #[test]
+    fn multiline_scanner_counts_packed_responses_in_one_pass() {
+        let mut scanner = MultilineScanner::default();
+
+        assert_eq!(
+            scanner.count_terminators(
+                b"222 body follows\r\npayload\r\n.\r\n220 article follows\r\npayload\r\n.\r\n"
+            ),
+            2
+        );
+        assert_eq!(scanner.count_terminators(b".\r\n"), 0);
     }
 }
