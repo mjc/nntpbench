@@ -902,9 +902,9 @@ impl MultilineScanner {
             last_end = end;
         }
 
-        for start in memchr::memmem::find_iter(&input[last_end..], TERMINATOR) {
+        for end in find_in_chunk_terminator_ends(&input[last_end..]) {
             count += 1;
-            last_end += start + TERMINATOR.len();
+            last_end += end;
         }
 
         if count == 0 {
@@ -917,6 +917,18 @@ impl MultilineScanner {
         }
         count
     }
+}
+
+fn find_in_chunk_terminator_ends(input: &[u8]) -> impl Iterator<Item = usize> + '_ {
+    memchr::memchr_iter(b'.', input).filter_map(|dot| {
+        (dot >= 2
+            && dot + 2 < input.len()
+            && input[dot - 2] == b'\r'
+            && input[dot - 1] == b'\n'
+            && input[dot + 1] == b'\r'
+            && input[dot + 2] == b'\n')
+            .then_some(dot + TERMINATOR.len() - 2)
+    })
 }
 
 pub async fn serve_session(
@@ -3062,5 +3074,17 @@ BODY <bench.4@nntpbench.local>\r\n"
             2
         );
         assert_eq!(scanner.count_terminators(b".\r\n"), 0);
+    }
+
+    #[test]
+    fn in_chunk_terminator_counter_rejects_plain_dots() {
+        let ends: Vec<_> =
+            find_in_chunk_terminator_ends(b"line.with.dots\r\nnot done\r\n").collect();
+        assert!(ends.is_empty());
+
+        let ends: Vec<_> =
+            find_in_chunk_terminator_ends(b"one\r\n.\r\ntwo\r\n..\r\nthree\r\n.\r\npartial\r\n.\r")
+                .collect();
+        assert_eq!(ends, vec![8, 27]);
     }
 }
