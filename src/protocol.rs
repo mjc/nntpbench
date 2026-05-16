@@ -113,6 +113,87 @@ fn validate_message_id(value: &str) -> Result<(), InvalidMessageId> {
     Ok(())
 }
 
+/// Validated NNTP header field name.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct HeaderName<'a>(Cow<'a, str>);
+
+impl<'a> HeaderName<'a> {
+    /// Construct a borrowed header name after validation.
+    pub fn from_borrowed(value: &'a str) -> Result<Self, InvalidHeaderName> {
+        validate_header_name(value)?;
+        Ok(Self(Cow::Borrowed(value)))
+    }
+
+    /// Construct an owned header name after validation.
+    pub fn from_owned(value: impl AsRef<str>) -> Result<HeaderName<'static>, InvalidHeaderName> {
+        let value = value.as_ref();
+        validate_header_name(value)?;
+        Ok(HeaderName(Cow::Owned(value.to_owned())))
+    }
+
+    /// Borrow the validated string.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidHeaderName;
+
+fn validate_header_name(value: &str) -> Result<(), InvalidHeaderName> {
+    if value.is_empty() {
+        return Err(InvalidHeaderName);
+    }
+
+    if value
+        .bytes()
+        .any(|byte| !byte.is_ascii_alphanumeric() && byte != b'-')
+    {
+        return Err(InvalidHeaderName);
+    }
+
+    Ok(())
+}
+
+/// Validated article selector for range-style header queries.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ArticleSelector<'a>(Cow<'a, str>);
+
+impl<'a> ArticleSelector<'a> {
+    /// Construct a borrowed selector after validation.
+    pub fn from_borrowed(value: &'a str) -> Result<Self, InvalidArticleSelector> {
+        validate_article_selector(value)?;
+        Ok(Self(Cow::Borrowed(value)))
+    }
+
+    /// Construct an owned selector after validation.
+    pub fn from_owned(
+        value: impl AsRef<str>,
+    ) -> Result<ArticleSelector<'static>, InvalidArticleSelector> {
+        let value = value.as_ref();
+        validate_article_selector(value)?;
+        Ok(ArticleSelector(Cow::Owned(value.to_owned())))
+    }
+
+    /// Borrow the validated string.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidArticleSelector;
+
+fn validate_article_selector(value: &str) -> Result<(), InvalidArticleSelector> {
+    if value.is_empty() || value.bytes().any(|byte| byte.is_ascii_whitespace()) {
+        return Err(InvalidArticleSelector);
+    }
+
+    Ok(())
+}
+
 /// Typed request kind for the currently-supported command set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestKind {
@@ -173,10 +254,26 @@ impl RequestKind {
 /// Typed client request for the current typed NNTP surface.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request<'a> {
-    Article { message_id: MessageId<'a> },
-    Body { message_id: MessageId<'a> },
-    Head { message_id: MessageId<'a> },
-    Stat { message_id: MessageId<'a> },
+    Article {
+        message_id: MessageId<'a>,
+    },
+    Body {
+        message_id: MessageId<'a>,
+    },
+    Head {
+        message_id: MessageId<'a>,
+    },
+    Stat {
+        message_id: MessageId<'a>,
+    },
+    Hdr {
+        header: HeaderName<'a>,
+        selector: ArticleSelector<'a>,
+    },
+    Xhdr {
+        header: HeaderName<'a>,
+        selector: ArticleSelector<'a>,
+    },
     List,
     Help,
     Capabilities,
@@ -194,6 +291,8 @@ impl<'a> Request<'a> {
             Self::Body { .. } => RequestKind::Body,
             Self::Head { .. } => RequestKind::Head,
             Self::Stat { .. } => RequestKind::Stat,
+            Self::Hdr { .. } => RequestKind::Hdr,
+            Self::Xhdr { .. } => RequestKind::Xhdr,
             Self::List => RequestKind::List,
             Self::Help => RequestKind::Help,
             Self::Capabilities => RequestKind::Capabilities,
@@ -210,6 +309,12 @@ impl<'a> Request<'a> {
             Self::Body { message_id } => write_request_wire(output, b"BODY ", message_id),
             Self::Head { message_id } => write_request_wire(output, b"HEAD ", message_id),
             Self::Stat { message_id } => write_request_wire(output, b"STAT ", message_id),
+            Self::Hdr { header, selector } => {
+                write_two_arg_request_wire(output, b"HDR ", header.as_str(), selector.as_str())
+            }
+            Self::Xhdr { header, selector } => {
+                write_two_arg_request_wire(output, b"XHDR ", header.as_str(), selector.as_str())
+            }
             Self::List => write_simple_request_wire(output, b"LIST"),
             Self::Help => write_simple_request_wire(output, b"HELP"),
             Self::Capabilities => write_simple_request_wire(output, b"CAPABILITIES"),
@@ -227,12 +332,24 @@ impl<'a> Request<'a> {
             | Self::Body { message_id }
             | Self::Head { message_id }
             | Self::Stat { message_id } => Some(message_id),
+            Self::Hdr { .. } | Self::Xhdr { .. } => None,
             Self::List
             | Self::Help
             | Self::Capabilities
             | Self::Date
             | Self::ModeReader
             | Self::Quit => None,
+        }
+    }
+
+    /// Borrow the validated header query arguments carried by this request, if any.
+    #[must_use]
+    pub const fn header_query(&self) -> Option<(&HeaderName<'a>, &ArticleSelector<'a>)> {
+        match self {
+            Self::Hdr { header, selector } | Self::Xhdr { header, selector } => {
+                Some((header, selector))
+            }
+            _ => None,
         }
     }
 }
@@ -263,6 +380,30 @@ impl Request<'static> {
     pub fn stat(message_id: impl AsRef<str>) -> Result<Self, InvalidMessageId> {
         Ok(Self::Stat {
             message_id: MessageId::from_str_or_wrap(message_id)?,
+        })
+    }
+
+    /// Build an HDR request.
+    pub fn hdr(
+        header: impl AsRef<str>,
+        selector: impl AsRef<str>,
+    ) -> Result<Self, InvalidHeaderQuery> {
+        Ok(Self::Hdr {
+            header: HeaderName::from_owned(header).map_err(InvalidHeaderQuery::Header)?,
+            selector: ArticleSelector::from_owned(selector)
+                .map_err(InvalidHeaderQuery::Selector)?,
+        })
+    }
+
+    /// Build an XHDR request.
+    pub fn xhdr(
+        header: impl AsRef<str>,
+        selector: impl AsRef<str>,
+    ) -> Result<Self, InvalidHeaderQuery> {
+        Ok(Self::Xhdr {
+            header: HeaderName::from_owned(header).map_err(InvalidHeaderQuery::Header)?,
+            selector: ArticleSelector::from_owned(selector)
+                .map_err(InvalidHeaderQuery::Selector)?,
         })
     }
 
@@ -301,6 +442,12 @@ impl Request<'static> {
     pub const fn quit() -> Self {
         Self::Quit
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvalidHeaderQuery {
+    Header(InvalidHeaderName),
+    Selector(InvalidArticleSelector),
 }
 
 /// Borrowed request-line parse result.
@@ -460,6 +607,14 @@ fn write_request_wire(output: &mut Vec<u8>, verb: &[u8], message_id: &MessageId<
     output.extend_from_slice(b"\r\n");
 }
 
+fn write_two_arg_request_wire(output: &mut Vec<u8>, verb: &[u8], left: &str, right: &str) {
+    output.extend_from_slice(verb);
+    output.extend_from_slice(left.as_bytes());
+    output.push(b' ');
+    output.extend_from_slice(right.as_bytes());
+    output.extend_from_slice(b"\r\n");
+}
+
 fn write_simple_request_wire(output: &mut Vec<u8>, verb: &[u8]) {
     output.extend_from_slice(verb);
     output.extend_from_slice(b"\r\n");
@@ -492,6 +647,26 @@ mod tests {
             MessageId::from_str_or_wrap("a@b").unwrap().as_str(),
             "<a@b>"
         );
+    }
+
+    #[test]
+    fn header_query_arguments_validate() {
+        assert_eq!(
+            HeaderName::from_borrowed("Subject").unwrap().as_str(),
+            "Subject"
+        );
+        assert_eq!(
+            ArticleSelector::from_borrowed("1-10").unwrap().as_str(),
+            "1-10"
+        );
+        assert_eq!(
+            ArticleSelector::from_borrowed("<a@b>").unwrap().as_str(),
+            "<a@b>"
+        );
+        assert!(HeaderName::from_borrowed("Bad Header").is_err());
+        assert!(HeaderName::from_borrowed("Subject:").is_err());
+        assert!(ArticleSelector::from_borrowed("1 10").is_err());
+        assert!(ArticleSelector::from_borrowed("1\r\nQUIT").is_err());
     }
 
     #[test]
@@ -580,6 +755,14 @@ mod tests {
         let stat = Request::Stat {
             message_id: MessageId::from_borrowed("<g@h>").unwrap(),
         };
+        let hdr = Request::Hdr {
+            header: HeaderName::from_borrowed("Subject").unwrap(),
+            selector: ArticleSelector::from_borrowed("1-10").unwrap(),
+        };
+        let xhdr = Request::Xhdr {
+            header: HeaderName::from_borrowed("Message-ID").unwrap(),
+            selector: ArticleSelector::from_borrowed("<a@b>").unwrap(),
+        };
         let list = Request::List;
         let help = Request::Help;
         let capabilities = Request::Capabilities;
@@ -606,6 +789,16 @@ mod tests {
         stat.write_wire_to(&mut wire);
         assert_eq!(stat.kind(), RequestKind::Stat);
         assert_eq!(wire, b"STAT <g@h>\r\n");
+
+        wire.clear();
+        hdr.write_wire_to(&mut wire);
+        assert_eq!(hdr.kind(), RequestKind::Hdr);
+        assert_eq!(wire, b"HDR Subject 1-10\r\n");
+
+        wire.clear();
+        xhdr.write_wire_to(&mut wire);
+        assert_eq!(xhdr.kind(), RequestKind::Xhdr);
+        assert_eq!(wire, b"XHDR Message-ID <a@b>\r\n");
 
         wire.clear();
         list.write_wire_to(&mut wire);
@@ -644,6 +837,8 @@ mod tests {
         let body = Request::body("<c@d>").unwrap();
         let head = Request::head("e@f").unwrap();
         let stat = Request::stat("<g@h>").unwrap();
+        let hdr = Request::hdr("Subject", "1-10").unwrap();
+        let xhdr = Request::xhdr("Message-ID", "<g@h>").unwrap();
         let list = Request::list();
         let help = Request::help();
         let capabilities = Request::capabilities();
@@ -659,6 +854,18 @@ mod tests {
         assert_eq!(head.message_id().unwrap().as_str(), "<e@f>");
         assert_eq!(stat.kind(), RequestKind::Stat);
         assert_eq!(stat.message_id().unwrap().as_str(), "<g@h>");
+        assert_eq!(hdr.kind(), RequestKind::Hdr);
+        assert_eq!(
+            hdr.header_query()
+                .map(|(header, selector)| (header.as_str(), selector.as_str())),
+            Some(("Subject", "1-10"))
+        );
+        assert_eq!(xhdr.kind(), RequestKind::Xhdr);
+        assert_eq!(
+            xhdr.header_query()
+                .map(|(header, selector)| (header.as_str(), selector.as_str())),
+            Some(("Message-ID", "<g@h>"))
+        );
         assert_eq!(list.kind(), RequestKind::List);
         assert!(list.message_id().is_none());
         assert_eq!(help.kind(), RequestKind::Help);
@@ -672,5 +879,7 @@ mod tests {
         assert_eq!(quit.kind(), RequestKind::Quit);
         assert!(quit.message_id().is_none());
         assert!(Request::article("<bad id>").is_err());
+        assert!(Request::hdr("Bad Header", "1").is_err());
+        assert!(Request::xhdr("Subject", "1 2").is_err());
     }
 }

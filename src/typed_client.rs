@@ -11,7 +11,9 @@ use tokio::sync::{Mutex, Notify, mpsc, oneshot, watch};
 
 use crate::protocol::Request;
 use crate::tail_buffer::{TailBuffer, TerminatorStatus};
-use crate::{Article, ArticleParseError, MessageId, RequestKind, StatusCode};
+use crate::{
+    Article, ArticleParseError, ArticleSelector, HeaderName, MessageId, RequestKind, StatusCode,
+};
 
 /// Options for the typed one-connection client prototype.
 #[derive(Debug, Clone, Copy)]
@@ -163,6 +165,46 @@ impl Client {
     ) -> Result<OwnedArticleExchange, TypedClientError> {
         let request = Request::stat(message_id).map_err(|_| TypedClientError::InvalidMessageId)?;
         self.execute_exchange(request).await
+    }
+
+    /// Send an HDR request and return the owned raw response frame.
+    pub async fn hdr(
+        &self,
+        header: impl AsRef<str>,
+        selector: impl AsRef<str>,
+    ) -> Result<OwnedResponse, TypedClientError> {
+        let request = Request::hdr(header, selector).map_err(TypedClientError::from)?;
+        self.execute_raw(request).await
+    }
+
+    /// Send an HDR request and return the completed raw request/response pair.
+    pub async fn hdr_exchange(
+        &self,
+        header: impl AsRef<str>,
+        selector: impl AsRef<str>,
+    ) -> Result<OwnedExchange, TypedClientError> {
+        let request = Request::hdr(header, selector).map_err(TypedClientError::from)?;
+        self.execute_raw_exchange(request).await
+    }
+
+    /// Send an XHDR request and return the owned raw response frame.
+    pub async fn xhdr(
+        &self,
+        header: impl AsRef<str>,
+        selector: impl AsRef<str>,
+    ) -> Result<OwnedResponse, TypedClientError> {
+        let request = Request::xhdr(header, selector).map_err(TypedClientError::from)?;
+        self.execute_raw(request).await
+    }
+
+    /// Send an XHDR request and return the completed raw request/response pair.
+    pub async fn xhdr_exchange(
+        &self,
+        header: impl AsRef<str>,
+        selector: impl AsRef<str>,
+    ) -> Result<OwnedExchange, TypedClientError> {
+        let request = Request::xhdr(header, selector).map_err(TypedClientError::from)?;
+        self.execute_raw_exchange(request).await
     }
 
     /// Send a LIST request and return the owned raw response frame.
@@ -360,6 +402,44 @@ impl TypedClientConnection {
         message_id: MessageId<'static>,
     ) -> Result<OwnedExchange, TypedClientError> {
         self.execute_exchange(Request::Stat { message_id }).await
+    }
+
+    /// Send an HDR request and return the owned response frame.
+    pub async fn hdr(
+        &self,
+        header: HeaderName<'static>,
+        selector: ArticleSelector<'static>,
+    ) -> Result<OwnedResponse, TypedClientError> {
+        self.execute(Request::Hdr { header, selector }).await
+    }
+
+    /// Send an HDR request and return the completed request/response pair.
+    pub async fn hdr_exchange(
+        &self,
+        header: HeaderName<'static>,
+        selector: ArticleSelector<'static>,
+    ) -> Result<OwnedExchange, TypedClientError> {
+        self.execute_exchange(Request::Hdr { header, selector })
+            .await
+    }
+
+    /// Send an XHDR request and return the owned response frame.
+    pub async fn xhdr(
+        &self,
+        header: HeaderName<'static>,
+        selector: ArticleSelector<'static>,
+    ) -> Result<OwnedResponse, TypedClientError> {
+        self.execute(Request::Xhdr { header, selector }).await
+    }
+
+    /// Send an XHDR request and return the completed request/response pair.
+    pub async fn xhdr_exchange(
+        &self,
+        header: HeaderName<'static>,
+        selector: ArticleSelector<'static>,
+    ) -> Result<OwnedExchange, TypedClientError> {
+        self.execute_exchange(Request::Xhdr { header, selector })
+            .await
     }
 
     /// Send a LIST request and return the owned response frame.
@@ -635,6 +715,10 @@ pub enum TypedClientError {
     InvalidStatusLine,
     InvalidMessageId,
     MissingMessageId,
+    InvalidHeaderName,
+    MissingHeaderName,
+    InvalidArticleSelector,
+    MissingArticleSelector,
     ConnectionClosed,
     UnexpectedArticleResponse {
         response: OwnedResponse,
@@ -650,6 +734,12 @@ impl fmt::Display for TypedClientError {
             Self::InvalidStatusLine => write!(f, "invalid NNTP status line"),
             Self::InvalidMessageId => write!(f, "invalid message-id"),
             Self::MissingMessageId => write!(f, "message-id is required for this request"),
+            Self::InvalidHeaderName => write!(f, "invalid header name"),
+            Self::MissingHeaderName => write!(f, "header is required for this request"),
+            Self::InvalidArticleSelector => write!(f, "invalid article selector"),
+            Self::MissingArticleSelector => {
+                write!(f, "article selector is required for this request")
+            }
             Self::ConnectionClosed => write!(f, "connection engine closed"),
             Self::UnexpectedArticleResponse { response, source } => write!(
                 f,
@@ -675,6 +765,15 @@ impl From<SharedEngineError> for TypedClientError {
             SharedEngineError::InvalidStatusLine => Self::InvalidStatusLine,
             SharedEngineError::ConnectionClosed => Self::ConnectionClosed,
             SharedEngineError::Io { kind, message } => Self::Io(io::Error::new(kind, message)),
+        }
+    }
+}
+
+impl From<crate::protocol::InvalidHeaderQuery> for TypedClientError {
+    fn from(value: crate::protocol::InvalidHeaderQuery) -> Self {
+        match value {
+            crate::protocol::InvalidHeaderQuery::Header(_) => Self::InvalidHeaderName,
+            crate::protocol::InvalidHeaderQuery::Selector(_) => Self::InvalidArticleSelector,
         }
     }
 }
@@ -1009,6 +1108,10 @@ fn shared_engine_error_from_typed(err: TypedClientError) -> SharedEngineError {
         TypedClientError::ConnectionClosed => SharedEngineError::ConnectionClosed,
         TypedClientError::InvalidMessageId
         | TypedClientError::MissingMessageId
+        | TypedClientError::InvalidHeaderName
+        | TypedClientError::MissingHeaderName
+        | TypedClientError::InvalidArticleSelector
+        | TypedClientError::MissingArticleSelector
         | TypedClientError::UnexpectedArticleResponse { .. } => SharedEngineError::ConnectionClosed,
     }
 }
@@ -1384,6 +1487,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn typed_connection_fetches_hdr_and_xhdr_frames() {
+        let listener = crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"201 typed ready\r\n").await.unwrap();
+
+            let mut request = [0_u8; 128];
+            let read = stream.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"HDR Subject 1-10\r\n");
+            stream.write_all(crate::HDR_RESPONSE).await.unwrap();
+
+            let read = stream.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"XHDR Message-ID <headers@test>\r\n");
+            stream.write_all(crate::XHDR_RESPONSE).await.unwrap();
+        });
+
+        let connection = TypedClientConnection::connect(addr).await.unwrap();
+        let hdr = connection
+            .hdr(
+                HeaderName::from_owned("Subject").unwrap(),
+                ArticleSelector::from_owned("1-10").unwrap(),
+            )
+            .await
+            .unwrap();
+        let xhdr = connection
+            .xhdr(
+                HeaderName::from_owned("Message-ID").unwrap(),
+                ArticleSelector::from_owned("<headers@test>").unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(hdr.kind(), RequestKind::Hdr);
+        assert_eq!(hdr.status().as_u16(), 225);
+        assert_eq!(hdr.as_bytes(), crate::HDR_RESPONSE);
+        assert_eq!(xhdr.kind(), RequestKind::Xhdr);
+        assert_eq!(xhdr.status().as_u16(), 225);
+        assert_eq!(xhdr.as_bytes(), crate::XHDR_RESPONSE);
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn client_article_returns_typed_owned_article_surface() {
         let listener = crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1532,6 +1679,45 @@ mod tests {
         assert_eq!(capabilities.status().as_u16(), 101);
         assert_eq!(exchange.request(), &Request::Date);
         assert_eq!(exchange.response().status().as_u16(), 111);
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn client_header_query_methods_expose_general_request_surface() {
+        let listener = crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"201 typed ready\r\n").await.unwrap();
+
+            let mut request = [0_u8; 128];
+            let read = stream.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"HDR Subject 1-10\r\n");
+            stream.write_all(crate::HDR_RESPONSE).await.unwrap();
+
+            let read = stream.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"XHDR Message-ID <headers@test>\r\n");
+            stream.write_all(crate::XHDR_RESPONSE).await.unwrap();
+        });
+
+        let client = Client::connect(addr).await.unwrap();
+        let hdr = client.hdr("Subject", "1-10").await.unwrap();
+        let xhdr = client
+            .xhdr_exchange("Message-ID", "<headers@test>")
+            .await
+            .unwrap();
+
+        assert_eq!(hdr.kind(), RequestKind::Hdr);
+        assert_eq!(hdr.status().as_u16(), 225);
+        assert_eq!(
+            xhdr.request()
+                .header_query()
+                .map(|(header, selector)| (header.as_str(), selector.as_str())),
+            Some(("Message-ID", "<headers@test>"))
+        );
+        assert_eq!(xhdr.response().kind(), RequestKind::Xhdr);
+        assert_eq!(xhdr.response().status().as_u16(), 225);
 
         server.await.unwrap();
     }

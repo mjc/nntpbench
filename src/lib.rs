@@ -25,8 +25,8 @@ pub mod tail_buffer;
 pub mod typed_client;
 
 pub use protocol::{
-    Article, ArticleNumber, ArticleParseError, HeaderIter, Headers, MessageId, Request,
-    RequestKind, RequestLine, StatusCode,
+    Article, ArticleNumber, ArticleParseError, ArticleSelector, HeaderIter, HeaderName, Headers,
+    MessageId, Request, RequestKind, RequestLine, StatusCode,
 };
 pub use typed_client::{
     Client, OwnedArticle, OwnedArticleExchange, OwnedExchange, OwnedResponse,
@@ -40,6 +40,10 @@ pub const MODE_READER_RESPONSE: &[u8] = b"201 posting not permitted\r\n";
 pub const DATE_RESPONSE: &[u8] = b"111 20260515120000\r\n";
 pub const LIST_RESPONSE: &[u8] =
     b"215 list of newsgroups follows\r\ncomp.lang.rust 0000000001 0000000001 y\r\n.\r\n";
+pub const HDR_RESPONSE: &[u8] =
+    b"225 headers follow\r\n1 Subject: example one\r\n2 Subject: example two\r\n.\r\n";
+pub const XHDR_RESPONSE: &[u8] =
+    b"225 headers follow\r\n1 <one@example>\r\n2 <two@example>\r\n.\r\n";
 pub const HELP_RESPONSE: &[u8] =
     b"100 help text follows\r\nLIST\r\nCAPABILITIES\r\nDATE\r\nMODE-READER\r\nQUIT\r\n.\r\n";
 pub const QUIT_RESPONSE: &[u8] = b"205 closing connection\r\n";
@@ -335,6 +339,14 @@ pub struct TypedFetchArgs {
     #[arg(long)]
     pub message_id: Option<String>,
 
+    /// Header name for HDR/XHDR requests.
+    #[arg(long)]
+    pub header: Option<String>,
+
+    /// Article selector for HDR/XHDR requests, such as 1, 1-10, or <message@id>.
+    #[arg(long)]
+    pub selector: Option<String>,
+
     /// Tokio runtime worker threads. Use 1 for the current-thread runtime.
     #[arg(long, default_value_t = 1)]
     pub threads: usize,
@@ -366,6 +378,8 @@ pub enum TypedRequestKind {
     Body,
     Head,
     Stat,
+    Hdr,
+    Xhdr,
     List,
     Help,
     Capabilities,
@@ -605,6 +619,12 @@ fn typed_fetch_request(args: &TypedFetchArgs) -> Result<Request<'static>, TypedC
         TypedRequestKind::Stat => {
             typed_fetch_message_id_request(args, |message_id| Request::stat(message_id))
         }
+        TypedRequestKind::Hdr => {
+            typed_fetch_header_request(args, |header, selector| Request::hdr(header, selector))
+        }
+        TypedRequestKind::Xhdr => {
+            typed_fetch_header_request(args, |header, selector| Request::xhdr(header, selector))
+        }
         TypedRequestKind::List => Ok(Request::list()),
         TypedRequestKind::Help => Ok(Request::help()),
         TypedRequestKind::Capabilities => Ok(Request::capabilities()),
@@ -626,6 +646,24 @@ where
         .as_deref()
         .ok_or(TypedClientError::MissingMessageId)?;
     build(message_id).map_err(|_| TypedClientError::InvalidMessageId)
+}
+
+fn typed_fetch_header_request<F>(
+    args: &TypedFetchArgs,
+    build: F,
+) -> Result<Request<'static>, TypedClientError>
+where
+    F: FnOnce(&str, &str) -> Result<Request<'static>, crate::protocol::InvalidHeaderQuery>,
+{
+    let header = args
+        .header
+        .as_deref()
+        .ok_or(TypedClientError::MissingHeaderName)?;
+    let selector = args
+        .selector
+        .as_deref()
+        .ok_or(TypedClientError::MissingArticleSelector)?;
+    build(header, selector).map_err(TypedClientError::from)
 }
 
 fn map_typed_client_error(err: TypedClientError) -> io::Error {
@@ -1678,6 +1716,14 @@ where
             write_response(writer, pending_write, config.body_response(), session_stats).await?;
             Ok(false)
         }
+        RequestKind::Hdr => {
+            write_response(writer, pending_write, HDR_RESPONSE, session_stats).await?;
+            Ok(false)
+        }
+        RequestKind::Xhdr => {
+            write_response(writer, pending_write, XHDR_RESPONSE, session_stats).await?;
+            Ok(false)
+        }
         RequestKind::Capabilities => {
             write_response(
                 writer,
@@ -1820,6 +1866,8 @@ pub fn process_command_to_buffer(
             stats.body_requests.fetch_add(1, Ordering::Relaxed);
             config.body_response()
         }
+        RequestKind::Hdr => HDR_RESPONSE,
+        RequestKind::Xhdr => XHDR_RESPONSE,
         RequestKind::List => LIST_RESPONSE,
         RequestKind::Capabilities => b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n",
         RequestKind::Help => HELP_RESPONSE,
@@ -2285,6 +2333,8 @@ mod tests {
             connect: "127.0.0.1:1199".parse().unwrap(),
             request: TypedRequestKind::Article,
             message_id: Some("bench@test".to_string()),
+            header: None,
+            selector: None,
             threads: 1,
             read_buffer_bytes: CLIENT_READER_CAPACITY,
             pipeline_depth: 64,
@@ -3641,12 +3691,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fetch_typed_response_supports_header_query_request_kinds() {
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            first.write_all(b"201 fetch ready\r\n").await.unwrap();
+
+            let mut request = [0_u8; 128];
+            let read = first.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"HDR Subject 1-10\r\n");
+            first.write_all(HDR_RESPONSE).await.unwrap();
+
+            let (mut second, _) = listener.accept().await.unwrap();
+            second.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = second.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"XHDR Message-ID <headers@test>\r\n");
+            second.write_all(XHDR_RESPONSE).await.unwrap();
+        });
+
+        let mut hdr_args = test_typed_fetch_args();
+        hdr_args.connect = addr;
+        hdr_args.request = TypedRequestKind::Hdr;
+        hdr_args.message_id = None;
+        hdr_args.header = Some("Subject".to_string());
+        hdr_args.selector = Some("1-10".to_string());
+        let hdr = fetch_typed_response(&hdr_args).await.unwrap();
+        assert_eq!(hdr.kind(), RequestKind::Hdr);
+        assert_eq!(hdr.status().as_u16(), 225);
+
+        let mut xhdr_args = test_typed_fetch_args();
+        xhdr_args.connect = addr;
+        xhdr_args.request = TypedRequestKind::Xhdr;
+        xhdr_args.message_id = None;
+        xhdr_args.header = Some("Message-ID".to_string());
+        xhdr_args.selector = Some("<headers@test>".to_string());
+        let xhdr = fetch_typed_response(&xhdr_args).await.unwrap();
+        assert_eq!(xhdr.kind(), RequestKind::Xhdr);
+        assert_eq!(xhdr.status().as_u16(), 225);
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn fetch_typed_response_rejects_missing_message_id_for_article_style_requests() {
         let mut args = test_typed_fetch_args();
         args.message_id = None;
 
         let err = fetch_typed_response(&args).await.unwrap_err();
         assert!(matches!(err, TypedClientError::MissingMessageId));
+    }
+
+    #[tokio::test]
+    async fn fetch_typed_response_rejects_missing_header_query_arguments() {
+        let mut args = test_typed_fetch_args();
+        args.request = TypedRequestKind::Hdr;
+        args.message_id = None;
+        args.header = None;
+        args.selector = Some("1-10".to_string());
+        assert!(matches!(
+            fetch_typed_response(&args).await.unwrap_err(),
+            TypedClientError::MissingHeaderName
+        ));
+
+        args.header = Some("Subject".to_string());
+        args.selector = None;
+        assert!(matches!(
+            fetch_typed_response(&args).await.unwrap_err(),
+            TypedClientError::MissingArticleSelector
+        ));
     }
 
     #[tokio::test]
