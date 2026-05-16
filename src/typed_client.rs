@@ -4,6 +4,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{Mutex, Notify, mpsc, oneshot, watch};
@@ -239,6 +240,7 @@ impl TypedClientConnection {
         let poisoned = Arc::new(Mutex::new(None));
         let inflight = Arc::new(Mutex::new(VecDeque::new()));
         let inflight_notify = Arc::new(Notify::new());
+        let read_chunk_bytes = read_buffer.len();
 
         tokio::spawn(run_writer_task(
             writer,
@@ -250,7 +252,7 @@ impl TypedClientConnection {
         ));
         tokio::spawn(run_reader_task(
             reader,
-            read_buffer,
+            read_chunk_bytes,
             inflight,
             inflight_notify,
             poisoned.clone(),
@@ -416,7 +418,7 @@ struct ConnectionHandle {
 pub struct OwnedResponse {
     kind: RequestKind,
     status: StatusCode,
-    bytes: Box<[u8]>,
+    bytes: Bytes,
 }
 
 impl OwnedResponse {
@@ -650,7 +652,7 @@ impl ResponseDecoder {
                 self.status = Some((status, status_end));
                 if !self.kind.expects_multiline_response(status) {
                     return Ok(DecodeProgress::Complete {
-                        response: self.finish(buffer, status, status_end),
+                        status,
                         consumed: status_end,
                     });
                 }
@@ -666,7 +668,7 @@ impl ResponseDecoder {
         let content_chunk = &buffer[content_chunk_start..];
         match self.tail.detect_terminator(content_chunk) {
             TerminatorStatus::FoundAt(end) => Ok(DecodeProgress::Complete {
-                response: self.finish(buffer, status, content_chunk_start + end),
+                status,
                 consumed: content_chunk_start + end,
             }),
             TerminatorStatus::NotFound => {
@@ -675,23 +677,12 @@ impl ResponseDecoder {
             }
         }
     }
-
-    fn finish(&mut self, buffer: &[u8], status: StatusCode, end: usize) -> OwnedResponse {
-        OwnedResponse {
-            kind: self.kind,
-            status,
-            bytes: buffer[..end].to_vec().into_boxed_slice(),
-        }
-    }
 }
 
 #[derive(Debug)]
 enum DecodeProgress {
     NeedMore,
-    Complete {
-        response: OwnedResponse,
-        consumed: usize,
-    },
+    Complete { status: StatusCode, consumed: usize },
 }
 
 #[derive(Debug)]
@@ -797,14 +788,13 @@ async fn run_writer_task(
 
 async fn run_reader_task(
     mut reader: OwnedReadHalf,
-    mut read_buffer: Box<[u8]>,
+    read_chunk_bytes: usize,
     inflight: Arc<Mutex<VecDeque<InFlightRequest>>>,
     inflight_notify: Arc<Notify>,
     poisoned: Arc<Mutex<Option<SharedEngineError>>>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
-    let mut pending_read = Vec::with_capacity(read_buffer.len().saturating_mul(2));
-    let mut pending_read_start = 0;
+    let mut pending_read = BytesMut::with_capacity(read_chunk_bytes.saturating_mul(2));
 
     loop {
         let Some(inflight_request) =
@@ -816,12 +806,15 @@ async fn run_reader_task(
         let response_tx = inflight_request.response_tx;
 
         loop {
-            if pending_read_start < pending_read.len() {
-                match decoder.push(&pending_read[pending_read_start..]) {
+            if !pending_read.is_empty() {
+                match decoder.push(&pending_read) {
                     Ok(DecodeProgress::NeedMore) => {}
-                    Ok(DecodeProgress::Complete { response, consumed }) => {
-                        pending_read_start += consumed;
-                        compact_pending_read(&mut pending_read, &mut pending_read_start);
+                    Ok(DecodeProgress::Complete { status, consumed }) => {
+                        let response = OwnedResponse {
+                            kind: inflight_request.kind,
+                            status,
+                            bytes: pending_read.split_to(consumed).freeze(),
+                        };
                         let _ = response_tx.send(Ok(response));
                         break;
                     }
@@ -840,8 +833,9 @@ async fn run_reader_task(
                 }
             }
 
+            pending_read.reserve(read_chunk_bytes);
             let read = tokio::select! {
-                result = reader.read(&mut read_buffer) => result,
+                result = reader.read_buf(&mut pending_read) => result,
                 changed = shutdown_rx.changed() => {
                     if changed.is_ok() || changed.is_err() {
                         return;
@@ -869,29 +863,7 @@ async fn run_reader_task(
                 poison_engine_without_requests(&poisoned, &inflight, error).await;
                 return;
             }
-
-            compact_pending_read(&mut pending_read, &mut pending_read_start);
-            pending_read.extend_from_slice(&read_buffer[..read]);
         }
-    }
-}
-
-fn compact_pending_read(buffer: &mut Vec<u8>, start: &mut usize) {
-    if *start == 0 {
-        return;
-    }
-
-    let len = buffer.len();
-    if *start >= len {
-        buffer.clear();
-        *start = 0;
-        return;
-    }
-
-    if *start >= len / 2 {
-        buffer.copy_within(*start.., 0);
-        buffer.truncate(len - *start);
-        *start = 0;
     }
 }
 
@@ -989,15 +961,28 @@ fn status_line_end(buffer: &[u8]) -> Option<usize> {
 mod tests {
     use super::*;
 
+    fn response_from_bytes(kind: RequestKind, status: StatusCode, bytes: &[u8]) -> OwnedResponse {
+        OwnedResponse {
+            kind,
+            status,
+            bytes: Bytes::copy_from_slice(bytes),
+        }
+    }
+
     #[test]
     fn decoder_completes_single_line_error_without_waiting_for_terminator() {
         let mut decoder = ResponseDecoder::new(RequestKind::Article);
-        let DecodeProgress::Complete { response, consumed } = decoder
+        let DecodeProgress::Complete { status, consumed } = decoder
             .push(b"430 no article with that message-id\r\n")
             .unwrap()
         else {
             panic!("decoder should complete");
         };
+        let response = response_from_bytes(
+            RequestKind::Article,
+            status,
+            b"430 no article with that message-id\r\n",
+        );
 
         assert_eq!(consumed, b"430 no article with that message-id\r\n".len());
         assert_eq!(response.kind(), RequestKind::Article);
@@ -1017,9 +1002,10 @@ mod tests {
             DecodeProgress::NeedMore
         ));
         buffer.extend_from_slice(b"\n.\r\n");
-        let DecodeProgress::Complete { response, consumed } = decoder.push(&buffer).unwrap() else {
+        let DecodeProgress::Complete { status, consumed } = decoder.push(&buffer).unwrap() else {
             panic!("decoder should complete");
         };
+        let response = response_from_bytes(RequestKind::Body, status, &buffer[..consumed]);
 
         assert_eq!(consumed, b"222 1 <a@b> body follows\r\nbody\r\n.\r\n".len());
         assert_eq!(response.status().as_u16(), 222);
@@ -1035,9 +1021,10 @@ mod tests {
             b"222 1 <a@b> body follows\r\nbody\r\n.\r\n220 1 <b@c> article follows\r\nh: v\r\n\r\nx\r\n.\r\n";
 
         let mut first = ResponseDecoder::new(RequestKind::Body);
-        let DecodeProgress::Complete { response, consumed } = first.push(chunk).unwrap() else {
+        let DecodeProgress::Complete { status, consumed } = first.push(chunk).unwrap() else {
             panic!("first decoder should complete");
         };
+        let response = response_from_bytes(RequestKind::Body, status, &chunk[..consumed]);
         assert_eq!(response.status().as_u16(), 222);
         assert_eq!(
             response.as_bytes(),
@@ -1046,29 +1033,19 @@ mod tests {
 
         let mut second = ResponseDecoder::new(RequestKind::Article);
         let DecodeProgress::Complete {
-            response: second_response,
+            status: second_status,
             consumed: second_consumed,
         } = second.push(&chunk[consumed..]).unwrap()
         else {
             panic!("second decoder should complete");
         };
+        let second_response = response_from_bytes(
+            RequestKind::Article,
+            second_status,
+            &chunk[consumed..consumed + second_consumed],
+        );
         assert_eq!(second_consumed, chunk.len() - consumed);
         assert_eq!(second_response.status().as_u16(), 220);
-    }
-
-    #[test]
-    fn compact_pending_read_keeps_live_suffix_without_front_drain() {
-        let mut buffer = b"consumed-live-bytes".to_vec();
-        let mut start = b"consumed-".len();
-        compact_pending_read(&mut buffer, &mut start);
-        assert_eq!(&buffer, b"live-bytes");
-        assert_eq!(start, 0);
-
-        let mut untouched = b"abcdef".to_vec();
-        let mut untouched_start = 2;
-        compact_pending_read(&mut untouched, &mut untouched_start);
-        assert_eq!(&untouched, b"abcdef");
-        assert_eq!(untouched_start, 2);
     }
 
     #[tokio::test]

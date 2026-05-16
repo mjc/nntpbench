@@ -282,6 +282,7 @@ name = "nntpbench"
 version = "0.1.0"
 dependencies = [
  "arrayvec",
+ "bytes",
  "clap",
  "divan",
  "iai-callgrind",
