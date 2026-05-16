@@ -1,4 +1,3 @@
-use std::collections::VecDeque;
 use std::fmt;
 use std::io;
 use std::net::SocketAddr;
@@ -7,7 +6,8 @@ use std::sync::Arc;
 use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::sync::{Mutex, Notify, mpsc, oneshot, watch};
+use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::task::JoinHandle;
 
 use crate::protocol::Request;
 use crate::tail_buffer::{TailBuffer, TerminatorStatus};
@@ -345,34 +345,31 @@ impl TypedClientConnection {
         crate::read_greeting(&mut stream, &mut read_buffer).await?;
         let (reader, writer) = stream.into_split();
         let (request_tx, request_rx) = mpsc::channel(options.pipeline_depth.max(1));
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (inflight_tx, inflight_rx) = mpsc::channel(options.pipeline_depth.max(1));
         let poisoned = Arc::new(Mutex::new(None));
-        let inflight = Arc::new(Mutex::new(VecDeque::new()));
-        let inflight_notify = Arc::new(Notify::new());
         let read_chunk_bytes = read_buffer.len();
 
-        tokio::spawn(run_writer_task(
+        let writer_task = tokio::spawn(run_writer_task(
             writer,
             request_rx,
-            inflight.clone(),
-            inflight_notify.clone(),
+            inflight_tx,
             poisoned.clone(),
-            shutdown_rx.clone(),
         ));
-        tokio::spawn(run_reader_task(
+        let writer_abort = writer_task.abort_handle();
+        let reader_task = tokio::spawn(run_reader_task(
             reader,
             read_chunk_bytes,
-            inflight,
-            inflight_notify,
+            inflight_rx,
             poisoned.clone(),
-            shutdown_rx,
+            writer_abort,
         ));
 
         Ok(Self {
             inner: Arc::new(ConnectionHandle {
                 request_tx,
-                shutdown_tx,
                 poisoned,
+                writer_task,
+                reader_task,
             }),
         })
     }
@@ -611,15 +608,17 @@ impl TypedClientConnection {
 
 impl Drop for ConnectionHandle {
     fn drop(&mut self) {
-        let _ = self.shutdown_tx.send(true);
+        self.writer_task.abort();
+        self.reader_task.abort();
     }
 }
 
 #[derive(Debug)]
 struct ConnectionHandle {
     request_tx: mpsc::Sender<QueuedRequest>,
-    shutdown_tx: watch::Sender<bool>,
     poisoned: Arc<Mutex<Option<SharedEngineError>>>,
+    writer_task: JoinHandle<()>,
+    reader_task: JoinHandle<()>,
 }
 
 /// Owned response bytes for the typed client path.
@@ -965,37 +964,13 @@ enum SharedEngineError {
 async fn run_writer_task(
     mut writer: OwnedWriteHalf,
     mut request_rx: mpsc::Receiver<QueuedRequest>,
-    inflight: Arc<Mutex<VecDeque<InFlightRequest>>>,
-    inflight_notify: Arc<Notify>,
+    inflight_tx: mpsc::Sender<InFlightRequest>,
     poisoned: Arc<Mutex<Option<SharedEngineError>>>,
-    mut shutdown_rx: watch::Receiver<bool>,
 ) {
     let mut write_buffer = Vec::with_capacity(crate::MAX_CLIENT_COMMAND_BYTES);
 
-    loop {
-        let queued = tokio::select! {
-            maybe = request_rx.recv() => maybe,
-            changed = shutdown_rx.changed() => {
-                if changed.is_ok() || changed.is_err() {
-                    break;
-                }
-                None
-            }
-        };
-
-        let Some(queued) = queued else {
-            break;
-        };
-
+    while let Some(queued) = request_rx.recv().await {
         let kind = queued.request.kind();
-        {
-            let mut guard = inflight.lock().await;
-            guard.push_back(InFlightRequest {
-                kind,
-                response_tx: queued.response_tx,
-            });
-        }
-
         write_buffer.clear();
         queued.request.write_wire_to(&mut write_buffer);
         if let Err(err) = writer.write_all(&write_buffer).await {
@@ -1003,33 +978,34 @@ async fn run_writer_task(
                 kind: err.kind(),
                 message: err.to_string(),
             };
-            if let Some(failed) = inflight.lock().await.pop_back() {
-                let _ = failed.response_tx.send(Err(error.clone()));
-            }
-            poison_engine(&poisoned, &inflight, &mut request_rx, error).await;
+            let _ = queued.response_tx.send(Err(error.clone()));
+            poison_writer_engine(&poisoned, &mut request_rx, error).await;
             return;
         }
 
-        inflight_notify.notify_one();
+        let inflight = InFlightRequest {
+            kind,
+            response_tx: queued.response_tx,
+        };
+        if let Err(err) = inflight_tx.send(inflight).await {
+            let error = SharedEngineError::ConnectionClosed;
+            let _ = err.0.response_tx.send(Err(error.clone()));
+            poison_writer_engine(&poisoned, &mut request_rx, error).await;
+            break;
+        }
     }
 }
 
 async fn run_reader_task(
     mut reader: OwnedReadHalf,
     read_chunk_bytes: usize,
-    inflight: Arc<Mutex<VecDeque<InFlightRequest>>>,
-    inflight_notify: Arc<Notify>,
+    mut inflight_rx: mpsc::Receiver<InFlightRequest>,
     poisoned: Arc<Mutex<Option<SharedEngineError>>>,
-    mut shutdown_rx: watch::Receiver<bool>,
+    writer_abort: tokio::task::AbortHandle,
 ) {
     let mut pending_read = BytesMut::with_capacity(read_chunk_bytes.saturating_mul(2));
 
-    loop {
-        let Some(inflight_request) =
-            next_inflight(&inflight, &inflight_notify, &mut shutdown_rx).await
-        else {
-            return;
-        };
+    while let Some(inflight_request) = inflight_rx.recv().await {
         let mut decoder = ResponseDecoder::new(inflight_request.kind);
         let response_tx = inflight_request.response_tx;
 
@@ -1049,30 +1025,22 @@ async fn run_reader_task(
                     Err(TypedClientError::InvalidStatusLine) => {
                         let error = SharedEngineError::InvalidStatusLine;
                         let _ = response_tx.send(Err(error.clone()));
-                        poison_engine_without_requests(&poisoned, &inflight, error).await;
+                        writer_abort.abort();
+                        poison_reader_engine(&poisoned, &mut inflight_rx, error).await;
                         return;
                     }
                     Err(err) => {
                         let error = shared_engine_error_from_typed(err);
                         let _ = response_tx.send(Err(error.clone()));
-                        poison_engine_without_requests(&poisoned, &inflight, error).await;
+                        writer_abort.abort();
+                        poison_reader_engine(&poisoned, &mut inflight_rx, error).await;
                         return;
                     }
                 }
             }
 
             pending_read.reserve(read_chunk_bytes);
-            let read = tokio::select! {
-                result = reader.read_buf(&mut pending_read) => result,
-                changed = shutdown_rx.changed() => {
-                    if changed.is_ok() || changed.is_err() {
-                        return;
-                    }
-                    Ok(0)
-                }
-            };
-
-            let read = match read {
+            let read = match reader.read_buf(&mut pending_read).await {
                 Ok(read) => read,
                 Err(err) => {
                     let error = SharedEngineError::Io {
@@ -1080,7 +1048,8 @@ async fn run_reader_task(
                         message: err.to_string(),
                     };
                     let _ = response_tx.send(Err(error.clone()));
-                    poison_engine_without_requests(&poisoned, &inflight, error).await;
+                    writer_abort.abort();
+                    poison_reader_engine(&poisoned, &mut inflight_rx, error).await;
                     return;
                 }
             };
@@ -1088,81 +1057,43 @@ async fn run_reader_task(
             if read == 0 {
                 let error = SharedEngineError::UnexpectedEof;
                 let _ = response_tx.send(Err(error.clone()));
-                poison_engine_without_requests(&poisoned, &inflight, error).await;
+                writer_abort.abort();
+                poison_reader_engine(&poisoned, &mut inflight_rx, error).await;
                 return;
             }
         }
     }
 }
 
-async fn next_inflight(
-    inflight: &Arc<Mutex<VecDeque<InFlightRequest>>>,
-    inflight_notify: &Arc<Notify>,
-    shutdown_rx: &mut watch::Receiver<bool>,
-) -> Option<InFlightRequest> {
-    loop {
-        if let Some(request) = inflight.lock().await.pop_front() {
-            return Some(request);
-        }
-
-        let notified = inflight_notify.notified();
-        if *shutdown_rx.borrow() {
-            return None;
-        }
-
-        tokio::select! {
-            _ = notified => {}
-            changed = shutdown_rx.changed() => {
-                if changed.is_ok() || changed.is_err() {
-                    return None;
-                }
-            }
-        }
-    }
-}
-
-async fn poison_engine(
+async fn poison_writer_engine(
     poisoned: &Arc<Mutex<Option<SharedEngineError>>>,
-    inflight: &Arc<Mutex<VecDeque<InFlightRequest>>>,
     request_rx: &mut mpsc::Receiver<QueuedRequest>,
     error: SharedEngineError,
 ) {
-    {
-        let mut guard = poisoned.lock().await;
-        if guard.is_none() {
-            *guard = Some(error.clone());
-        }
-    }
-
+    store_poisoned(poisoned, &error).await;
     while let Ok(queued) = request_rx.try_recv() {
         let _ = queued.response_tx.send(Err(error.clone()));
     }
-
-    drain_inflight(inflight, error).await;
 }
 
-async fn poison_engine_without_requests(
+async fn poison_reader_engine(
     poisoned: &Arc<Mutex<Option<SharedEngineError>>>,
-    inflight: &Arc<Mutex<VecDeque<InFlightRequest>>>,
+    inflight_rx: &mut mpsc::Receiver<InFlightRequest>,
     error: SharedEngineError,
 ) {
-    {
-        let mut guard = poisoned.lock().await;
-        if guard.is_none() {
-            *guard = Some(error.clone());
-        }
+    store_poisoned(poisoned, &error).await;
+    while let Ok(request) = inflight_rx.try_recv() {
+        let _ = request.response_tx.send(Err(error.clone()));
     }
-
-    drain_inflight(inflight, error).await;
 }
 
-async fn drain_inflight(
-    inflight: &Arc<Mutex<VecDeque<InFlightRequest>>>,
-    error: SharedEngineError,
+async fn store_poisoned(
+    poisoned: &Arc<Mutex<Option<SharedEngineError>>>,
+    error: &SharedEngineError,
 ) {
-    let mut queued = inflight.lock().await;
-    while let Some(request) = queued.pop_front() {
-        let _ = request.response_tx.send(Err(error.clone()));
+    let mut guard = poisoned.lock().await;
+    if guard.is_none() {
+        *guard = Some(error.clone());
     }
 }
 
