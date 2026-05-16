@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use arrayvec::ArrayVec;
-use clap::{Parser, ValueEnum};
+use clap::{ArgAction, Parser, ValueEnum};
 use socket2::{Domain, Protocol, SockRef, Socket, Type};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
@@ -26,7 +26,7 @@ pub mod typed_client;
 
 pub use protocol::{
     Article, ArticleNumber, ArticleParseError, ArticleSelector, GroupName, HeaderIter, HeaderName,
-    Headers, MessageId, Request, RequestKind, RequestLine, StatusCode,
+    Headers, MessageId, NntpDate, NntpTime, Request, RequestKind, RequestLine, StatusCode, Wildmat,
 };
 pub use typed_client::{
     Client, OwnedArticle, OwnedArticleExchange, OwnedExchange, OwnedResponse,
@@ -46,6 +46,10 @@ pub const LAST_RESPONSE: &[u8] =
     b"223 1 <prev@alt.test> article retrieved - request text separately\r\n";
 pub const NEXT_RESPONSE: &[u8] =
     b"223 2 <next@alt.test> article retrieved - request text separately\r\n";
+pub const NEWGROUPS_RESPONSE: &[u8] =
+    b"231 list of new newsgroups follows\r\ncomp.lang.rust 0000000003 0000000001 y\r\nalt.test 0000000003 0000000001 y\r\n.\r\n";
+pub const NEWNEWS_RESPONSE: &[u8] =
+    b"230 list of new articles follows\r\n<one@alt.test>\r\n<two@alt.test>\r\n.\r\n";
 pub const OVER_RESPONSE: &[u8] = b"224 Overview information follows\r\n1\tSubject one\tone@example.com\tFri, 16 May 2026 12:00:00 +0000\t<one@example.com>\t\t123\t4\r\n.\r\n";
 pub const XOVER_RESPONSE: &[u8] = b"224 Overview information follows\r\n2\tSubject two\ttwo@example.com\tFri, 16 May 2026 12:00:01 +0000\t<two@example.com>\t<ref@example.com>\t456\t8\r\n.\r\n";
 pub const HDR_RESPONSE: &[u8] =
@@ -355,6 +359,22 @@ pub struct TypedFetchArgs {
     #[arg(long)]
     pub group: Option<String>,
 
+    /// Wildmat pattern for NEWNEWS requests.
+    #[arg(long)]
+    pub wildmat: Option<String>,
+
+    /// NNTP date for NEWGROUPS/NEWNEWS, in YYMMDD or YYYYMMDD form.
+    #[arg(long)]
+    pub date: Option<String>,
+
+    /// NNTP time for NEWGROUPS/NEWNEWS, in HHMMSS form.
+    #[arg(long)]
+    pub time: Option<String>,
+
+    /// Treat NEWGROUPS/NEWNEWS timestamps as UTC.
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    pub gmt: bool,
+
     /// Article selector for OVER/XOVER/HDR/XHDR requests, such as 1, 1-10, or <message@id>.
     #[arg(long)]
     pub selector: Option<String>,
@@ -394,6 +414,8 @@ pub enum TypedRequestKind {
     Listgroup,
     Last,
     Next,
+    Newgroups,
+    Newnews,
     Over,
     Xover,
     Hdr,
@@ -643,6 +665,8 @@ fn typed_fetch_request(args: &TypedFetchArgs) -> Result<Request<'static>, TypedC
         }
         TypedRequestKind::Last => Ok(Request::last()),
         TypedRequestKind::Next => Ok(Request::next()),
+        TypedRequestKind::Newgroups => typed_fetch_newgroups_request(args),
+        TypedRequestKind::Newnews => typed_fetch_newnews_request(args),
         TypedRequestKind::Over => {
             typed_fetch_selector_request(args, |selector| Request::over(selector))
         }
@@ -708,6 +732,26 @@ where
         .as_deref()
         .ok_or(TypedClientError::MissingGroupName)?;
     build(group).map_err(|_| TypedClientError::InvalidGroupName)
+}
+
+fn typed_fetch_newgroups_request(
+    args: &TypedFetchArgs,
+) -> Result<Request<'static>, TypedClientError> {
+    let date = args.date.as_deref().ok_or(TypedClientError::MissingDate)?;
+    let time = args.time.as_deref().ok_or(TypedClientError::MissingTime)?;
+    Request::newgroups(date, time, args.gmt).map_err(TypedClientError::from)
+}
+
+fn typed_fetch_newnews_request(
+    args: &TypedFetchArgs,
+) -> Result<Request<'static>, TypedClientError> {
+    let wildmat = args
+        .wildmat
+        .as_deref()
+        .ok_or(TypedClientError::MissingWildmat)?;
+    let date = args.date.as_deref().ok_or(TypedClientError::MissingDate)?;
+    let time = args.time.as_deref().ok_or(TypedClientError::MissingTime)?;
+    Request::newnews(wildmat, date, time, args.gmt).map_err(TypedClientError::from)
 }
 
 fn typed_fetch_selector_request<F>(
@@ -1790,6 +1834,14 @@ where
             write_response(writer, pending_write, NEXT_RESPONSE, session_stats).await?;
             Ok(false)
         }
+        RequestKind::NewGroups => {
+            write_response(writer, pending_write, NEWGROUPS_RESPONSE, session_stats).await?;
+            Ok(false)
+        }
+        RequestKind::NewNews => {
+            write_response(writer, pending_write, NEWNEWS_RESPONSE, session_stats).await?;
+            Ok(false)
+        }
         RequestKind::Over => {
             write_response(writer, pending_write, OVER_RESPONSE, session_stats).await?;
             Ok(false)
@@ -1952,6 +2004,8 @@ pub fn process_command_to_buffer(
         RequestKind::ListGroup => LISTGROUP_RESPONSE,
         RequestKind::Last => LAST_RESPONSE,
         RequestKind::Next => NEXT_RESPONSE,
+        RequestKind::NewGroups => NEWGROUPS_RESPONSE,
+        RequestKind::NewNews => NEWNEWS_RESPONSE,
         RequestKind::Over => OVER_RESPONSE,
         RequestKind::Xover => XOVER_RESPONSE,
         RequestKind::Hdr => HDR_RESPONSE,
@@ -2423,6 +2477,10 @@ mod tests {
             message_id: Some("bench@test".to_string()),
             header: None,
             group: None,
+            wildmat: None,
+            date: None,
+            time: None,
+            gmt: true,
             selector: None,
             threads: 1,
             read_buffer_bytes: CLIENT_READER_CAPACITY,
@@ -3864,7 +3922,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_typed_response_supports_group_navigation_request_kinds() {
+    async fn fetch_typed_response_supports_group_navigation_and_discovery_request_kinds() {
         let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -3893,6 +3951,21 @@ mod tests {
             let read = fourth.read(&mut request).await.unwrap();
             assert_eq!(&request[..read], b"NEXT\r\n");
             fourth.write_all(NEXT_RESPONSE).await.unwrap();
+
+            let (mut fifth, _) = listener.accept().await.unwrap();
+            fifth.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = fifth.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"NEWGROUPS 20260101 000000 GMT\r\n");
+            fifth.write_all(NEWGROUPS_RESPONSE).await.unwrap();
+
+            let (mut sixth, _) = listener.accept().await.unwrap();
+            sixth.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = sixth.read(&mut request).await.unwrap();
+            assert_eq!(
+                &request[..read],
+                b"NEWNEWS comp.lang.*,alt.test 20260101 000000\r\n"
+            );
+            sixth.write_all(NEWNEWS_RESPONSE).await.unwrap();
         });
 
         let mut group_args = test_typed_fetch_args();
@@ -3928,6 +4001,28 @@ mod tests {
         let next = fetch_typed_response(&next_args).await.unwrap();
         assert_eq!(next.kind(), RequestKind::Next);
         assert_eq!(next.status().as_u16(), 223);
+
+        let mut newgroups_args = test_typed_fetch_args();
+        newgroups_args.connect = addr;
+        newgroups_args.request = TypedRequestKind::Newgroups;
+        newgroups_args.message_id = None;
+        newgroups_args.date = Some("20260101".to_string());
+        newgroups_args.time = Some("000000".to_string());
+        let newgroups = fetch_typed_response(&newgroups_args).await.unwrap();
+        assert_eq!(newgroups.kind(), RequestKind::NewGroups);
+        assert_eq!(newgroups.status().as_u16(), 231);
+
+        let mut newnews_args = test_typed_fetch_args();
+        newnews_args.connect = addr;
+        newnews_args.request = TypedRequestKind::Newnews;
+        newnews_args.message_id = None;
+        newnews_args.wildmat = Some("comp.lang.*,alt.test".to_string());
+        newnews_args.date = Some("20260101".to_string());
+        newnews_args.time = Some("000000".to_string());
+        newnews_args.gmt = false;
+        let newnews = fetch_typed_response(&newnews_args).await.unwrap();
+        assert_eq!(newnews.kind(), RequestKind::NewNews);
+        assert_eq!(newnews.status().as_u16(), 230);
 
         server.await.unwrap();
     }
@@ -3984,6 +4079,37 @@ mod tests {
         assert!(matches!(
             fetch_typed_response(&args).await.unwrap_err(),
             TypedClientError::MissingGroupName
+        ));
+    }
+
+    #[tokio::test]
+    async fn fetch_typed_response_rejects_missing_discovery_arguments() {
+        let mut newgroups_args = test_typed_fetch_args();
+        newgroups_args.request = TypedRequestKind::Newgroups;
+        newgroups_args.message_id = None;
+        newgroups_args.date = None;
+        newgroups_args.time = Some("000000".to_string());
+        assert!(matches!(
+            fetch_typed_response(&newgroups_args).await.unwrap_err(),
+            TypedClientError::MissingDate
+        ));
+
+        newgroups_args.date = Some("20260101".to_string());
+        newgroups_args.time = None;
+        assert!(matches!(
+            fetch_typed_response(&newgroups_args).await.unwrap_err(),
+            TypedClientError::MissingTime
+        ));
+
+        let mut newnews_args = test_typed_fetch_args();
+        newnews_args.request = TypedRequestKind::Newnews;
+        newnews_args.message_id = None;
+        newnews_args.wildmat = None;
+        newnews_args.date = Some("20260101".to_string());
+        newnews_args.time = Some("000000".to_string());
+        assert!(matches!(
+            fetch_typed_response(&newnews_args).await.unwrap_err(),
+            TypedClientError::MissingWildmat
         ));
     }
 
@@ -4192,6 +4318,21 @@ mod tests {
             .concat()
         );
         assert_eq!(stats.snapshot().commands, 4);
+    }
+
+    #[tokio::test]
+    async fn serve_session_supports_discovery_commands() {
+        let (output, stats) = run_session_with_input(
+            test_config(),
+            b"NEWGROUPS 20260101 000000 GMT\r\nNEWNEWS comp.lang.* 20260101 000000\r\n",
+        )
+        .await;
+
+        assert_eq!(
+            output,
+            [GREETING, NEWGROUPS_RESPONSE, NEWNEWS_RESPONSE].concat()
+        );
+        assert_eq!(stats.snapshot().commands, 2);
     }
 
     #[tokio::test]
@@ -4483,6 +4624,29 @@ mod tests {
             .concat()
         );
         assert_eq!(stats.snapshot().commands, 4);
+    }
+
+    #[test]
+    fn process_command_to_buffer_supports_discovery_commands() {
+        let config = test_config();
+        let stats = Stats::new();
+        let mut output = Vec::new();
+
+        assert!(!process_command_to_buffer(
+            RequestKind::NewGroups,
+            &config,
+            &stats,
+            &mut output,
+        ));
+        assert!(!process_command_to_buffer(
+            RequestKind::NewNews,
+            &config,
+            &stats,
+            &mut output,
+        ));
+
+        assert_eq!(output, [NEWGROUPS_RESPONSE, NEWNEWS_RESPONSE].concat());
+        assert_eq!(stats.snapshot().commands, 2);
     }
 
     #[test]

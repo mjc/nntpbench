@@ -12,8 +12,8 @@ use tokio::task::JoinHandle;
 use crate::protocol::Request;
 use crate::tail_buffer::{TailBuffer, TerminatorStatus};
 use crate::{
-    Article, ArticleParseError, ArticleSelector, GroupName, HeaderName, MessageId, RequestKind,
-    StatusCode,
+    Article, ArticleParseError, ArticleSelector, GroupName, HeaderName, MessageId, NntpDate,
+    NntpTime, RequestKind, StatusCode, Wildmat,
 };
 
 /// Options for the typed one-connection client prototype.
@@ -219,6 +219,52 @@ impl Client {
     /// Send a NEXT request and return the completed raw request/response pair.
     pub async fn next_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
         self.execute_raw_exchange(Request::next()).await
+    }
+
+    /// Send a NEWGROUPS request and return the owned raw response frame.
+    pub async fn newgroups(
+        &self,
+        date: impl AsRef<str>,
+        time: impl AsRef<str>,
+        gmt: bool,
+    ) -> Result<OwnedResponse, TypedClientError> {
+        let request = Request::newgroups(date, time, gmt).map_err(TypedClientError::from)?;
+        self.execute_raw(request).await
+    }
+
+    /// Send a NEWGROUPS request and return the completed raw request/response pair.
+    pub async fn newgroups_exchange(
+        &self,
+        date: impl AsRef<str>,
+        time: impl AsRef<str>,
+        gmt: bool,
+    ) -> Result<OwnedExchange, TypedClientError> {
+        let request = Request::newgroups(date, time, gmt).map_err(TypedClientError::from)?;
+        self.execute_raw_exchange(request).await
+    }
+
+    /// Send a NEWNEWS request and return the owned raw response frame.
+    pub async fn newnews(
+        &self,
+        wildmat: impl AsRef<str>,
+        date: impl AsRef<str>,
+        time: impl AsRef<str>,
+        gmt: bool,
+    ) -> Result<OwnedResponse, TypedClientError> {
+        let request = Request::newnews(wildmat, date, time, gmt).map_err(TypedClientError::from)?;
+        self.execute_raw(request).await
+    }
+
+    /// Send a NEWNEWS request and return the completed raw request/response pair.
+    pub async fn newnews_exchange(
+        &self,
+        wildmat: impl AsRef<str>,
+        date: impl AsRef<str>,
+        time: impl AsRef<str>,
+        gmt: bool,
+    ) -> Result<OwnedExchange, TypedClientError> {
+        let request = Request::newnews(wildmat, date, time, gmt).map_err(TypedClientError::from)?;
+        self.execute_raw_exchange(request).await
     }
 
     /// Send an OVER request and return the owned raw response frame.
@@ -542,6 +588,61 @@ impl TypedClientConnection {
     /// Send a NEXT request and return the completed request/response pair.
     pub async fn next_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
         self.execute_exchange(Request::Next).await
+    }
+
+    /// Send a NEWGROUPS request and return the owned response frame.
+    pub async fn newgroups(
+        &self,
+        date: NntpDate<'static>,
+        time: NntpTime<'static>,
+        gmt: bool,
+    ) -> Result<OwnedResponse, TypedClientError> {
+        self.execute(Request::NewGroups { date, time, gmt }).await
+    }
+
+    /// Send a NEWGROUPS request and return the completed request/response pair.
+    pub async fn newgroups_exchange(
+        &self,
+        date: NntpDate<'static>,
+        time: NntpTime<'static>,
+        gmt: bool,
+    ) -> Result<OwnedExchange, TypedClientError> {
+        self.execute_exchange(Request::NewGroups { date, time, gmt })
+            .await
+    }
+
+    /// Send a NEWNEWS request and return the owned response frame.
+    pub async fn newnews(
+        &self,
+        wildmat: Wildmat<'static>,
+        date: NntpDate<'static>,
+        time: NntpTime<'static>,
+        gmt: bool,
+    ) -> Result<OwnedResponse, TypedClientError> {
+        self.execute(Request::NewNews {
+            wildmat,
+            date,
+            time,
+            gmt,
+        })
+        .await
+    }
+
+    /// Send a NEWNEWS request and return the completed request/response pair.
+    pub async fn newnews_exchange(
+        &self,
+        wildmat: Wildmat<'static>,
+        date: NntpDate<'static>,
+        time: NntpTime<'static>,
+        gmt: bool,
+    ) -> Result<OwnedExchange, TypedClientError> {
+        self.execute_exchange(Request::NewNews {
+            wildmat,
+            date,
+            time,
+            gmt,
+        })
+        .await
     }
 
     /// Send an OVER request and return the owned response frame.
@@ -891,6 +992,12 @@ pub enum TypedClientError {
     MissingMessageId,
     InvalidGroupName,
     MissingGroupName,
+    InvalidWildmat,
+    MissingWildmat,
+    InvalidDate,
+    MissingDate,
+    InvalidTime,
+    MissingTime,
     InvalidHeaderName,
     MissingHeaderName,
     InvalidArticleSelector,
@@ -912,6 +1019,12 @@ impl fmt::Display for TypedClientError {
             Self::MissingMessageId => write!(f, "message-id is required for this request"),
             Self::InvalidGroupName => write!(f, "invalid group name"),
             Self::MissingGroupName => write!(f, "group is required for this request"),
+            Self::InvalidWildmat => write!(f, "invalid wildmat"),
+            Self::MissingWildmat => write!(f, "wildmat is required for this request"),
+            Self::InvalidDate => write!(f, "invalid NNTP date"),
+            Self::MissingDate => write!(f, "date is required for this request"),
+            Self::InvalidTime => write!(f, "invalid NNTP time"),
+            Self::MissingTime => write!(f, "time is required for this request"),
             Self::InvalidHeaderName => write!(f, "invalid header name"),
             Self::MissingHeaderName => write!(f, "header is required for this request"),
             Self::InvalidArticleSelector => write!(f, "invalid article selector"),
@@ -952,6 +1065,16 @@ impl From<crate::protocol::InvalidHeaderQuery> for TypedClientError {
         match value {
             crate::protocol::InvalidHeaderQuery::Header(_) => Self::InvalidHeaderName,
             crate::protocol::InvalidHeaderQuery::Selector(_) => Self::InvalidArticleSelector,
+        }
+    }
+}
+
+impl From<crate::protocol::InvalidDiscoveryArguments> for TypedClientError {
+    fn from(value: crate::protocol::InvalidDiscoveryArguments) -> Self {
+        match value {
+            crate::protocol::InvalidDiscoveryArguments::Wildmat(_) => Self::InvalidWildmat,
+            crate::protocol::InvalidDiscoveryArguments::Date(_) => Self::InvalidDate,
+            crate::protocol::InvalidDiscoveryArguments::Time(_) => Self::InvalidTime,
         }
     }
 }
@@ -1220,6 +1343,12 @@ fn shared_engine_error_from_typed(err: TypedClientError) -> SharedEngineError {
         | TypedClientError::MissingMessageId
         | TypedClientError::InvalidGroupName
         | TypedClientError::MissingGroupName
+        | TypedClientError::InvalidWildmat
+        | TypedClientError::MissingWildmat
+        | TypedClientError::InvalidDate
+        | TypedClientError::MissingDate
+        | TypedClientError::InvalidTime
+        | TypedClientError::MissingTime
         | TypedClientError::InvalidHeaderName
         | TypedClientError::MissingHeaderName
         | TypedClientError::InvalidArticleSelector
@@ -1653,6 +1782,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn typed_connection_fetches_newgroups_and_newnews_frames() {
+        let listener = crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"201 typed ready\r\n").await.unwrap();
+
+            let mut request = [0_u8; 128];
+            let read = stream.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"NEWGROUPS 20260101 000000 GMT\r\n");
+            stream.write_all(crate::NEWGROUPS_RESPONSE).await.unwrap();
+
+            let read = stream.read(&mut request).await.unwrap();
+            assert_eq!(
+                &request[..read],
+                b"NEWNEWS comp.lang.*,alt.test 20260101 000000\r\n"
+            );
+            stream.write_all(crate::NEWNEWS_RESPONSE).await.unwrap();
+        });
+
+        let connection = TypedClientConnection::connect(addr).await.unwrap();
+        let newgroups = connection
+            .newgroups(
+                NntpDate::from_owned("20260101").unwrap(),
+                NntpTime::from_owned("000000").unwrap(),
+                true,
+            )
+            .await
+            .unwrap();
+        let newnews = connection
+            .newnews(
+                Wildmat::from_owned("comp.lang.*,alt.test").unwrap(),
+                NntpDate::from_owned("20260101").unwrap(),
+                NntpTime::from_owned("000000").unwrap(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(newgroups.kind(), RequestKind::NewGroups);
+        assert_eq!(newgroups.status().as_u16(), 231);
+        assert_eq!(newgroups.as_bytes(), crate::NEWGROUPS_RESPONSE);
+        assert_eq!(newnews.kind(), RequestKind::NewNews);
+        assert_eq!(newnews.status().as_u16(), 230);
+        assert_eq!(newnews.as_bytes(), crate::NEWNEWS_RESPONSE);
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn typed_connection_fetches_hdr_and_xhdr_frames() {
         let listener = crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1928,6 +2107,53 @@ mod tests {
         assert_eq!(next.request(), &Request::Next);
         assert_eq!(next.response().kind(), RequestKind::Next);
         assert_eq!(next.response().status().as_u16(), 223);
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn client_discovery_methods_expose_general_request_surface() {
+        let listener = crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"201 typed ready\r\n").await.unwrap();
+
+            let mut request = [0_u8; 128];
+            let read = stream.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"NEWGROUPS 20260101 000000 GMT\r\n");
+            stream.write_all(crate::NEWGROUPS_RESPONSE).await.unwrap();
+
+            let read = stream.read(&mut request).await.unwrap();
+            assert_eq!(
+                &request[..read],
+                b"NEWNEWS comp.lang.*,alt.test 20260101 000000\r\n"
+            );
+            stream.write_all(crate::NEWNEWS_RESPONSE).await.unwrap();
+        });
+
+        let client = Client::connect(addr).await.unwrap();
+        let newgroups = client.newgroups("20260101", "000000", true).await.unwrap();
+        let newnews = client
+            .newnews_exchange("comp.lang.*,alt.test", "20260101", "000000", false)
+            .await
+            .unwrap();
+
+        assert_eq!(newgroups.kind(), RequestKind::NewGroups);
+        assert_eq!(newgroups.status().as_u16(), 231);
+        assert_eq!(
+            newnews
+                .request()
+                .discovery_datetime()
+                .map(|(date, time, gmt)| (date.as_str(), time.as_str(), gmt)),
+            Some(("20260101", "000000", false))
+        );
+        assert_eq!(
+            newnews.request().wildmat().map(Wildmat::as_str),
+            Some("comp.lang.*,alt.test")
+        );
+        assert_eq!(newnews.response().kind(), RequestKind::NewNews);
+        assert_eq!(newnews.response().status().as_u16(), 230);
 
         server.await.unwrap();
     }

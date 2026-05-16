@@ -239,6 +239,157 @@ fn validate_group_name(value: &str) -> Result<(), InvalidGroupName> {
     Ok(())
 }
 
+/// Validated NNTP date argument for NEWGROUPS/NEWNEWS.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct NntpDate<'a>(Cow<'a, str>);
+
+impl<'a> NntpDate<'a> {
+    /// Construct a borrowed date after validation.
+    pub fn from_borrowed(value: &'a str) -> Result<Self, InvalidNntpDate> {
+        validate_nntp_date(value)?;
+        Ok(Self(Cow::Borrowed(value)))
+    }
+
+    /// Construct an owned date after validation.
+    pub fn from_owned(value: impl AsRef<str>) -> Result<NntpDate<'static>, InvalidNntpDate> {
+        let value = value.as_ref();
+        validate_nntp_date(value)?;
+        Ok(NntpDate(Cow::Owned(value.to_owned())))
+    }
+
+    /// Borrow the validated string.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidNntpDate;
+
+fn validate_nntp_date(value: &str) -> Result<(), InvalidNntpDate> {
+    let bytes = value.as_bytes();
+    if !matches!(bytes.len(), 6 | 8) || bytes.iter().any(|byte| !byte.is_ascii_digit()) {
+        return Err(InvalidNntpDate);
+    }
+
+    let month =
+        parse_two_digits(&bytes[bytes.len() - 4..bytes.len() - 2]).ok_or(InvalidNntpDate)?;
+    let day = parse_two_digits(&bytes[bytes.len() - 2..]).ok_or(InvalidNntpDate)?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return Err(InvalidNntpDate);
+    }
+
+    Ok(())
+}
+
+/// Validated NNTP time argument for NEWGROUPS/NEWNEWS.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct NntpTime<'a>(Cow<'a, str>);
+
+impl<'a> NntpTime<'a> {
+    /// Construct a borrowed time after validation.
+    pub fn from_borrowed(value: &'a str) -> Result<Self, InvalidNntpTime> {
+        validate_nntp_time(value)?;
+        Ok(Self(Cow::Borrowed(value)))
+    }
+
+    /// Construct an owned time after validation.
+    pub fn from_owned(value: impl AsRef<str>) -> Result<NntpTime<'static>, InvalidNntpTime> {
+        let value = value.as_ref();
+        validate_nntp_time(value)?;
+        Ok(NntpTime(Cow::Owned(value.to_owned())))
+    }
+
+    /// Borrow the validated string.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidNntpTime;
+
+fn validate_nntp_time(value: &str) -> Result<(), InvalidNntpTime> {
+    let bytes = value.as_bytes();
+    if bytes.len() != 6 || bytes.iter().any(|byte| !byte.is_ascii_digit()) {
+        return Err(InvalidNntpTime);
+    }
+
+    let hour = parse_two_digits(&bytes[..2]).ok_or(InvalidNntpTime)?;
+    let minute = parse_two_digits(&bytes[2..4]).ok_or(InvalidNntpTime)?;
+    let second = parse_two_digits(&bytes[4..]).ok_or(InvalidNntpTime)?;
+    if hour > 23 || minute > 59 || second > 60 {
+        return Err(InvalidNntpTime);
+    }
+
+    Ok(())
+}
+
+/// Validated wildmat argument for NEWNEWS.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Wildmat<'a>(Cow<'a, str>);
+
+impl<'a> Wildmat<'a> {
+    /// Construct a borrowed wildmat after validation.
+    pub fn from_borrowed(value: &'a str) -> Result<Self, InvalidWildmat> {
+        validate_wildmat(value)?;
+        Ok(Self(Cow::Borrowed(value)))
+    }
+
+    /// Construct an owned wildmat after validation.
+    pub fn from_owned(value: impl AsRef<str>) -> Result<Wildmat<'static>, InvalidWildmat> {
+        let value = value.as_ref();
+        validate_wildmat(value)?;
+        Ok(Wildmat(Cow::Owned(value.to_owned())))
+    }
+
+    /// Borrow the validated string.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidWildmat;
+
+fn validate_wildmat(value: &str) -> Result<(), InvalidWildmat> {
+    if value.is_empty() || value.bytes().any(|byte| !(0x21..=0x7e).contains(&byte)) {
+        return Err(InvalidWildmat);
+    }
+
+    for pattern in value.split(',') {
+        if pattern.is_empty() || pattern == "!" {
+            return Err(InvalidWildmat);
+        }
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvalidDiscoveryArguments {
+    Wildmat(InvalidWildmat),
+    Date(InvalidNntpDate),
+    Time(InvalidNntpTime),
+}
+
+fn parse_two_digits(bytes: &[u8]) -> Option<u8> {
+    if bytes.len() != 2 {
+        return None;
+    }
+
+    let tens = bytes[0].checked_sub(b'0')?;
+    let ones = bytes[1].checked_sub(b'0')?;
+    if tens > 9 || ones > 9 {
+        return None;
+    }
+
+    Some(tens * 10 + ones)
+}
+
 /// Typed request kind for the currently-supported command set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestKind {
@@ -333,6 +484,17 @@ pub enum Request<'a> {
         header: HeaderName<'a>,
         selector: ArticleSelector<'a>,
     },
+    NewGroups {
+        date: NntpDate<'a>,
+        time: NntpTime<'a>,
+        gmt: bool,
+    },
+    NewNews {
+        wildmat: Wildmat<'a>,
+        date: NntpDate<'a>,
+        time: NntpTime<'a>,
+        gmt: bool,
+    },
     List,
     Help,
     Capabilities,
@@ -358,6 +520,8 @@ impl<'a> Request<'a> {
             Self::Xover { .. } => RequestKind::Xover,
             Self::Hdr { .. } => RequestKind::Hdr,
             Self::Xhdr { .. } => RequestKind::Xhdr,
+            Self::NewGroups { .. } => RequestKind::NewGroups,
+            Self::NewNews { .. } => RequestKind::NewNews,
             Self::List => RequestKind::List,
             Self::Help => RequestKind::Help,
             Self::Capabilities => RequestKind::Capabilities,
@@ -392,6 +556,25 @@ impl<'a> Request<'a> {
             Self::Xhdr { header, selector } => {
                 write_two_arg_request_wire(output, b"XHDR ", header.as_str(), selector.as_str())
             }
+            Self::NewGroups { date, time, gmt } => write_datetime_request_wire(
+                output,
+                b"NEWGROUPS ",
+                date.as_str(),
+                time.as_str(),
+                *gmt,
+            ),
+            Self::NewNews {
+                wildmat,
+                date,
+                time,
+                gmt,
+            } => write_newnews_request_wire(
+                output,
+                wildmat.as_str(),
+                date.as_str(),
+                time.as_str(),
+                *gmt,
+            ),
             Self::List => write_simple_request_wire(output, b"LIST"),
             Self::Help => write_simple_request_wire(output, b"HELP"),
             Self::Capabilities => write_simple_request_wire(output, b"CAPABILITIES"),
@@ -416,7 +599,9 @@ impl<'a> Request<'a> {
             | Self::Over { .. }
             | Self::Xover { .. }
             | Self::Hdr { .. }
-            | Self::Xhdr { .. } => None,
+            | Self::Xhdr { .. }
+            | Self::NewGroups { .. }
+            | Self::NewNews { .. } => None,
             Self::List
             | Self::Help
             | Self::Capabilities
@@ -443,6 +628,8 @@ impl<'a> Request<'a> {
             | Self::Next
             | Self::Over { .. }
             | Self::Xover { .. }
+            | Self::NewGroups { .. }
+            | Self::NewNews { .. }
             | Self::List
             | Self::Help
             | Self::Capabilities
@@ -467,6 +654,8 @@ impl<'a> Request<'a> {
             | Self::Next
             | Self::Hdr { .. }
             | Self::Xhdr { .. }
+            | Self::NewGroups { .. }
+            | Self::NewNews { .. }
             | Self::List
             | Self::Help
             | Self::Capabilities
@@ -491,6 +680,64 @@ impl<'a> Request<'a> {
             | Self::Xover { .. }
             | Self::Hdr { .. }
             | Self::Xhdr { .. }
+            | Self::NewGroups { .. }
+            | Self::NewNews { .. }
+            | Self::List
+            | Self::Help
+            | Self::Capabilities
+            | Self::Date
+            | Self::ModeReader
+            | Self::Quit => None,
+        }
+    }
+
+    /// Borrow the validated discovery date/time carried by this request, if any.
+    #[must_use]
+    pub const fn discovery_datetime(&self) -> Option<(&NntpDate<'a>, &NntpTime<'a>, bool)> {
+        match self {
+            Self::NewGroups { date, time, gmt }
+            | Self::NewNews {
+                date, time, gmt, ..
+            } => Some((date, time, *gmt)),
+            Self::Article { .. }
+            | Self::Body { .. }
+            | Self::Head { .. }
+            | Self::Stat { .. }
+            | Self::Group { .. }
+            | Self::ListGroup { .. }
+            | Self::Last
+            | Self::Next
+            | Self::Over { .. }
+            | Self::Xover { .. }
+            | Self::Hdr { .. }
+            | Self::Xhdr { .. }
+            | Self::List
+            | Self::Help
+            | Self::Capabilities
+            | Self::Date
+            | Self::ModeReader
+            | Self::Quit => None,
+        }
+    }
+
+    /// Borrow the validated NEWNEWS wildmat carried by this request, if any.
+    #[must_use]
+    pub const fn wildmat(&self) -> Option<&Wildmat<'a>> {
+        match self {
+            Self::NewNews { wildmat, .. } => Some(wildmat),
+            Self::Article { .. }
+            | Self::Body { .. }
+            | Self::Head { .. }
+            | Self::Stat { .. }
+            | Self::Group { .. }
+            | Self::ListGroup { .. }
+            | Self::Last
+            | Self::Next
+            | Self::Over { .. }
+            | Self::Xover { .. }
+            | Self::Hdr { .. }
+            | Self::Xhdr { .. }
+            | Self::NewGroups { .. }
             | Self::List
             | Self::Help
             | Self::Capabilities
@@ -591,6 +838,34 @@ impl Request<'static> {
             header: HeaderName::from_owned(header).map_err(InvalidHeaderQuery::Header)?,
             selector: ArticleSelector::from_owned(selector)
                 .map_err(InvalidHeaderQuery::Selector)?,
+        })
+    }
+
+    /// Build a NEWGROUPS request.
+    pub fn newgroups(
+        date: impl AsRef<str>,
+        time: impl AsRef<str>,
+        gmt: bool,
+    ) -> Result<Self, InvalidDiscoveryArguments> {
+        Ok(Self::NewGroups {
+            date: NntpDate::from_owned(date).map_err(InvalidDiscoveryArguments::Date)?,
+            time: NntpTime::from_owned(time).map_err(InvalidDiscoveryArguments::Time)?,
+            gmt,
+        })
+    }
+
+    /// Build a NEWNEWS request.
+    pub fn newnews(
+        wildmat: impl AsRef<str>,
+        date: impl AsRef<str>,
+        time: impl AsRef<str>,
+        gmt: bool,
+    ) -> Result<Self, InvalidDiscoveryArguments> {
+        Ok(Self::NewNews {
+            wildmat: Wildmat::from_owned(wildmat).map_err(InvalidDiscoveryArguments::Wildmat)?,
+            date: NntpDate::from_owned(date).map_err(InvalidDiscoveryArguments::Date)?,
+            time: NntpTime::from_owned(time).map_err(InvalidDiscoveryArguments::Time)?,
+            gmt,
         })
     }
 
@@ -808,6 +1083,42 @@ fn write_two_arg_request_wire(output: &mut Vec<u8>, verb: &[u8], left: &str, rig
     output.extend_from_slice(b"\r\n");
 }
 
+fn write_datetime_request_wire(
+    output: &mut Vec<u8>,
+    verb: &[u8],
+    date: &str,
+    time: &str,
+    gmt: bool,
+) {
+    output.extend_from_slice(verb);
+    output.extend_from_slice(date.as_bytes());
+    output.push(b' ');
+    output.extend_from_slice(time.as_bytes());
+    if gmt {
+        output.extend_from_slice(b" GMT");
+    }
+    output.extend_from_slice(b"\r\n");
+}
+
+fn write_newnews_request_wire(
+    output: &mut Vec<u8>,
+    wildmat: &str,
+    date: &str,
+    time: &str,
+    gmt: bool,
+) {
+    output.extend_from_slice(b"NEWNEWS ");
+    output.extend_from_slice(wildmat.as_bytes());
+    output.push(b' ');
+    output.extend_from_slice(date.as_bytes());
+    output.push(b' ');
+    output.extend_from_slice(time.as_bytes());
+    if gmt {
+        output.extend_from_slice(b" GMT");
+    }
+    output.extend_from_slice(b"\r\n");
+}
+
 fn write_simple_request_wire(output: &mut Vec<u8>, verb: &[u8]) {
     output.extend_from_slice(verb);
     output.extend_from_slice(b"\r\n");
@@ -909,6 +1220,40 @@ mod tests {
     }
 
     #[test]
+    fn discovery_arguments_validate() {
+        assert_eq!(
+            NntpDate::from_borrowed("20260101").unwrap().as_str(),
+            "20260101"
+        );
+        assert_eq!(
+            NntpDate::from_borrowed("260101").unwrap().as_str(),
+            "260101"
+        );
+        assert_eq!(
+            NntpTime::from_borrowed("235960").unwrap().as_str(),
+            "235960"
+        );
+        assert_eq!(
+            Wildmat::from_borrowed("comp.lang.*,alt.test")
+                .unwrap()
+                .as_str(),
+            "comp.lang.*,alt.test"
+        );
+
+        assert!(NntpDate::from_borrowed("20261301").is_err());
+        assert!(NntpDate::from_borrowed("20260100").is_err());
+        assert!(NntpDate::from_borrowed("202601").is_err());
+        assert!(NntpTime::from_borrowed("240000").is_err());
+        assert!(NntpTime::from_borrowed("126061").is_err());
+        assert!(NntpTime::from_borrowed("1200").is_err());
+        assert!(Wildmat::from_borrowed("").is_err());
+        assert!(Wildmat::from_borrowed(",alt.test").is_err());
+        assert!(Wildmat::from_borrowed("alt.test,").is_err());
+        assert!(Wildmat::from_borrowed("!").is_err());
+        assert!(Wildmat::from_borrowed("alt test").is_err());
+    }
+
+    #[test]
     fn request_line_parses_current_command_set() {
         assert_eq!(
             RequestLine::parse(b"ARTICLE <a@b>").kind(),
@@ -969,6 +1314,22 @@ mod tests {
             (b"XOVER 1-10".as_slice(), RequestKind::Xover),
             (b"HDR Subject 1-10".as_slice(), RequestKind::Hdr),
             (b"XHDR Subject 1-10".as_slice(), RequestKind::Xhdr),
+            (
+                b"NEWGROUPS 20260101 000000 GMT".as_slice(),
+                RequestKind::NewGroups,
+            ),
+            (
+                b"NEWGROUPS 20260101 000000 gmt".as_slice(),
+                RequestKind::NewGroups,
+            ),
+            (
+                b"NEWNEWS * 20260101 000000 GMT".as_slice(),
+                RequestKind::NewNews,
+            ),
+            (
+                b"NEWNEWS comp.lang.* 20260101 000000".as_slice(),
+                RequestKind::NewNews,
+            ),
             (b"POST".as_slice(), RequestKind::Post),
             (b"IHAVE <a@b>".as_slice(), RequestKind::Ihave),
             (b"CHECK <a@b>".as_slice(), RequestKind::Check),
@@ -1014,6 +1375,8 @@ mod tests {
         assert!(RequestKind::List.expects_multiline_response(StatusCode(215)));
         assert!(RequestKind::Over.expects_multiline_response(StatusCode(224)));
         assert!(RequestKind::Xhdr.expects_multiline_response(StatusCode(225)));
+        assert!(RequestKind::NewGroups.expects_multiline_response(StatusCode(231)));
+        assert!(RequestKind::NewNews.expects_multiline_response(StatusCode(230)));
         assert!(RequestKind::Capabilities.expects_multiline_response(StatusCode(101)));
         assert!(!RequestKind::Date.expects_multiline_response(StatusCode(111)));
         assert!(!RequestKind::ModeReader.expects_multiline_response(StatusCode(201)));
@@ -1056,6 +1419,17 @@ mod tests {
         let xhdr = Request::Xhdr {
             header: HeaderName::from_borrowed("Message-ID").unwrap(),
             selector: ArticleSelector::from_borrowed("<a@b>").unwrap(),
+        };
+        let newgroups = Request::NewGroups {
+            date: NntpDate::from_borrowed("20260101").unwrap(),
+            time: NntpTime::from_borrowed("000000").unwrap(),
+            gmt: true,
+        };
+        let newnews = Request::NewNews {
+            wildmat: Wildmat::from_borrowed("comp.lang.*,alt.test").unwrap(),
+            date: NntpDate::from_borrowed("20260101").unwrap(),
+            time: NntpTime::from_borrowed("000000").unwrap(),
+            gmt: false,
         };
         let list = Request::List;
         let help = Request::Help;
@@ -1125,6 +1499,16 @@ mod tests {
         assert_eq!(wire, b"XHDR Message-ID <a@b>\r\n");
 
         wire.clear();
+        newgroups.write_wire_to(&mut wire);
+        assert_eq!(newgroups.kind(), RequestKind::NewGroups);
+        assert_eq!(wire, b"NEWGROUPS 20260101 000000 GMT\r\n");
+
+        wire.clear();
+        newnews.write_wire_to(&mut wire);
+        assert_eq!(newnews.kind(), RequestKind::NewNews);
+        assert_eq!(wire, b"NEWNEWS comp.lang.*,alt.test 20260101 000000\r\n");
+
+        wire.clear();
         list.write_wire_to(&mut wire);
         assert_eq!(list.kind(), RequestKind::List);
         assert_eq!(wire, b"LIST\r\n");
@@ -1169,6 +1553,9 @@ mod tests {
         let xover = Request::xover("<g@h>").unwrap();
         let hdr = Request::hdr("Subject", "1-10").unwrap();
         let xhdr = Request::xhdr("Message-ID", "<g@h>").unwrap();
+        let newgroups = Request::newgroups("20260101", "000000", true).unwrap();
+        let newnews =
+            Request::newnews("comp.lang.*,alt.test", "20260101", "000000", false).unwrap();
         let list = Request::list();
         let help = Request::help();
         let capabilities = Request::capabilities();
@@ -1217,6 +1604,29 @@ mod tests {
                 .map(|(header, selector)| (header.as_str(), selector.as_str())),
             Some(("Message-ID", "<g@h>"))
         );
+        assert_eq!(newgroups.kind(), RequestKind::NewGroups);
+        assert_eq!(
+            newgroups.discovery_datetime().map(|(date, time, gmt)| (
+                date.as_str(),
+                time.as_str(),
+                gmt
+            )),
+            Some(("20260101", "000000", true))
+        );
+        assert!(newgroups.wildmat().is_none());
+        assert_eq!(newnews.kind(), RequestKind::NewNews);
+        assert_eq!(
+            newnews.wildmat().map(Wildmat::as_str),
+            Some("comp.lang.*,alt.test")
+        );
+        assert_eq!(
+            newnews.discovery_datetime().map(|(date, time, gmt)| (
+                date.as_str(),
+                time.as_str(),
+                gmt
+            )),
+            Some(("20260101", "000000", false))
+        );
         assert_eq!(list.kind(), RequestKind::List);
         assert!(list.message_id().is_none());
         assert_eq!(help.kind(), RequestKind::Help);
@@ -1236,6 +1646,8 @@ mod tests {
         assert!(Request::xover("").is_err());
         assert!(Request::hdr("Bad Header", "1").is_err());
         assert!(Request::xhdr("Subject", "1 2").is_err());
+        assert!(Request::newgroups("20261301", "000000", true).is_err());
+        assert!(Request::newnews("", "20260101", "000000", false).is_err());
     }
 
     #[test]
@@ -1253,6 +1665,8 @@ mod tests {
             Request::xover("<i@j>").unwrap(),
             Request::hdr("Subject", "1-10").unwrap(),
             Request::xhdr("Message-ID", "<i@j>").unwrap(),
+            Request::newgroups("20260101", "000000", true).unwrap(),
+            Request::newnews("comp.lang.*", "20260101", "000000", false).unwrap(),
             Request::list(),
             Request::help(),
             Request::capabilities(),
