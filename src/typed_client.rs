@@ -165,7 +165,17 @@ impl Client {
         self.execute_exchange(request).await
     }
 
-    /// Send a CAPABILITIES request and return the owned raw response frame.
+    /// Send a LIST request and return the owned raw response frame.
+    pub async fn list(&self) -> Result<OwnedResponse, TypedClientError> {
+        self.execute_raw(Request::list()).await
+    }
+
+    /// Send a LIST request and return the completed raw request/response pair.
+    pub async fn list_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+        self.execute_raw_exchange(Request::list()).await
+    }
+
+    /// Send a HELP request and return the owned raw response frame.
     pub async fn help(&self) -> Result<OwnedResponse, TypedClientError> {
         self.execute_raw(Request::help()).await
     }
@@ -352,7 +362,17 @@ impl TypedClientConnection {
         self.execute_exchange(Request::Stat { message_id }).await
     }
 
-    /// Send a CAPABILITIES request and return the owned response frame.
+    /// Send a LIST request and return the owned response frame.
+    pub async fn list(&self) -> Result<OwnedResponse, TypedClientError> {
+        self.execute(Request::List).await
+    }
+
+    /// Send a LIST request and return the completed request/response pair.
+    pub async fn list_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+        self.execute_exchange(Request::List).await
+    }
+
+    /// Send a HELP request and return the owned response frame.
     pub async fn help(&self) -> Result<OwnedResponse, TypedClientError> {
         self.execute(Request::Help).await
     }
@@ -1286,7 +1306,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn typed_connection_fetches_help_capabilities_date_mode_reader_and_quit_frames() {
+    async fn typed_connection_fetches_list_help_capabilities_date_mode_reader_and_quit_frames() {
         let listener = crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -1294,6 +1314,10 @@ mod tests {
             stream.write_all(b"201 typed ready\r\n").await.unwrap();
 
             let mut request = [0_u8; 128];
+            let read = stream.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"LIST\r\n");
+            stream.write_all(crate::LIST_RESPONSE).await.unwrap();
+
             let read = stream.read(&mut request).await.unwrap();
             assert_eq!(&request[..read], b"HELP\r\n");
             stream.write_all(crate::HELP_RESPONSE).await.unwrap();
@@ -1322,11 +1346,16 @@ mod tests {
         });
 
         let connection = TypedClientConnection::connect(addr).await.unwrap();
+        let list = connection.list().await.unwrap();
         let help = connection.help().await.unwrap();
         let capabilities = connection.capabilities().await.unwrap();
         let date = connection.date().await.unwrap();
         let mode_reader = connection.mode_reader().await.unwrap();
         let quit = connection.quit().await.unwrap();
+
+        assert_eq!(list.kind(), RequestKind::List);
+        assert_eq!(list.status().as_u16(), 215);
+        assert_eq!(list.as_bytes(), crate::LIST_RESPONSE);
 
         assert_eq!(help.kind(), RequestKind::Help);
         assert_eq!(help.status().as_u16(), 100);
@@ -1477,6 +1506,10 @@ mod tests {
 
             let mut request = [0_u8; 128];
             let read = stream.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"LIST\r\n");
+            stream.write_all(crate::LIST_RESPONSE).await.unwrap();
+
+            let read = stream.read(&mut request).await.unwrap();
             assert_eq!(&request[..read], b"CAPABILITIES\r\n");
             stream
                 .write_all(b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n")
@@ -1489,9 +1522,12 @@ mod tests {
         });
 
         let client = Client::connect(addr).await.unwrap();
+        let list = client.list().await.unwrap();
         let capabilities = client.capabilities().await.unwrap();
         let exchange = client.date_exchange().await.unwrap();
 
+        assert_eq!(list.kind(), RequestKind::List);
+        assert_eq!(list.status().as_u16(), 215);
         assert_eq!(capabilities.kind(), RequestKind::Capabilities);
         assert_eq!(capabilities.status().as_u16(), 101);
         assert_eq!(exchange.request(), &Request::Date);

@@ -177,6 +177,7 @@ pub enum Request<'a> {
     Body { message_id: MessageId<'a> },
     Head { message_id: MessageId<'a> },
     Stat { message_id: MessageId<'a> },
+    List,
     Help,
     Capabilities,
     Date,
@@ -193,6 +194,7 @@ impl<'a> Request<'a> {
             Self::Body { .. } => RequestKind::Body,
             Self::Head { .. } => RequestKind::Head,
             Self::Stat { .. } => RequestKind::Stat,
+            Self::List => RequestKind::List,
             Self::Help => RequestKind::Help,
             Self::Capabilities => RequestKind::Capabilities,
             Self::Date => RequestKind::Date,
@@ -208,6 +210,7 @@ impl<'a> Request<'a> {
             Self::Body { message_id } => write_request_wire(output, b"BODY ", message_id),
             Self::Head { message_id } => write_request_wire(output, b"HEAD ", message_id),
             Self::Stat { message_id } => write_request_wire(output, b"STAT ", message_id),
+            Self::List => write_simple_request_wire(output, b"LIST"),
             Self::Help => write_simple_request_wire(output, b"HELP"),
             Self::Capabilities => write_simple_request_wire(output, b"CAPABILITIES"),
             Self::Date => write_simple_request_wire(output, b"DATE"),
@@ -224,7 +227,12 @@ impl<'a> Request<'a> {
             | Self::Body { message_id }
             | Self::Head { message_id }
             | Self::Stat { message_id } => Some(message_id),
-            Self::Help | Self::Capabilities | Self::Date | Self::ModeReader | Self::Quit => None,
+            Self::List
+            | Self::Help
+            | Self::Capabilities
+            | Self::Date
+            | Self::ModeReader
+            | Self::Quit => None,
         }
     }
 }
@@ -258,7 +266,13 @@ impl Request<'static> {
         })
     }
 
-    /// Build a CAPABILITIES request.
+    /// Build a LIST request.
+    #[must_use]
+    pub const fn list() -> Self {
+        Self::List
+    }
+
+    /// Build a HELP request.
     #[must_use]
     pub const fn help() -> Self {
         Self::Help
@@ -566,6 +580,7 @@ mod tests {
         let stat = Request::Stat {
             message_id: MessageId::from_borrowed("<g@h>").unwrap(),
         };
+        let list = Request::List;
         let help = Request::Help;
         let capabilities = Request::Capabilities;
         let date = Request::Date;
@@ -591,6 +606,11 @@ mod tests {
         stat.write_wire_to(&mut wire);
         assert_eq!(stat.kind(), RequestKind::Stat);
         assert_eq!(wire, b"STAT <g@h>\r\n");
+
+        wire.clear();
+        list.write_wire_to(&mut wire);
+        assert_eq!(list.kind(), RequestKind::List);
+        assert_eq!(wire, b"LIST\r\n");
 
         wire.clear();
         help.write_wire_to(&mut wire);
@@ -624,6 +644,7 @@ mod tests {
         let body = Request::body("<c@d>").unwrap();
         let head = Request::head("e@f").unwrap();
         let stat = Request::stat("<g@h>").unwrap();
+        let list = Request::list();
         let help = Request::help();
         let capabilities = Request::capabilities();
         let date = Request::date();
@@ -638,6 +659,8 @@ mod tests {
         assert_eq!(head.message_id().unwrap().as_str(), "<e@f>");
         assert_eq!(stat.kind(), RequestKind::Stat);
         assert_eq!(stat.message_id().unwrap().as_str(), "<g@h>");
+        assert_eq!(list.kind(), RequestKind::List);
+        assert!(list.message_id().is_none());
         assert_eq!(help.kind(), RequestKind::Help);
         assert!(help.message_id().is_none());
         assert_eq!(capabilities.kind(), RequestKind::Capabilities);

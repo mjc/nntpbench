@@ -38,8 +38,10 @@ pub const TERMINATOR: &[u8] = b"\r\n.\r\n";
 pub const GREETING: &[u8] = b"201 nntpbench mock server ready\r\n";
 pub const MODE_READER_RESPONSE: &[u8] = b"201 posting not permitted\r\n";
 pub const DATE_RESPONSE: &[u8] = b"111 20260515120000\r\n";
+pub const LIST_RESPONSE: &[u8] =
+    b"215 list of newsgroups follows\r\ncomp.lang.rust 0000000001 0000000001 y\r\n.\r\n";
 pub const HELP_RESPONSE: &[u8] =
-    b"100 help text follows\r\nCAPABILITIES\r\nDATE\r\nMODE-READER\r\nQUIT\r\n.\r\n";
+    b"100 help text follows\r\nLIST\r\nCAPABILITIES\r\nDATE\r\nMODE-READER\r\nQUIT\r\n.\r\n";
 pub const QUIT_RESPONSE: &[u8] = b"205 closing connection\r\n";
 const MAX_COMMAND_LINE_BYTES: usize = 1024;
 const MAX_SERVER_PIPELINE_DEPTH: usize = 1024;
@@ -364,6 +366,7 @@ pub enum TypedRequestKind {
     Body,
     Head,
     Stat,
+    List,
     Help,
     Capabilities,
     Date,
@@ -602,6 +605,7 @@ fn typed_fetch_request(args: &TypedFetchArgs) -> Result<Request<'static>, TypedC
         TypedRequestKind::Stat => {
             typed_fetch_message_id_request(args, |message_id| Request::stat(message_id))
         }
+        TypedRequestKind::List => Ok(Request::list()),
         TypedRequestKind::Help => Ok(Request::help()),
         TypedRequestKind::Capabilities => Ok(Request::capabilities()),
         TypedRequestKind::Date => Ok(Request::date()),
@@ -1684,6 +1688,10 @@ where
             .await?;
             Ok(false)
         }
+        RequestKind::List => {
+            write_response(writer, pending_write, LIST_RESPONSE, session_stats).await?;
+            Ok(false)
+        }
         RequestKind::Help => {
             write_response(writer, pending_write, HELP_RESPONSE, session_stats).await?;
             Ok(false)
@@ -1812,6 +1820,7 @@ pub fn process_command_to_buffer(
             stats.body_requests.fetch_add(1, Ordering::Relaxed);
             config.body_response()
         }
+        RequestKind::List => LIST_RESPONSE,
         RequestKind::Capabilities => b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n",
         RequestKind::Help => HELP_RESPONSE,
         RequestKind::Date => DATE_RESPONSE,
@@ -3540,39 +3549,53 @@ mod tests {
 
             let mut request = [0_u8; 128];
             let read = first.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"HELP\r\n");
-            first.write_all(HELP_RESPONSE).await.unwrap();
+            assert_eq!(&request[..read], b"LIST\r\n");
+            first.write_all(LIST_RESPONSE).await.unwrap();
 
             let (mut second, _) = listener.accept().await.unwrap();
             second.write_all(b"201 fetch ready\r\n").await.unwrap();
             let read = second.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"CAPABILITIES\r\n");
-            second
-                .write_all(b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n")
-                .await
-                .unwrap();
+            assert_eq!(&request[..read], b"HELP\r\n");
+            second.write_all(HELP_RESPONSE).await.unwrap();
 
             let (mut third, _) = listener.accept().await.unwrap();
             third.write_all(b"201 fetch ready\r\n").await.unwrap();
             let read = third.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"DATE\r\n");
-            third.write_all(b"111 20260515120000\r\n").await.unwrap();
+            assert_eq!(&request[..read], b"CAPABILITIES\r\n");
+            third
+                .write_all(b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n")
+                .await
+                .unwrap();
 
             let (mut fourth, _) = listener.accept().await.unwrap();
             fourth.write_all(b"201 fetch ready\r\n").await.unwrap();
             let read = fourth.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"MODE READER\r\n");
-            fourth
-                .write_all(b"201 posting not permitted\r\n")
-                .await
-                .unwrap();
+            assert_eq!(&request[..read], b"DATE\r\n");
+            fourth.write_all(b"111 20260515120000\r\n").await.unwrap();
 
             let (mut fifth, _) = listener.accept().await.unwrap();
             fifth.write_all(b"201 fetch ready\r\n").await.unwrap();
             let read = fifth.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"MODE READER\r\n");
+            fifth
+                .write_all(b"201 posting not permitted\r\n")
+                .await
+                .unwrap();
+
+            let (mut sixth, _) = listener.accept().await.unwrap();
+            sixth.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = sixth.read(&mut request).await.unwrap();
             assert_eq!(&request[..read], b"QUIT\r\n");
-            fifth.write_all(QUIT_RESPONSE).await.unwrap();
+            sixth.write_all(QUIT_RESPONSE).await.unwrap();
         });
+
+        let mut list_args = test_typed_fetch_args();
+        list_args.connect = addr;
+        list_args.request = TypedRequestKind::List;
+        list_args.message_id = None;
+        let list = fetch_typed_response(&list_args).await.unwrap();
+        assert_eq!(list.kind(), RequestKind::List);
+        assert_eq!(list.status().as_u16(), 215);
 
         let mut help_args = test_typed_fetch_args();
         help_args.connect = addr;
@@ -3792,10 +3815,14 @@ mod tests {
 
     #[tokio::test]
     async fn serve_session_supports_help_and_quit_commands() {
-        let (output, stats) = run_session_with_input(test_config(), b"HELP\r\nQUIT\r\n").await;
+        let (output, stats) =
+            run_session_with_input(test_config(), b"LIST\r\nHELP\r\nQUIT\r\n").await;
 
-        assert_eq!(output, [GREETING, HELP_RESPONSE, QUIT_RESPONSE].concat());
-        assert_eq!(stats.snapshot().commands, 2);
+        assert_eq!(
+            output,
+            [GREETING, LIST_RESPONSE, HELP_RESPONSE, QUIT_RESPONSE].concat()
+        );
+        assert_eq!(stats.snapshot().commands, 3);
     }
 
     #[tokio::test]
@@ -3985,6 +4012,12 @@ mod tests {
         let mut output = Vec::new();
 
         assert!(!process_command_to_buffer(
+            RequestKind::List,
+            &config,
+            &stats,
+            &mut output,
+        ));
+        assert!(!process_command_to_buffer(
             RequestKind::Help,
             &config,
             &stats,
@@ -4005,9 +4038,15 @@ mod tests {
 
         assert_eq!(
             output,
-            [HELP_RESPONSE, MODE_READER_RESPONSE, DATE_RESPONSE].concat()
+            [
+                LIST_RESPONSE,
+                HELP_RESPONSE,
+                MODE_READER_RESPONSE,
+                DATE_RESPONSE
+            ]
+            .concat()
         );
-        assert_eq!(stats.snapshot().commands, 3);
+        assert_eq!(stats.snapshot().commands, 4);
     }
 
     #[test]
