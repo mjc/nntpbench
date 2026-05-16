@@ -481,70 +481,124 @@ impl ClientSession {
 
         let mut write_buffer = vec![0; self.command_buffer_bytes].into_boxed_slice();
         let mut scanner = MultilineScanner::default();
+        let start_id = self.next_id;
+        let mut issued = 0_u64;
         let mut completed = 0_u64;
+        let mut in_flight = 0_usize;
+        let (mut reader, mut writer) = stream.split();
 
-        while !stop.load(Ordering::Acquire)
-            && (self.requests == 0 || completed < self.requests)
+        while in_flight < self.pipeline_depth
+            && (self.requests == 0 || issued < self.requests)
             && !transfer_limit_reached(stats, self.transfer_bytes)
         {
-            let remaining = self.requests.saturating_sub(completed);
-            let batch = if self.requests == 0 {
-                self.pipeline_depth
-            } else {
-                remaining.min(self.pipeline_depth as u64) as usize
-            };
-
-            let written = fill_client_command_batch(
-                &mut write_buffer,
-                CommandBatchSpec {
-                    start_command_id: self.next_id,
-                    start_request_index: completed,
-                    count: batch,
-                    mix: self.command_mix,
-                    segments: self.segments.as_deref(),
-                    client_index: self.client_index,
-                    total_clients: self.total_clients,
-                },
-            );
-            stream.write_all(&write_buffer[..written]).await?;
+            let count = self.next_issue_count(issued, in_flight);
+            if count == 0 {
+                break;
+            }
+            self.write_command_batch(&mut writer, &mut write_buffer, issued, count)
+                .await?;
             stats
                 .pipeline_batches
-                .fetch_add(u64::from(batch > 1), Ordering::Relaxed);
+                .fetch_add(u64::from(count > 1), Ordering::Relaxed);
+            issued = issued.wrapping_add(count as u64);
+            in_flight += count;
+        }
 
-            let mut responses = 0_usize;
-            let mut received = 0_u64;
-            while responses < batch {
-                let read = stream.read(&mut read_buffer).await?;
-                if read == 0 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "server closed during multiline response",
-                    ));
-                }
-
-                received += read as u64;
-                responses += scanner.count_terminators(&read_buffer[..read]);
+        while in_flight != 0 && !stop.load(Ordering::Acquire) {
+            let read = reader.read(&mut read_buffer).await?;
+            if read == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "server closed during multiline response",
+                ));
             }
 
-            let batch = batch as u64;
-            let (articles, bodies) = count_client_commands(self.next_id, batch, self.command_mix);
-            self.next_id = self.next_id.wrapping_add(batch);
-            completed += batch;
-
-            stats.commands.fetch_add(batch, Ordering::Relaxed);
-            stats
-                .article_requests
-                .fetch_add(articles, Ordering::Relaxed);
-            stats.body_requests.fetch_add(bodies, Ordering::Relaxed);
-            let previous_bytes = stats.bytes_sent.fetch_add(received, Ordering::Relaxed);
+            let previous_bytes = stats.bytes_sent.fetch_add(read as u64, Ordering::Relaxed);
             if self.transfer_bytes != 0
-                && previous_bytes.saturating_add(received) >= self.transfer_bytes
+                && previous_bytes.saturating_add(read as u64) >= self.transfer_bytes
             {
                 stop.store(true, Ordering::Release);
             }
+
+            let responses = scanner.count_terminators(&read_buffer[..read]);
+            if responses > in_flight {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "server returned more multiline responses than outstanding requests",
+                ));
+            }
+
+            if responses != 0 {
+                let completed_before = completed;
+                let responses = responses as u64;
+                completed = completed.wrapping_add(responses);
+                in_flight -= responses as usize;
+
+                let command_id = start_id.wrapping_add(completed_before);
+                let (articles, bodies) =
+                    count_client_commands(command_id, responses, self.command_mix);
+                stats.commands.fetch_add(responses, Ordering::Relaxed);
+                stats
+                    .article_requests
+                    .fetch_add(articles, Ordering::Relaxed);
+                stats.body_requests.fetch_add(bodies, Ordering::Relaxed);
+            }
+
+            while !stop.load(Ordering::Acquire)
+                && in_flight < self.pipeline_depth
+                && (self.requests == 0 || issued < self.requests)
+                && !transfer_limit_reached(stats, self.transfer_bytes)
+            {
+                let count = self.next_issue_count(issued, in_flight);
+                if count == 0 {
+                    break;
+                }
+                self.write_command_batch(&mut writer, &mut write_buffer, issued, count)
+                    .await?;
+                stats
+                    .pipeline_batches
+                    .fetch_add(u64::from(count > 1), Ordering::Relaxed);
+                issued = issued.wrapping_add(count as u64);
+                in_flight += count;
+            }
         }
 
+        self.next_id = start_id.wrapping_add(issued);
         Ok(())
+    }
+
+    fn next_issue_count(&self, issued: u64, in_flight: usize) -> usize {
+        let available = self.pipeline_depth - in_flight;
+        if self.requests == 0 {
+            available
+        } else {
+            self.requests.saturating_sub(issued).min(available as u64) as usize
+        }
+    }
+
+    async fn write_command_batch<W>(
+        &self,
+        writer: &mut W,
+        write_buffer: &mut [u8],
+        issued: u64,
+        count: usize,
+    ) -> io::Result<()>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        let written = fill_client_command_batch(
+            write_buffer,
+            CommandBatchSpec {
+                start_command_id: self.next_id.wrapping_add(issued),
+                start_request_index: issued,
+                count,
+                mix: self.command_mix,
+                segments: self.segments.as_deref(),
+                client_index: self.client_index,
+                total_clients: self.total_clients,
+            },
+        );
+        writer.write_all(&write_buffer[..written]).await
     }
 
     #[cfg_attr(coverage_nightly, coverage(off))]
@@ -2435,6 +2489,67 @@ mod tests {
         assert_eq!(snapshot.pipeline_batches, 1);
         assert!(snapshot.bytes_sent > 0);
         assert!(!stop.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn client_session_refills_pipeline_before_batch_is_drained() {
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"201 loopback ready\r\n").await.unwrap();
+
+            let mut scratch = [0_u8; 128];
+            let mut pending = Vec::new();
+            while pending.iter().filter(|byte| **byte == b'\n').count() < 2 {
+                let read = stream.read(&mut scratch).await.unwrap();
+                assert_ne!(read, 0);
+                pending.extend_from_slice(&scratch[..read]);
+            }
+
+            stream
+                .write_all(b"220 1 article follows\r\nbody\r\n.\r\n")
+                .await
+                .unwrap();
+
+            time::timeout(Duration::from_secs(1), async {
+                while pending.iter().filter(|byte| **byte == b'\n').count() < 3 {
+                    let read = stream.read(&mut scratch).await.unwrap();
+                    assert_ne!(read, 0);
+                    pending.extend_from_slice(&scratch[..read]);
+                }
+            })
+            .await
+            .expect("client should refill pipeline before draining the original batch");
+
+            stream
+                .write_all(b"222 1 body follows\r\nbody\r\n.\r\n")
+                .await
+                .unwrap();
+            stream
+                .write_all(b"220 1 article follows\r\nbody\r\n.\r\n")
+                .await
+                .unwrap();
+        });
+
+        let mut args = test_client_args();
+        args.connect = addr;
+        args.requests = 3;
+        args.pipeline_depth = 2;
+        args.command_mix = ClientCommandMix::Alternate;
+        args.read_buffer_bytes = 64;
+        let config = ClientConfig::from_args(args).unwrap();
+        let session = ClientSession::new(&config, 0, 1, 3);
+        let stats = Arc::new(Stats::new());
+        let stop = Arc::new(AtomicBool::new(false));
+
+        session.run(stats.clone(), stop.clone()).await.unwrap();
+        server.await.unwrap();
+
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.commands, 3);
+        assert_eq!(snapshot.article_requests, 2);
+        assert_eq!(snapshot.body_requests, 1);
     }
 
     #[tokio::test]
