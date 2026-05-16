@@ -1424,6 +1424,7 @@ pub async fn read_command_batch<R>(
 where
     R: tokio::io::AsyncRead + Unpin,
 {
+    command_batch.clear();
     command_buf.clear();
     let read = reader.read_until(b'\n', command_buf).await?;
     if read == 0 {
@@ -2505,6 +2506,36 @@ mod tests {
             command_batch,
             vec![ParsedCommand::Article, ParsedCommand::Body]
         );
+    }
+
+    #[tokio::test]
+    async fn read_command_batch_clears_reused_batch_between_reads() {
+        let (mut client, server) = tokio::io::duplex(1024);
+        client
+            .write_all(b"ARTICLE 1\r\nBODY 2\r\nQUIT\r\n")
+            .await
+            .unwrap();
+
+        let mut reader = BufReader::with_capacity(1024, server);
+        let mut command_buf = Vec::with_capacity(1024);
+        let mut command_batch = Vec::with_capacity(2);
+
+        assert!(
+            read_command_batch(&mut reader, &mut command_buf, &mut command_batch, 2)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            command_batch,
+            vec![ParsedCommand::Article, ParsedCommand::Body]
+        );
+
+        assert!(
+            read_command_batch(&mut reader, &mut command_buf, &mut command_batch, 2)
+                .await
+                .unwrap()
+        );
+        assert_eq!(command_batch, vec![ParsedCommand::Quit]);
     }
 
     #[tokio::test]
