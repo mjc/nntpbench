@@ -1789,6 +1789,21 @@ mod tests {
     }
 
     #[test]
+    fn decoder_completes_empty_multiline_response() {
+        let mut decoder = ResponseDecoder::new(RequestKind::Capabilities);
+        let buffer = b"101 Capability list:\r\n.\r\n";
+
+        let DecodeProgress::Complete { status, consumed } = decoder.push(buffer).unwrap() else {
+            panic!("decoder should complete");
+        };
+        let response = response_from_bytes(RequestKind::Capabilities, status, &buffer[..consumed]);
+
+        assert_eq!(consumed, buffer.len());
+        assert_eq!(response.status().as_u16(), 101);
+        assert_eq!(response.as_bytes(), buffer);
+    }
+
+    #[test]
     fn decoder_reports_consumed_bytes_and_preserves_leftover_chunk_data() {
         let chunk =
             b"222 1 <a@b> body follows\r\nbody\r\n.\r\n220 1 <b@c> article follows\r\nh: v\r\n\r\nx\r\n.\r\n";
