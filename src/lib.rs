@@ -32,7 +32,7 @@ pub use protocol::{
 };
 pub use typed_client::{
     Client, OwnedArticle, OwnedArticleExchange, OwnedExchange, OwnedResponse,
-    TypedClientConnection, TypedClientError, TypedClientOptions,
+    TypedClientConnection, TypedClientError, TypedClientOptions, TypedClientResponseMode,
 };
 
 pub const CRLF: &[u8] = b"\r\n";
@@ -281,6 +281,14 @@ pub struct TypedClientArgs {
     #[arg(long, default_value = "127.0.0.1:1199")]
     pub connect: SocketAddr,
 
+    /// Comma-separated target ports. When set, clients rotate across these ports on the connect host.
+    #[arg(long, value_delimiter = ',')]
+    pub ports: Vec<u16>,
+
+    /// Tab-separated segment file. Lines are SIZE<TAB>MSGID; MSGID is normalized into angle brackets.
+    #[arg(long)]
+    pub segments: Option<PathBuf>,
+
     /// Total typed ARTICLE/BODY requests to complete. Use 0 to disable this limit.
     #[arg(long, default_value_t = 0)]
     pub requests: u64,
@@ -455,12 +463,22 @@ pub enum TypedRequestKind {
 #[derive(Debug)]
 struct SegmentSet {
     ids: Box<[Box<[u8]>]>,
-    max_id_len: usize,
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
 pub async fn run_client(args: ClientArgs) -> io::Result<()> {
-    let config = ClientConfig::from_args(args)?;
+    let config = TypedClientConfig::from_client_args(args)?;
+    run_typed_workload(config).await
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+pub async fn run_typed_client(args: TypedClientArgs) -> io::Result<()> {
+    let config = TypedClientConfig::from_args(args)?;
+    run_typed_workload(config).await
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn run_typed_workload(config: TypedClientConfig) -> io::Result<()> {
     let start_cpu_ticks = process_cpu_ticks();
     let started = Instant::now();
     let stats = Arc::new(Stats::new());
@@ -468,97 +486,6 @@ pub async fn run_client(args: ClientArgs) -> io::Result<()> {
 
     eprintln!(
         "nntpbench client connecting to {} requests={} transfer_bytes={} duration_secs={} connections={} total_clients={} client_offset={} pipeline_depth={} command_mix={:?}",
-        config.connect,
-        config.requests,
-        config.transfer_bytes,
-        config.duration.as_secs(),
-        config.connections,
-        config.total_clients,
-        config.client_offset,
-        config.pipeline_depth,
-        config.command_mix
-    );
-
-    if config.stats_interval != Duration::ZERO {
-        tokio::spawn(report_stats(stats.clone(), config.stats_interval));
-    }
-
-    tokio::spawn({
-        let stop = stop.clone();
-        async move {
-            if tokio::signal::ctrl_c().await.is_ok() {
-                stop.store(true, Ordering::Release);
-            }
-        }
-    });
-
-    if config.duration != Duration::ZERO {
-        tokio::spawn({
-            let stop = stop.clone();
-            let duration = config.duration;
-            async move {
-                time::sleep(duration).await;
-                stop.store(true, Ordering::Release);
-            }
-        });
-    }
-
-    let mut sessions = JoinSet::new();
-    let mut next_start_id = config.start_id;
-    for connection_index in 0..config.connections {
-        let global_index = config.client_offset + connection_index;
-        let requests = requests_for_connection(config.requests, config.total_clients, global_index);
-        let session = ClientSession::new(&config, global_index, next_start_id, requests);
-        next_start_id = next_start_id.wrapping_add(requests);
-        let stats = stats.clone();
-        let stop = stop.clone();
-        sessions.spawn(async move { session.run(stats, stop).await });
-    }
-
-    while let Some(result) = sessions.join_next().await {
-        match result {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => {
-                stats.errors.fetch_add(1, Ordering::Relaxed);
-                stop.store(true, Ordering::Release);
-                sessions.abort_all();
-                return Err(err);
-            }
-            Err(err) => {
-                stats.errors.fetch_add(1, Ordering::Relaxed);
-                stop.store(true, Ordering::Release);
-                sessions.abort_all();
-                return Err(io::Error::other(err));
-            }
-        }
-    }
-
-    if config.csv {
-        let snapshot = stats.snapshot();
-        println!(
-            "{},{},{:.9},{:.9},{}",
-            snapshot.commands,
-            snapshot.bytes_sent,
-            started.elapsed().as_secs_f64(),
-            cpu_seconds_since(start_cpu_ticks),
-            process_rss_kib()
-        );
-    } else {
-        stats.print_snapshot("final");
-    }
-    Ok(())
-}
-
-#[cfg_attr(coverage_nightly, coverage(off))]
-pub async fn run_typed_client(args: TypedClientArgs) -> io::Result<()> {
-    let config = TypedClientConfig::from_args(args);
-    let start_cpu_ticks = process_cpu_ticks();
-    let started = Instant::now();
-    let stats = Arc::new(Stats::new());
-    let stop = Arc::new(AtomicBool::new(false));
-
-    eprintln!(
-        "nntpbench typed client connecting to {} requests={} transfer_bytes={} duration_secs={} connections={} total_clients={} client_offset={} pipeline_depth={} command_mix={:?}",
         config.connect,
         config.requests,
         config.transfer_bytes,
@@ -662,6 +589,7 @@ pub async fn fetch_typed_response(
             socket_recv_buffer: args.socket_recv_buffer,
             socket_send_buffer: args.socket_send_buffer,
             pipeline_depth: args.pipeline_depth.clamp(1, 4096),
+            response_mode: TypedClientResponseMode::Owned,
         },
     )
     .await?;
@@ -839,12 +767,19 @@ fn typed_fetch_takethis_request(
 fn map_typed_client_error(err: TypedClientError) -> io::Error {
     match err {
         TypedClientError::Io(err) => err,
+        TypedClientError::UnexpectedEof => io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "server closed before completing response",
+        ),
+        TypedClientError::ConnectionClosed => {
+            io::Error::new(io::ErrorKind::BrokenPipe, "connection engine closed")
+        }
         other => io::Error::new(io::ErrorKind::InvalidData, other),
     }
 }
 
 #[derive(Debug, Clone)]
-struct ClientConfig {
+struct TypedClientConfig {
     connect: SocketAddr,
     ports: Box<[u16]>,
     segments: Option<Arc<SegmentSet>>,
@@ -865,44 +800,105 @@ struct ClientConfig {
     stats_interval: Duration,
 }
 
-impl ClientConfig {
-    fn from_args(args: ClientArgs) -> io::Result<Self> {
-        let connections = args.connections.max(1);
-        let total_clients = if args.total_clients == 0 {
+impl TypedClientConfig {
+    fn from_client_args(args: ClientArgs) -> io::Result<Self> {
+        Self::build(
+            args.connect,
+            args.ports.into_boxed_slice(),
+            args.segments,
+            args.requests,
+            args.transfer_bytes,
+            args.duration_secs,
+            args.connections,
+            args.client_offset,
+            args.total_clients,
+            args.pipeline_depth,
+            args.command_mix,
+            args.start_id,
+            args.read_buffer_bytes,
+            args.nodelay,
+            args.socket_recv_buffer,
+            args.socket_send_buffer,
+            args.csv,
+            args.stats_interval_secs,
+        )
+    }
+
+    fn from_args(args: TypedClientArgs) -> io::Result<Self> {
+        Self::build(
+            args.connect,
+            args.ports.into_boxed_slice(),
+            args.segments,
+            args.requests,
+            args.transfer_bytes,
+            args.duration_secs,
+            args.connections,
+            args.client_offset,
+            args.total_clients,
+            args.pipeline_depth,
+            args.command_mix,
+            args.start_id,
+            args.read_buffer_bytes,
+            args.nodelay,
+            args.socket_recv_buffer,
+            args.socket_send_buffer,
+            args.csv,
+            args.stats_interval_secs,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        connect: SocketAddr,
+        ports: Box<[u16]>,
+        segments: Option<PathBuf>,
+        requests: u64,
+        transfer_bytes: u64,
+        duration_secs: u64,
+        connections: usize,
+        client_offset: usize,
+        total_clients: usize,
+        pipeline_depth: usize,
+        command_mix: ClientCommandMix,
+        start_id: u64,
+        read_buffer_bytes: usize,
+        nodelay: bool,
+        socket_recv_buffer: usize,
+        socket_send_buffer: usize,
+        csv: bool,
+        stats_interval_secs: u64,
+    ) -> io::Result<Self> {
+        let connections = connections.max(1);
+        let total_clients = if total_clients == 0 {
             connections
         } else {
-            args.total_clients
+            total_clients
         };
-        let pipeline_depth = args.pipeline_depth.clamp(1, 4096);
-        let read_buffer_bytes = args
-            .read_buffer_bytes
-            .max(tail_buffer::TERMINATOR_TAIL_SIZE);
-        let segments = args
-            .segments
+        let segments = segments
             .as_deref()
             .map(read_segments)
             .transpose()?
             .map(Arc::new);
 
         Ok(Self {
-            connect: args.connect,
-            ports: args.ports.into_boxed_slice(),
+            connect,
+            ports,
             segments,
-            requests: args.requests,
-            transfer_bytes: args.transfer_bytes,
-            duration: Duration::from_secs(args.duration_secs),
+            requests,
+            transfer_bytes,
+            duration: Duration::from_secs(duration_secs),
             connections,
-            client_offset: args.client_offset,
+            client_offset,
             total_clients,
-            pipeline_depth,
-            command_mix: args.command_mix,
-            start_id: args.start_id,
-            read_buffer_bytes,
-            nodelay: args.nodelay,
-            socket_recv_buffer: args.socket_recv_buffer,
-            socket_send_buffer: args.socket_send_buffer,
-            csv: args.csv,
-            stats_interval: Duration::from_secs(args.stats_interval_secs),
+            pipeline_depth: pipeline_depth.clamp(1, 4096),
+            command_mix,
+            start_id,
+            read_buffer_bytes: read_buffer_bytes.max(tail_buffer::TERMINATOR_TAIL_SIZE),
+            nodelay,
+            socket_recv_buffer,
+            socket_send_buffer,
+            csv,
+            stats_interval: Duration::from_secs(stats_interval_secs),
         })
     }
 
@@ -913,278 +909,14 @@ impl ClientConfig {
         }
         connect
     }
-
-    fn command_capacity(&self) -> usize {
-        let max_command = self
-            .segments
-            .as_ref()
-            .map_or(MAX_CLIENT_COMMAND_BYTES, |segments| {
-                b"ARTICLE "
-                    .len()
-                    .max(b"BODY ".len())
-                    .saturating_add(segments.max_id_len)
-                    .saturating_add(CRLF.len())
-            });
-        self.pipeline_depth.saturating_mul(max_command)
-    }
-}
-
-#[derive(Debug, Clone)]
-struct TypedClientConfig {
-    connect: SocketAddr,
-    requests: u64,
-    transfer_bytes: u64,
-    duration: Duration,
-    connections: usize,
-    client_offset: usize,
-    total_clients: usize,
-    pipeline_depth: usize,
-    command_mix: ClientCommandMix,
-    start_id: u64,
-    read_buffer_bytes: usize,
-    nodelay: bool,
-    socket_recv_buffer: usize,
-    socket_send_buffer: usize,
-    csv: bool,
-    stats_interval: Duration,
-}
-
-impl TypedClientConfig {
-    fn from_args(args: TypedClientArgs) -> Self {
-        let connections = args.connections.max(1);
-        let total_clients = if args.total_clients == 0 {
-            connections
-        } else {
-            args.total_clients
-        };
-
-        Self {
-            connect: args.connect,
-            requests: args.requests,
-            transfer_bytes: args.transfer_bytes,
-            duration: Duration::from_secs(args.duration_secs),
-            connections,
-            client_offset: args.client_offset,
-            total_clients,
-            pipeline_depth: args.pipeline_depth.clamp(1, 4096),
-            command_mix: args.command_mix,
-            start_id: args.start_id,
-            read_buffer_bytes: args
-                .read_buffer_bytes
-                .max(tail_buffer::TERMINATOR_TAIL_SIZE),
-            nodelay: args.nodelay,
-            socket_recv_buffer: args.socket_recv_buffer,
-            socket_send_buffer: args.socket_send_buffer,
-            csv: args.csv,
-            stats_interval: Duration::from_secs(args.stats_interval_secs),
-        }
-    }
-}
-
-#[derive(Debug)]
-struct ClientSession {
-    connect: SocketAddr,
-    segments: Option<Arc<SegmentSet>>,
-    client_index: usize,
-    total_clients: usize,
-    requests: u64,
-    transfer_bytes: u64,
-    next_id: u64,
-    pipeline_depth: usize,
-    command_mix: ClientCommandMix,
-    read_buffer_bytes: usize,
-    command_buffer_bytes: usize,
-    nodelay: bool,
-    socket_recv_buffer: usize,
-    socket_send_buffer: usize,
-}
-
-impl ClientSession {
-    fn new(config: &ClientConfig, global_index: usize, start_id: u64, requests: u64) -> Self {
-        Self {
-            connect: config.endpoint_for(global_index),
-            segments: config.segments.clone(),
-            client_index: global_index,
-            total_clients: config.total_clients,
-            requests,
-            transfer_bytes: config.transfer_bytes,
-            next_id: start_id,
-            pipeline_depth: config.pipeline_depth,
-            command_mix: config.command_mix,
-            read_buffer_bytes: config.read_buffer_bytes,
-            command_buffer_bytes: config.command_capacity(),
-            nodelay: config.nodelay,
-            socket_recv_buffer: config.socket_recv_buffer,
-            socket_send_buffer: config.socket_send_buffer,
-        }
-    }
-
-    async fn run(mut self, stats: Arc<Stats>, stop: Arc<AtomicBool>) -> io::Result<()> {
-        stats.accepted_connections.fetch_add(1, Ordering::Relaxed);
-        stats.active_connections.fetch_add(1, Ordering::Relaxed);
-
-        let result = self.run_inner(&stats, &stop).await;
-        stats.active_connections.fetch_sub(1, Ordering::Relaxed);
-        result
-    }
-
-    async fn run_inner(&mut self, stats: &Stats, stop: &AtomicBool) -> io::Result<()> {
-        let mut stream = connect_client_socket(
-            self.connect,
-            self.nodelay,
-            self.socket_recv_buffer,
-            self.socket_send_buffer,
-        )
-        .await?;
-        #[cfg(not(coverage_nightly))]
-        self.optimize_stream(&stream)?;
-        #[cfg(coverage_nightly)]
-        let _ = self.optimize_stream(&stream);
-
-        let mut read_buffer = vec![0; self.read_buffer_bytes].into_boxed_slice();
-        read_greeting(&mut stream, &mut read_buffer).await?;
-
-        let mut write_buffer = vec![0; self.command_buffer_bytes].into_boxed_slice();
-        let mut framer = MultilineResponseFramer::default();
-        let start_id = self.next_id;
-        let mut issued = 0_u64;
-        let mut completed = 0_u64;
-        let mut in_flight = 0_usize;
-        let (mut reader, mut writer) = stream.split();
-
-        while in_flight < self.pipeline_depth
-            && (self.requests == 0 || issued < self.requests)
-            && !transfer_limit_reached(stats, self.transfer_bytes)
-        {
-            let count = self.next_issue_count(issued, in_flight);
-            if count == 0 {
-                break;
-            }
-            self.write_command_batch(&mut writer, &mut write_buffer, issued, count)
-                .await?;
-            stats
-                .pipeline_batches
-                .fetch_add(u64::from(count > 1), Ordering::Relaxed);
-            issued = issued.wrapping_add(count as u64);
-            in_flight += count;
-        }
-
-        while in_flight != 0 && !stop.load(Ordering::Acquire) {
-            let read = reader.read(&mut read_buffer).await?;
-            if read == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "server closed during multiline response",
-                ));
-            }
-
-            let previous_bytes = stats.bytes_sent.fetch_add(read as u64, Ordering::Relaxed);
-            if self.transfer_bytes != 0
-                && previous_bytes.saturating_add(read as u64) >= self.transfer_bytes
-            {
-                stop.store(true, Ordering::Release);
-            }
-
-            let responses = framer.count_completed_responses(&read_buffer[..read]);
-            if responses > in_flight {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "server returned more multiline responses than outstanding requests",
-                ));
-            }
-
-            if responses != 0 {
-                let completed_before = completed;
-                let responses = responses as u64;
-                completed = completed.wrapping_add(responses);
-                in_flight -= responses as usize;
-
-                let command_id = start_id.wrapping_add(completed_before);
-                let (articles, bodies) =
-                    count_client_commands(command_id, responses, self.command_mix);
-                stats.commands.fetch_add(responses, Ordering::Relaxed);
-                stats
-                    .article_requests
-                    .fetch_add(articles, Ordering::Relaxed);
-                stats.body_requests.fetch_add(bodies, Ordering::Relaxed);
-            }
-
-            while !stop.load(Ordering::Acquire)
-                && in_flight <= self.pipeline_low_watermark()
-                && in_flight < self.pipeline_depth
-                && (self.requests == 0 || issued < self.requests)
-                && !transfer_limit_reached(stats, self.transfer_bytes)
-            {
-                let count = self.next_issue_count(issued, in_flight);
-                if count == 0 {
-                    break;
-                }
-                self.write_command_batch(&mut writer, &mut write_buffer, issued, count)
-                    .await?;
-                stats
-                    .pipeline_batches
-                    .fetch_add(u64::from(count > 1), Ordering::Relaxed);
-                issued = issued.wrapping_add(count as u64);
-                in_flight += count;
-            }
-        }
-
-        self.next_id = start_id.wrapping_add(issued);
-        Ok(())
-    }
-
-    fn next_issue_count(&self, issued: u64, in_flight: usize) -> usize {
-        let available = self.pipeline_depth - in_flight;
-        if self.requests == 0 {
-            available
-        } else {
-            self.requests.saturating_sub(issued).min(available as u64) as usize
-        }
-    }
-
-    fn pipeline_low_watermark(&self) -> usize {
-        self.pipeline_depth / 2
-    }
-
-    async fn write_command_batch<W>(
-        &self,
-        writer: &mut W,
-        write_buffer: &mut [u8],
-        issued: u64,
-        count: usize,
-    ) -> io::Result<()>
-    where
-        W: AsyncWrite + Unpin,
-    {
-        let written = fill_client_command_batch(
-            write_buffer,
-            CommandBatchSpec {
-                start_command_id: self.next_id.wrapping_add(issued),
-                start_request_index: issued,
-                count,
-                mix: self.command_mix,
-                segments: self.segments.as_deref(),
-                client_index: self.client_index,
-                total_clients: self.total_clients,
-            },
-        );
-        writer.write_all(&write_buffer[..written]).await
-    }
-
-    #[cfg_attr(coverage_nightly, coverage(off))]
-    fn optimize_stream(&self, stream: &TcpStream) -> io::Result<()> {
-        optimize_client_socket(
-            stream,
-            self.nodelay,
-            self.socket_recv_buffer,
-            self.socket_send_buffer,
-        )
-    }
 }
 
 #[derive(Debug)]
 struct TypedClientSession {
     connect: SocketAddr,
+    segments: Option<Arc<SegmentSet>>,
+    client_index: usize,
+    total_clients: usize,
     requests: u64,
     transfer_bytes: u64,
     next_id: u64,
@@ -1197,9 +929,12 @@ struct TypedClientSession {
 }
 
 impl TypedClientSession {
-    fn new(config: &TypedClientConfig, _global_index: usize, start_id: u64, requests: u64) -> Self {
+    fn new(config: &TypedClientConfig, global_index: usize, start_id: u64, requests: u64) -> Self {
         Self {
-            connect: config.connect,
+            connect: config.endpoint_for(global_index),
+            segments: config.segments.clone(),
+            client_index: global_index,
+            total_clients: config.total_clients,
             requests,
             transfer_bytes: config.transfer_bytes,
             next_id: start_id,
@@ -1230,20 +965,21 @@ impl TypedClientSession {
                 socket_recv_buffer: self.socket_recv_buffer,
                 socket_send_buffer: self.socket_send_buffer,
                 pipeline_depth: self.pipeline_depth,
+                response_mode: TypedClientResponseMode::Drained,
             },
         )
         .await
         .map_err(map_typed_client_error)?;
 
-        let mut pending = VecDeque::with_capacity(self.pipeline_depth);
+        let mut pending: VecDeque<(u64, crate::typed_client::PendingDrainedResponse)> =
+            VecDeque::with_capacity(self.pipeline_depth);
         let mut issued = 0_u64;
 
-        self.fill_typed_pipeline(&connection, &mut pending, issued, stats, stop)
+        self.fill_typed_pipeline(&connection, &mut pending, &mut issued, stats, stop)
             .await?;
         if pending.len() > 1 {
             stats.pipeline_batches.fetch_add(1, Ordering::Relaxed);
         }
-        issued = issued.wrapping_add(pending.len() as u64);
 
         while let Some((command_id, pending_response)) = pending.pop_front() {
             let response = pending_response
@@ -1253,7 +989,7 @@ impl TypedClientSession {
 
             stats
                 .bytes_sent
-                .fetch_add(response.as_bytes().len() as u64, Ordering::Relaxed);
+                .fetch_add(response.bytes_len() as u64, Ordering::Relaxed);
             stats.commands.fetch_add(1, Ordering::Relaxed);
             match client_command_kind(command_id, self.command_mix) {
                 ClientCommandMix::Article | ClientCommandMix::Alternate => {
@@ -1271,13 +1007,11 @@ impl TypedClientSession {
             }
 
             let before = pending.len();
-            self.fill_typed_pipeline(&connection, &mut pending, issued, stats, stop)
+            self.fill_typed_pipeline(&connection, &mut pending, &mut issued, stats, stop)
                 .await?;
-            let added = pending.len().saturating_sub(before);
-            if added > 1 {
+            if pending.len().saturating_sub(before) > 1 {
                 stats.pipeline_batches.fetch_add(1, Ordering::Relaxed);
             }
-            issued = issued.wrapping_add(added as u64);
         }
 
         Ok(())
@@ -1286,8 +1020,8 @@ impl TypedClientSession {
     async fn fill_typed_pipeline(
         &self,
         connection: &TypedClientConnection,
-        pending: &mut VecDeque<(u64, crate::typed_client::PendingResponse)>,
-        issued: u64,
+        pending: &mut VecDeque<(u64, crate::typed_client::PendingDrainedResponse)>,
+        issued: &mut u64,
         stats: &Stats,
         stop: &AtomicBool,
     ) -> io::Result<()> {
@@ -1296,19 +1030,25 @@ impl TypedClientSession {
         }
 
         while pending.len() < self.pipeline_depth
-            && (self.requests == 0 || issued + (pending.len() as u64) < self.requests)
+            && (self.requests == 0 || *issued < self.requests)
             && !transfer_limit_reached(stats, self.transfer_bytes)
         {
-            let command_id = self
-                .next_id
-                .wrapping_add(issued)
-                .wrapping_add(pending.len() as u64);
-            let request = typed_request_for_command(command_id, self.command_mix)?;
+            let command_id = self.next_id.wrapping_add(*issued);
+            let request_index = *issued;
+            let request = typed_request_for_command(
+                command_id,
+                request_index,
+                self.command_mix,
+                self.segments.as_deref(),
+                self.client_index,
+                self.total_clients,
+            )?;
             let pending_response = connection
-                .queue_request(request)
+                .queue_request_drained(request)
                 .await
                 .map_err(map_typed_client_error)?;
             pending.push_back((command_id, pending_response));
+            *issued = issued.wrapping_add(1);
         }
 
         Ok(())
@@ -1321,26 +1061,58 @@ fn transfer_limit_reached(stats: &Stats, transfer_bytes: u64) -> bool {
 
 fn typed_request_for_command(
     command_id: u64,
+    request_index: u64,
     mix: ClientCommandMix,
+    segments: Option<&SegmentSet>,
+    client_index: usize,
+    total_clients: usize,
 ) -> io::Result<Request<'static>> {
-    let request = match client_command_kind(command_id, mix) {
-        ClientCommandMix::Article | ClientCommandMix::Alternate => Request::Article {
-            message_id: MessageId::from_borrowed("<bench.article@nntpbench.local>").map_err(
-                |_| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "invalid static article message-id",
-                    )
-                },
-            )?,
-        },
-        ClientCommandMix::Body => Request::Body {
-            message_id: MessageId::from_borrowed("<bench.body@nntpbench.local>").map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidData, "invalid static body message-id")
-            })?,
-        },
+    let kind = client_command_kind(command_id, mix);
+    let message_id = request_message_id_for_command(
+        kind,
+        command_id,
+        request_index,
+        segments,
+        client_index,
+        total_clients,
+    )?;
+    match kind {
+        ClientCommandMix::Article | ClientCommandMix::Alternate => Request::article(message_id)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid article message-id")),
+        ClientCommandMix::Body => Request::body(message_id)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid body message-id")),
+    }
+}
+
+fn request_message_id_for_command(
+    kind: ClientCommandMix,
+    command_id: u64,
+    request_index: u64,
+    segments: Option<&SegmentSet>,
+    client_index: usize,
+    total_clients: usize,
+) -> io::Result<String> {
+    if let Some(segments) = segments {
+        let message_id = std::str::from_utf8(segment_for_request(
+            segments,
+            client_index,
+            total_clients,
+            request_index,
+        ))
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "segment message-id is not utf-8",
+            )
+        })?;
+        return Ok(message_id.to_owned());
+    }
+
+    let prefix = match kind {
+        ClientCommandMix::Article | ClientCommandMix::Alternate => "bench.",
+        ClientCommandMix::Body => "bench.",
     };
-    Ok(request)
+    Ok(format!("<{prefix}{command_id}@nntpbench.local>"))
 }
 
 fn requests_for_connection(total: u64, connections: usize, index: usize) -> u64 {
@@ -1356,7 +1128,6 @@ fn requests_for_connection(total: u64, connections: usize, index: usize) -> u64 
 fn read_segments(path: &std::path::Path) -> io::Result<SegmentSet> {
     let contents = fs::read_to_string(path)?;
     let mut ids = Vec::new();
-    let mut max_id_len = 0;
 
     for (line_index, line) in contents.lines().enumerate() {
         let line = line.trim();
@@ -1374,7 +1145,6 @@ fn read_segments(path: &std::path::Path) -> io::Result<SegmentSet> {
             )
         })?;
         let id = normalize_msgid(msgid.trim());
-        max_id_len = max_id_len.max(id.len());
         ids.push(id.into_boxed_slice());
     }
 
@@ -1387,7 +1157,6 @@ fn read_segments(path: &std::path::Path) -> io::Result<SegmentSet> {
 
     Ok(SegmentSet {
         ids: ids.into_boxed_slice(),
-        max_id_len,
     })
 }
 
@@ -1401,32 +1170,6 @@ fn normalize_msgid(value: &str) -> Vec<u8> {
     normalized.extend_from_slice(value.as_bytes());
     normalized.push(b'>');
     normalized
-}
-
-#[cfg_attr(coverage_nightly, coverage(off))]
-fn optimize_client_socket(
-    stream: &TcpStream,
-    nodelay: bool,
-    recv_buffer: usize,
-    send_buffer: usize,
-) -> io::Result<()> {
-    stream.set_nodelay(nodelay)?;
-    let socket = socket2::SockRef::from(stream);
-    if recv_buffer != 0 {
-        socket.set_recv_buffer_size(recv_buffer)?;
-    }
-    if send_buffer != 0 {
-        socket.set_send_buffer_size(send_buffer)?;
-    }
-    socket.set_linger(Some(TCP_LINGER_TIMEOUT))?;
-
-    #[cfg(target_os = "linux")]
-    {
-        let _ = socket.set_tcp_user_timeout(Some(TCP_USER_TIMEOUT));
-        let _ = socket.set_tos_v4(TOS_THROUGHPUT);
-    }
-
-    Ok(())
 }
 
 async fn connect_client_socket(
@@ -1553,68 +1296,6 @@ async fn read_greeting(stream: &mut TcpStream, buffer: &mut [u8]) -> io::Result<
     }
 }
 
-#[derive(Clone, Copy)]
-struct CommandBatchSpec<'a> {
-    start_command_id: u64,
-    start_request_index: u64,
-    count: usize,
-    mix: ClientCommandMix,
-    segments: Option<&'a SegmentSet>,
-    client_index: usize,
-    total_clients: usize,
-}
-
-fn fill_client_command_batch(output: &mut [u8], spec: CommandBatchSpec<'_>) -> usize {
-    let mut written = 0;
-    for offset in 0..spec.count {
-        let id = spec.start_command_id.wrapping_add(offset as u64);
-        let request_index = spec.start_request_index.wrapping_add(offset as u64);
-        let kind = client_command_kind(id, spec.mix);
-        written += if let Some(segments) = spec.segments {
-            let segment = segment_for_request(
-                segments,
-                spec.client_index,
-                spec.total_clients,
-                request_index,
-            );
-            write_segment_command(&mut output[written..], kind, segment)
-        } else {
-            write_synthetic_command(&mut output[written..], kind, id)
-        };
-    }
-    written
-}
-
-fn write_synthetic_command(output: &mut [u8], kind: ClientCommandMix, id: u64) -> usize {
-    let prefix: &[u8] = match kind {
-        ClientCommandMix::Article | ClientCommandMix::Alternate => b"ARTICLE <bench.",
-        ClientCommandMix::Body => b"BODY <bench.",
-    };
-    let suffix = b"@nntpbench.local>\r\n";
-
-    let mut written = 0;
-    output[..prefix.len()].copy_from_slice(prefix);
-    written += prefix.len();
-    written += write_u64_ascii(&mut output[written..], id);
-    output[written..written + suffix.len()].copy_from_slice(suffix);
-    written + suffix.len()
-}
-
-fn write_segment_command(output: &mut [u8], kind: ClientCommandMix, segment: &[u8]) -> usize {
-    let prefix: &[u8] = match kind {
-        ClientCommandMix::Article | ClientCommandMix::Alternate => b"ARTICLE ",
-        ClientCommandMix::Body => b"BODY ",
-    };
-
-    let mut written = 0;
-    output[..prefix.len()].copy_from_slice(prefix);
-    written += prefix.len();
-    output[written..written + segment.len()].copy_from_slice(segment);
-    written += segment.len();
-    output[written..written + CRLF.len()].copy_from_slice(CRLF);
-    written + CRLF.len()
-}
-
 fn segment_for_request(
     segments: &SegmentSet,
     client_index: usize,
@@ -1626,124 +1307,11 @@ fn segment_for_request(
     &segments.ids[index]
 }
 
-fn write_u64_ascii(output: &mut [u8], value: u64) -> usize {
-    let mut digits = [0_u8; 20];
-    let mut cursor = digits.len();
-    let mut value = value;
-
-    loop {
-        cursor -= 1;
-        digits[cursor] = b'0' + (value % 10) as u8;
-        value /= 10;
-        if value == 0 {
-            break;
-        }
-    }
-
-    let len = digits.len() - cursor;
-    output[..len].copy_from_slice(&digits[cursor..]);
-    len
-}
-
 fn client_command_kind(id: u64, mix: ClientCommandMix) -> ClientCommandMix {
     match mix {
         ClientCommandMix::Alternate if id.is_multiple_of(2) => ClientCommandMix::Body,
         ClientCommandMix::Alternate => ClientCommandMix::Article,
         command => command,
-    }
-}
-
-fn count_client_commands(start_id: u64, count: u64, mix: ClientCommandMix) -> (u64, u64) {
-    match mix {
-        ClientCommandMix::Article => (count, 0),
-        ClientCommandMix::Body => (0, count),
-        ClientCommandMix::Alternate => {
-            let odd_ids =
-                count / 2 + u64::from(!count.is_multiple_of(2) && !start_id.is_multiple_of(2));
-            (odd_ids, count - odd_ids)
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ResponseChunkRange {
-    start: usize,
-    end: usize,
-    started_before_chunk: bool,
-}
-
-#[derive(Debug, Default)]
-struct MultilineResponseFramer {
-    tail: tail_buffer::TailBuffer,
-}
-
-impl MultilineResponseFramer {
-    fn count_completed_responses(&mut self, input: &[u8]) -> usize {
-        let mut count = 0;
-        self.for_each_completed_range(input, |_| {
-            count += 1;
-        });
-        count
-    }
-
-    fn for_each_completed_range<F>(&mut self, input: &[u8], mut visit: F)
-    where
-        F: FnMut(ResponseChunkRange),
-    {
-        if input.is_empty() {
-            return;
-        }
-
-        let mut last_end = 0;
-        if let Some(end) = self.tail.find_spanning_terminator(input) {
-            last_end = end;
-            visit(ResponseChunkRange {
-                start: 0,
-                end,
-                started_before_chunk: true,
-            });
-        }
-
-        let mut frame_start = last_end;
-        let scan_start = last_end;
-        let mut found_any = last_end != 0;
-        scan_chunk_terminator_ends(&input[scan_start..], |relative_end| {
-            let end = scan_start + relative_end;
-            visit(ResponseChunkRange {
-                start: frame_start,
-                end,
-                started_before_chunk: false,
-            });
-            frame_start = end;
-            last_end = end;
-            found_any = true;
-        });
-
-        if !found_any {
-            self.tail.update(input);
-        } else {
-            self.tail = tail_buffer::TailBuffer::default();
-            if last_end < input.len() {
-                self.tail.update(&input[last_end..]);
-            }
-        }
-    }
-}
-
-fn scan_chunk_terminator_ends<F>(input: &[u8], mut visit: F)
-where
-    F: FnMut(usize),
-{
-    for dot in memchr::memchr_iter(b'.', input) {
-        if dot >= 2
-            && dot + 2 < input.len()
-            && input[dot - 2] == b'\r'
-            && input[dot - 1] == b'\n'
-            && input[dot + 1] == b'\r'
-            && input[dot + 2] == b'\n'
-        {
-            visit(dot + TERMINATOR.len() - 2);
-        }
     }
 }
 
@@ -2099,15 +1667,15 @@ where
     Ok(())
 }
 
-pub fn process_command_to_buffer(
-    command: RequestKind,
+pub fn process_request_to_buffer(
+    request: RequestLine<'_>,
     config: &ServerConfig,
     stats: &Stats,
     output: &mut Vec<u8>,
 ) -> bool {
     stats.commands.fetch_add(1, Ordering::Relaxed);
 
-    let response = match command {
+    let response = match request.kind() {
         RequestKind::Article => {
             stats.article_requests.fetch_add(1, Ordering::Relaxed);
             config.article_response()
@@ -2147,33 +1715,36 @@ pub fn process_command_to_buffer(
         .bytes_sent
         .fetch_add(response.len() as u64, Ordering::Relaxed);
     output.extend_from_slice(response);
-    matches!(command, RequestKind::Quit)
+    matches!(request.kind(), RequestKind::Quit)
 }
 
-pub fn parse_command_batch_bytes(
+pub fn for_each_request_line_in_batch<F>(
     input: &[u8],
     max_pipeline_depth: usize,
-    command_batch: &mut Vec<RequestKind>,
-) -> usize {
-    command_batch.clear();
+    mut visit: F,
+) -> usize
+where
+    F: FnMut(RequestLine<'_>),
+{
     let mut start = 0;
+    let mut count = 0;
 
-    while command_batch.len() < max_pipeline_depth {
+    while count < max_pipeline_depth {
         let Some(relative_lf) = memchr::memchr(b'\n', &input[start..]) else {
             break;
         };
         let end = start + relative_lf + 1;
         let line = trim_line_slice(&input[start..end]);
-        let kind = RequestLine::parse(line).kind();
-        if matches!(kind, RequestKind::TakeThis) {
+        let request = RequestLine::parse(line);
+        visit(request);
+        count += 1;
+        if matches!(request.kind(), RequestKind::TakeThis) {
             let Some(body_end) = find_dot_terminated_block_end(input, end) else {
                 break;
             };
-            command_batch.push(kind);
             start = body_end;
             continue;
         }
-        command_batch.push(kind);
         start = end;
     }
 
@@ -2725,6 +2296,8 @@ mod tests {
     fn test_typed_client_args() -> TypedClientArgs {
         TypedClientArgs {
             connect: "127.0.0.1:1199".parse().unwrap(),
+            ports: Vec::new(),
+            segments: None,
             requests: 0,
             transfer_bytes: 0,
             duration_secs: 0,
@@ -3260,7 +2833,7 @@ mod tests {
         args.csv = true;
         args.stats_interval_secs = 2;
 
-        let config = ClientConfig::from_args(args).unwrap();
+        let config = TypedClientConfig::from_client_args(args).unwrap();
         fs::remove_file(path).unwrap();
 
         assert_eq!(config.requests, 17);
@@ -3281,7 +2854,7 @@ mod tests {
         assert_eq!(config.endpoint_for(0).port(), 1200);
         assert_eq!(config.endpoint_for(1).port(), 1201);
         assert_eq!(config.endpoint_for(2).port(), 1200);
-        assert!(config.command_capacity() >= b"BODY <wrapped@test>\r\n".len());
+        assert!(config.segments.is_some());
     }
 
     #[test]
@@ -3289,20 +2862,20 @@ mod tests {
         let invalid = write_temp_segments("invalid", "missing-tab\n");
         let mut args = test_client_args();
         args.segments = Some(invalid.clone());
-        let err = ClientConfig::from_args(args).unwrap_err();
+        let err = TypedClientConfig::from_client_args(args).unwrap_err();
         fs::remove_file(invalid).unwrap();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
 
         let empty = write_temp_segments("empty", "\n\n");
         let mut args = test_client_args();
         args.segments = Some(empty.clone());
-        let err = ClientConfig::from_args(args).unwrap_err();
+        let err = TypedClientConfig::from_client_args(args).unwrap_err();
         fs::remove_file(empty).unwrap();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
 
         let mut args = test_client_args();
         args.segments = Some(std::env::temp_dir().join("nntpbench-missing-segments"));
-        let err = ClientConfig::from_args(args).unwrap_err();
+        let err = TypedClientConfig::from_client_args(args).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
     }
 
@@ -3324,9 +2897,9 @@ mod tests {
         args.socket_recv_buffer = 1024;
         args.socket_send_buffer = 2048;
 
-        let config = ClientConfig::from_args(args).unwrap();
+        let config = TypedClientConfig::from_client_args(args).unwrap();
         fs::remove_file(path).unwrap();
-        let session = ClientSession::new(&config, 3, 55, 7);
+        let session = TypedClientSession::new(&config, 3, 55, 7);
 
         assert_eq!(session.connect.port(), 1301);
         assert_eq!(session.client_index, 3);
@@ -3337,7 +2910,6 @@ mod tests {
         assert_eq!(session.pipeline_depth, 3);
         assert_eq!(session.command_mix, ClientCommandMix::Article);
         assert_eq!(session.read_buffer_bytes, 64);
-        assert!(session.command_buffer_bytes >= b"ARTICLE <two@test>\r\n".len() * 3);
         assert!(!session.nodelay);
         assert_eq!(session.socket_recv_buffer, 1024);
         assert_eq!(session.socket_send_buffer, 2048);
@@ -3363,7 +2935,7 @@ mod tests {
         args.csv = true;
         args.stats_interval_secs = 2;
 
-        let config = TypedClientConfig::from_args(args);
+        let config = TypedClientConfig::from_args(args).unwrap();
 
         assert_eq!(config.requests, 17);
         assert_eq!(config.transfer_bytes, 8192);
@@ -3404,7 +2976,6 @@ mod tests {
 
         assert_eq!(normalize_msgid("bare@test"), b"<bare@test>");
         assert_eq!(normalize_msgid("<wrapped@test>"), b"<wrapped@test>");
-        assert_eq!(segments.max_id_len, b"<wrapped@test>".len());
         assert_eq!(segment_for_request(&segments, 0, 2, 0), b"<bare@test>");
         assert_eq!(segment_for_request(&segments, 1, 2, 0), b"<wrapped@test>");
     }
@@ -3415,16 +2986,6 @@ mod tests {
         let start = process_cpu_ticks();
         assert!(cpu_seconds_since(start) >= 0.0);
         assert!(process_rss_kib() > 0);
-    }
-
-    #[test]
-    fn write_u64_ascii_handles_zero_and_large_values() {
-        let mut output = [0_u8; 20];
-        let written = write_u64_ascii(&mut output, 0);
-        assert_eq!(&output[..written], b"0");
-
-        let written = write_u64_ascii(&mut output, u64::MAX);
-        assert_eq!(&output[..written], b"18446744073709551615");
     }
 
     #[tokio::test]
@@ -3445,20 +3006,6 @@ mod tests {
     #[tokio::test]
     async fn bind_listener_selects_ipv6_domain() {
         let _ = bind_listener("[::1]:0".parse().unwrap(), 16, false);
-    }
-
-    #[tokio::test]
-    async fn optimize_client_socket_accepts_explicit_buffers() {
-        let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
-        let addr = listener.local_addr().unwrap();
-        let client = TcpStream::connect(addr);
-        let accepted = listener.accept();
-        let (client, accepted) = tokio::join!(client, accepted);
-        let client = client.unwrap();
-        let (_server, _) = accepted.unwrap();
-
-        optimize_client_socket(&client, true, 4096, 4096).unwrap();
-        optimize_client_socket(&client, false, 0, 0).unwrap();
     }
 
     #[test]
@@ -3559,8 +3106,8 @@ mod tests {
         args.pipeline_depth = 2;
         args.command_mix = ClientCommandMix::Alternate;
         args.read_buffer_bytes = 64;
-        let config = ClientConfig::from_args(args).unwrap();
-        let session = ClientSession::new(&config, 0, 1, 2);
+        let config = TypedClientConfig::from_client_args(args).unwrap();
+        let session = TypedClientSession::new(&config, 0, 1, 2);
         let stats = Arc::new(Stats::new());
         let stop = Arc::new(AtomicBool::new(false));
 
@@ -3596,17 +3143,17 @@ mod tests {
 
             assert_eq!(
                 &pending[..],
-                b"ARTICLE <bench.article@nntpbench.local>\r\nBODY <bench.body@nntpbench.local>\r\n"
+                b"ARTICLE <bench.1@nntpbench.local>\r\nBODY <bench.2@nntpbench.local>\r\n"
             );
 
             stream
                 .write_all(
-                    b"220 1 <bench.article@nntpbench.local> article follows\r\nSubject: Bench\r\n\r\none\r\n.\r\n",
+                    b"220 1 <bench.1@nntpbench.local> article follows\r\nSubject: Bench\r\n\r\none\r\n.\r\n",
                 )
                 .await
                 .unwrap();
             stream
-                .write_all(b"222 1 <bench.body@nntpbench.local> body follows\r\ntwo\r\n.\r\n")
+                .write_all(b"222 1 <bench.2@nntpbench.local> body follows\r\ntwo\r\n.\r\n")
                 .await
                 .unwrap();
         });
@@ -3617,7 +3164,7 @@ mod tests {
         args.pipeline_depth = 2;
         args.command_mix = ClientCommandMix::Alternate;
         args.read_buffer_bytes = 64;
-        let config = TypedClientConfig::from_args(args);
+        let config = TypedClientConfig::from_args(args).unwrap();
         let session = TypedClientSession::new(&config, 0, 1, 2);
         let stats = Arc::new(Stats::new());
         let stop = Arc::new(AtomicBool::new(false));
@@ -3683,8 +3230,8 @@ mod tests {
         args.pipeline_depth = 2;
         args.command_mix = ClientCommandMix::Alternate;
         args.read_buffer_bytes = 64;
-        let config = ClientConfig::from_args(args).unwrap();
-        let session = ClientSession::new(&config, 0, 1, 3);
+        let config = TypedClientConfig::from_client_args(args).unwrap();
+        let session = TypedClientSession::new(&config, 0, 1, 3);
         let stats = Arc::new(Stats::new());
         let stop = Arc::new(AtomicBool::new(false));
 
@@ -3707,8 +3254,8 @@ mod tests {
         args.connect = addr;
         args.requests = 1;
         args.pipeline_depth = 1;
-        let config = ClientConfig::from_args(args).unwrap();
-        let session = ClientSession::new(&config, 0, 1, 1);
+        let config = TypedClientConfig::from_client_args(args).unwrap();
+        let session = TypedClientSession::new(&config, 0, 1, 1);
         let stats = Arc::new(Stats::new());
         let stop = Arc::new(AtomicBool::new(false));
 
@@ -3742,8 +3289,8 @@ mod tests {
         args.pipeline_depth = 1;
         args.command_mix = ClientCommandMix::Body;
         args.read_buffer_bytes = 64;
-        let config = ClientConfig::from_args(args).unwrap();
-        let session = ClientSession::new(&config, 0, 1, 0);
+        let config = TypedClientConfig::from_client_args(args).unwrap();
+        let session = TypedClientSession::new(&config, 0, 1, 0);
         let stats = Arc::new(Stats::new());
         let stop = Arc::new(AtomicBool::new(false));
 
@@ -3771,8 +3318,8 @@ mod tests {
         args.requests = 1;
         args.pipeline_depth = 1;
         args.read_buffer_bytes = 64;
-        let config = ClientConfig::from_args(args).unwrap();
-        let session = ClientSession::new(&config, 0, 1, 1);
+        let config = TypedClientConfig::from_client_args(args).unwrap();
+        let session = TypedClientSession::new(&config, 0, 1, 1);
         let stats = Arc::new(Stats::new());
         let stop = Arc::new(AtomicBool::new(false));
 
@@ -3803,8 +3350,8 @@ mod tests {
         args.requests = 1;
         args.pipeline_depth = 1;
         args.read_buffer_bytes = 64;
-        let config = ClientConfig::from_args(args).unwrap();
-        let session = ClientSession::new(&config, 0, 1, 1);
+        let config = TypedClientConfig::from_client_args(args).unwrap();
+        let session = TypedClientSession::new(&config, 0, 1, 1);
         let stats = Arc::new(Stats::new());
         let stop = Arc::new(AtomicBool::new(false));
 
@@ -3829,8 +3376,8 @@ mod tests {
         args.requests = 1;
         args.pipeline_depth = 1;
         args.read_buffer_bytes = 64;
-        let config = ClientConfig::from_args(args).unwrap();
-        let session = ClientSession::new(&config, 0, 1, 1);
+        let config = TypedClientConfig::from_client_args(args).unwrap();
+        let session = TypedClientSession::new(&config, 0, 1, 1);
         let stats = Arc::new(Stats::new());
         let stop = Arc::new(AtomicBool::new(false));
 
@@ -3858,8 +3405,8 @@ mod tests {
         args.requests = 1;
         args.pipeline_depth = 1;
         args.read_buffer_bytes = 64;
-        let config = ClientConfig::from_args(args).unwrap();
-        let session = ClientSession::new(&config, 0, 1, 1);
+        let config = TypedClientConfig::from_client_args(args).unwrap();
+        let session = TypedClientSession::new(&config, 0, 1, 1);
         let stats = Arc::new(Stats::new());
         let stop = Arc::new(AtomicBool::new(false));
 
@@ -4991,21 +4538,28 @@ mod tests {
     }
 
     #[test]
-    fn parse_command_batch_bytes_returns_consumed_prefix() {
+    fn for_each_request_line_in_batch_returns_consumed_prefix() {
         let mut batch = Vec::with_capacity(8);
-        let consumed = parse_command_batch_bytes(b"ARTICLE 1\r\nBODY 2\r\nQUIT", 8, &mut batch);
+        let consumed =
+            for_each_request_line_in_batch(b"ARTICLE 1\r\nBODY 2\r\nQUIT", 8, |request| {
+                batch.push(request.kind());
+            });
 
         assert_eq!(consumed, b"ARTICLE 1\r\nBODY 2\r\n".len());
         assert_eq!(batch, vec![RequestKind::Article, RequestKind::Body]);
 
-        let consumed = parse_command_batch_bytes(b"DATE\nMODE READER\n", 8, &mut batch);
+        batch.clear();
+        let consumed = for_each_request_line_in_batch(b"DATE\nMODE READER\n", 8, |request| {
+            batch.push(request.kind());
+        });
         assert_eq!(consumed, b"DATE\nMODE READER\n".len());
         assert_eq!(batch, vec![RequestKind::Date, RequestKind::ModeReader]);
 
-        let consumed = parse_command_batch_bytes(
+        batch.clear();
+        let consumed = for_each_request_line_in_batch(
             b"TAKETHIS <take@test>\r\nHeader: value\r\n\r\nbody\r\n.\r\nQUIT\r\n",
             8,
-            &mut batch,
+            |request| batch.push(request.kind()),
         );
         assert_eq!(
             consumed,
@@ -5015,19 +4569,19 @@ mod tests {
     }
 
     #[test]
-    fn process_command_to_buffer_counts_and_returns_quit() {
+    fn process_request_to_buffer_counts_and_returns_quit() {
         let config = test_config();
         let stats = Stats::new();
         let mut output = Vec::new();
 
-        assert!(!process_command_to_buffer(
-            RequestKind::Article,
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"ARTICLE <bench@nntpbench.local>"),
             &config,
             &stats,
             &mut output,
         ));
-        assert!(process_command_to_buffer(
-            RequestKind::Quit,
+        assert!(process_request_to_buffer(
+            RequestLine::parse(b"QUIT"),
             &config,
             &stats,
             &mut output,
@@ -5041,31 +4595,31 @@ mod tests {
     }
 
     #[test]
-    fn process_command_to_buffer_supports_negotiation_commands() {
+    fn process_request_to_buffer_supports_negotiation_commands() {
         let config = test_config();
         let stats = Stats::new();
         let mut output = Vec::new();
 
-        assert!(!process_command_to_buffer(
-            RequestKind::List,
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"LIST ACTIVE"),
             &config,
             &stats,
             &mut output,
         ));
-        assert!(!process_command_to_buffer(
-            RequestKind::Help,
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"HELP"),
             &config,
             &stats,
             &mut output,
         ));
-        assert!(!process_command_to_buffer(
-            RequestKind::ModeReader,
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"MODE READER"),
             &config,
             &stats,
             &mut output,
         ));
-        assert!(!process_command_to_buffer(
-            RequestKind::Date,
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"DATE"),
             &config,
             &stats,
             &mut output,
@@ -5085,55 +4639,55 @@ mod tests {
     }
 
     #[test]
-    fn process_command_to_buffer_supports_remaining_rfc_commands() {
+    fn process_request_to_buffer_supports_remaining_rfc_commands() {
         let config = test_config();
         let stats = Stats::new();
         let mut output = Vec::new();
 
-        assert!(!process_command_to_buffer(
-            RequestKind::Post,
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"POST"),
             &config,
             &stats,
             &mut output,
         ));
-        assert!(!process_command_to_buffer(
-            RequestKind::Ihave,
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"IHAVE <article@test>"),
             &config,
             &stats,
             &mut output,
         ));
-        assert!(!process_command_to_buffer(
-            RequestKind::Check,
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"CHECK <article@test>"),
             &config,
             &stats,
             &mut output,
         ));
-        assert!(!process_command_to_buffer(
-            RequestKind::TakeThis,
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"TAKETHIS <article@test>"),
             &config,
             &stats,
             &mut output,
         ));
-        assert!(!process_command_to_buffer(
-            RequestKind::AuthInfoUser,
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"AUTHINFO USER bench"),
             &config,
             &stats,
             &mut output,
         ));
-        assert!(!process_command_to_buffer(
-            RequestKind::AuthInfoPass,
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"AUTHINFO PASS bench"),
             &config,
             &stats,
             &mut output,
         ));
-        assert!(!process_command_to_buffer(
-            RequestKind::AuthInfo,
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"AUTHINFO SASL bench"),
             &config,
             &stats,
             &mut output,
         ));
-        assert!(!process_command_to_buffer(
-            RequestKind::StartTls,
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"STARTTLS"),
             &config,
             &stats,
             &mut output,
@@ -5157,19 +4711,19 @@ mod tests {
     }
 
     #[test]
-    fn process_command_to_buffer_supports_overview_commands() {
+    fn process_request_to_buffer_supports_overview_commands() {
         let config = test_config();
         let stats = Stats::new();
         let mut output = Vec::new();
 
-        assert!(!process_command_to_buffer(
-            RequestKind::Over,
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"OVER 1-10"),
             &config,
             &stats,
             &mut output,
         ));
-        assert!(!process_command_to_buffer(
-            RequestKind::Xover,
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"XOVER 1-10"),
             &config,
             &stats,
             &mut output,
@@ -5180,31 +4734,31 @@ mod tests {
     }
 
     #[test]
-    fn process_command_to_buffer_supports_group_navigation_commands() {
+    fn process_request_to_buffer_supports_group_navigation_commands() {
         let config = test_config();
         let stats = Stats::new();
         let mut output = Vec::new();
 
-        assert!(!process_command_to_buffer(
-            RequestKind::Group,
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"GROUP alt.binaries.test"),
             &config,
             &stats,
             &mut output,
         ));
-        assert!(!process_command_to_buffer(
-            RequestKind::ListGroup,
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"LISTGROUP alt.binaries.test"),
             &config,
             &stats,
             &mut output,
         ));
-        assert!(!process_command_to_buffer(
-            RequestKind::Last,
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"LAST"),
             &config,
             &stats,
             &mut output,
         ));
-        assert!(!process_command_to_buffer(
-            RequestKind::Next,
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"NEXT"),
             &config,
             &stats,
             &mut output,
@@ -5224,19 +4778,19 @@ mod tests {
     }
 
     #[test]
-    fn process_command_to_buffer_supports_discovery_commands() {
+    fn process_request_to_buffer_supports_discovery_commands() {
         let config = test_config();
         let stats = Stats::new();
         let mut output = Vec::new();
 
-        assert!(!process_command_to_buffer(
-            RequestKind::NewGroups,
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"NEWGROUPS 231231 235959 GMT"),
             &config,
             &stats,
             &mut output,
         ));
-        assert!(!process_command_to_buffer(
-            RequestKind::NewNews,
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"NEWNEWS alt.binaries.test 231231 235959 GMT"),
             &config,
             &stats,
             &mut output,
@@ -5247,25 +4801,25 @@ mod tests {
     }
 
     #[test]
-    fn process_command_to_buffer_supports_body_capabilities_and_unknown() {
+    fn process_request_to_buffer_supports_body_capabilities_and_unknown() {
         let config = test_config();
         let stats = Stats::new();
         let mut output = Vec::new();
 
-        assert!(!process_command_to_buffer(
-            RequestKind::Body,
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"BODY <body@test>"),
             &config,
             &stats,
             &mut output,
         ));
-        assert!(!process_command_to_buffer(
-            RequestKind::Capabilities,
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"CAPABILITIES"),
             &config,
             &stats,
             &mut output,
         ));
-        assert!(!process_command_to_buffer(
-            RequestKind::Unknown,
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"HEAD 1"),
             &config,
             &stats,
             &mut output,
@@ -5276,146 +4830,5 @@ mod tests {
         assert_eq!(snapshot.body_requests, 1);
         assert!(output.starts_with(b"222 "));
         assert!(output.ends_with(b"500 unknown command\r\n"));
-    }
-
-    #[test]
-    fn client_command_batch_generates_article_and_body_without_growth() {
-        let mut output = [0_u8; 4 * MAX_CLIENT_COMMAND_BYTES];
-        let written = fill_client_command_batch(
-            &mut output,
-            CommandBatchSpec {
-                start_command_id: 1,
-                start_request_index: 0,
-                count: 4,
-                mix: ClientCommandMix::Alternate,
-                segments: None,
-                client_index: 0,
-                total_clients: 1,
-            },
-        );
-
-        assert_eq!(
-            &output[..written],
-            b"ARTICLE <bench.1@nntpbench.local>\r\n\
-BODY <bench.2@nntpbench.local>\r\n\
-ARTICLE <bench.3@nntpbench.local>\r\n\
-BODY <bench.4@nntpbench.local>\r\n"
-        );
-    }
-
-    #[test]
-    fn client_command_batch_can_use_segment_message_ids() {
-        let segments = SegmentSet {
-            ids: vec![
-                b"<a@nntpbench.local>".to_vec().into_boxed_slice(),
-                b"<b@nntpbench.local>".to_vec().into_boxed_slice(),
-            ]
-            .into_boxed_slice(),
-            max_id_len: b"<a@nntpbench.local>".len(),
-        };
-        let mut output = [0_u8; 128];
-        let written = fill_client_command_batch(
-            &mut output,
-            CommandBatchSpec {
-                start_command_id: 0,
-                start_request_index: 0,
-                count: 2,
-                mix: ClientCommandMix::Alternate,
-                segments: Some(&segments),
-                client_index: 0,
-                total_clients: 1,
-            },
-        );
-
-        assert_eq!(
-            &output[..written],
-            b"BODY <a@nntpbench.local>\r\nARTICLE <b@nntpbench.local>\r\n"
-        );
-    }
-
-    #[test]
-    fn client_command_counts_match_alternating_id_parity() {
-        assert_eq!(
-            count_client_commands(1, 5, ClientCommandMix::Alternate),
-            (3, 2)
-        );
-        assert_eq!(
-            count_client_commands(2, 5, ClientCommandMix::Alternate),
-            (2, 3)
-        );
-        assert_eq!(
-            count_client_commands(7, 5, ClientCommandMix::Article),
-            (5, 0)
-        );
-        assert_eq!(count_client_commands(7, 5, ClientCommandMix::Body), (0, 5));
-    }
-
-    #[test]
-    fn multiline_framer_uses_tail_buffer_across_boundaries() {
-        let mut framer = MultilineResponseFramer::default();
-
-        assert_eq!(
-            framer.count_completed_responses(b"222 body\r\npayload\r"),
-            0
-        );
-        assert_eq!(framer.count_completed_responses(b"\n.\r"), 0);
-        assert_eq!(
-            framer.count_completed_responses(b"\n220 article\r\n.\r\n"),
-            2
-        );
-    }
-
-    #[test]
-    fn multiline_framer_surfaces_completed_chunk_ranges() {
-        let mut framer = MultilineResponseFramer::default();
-        let mut ranges = Vec::new();
-
-        framer.for_each_completed_range(b"222 body\r\npayload\r", |range| ranges.push(range));
-        assert!(ranges.is_empty());
-
-        framer.for_each_completed_range(b"\n.\r\n220 article\r\npayload\r\n.\r\n", |range| {
-            ranges.push(range);
-        });
-        assert_eq!(
-            ranges,
-            vec![
-                ResponseChunkRange {
-                    start: 0,
-                    end: 4,
-                    started_before_chunk: true
-                },
-                ResponseChunkRange {
-                    start: 4,
-                    end: 29,
-                    started_before_chunk: false
-                }
-            ]
-        );
-    }
-
-    #[test]
-    fn multiline_framer_counts_packed_responses_in_one_pass() {
-        let mut framer = MultilineResponseFramer::default();
-
-        assert_eq!(
-            framer.count_completed_responses(
-                b"222 body follows\r\npayload\r\n.\r\n220 article follows\r\npayload\r\n.\r\n"
-            ),
-            2
-        );
-        assert_eq!(framer.count_completed_responses(b".\r\n"), 0);
-    }
-
-    #[test]
-    fn chunk_terminator_scan_rejects_plain_dots() {
-        let mut ends = Vec::new();
-        scan_chunk_terminator_ends(b"line.with.dots\r\nnot done\r\n", |end| ends.push(end));
-        assert!(ends.is_empty());
-
-        scan_chunk_terminator_ends(
-            b"one\r\n.\r\ntwo\r\n..\r\nthree\r\n.\r\npartial\r\n.\r",
-            |end| ends.push(end),
-        );
-        assert_eq!(ends, vec![8, 27]);
     }
 }

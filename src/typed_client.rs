@@ -3,7 +3,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use bytes::{Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -24,6 +24,13 @@ pub struct TypedClientOptions {
     pub socket_recv_buffer: usize,
     pub socket_send_buffer: usize,
     pub pipeline_depth: usize,
+    pub response_mode: TypedClientResponseMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypedClientResponseMode {
+    Owned,
+    Drained,
 }
 
 impl Default for TypedClientOptions {
@@ -34,6 +41,7 @@ impl Default for TypedClientOptions {
             socket_recv_buffer: 0,
             socket_send_buffer: 0,
             pipeline_depth: 64,
+            response_mode: TypedClientResponseMode::Owned,
         }
     }
 }
@@ -566,6 +574,7 @@ impl TypedClientConnection {
         let (inflight_tx, inflight_rx) = mpsc::channel(options.pipeline_depth.max(1));
         let poisoned = Arc::new(Mutex::new(None));
         let read_chunk_bytes = read_buffer.len();
+        let response_mode = options.response_mode;
 
         let writer_task = tokio::spawn(run_writer_task(
             writer,
@@ -577,6 +586,7 @@ impl TypedClientConnection {
         let reader_task = tokio::spawn(run_reader_task(
             reader,
             read_chunk_bytes,
+            response_mode,
             inflight_rx,
             poisoned.clone(),
             writer_abort,
@@ -585,6 +595,7 @@ impl TypedClientConnection {
         Ok(Self {
             inner: Arc::new(ConnectionHandle {
                 request_tx,
+                response_mode,
                 poisoned,
                 writer_task,
                 reader_task,
@@ -1031,6 +1042,11 @@ impl TypedClientConnection {
         &self,
         request: Request<'static>,
     ) -> Result<PendingResponse, TypedClientError> {
+        if self.inner.response_mode != TypedClientResponseMode::Owned {
+            return Err(TypedClientError::Io(io::Error::other(
+                "owned response requested from drained typed connection",
+            )));
+        }
         let (response_tx, response_rx) = oneshot::channel();
         self.inner
             .request_tx
@@ -1042,6 +1058,31 @@ impl TypedClientConnection {
             .map_err(|_| TypedClientError::ConnectionClosed)?;
 
         Ok(PendingResponse {
+            inner: self.inner.clone(),
+            response_rx,
+        })
+    }
+
+    pub(crate) async fn queue_request_drained(
+        &self,
+        request: Request<'static>,
+    ) -> Result<PendingDrainedResponse, TypedClientError> {
+        if self.inner.response_mode != TypedClientResponseMode::Drained {
+            return Err(TypedClientError::Io(io::Error::other(
+                "drained response requested from owned typed connection",
+            )));
+        }
+        let (response_tx, response_rx) = oneshot::channel();
+        self.inner
+            .request_tx
+            .send(QueuedRequest {
+                request,
+                response_tx,
+            })
+            .await
+            .map_err(|_| TypedClientError::ConnectionClosed)?;
+
+        Ok(PendingDrainedResponse {
             inner: self.inner.clone(),
             response_rx,
         })
@@ -1067,6 +1108,7 @@ impl Drop for ConnectionHandle {
 #[derive(Debug)]
 struct ConnectionHandle {
     request_tx: mpsc::Sender<QueuedRequest>,
+    response_mode: TypedClientResponseMode,
     poisoned: Arc<Mutex<Option<SharedEngineError>>>,
     writer_task: JoinHandle<()>,
     reader_task: JoinHandle<()>,
@@ -1404,13 +1446,13 @@ enum DecodeProgress {
 #[derive(Debug)]
 struct QueuedRequest {
     request: Request<'static>,
-    response_tx: oneshot::Sender<Result<OwnedResponse, SharedEngineError>>,
+    response_tx: oneshot::Sender<Result<CompletedResponse, SharedEngineError>>,
 }
 
 #[derive(Debug)]
 pub(crate) struct PendingResponse {
     inner: Arc<ConnectionHandle>,
-    response_rx: oneshot::Receiver<Result<OwnedResponse, SharedEngineError>>,
+    response_rx: oneshot::Receiver<Result<CompletedResponse, SharedEngineError>>,
 }
 
 impl PendingResponse {
@@ -1429,14 +1471,67 @@ impl PendingResponse {
             }
         };
 
-        response.map_err(Into::into)
+        match response.map_err(TypedClientError::from)? {
+            CompletedResponse::Owned(response) => Ok(response),
+            CompletedResponse::Drained(_) => Err(TypedClientError::Io(io::Error::other(
+                "drained response returned to owned caller",
+            ))),
+        }
     }
+}
+
+#[derive(Debug)]
+pub(crate) struct PendingDrainedResponse {
+    inner: Arc<ConnectionHandle>,
+    response_rx: oneshot::Receiver<Result<CompletedResponse, SharedEngineError>>,
+}
+
+impl PendingDrainedResponse {
+    pub(crate) async fn receive(self) -> Result<DrainedResponse, TypedClientError> {
+        let response = match self.response_rx.await {
+            Ok(response) => response,
+            Err(_) => {
+                return Err(self
+                    .inner
+                    .poisoned
+                    .lock()
+                    .await
+                    .clone()
+                    .map(TypedClientError::from)
+                    .unwrap_or(TypedClientError::ConnectionClosed));
+            }
+        };
+
+        match response.map_err(TypedClientError::from)? {
+            CompletedResponse::Drained(response) => Ok(response),
+            CompletedResponse::Owned(_) => Err(TypedClientError::Io(io::Error::other(
+                "owned response returned to drained caller",
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DrainedResponse {
+    bytes_len: usize,
+}
+
+impl DrainedResponse {
+    pub(crate) fn bytes_len(&self) -> usize {
+        self.bytes_len
+    }
+}
+
+#[derive(Debug)]
+enum CompletedResponse {
+    Owned(OwnedResponse),
+    Drained(DrainedResponse),
 }
 
 #[derive(Debug)]
 struct InFlightRequest {
     kind: RequestKind,
-    response_tx: oneshot::Sender<Result<OwnedResponse, SharedEngineError>>,
+    response_tx: oneshot::Sender<Result<CompletedResponse, SharedEngineError>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1488,11 +1583,16 @@ async fn run_writer_task(
 async fn run_reader_task(
     mut reader: OwnedReadHalf,
     read_chunk_bytes: usize,
+    response_mode: TypedClientResponseMode,
     mut inflight_rx: mpsc::Receiver<InFlightRequest>,
     poisoned: Arc<Mutex<Option<SharedEngineError>>>,
     writer_abort: tokio::task::AbortHandle,
 ) {
-    let mut pending_read = BytesMut::with_capacity(read_chunk_bytes.saturating_mul(2));
+    let initial_capacity = match response_mode {
+        TypedClientResponseMode::Owned => read_chunk_bytes.saturating_mul(2),
+        TypedClientResponseMode::Drained => read_chunk_bytes.saturating_mul(4),
+    };
+    let mut pending_read = BytesMut::with_capacity(initial_capacity);
 
     while let Some(inflight_request) = inflight_rx.recv().await {
         let mut decoder = ResponseDecoder::new(inflight_request.kind);
@@ -1503,10 +1603,20 @@ async fn run_reader_task(
                 match decoder.push(&pending_read) {
                     Ok(DecodeProgress::NeedMore) => {}
                     Ok(DecodeProgress::Complete { status, consumed }) => {
-                        let response = OwnedResponse {
-                            kind: inflight_request.kind,
-                            status,
-                            bytes: pending_read.split_to(consumed).freeze(),
+                        let response = match response_mode {
+                            TypedClientResponseMode::Owned => {
+                                CompletedResponse::Owned(OwnedResponse {
+                                    kind: inflight_request.kind,
+                                    status,
+                                    bytes: pending_read.split_to(consumed).freeze(),
+                                })
+                            }
+                            TypedClientResponseMode::Drained => {
+                                pending_read.advance(consumed);
+                                CompletedResponse::Drained(DrainedResponse {
+                                    bytes_len: consumed,
+                                })
+                            }
                         };
                         let _ = response_tx.send(Ok(response));
                         break;

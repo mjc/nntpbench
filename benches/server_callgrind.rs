@@ -19,8 +19,8 @@ supported! {
         Callgrind, LibraryBenchmarkConfig, library_benchmark, library_benchmark_group, main,
     };
     use nntpbench::{
-        RequestKind, RequestLine, ServerArgs, ServerConfig, Stats, parse_command_batch_bytes,
-        process_command_to_buffer,
+        RequestKind, RequestLine, ServerArgs, ServerConfig, Stats, for_each_request_line_in_batch,
+        process_request_to_buffer,
     };
     use std::hint::black_box;
     use std::sync::Arc;
@@ -102,8 +102,8 @@ supported! {
     #[bench::article_64k(setup = setup_64k)]
     #[bench::article_768k(setup = setup_768k)]
     fn process_article(mut harness: ProcessHarness) -> usize {
-        process_command_to_buffer(
-            RequestKind::Article,
+        process_request_to_buffer(
+            RequestLine::parse(b"ARTICLE <bench@nntpbench.local>"),
             &harness.config,
             &harness.stats,
             &mut harness.output,
@@ -115,8 +115,8 @@ supported! {
     #[bench::body_64k(setup = setup_64k)]
     #[bench::body_768k(setup = setup_768k)]
     fn process_body(mut harness: ProcessHarness) -> usize {
-        process_command_to_buffer(
-            RequestKind::Body,
+        process_request_to_buffer(
+            RequestLine::parse(b"BODY <bench@nntpbench.local>"),
             &harness.config,
             &harness.stats,
             &mut harness.output,
@@ -127,8 +127,8 @@ supported! {
     #[library_benchmark]
     #[bench::capabilities(setup = setup_64k)]
     fn process_capabilities(mut harness: ProcessHarness) -> usize {
-        process_command_to_buffer(
-            RequestKind::Capabilities,
+        process_request_to_buffer(
+            RequestLine::parse(b"CAPABILITIES"),
             &harness.config,
             &harness.stats,
             &mut harness.output,
@@ -139,8 +139,8 @@ supported! {
     #[library_benchmark]
     #[bench::unknown(setup = setup_64k)]
     fn process_unknown(mut harness: ProcessHarness) -> usize {
-        process_command_to_buffer(
-            RequestKind::Unknown,
+        process_request_to_buffer(
+            RequestLine::parse(b"HEAD 1"),
             &harness.config,
             &harness.stats,
             &mut harness.output,
@@ -151,8 +151,8 @@ supported! {
     #[library_benchmark]
     #[bench::date(setup = setup_64k)]
     fn process_date(mut harness: ProcessHarness) -> usize {
-        process_command_to_buffer(
-            RequestKind::Date,
+        process_request_to_buffer(
+            RequestLine::parse(b"DATE"),
             &harness.config,
             &harness.stats,
             &mut harness.output,
@@ -163,8 +163,8 @@ supported! {
     #[library_benchmark]
     #[bench::mode_reader(setup = setup_64k)]
     fn process_mode_reader(mut harness: ProcessHarness) -> usize {
-        process_command_to_buffer(
-            RequestKind::ModeReader,
+        process_request_to_buffer(
+            RequestLine::parse(b"MODE READER"),
             &harness.config,
             &harness.stats,
             &mut harness.output,
@@ -175,8 +175,8 @@ supported! {
     #[library_benchmark]
     #[bench::quit(setup = setup_64k)]
     fn process_quit(mut harness: ProcessHarness) -> bool {
-        black_box(process_command_to_buffer(
-            RequestKind::Quit,
+        black_box(process_request_to_buffer(
+            RequestLine::parse(b"QUIT"),
             &harness.config,
             &harness.stats,
             &mut harness.output,
@@ -195,17 +195,15 @@ MODE READER\r\n\
 HEAD 1\r\n\
 QUIT\r\n",
         );
-        let consumed = parse_command_batch_bytes(request, 64, &mut harness.commands);
-        for command in &harness.commands {
-            if process_command_to_buffer(
-                *command,
+        let consumed = for_each_request_line_in_batch(request, 64, |request| {
+            harness.commands.push(request.kind());
+            let _ = process_request_to_buffer(
+                request,
                 &harness.config,
                 &harness.stats,
                 &mut harness.output,
-            ) {
-                break;
-            }
-        }
+            );
+        });
         black_box(consumed + harness.output.len())
     }
 
