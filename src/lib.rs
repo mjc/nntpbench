@@ -62,7 +62,7 @@ pub struct ServerArgs {
     pub threads: usize,
 
     /// Maximum complete commands consumed from one pipelined read batch.
-    #[arg(long, default_value_t = 64)]
+    #[arg(long, default_value_t = MAX_SERVER_PIPELINE_DEPTH)]
     pub max_pipeline_depth: usize,
 
     /// Listen backlog passed to the OS.
