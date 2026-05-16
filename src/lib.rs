@@ -2,7 +2,7 @@
 
 use std::fs;
 use std::future::poll_fn;
-use std::io::{self, IoSlice};
+use std::io::{self, IoSlice, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -19,7 +19,18 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio::time;
 
+pub mod protocol;
 pub mod tail_buffer;
+pub mod typed_client;
+
+pub use protocol::{
+    Article, ArticleNumber, ArticleParseError, HeaderIter, Headers, MessageId, Request,
+    RequestKind, RequestLine, StatusCode,
+};
+pub use typed_client::{
+    Client, OwnedArticle, OwnedArticleExchange, OwnedExchange, OwnedResponse,
+    TypedClientConnection, TypedClientError, TypedClientOptions,
+};
 
 pub const CRLF: &[u8] = b"\r\n";
 pub const TERMINATOR: &[u8] = b"\r\n.\r\n";
@@ -233,6 +244,56 @@ pub enum ClientCommandMix {
     Alternate,
 }
 
+#[derive(Debug, Parser, Clone)]
+pub struct TypedFetchArgs {
+    /// Address to connect to.
+    #[arg(long, default_value = "127.0.0.1:1199")]
+    pub connect: SocketAddr,
+
+    /// Request kind to send.
+    #[arg(long, value_enum)]
+    pub request: TypedRequestKind,
+
+    /// Message-ID to request for ARTICLE/BODY/HEAD/STAT. Bare IDs are wrapped in angle brackets.
+    #[arg(long)]
+    pub message_id: Option<String>,
+
+    /// Tokio runtime worker threads. Use 1 for the current-thread runtime.
+    #[arg(long, default_value_t = 1)]
+    pub threads: usize,
+
+    /// Per-connection read buffer size.
+    #[arg(long, default_value_t = CLIENT_READER_CAPACITY)]
+    pub read_buffer_bytes: usize,
+
+    /// Maximum in-flight typed requests allowed on the connection.
+    #[arg(long, default_value_t = 64)]
+    pub pipeline_depth: usize,
+
+    /// Set TCP_NODELAY on client sockets.
+    #[arg(long, default_value_t = true)]
+    pub nodelay: bool,
+
+    /// Socket receive buffer size in bytes. Use 0 to leave the OS default.
+    #[arg(long, default_value_t = HIGH_THROUGHPUT_SOCKET_BUFFER)]
+    pub socket_recv_buffer: usize,
+
+    /// Socket send buffer size in bytes. Use 0 to leave the OS default.
+    #[arg(long, default_value_t = HIGH_THROUGHPUT_SOCKET_BUFFER)]
+    pub socket_send_buffer: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum TypedRequestKind {
+    Article,
+    Body,
+    Head,
+    Stat,
+    Capabilities,
+    Date,
+    ModeReader,
+}
+
 #[derive(Debug)]
 struct SegmentSet {
     ids: Box<[Box<[u8]>]>,
@@ -328,6 +389,76 @@ pub async fn run_client(args: ClientArgs) -> io::Result<()> {
         stats.print_snapshot("final");
     }
     Ok(())
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+pub async fn run_typed_fetch(args: TypedFetchArgs) -> io::Result<()> {
+    let response = fetch_typed_response(&args)
+        .await
+        .map_err(map_typed_client_error)?;
+    io::stdout().write_all(response.as_bytes())
+}
+
+pub async fn fetch_typed_response(
+    args: &TypedFetchArgs,
+) -> Result<OwnedResponse, TypedClientError> {
+    let request = typed_fetch_request(args)?;
+    let connection = TypedClientConnection::connect_with_options(
+        args.connect,
+        TypedClientOptions {
+            read_buffer_bytes: args
+                .read_buffer_bytes
+                .max(tail_buffer::TERMINATOR_TAIL_SIZE),
+            nodelay: args.nodelay,
+            socket_recv_buffer: args.socket_recv_buffer,
+            socket_send_buffer: args.socket_send_buffer,
+            pipeline_depth: args.pipeline_depth.clamp(1, 4096),
+        },
+    )
+    .await?;
+
+    connection.execute(request).await
+}
+
+fn typed_fetch_request(args: &TypedFetchArgs) -> Result<Request<'static>, TypedClientError> {
+    match args.request {
+        TypedRequestKind::Article => {
+            typed_fetch_message_id_request(args, |message_id| Request::article(message_id))
+        }
+        TypedRequestKind::Body => {
+            typed_fetch_message_id_request(args, |message_id| Request::body(message_id))
+        }
+        TypedRequestKind::Head => {
+            typed_fetch_message_id_request(args, |message_id| Request::head(message_id))
+        }
+        TypedRequestKind::Stat => {
+            typed_fetch_message_id_request(args, |message_id| Request::stat(message_id))
+        }
+        TypedRequestKind::Capabilities => Ok(Request::capabilities()),
+        TypedRequestKind::Date => Ok(Request::date()),
+        TypedRequestKind::ModeReader => Ok(Request::mode_reader()),
+    }
+}
+
+fn typed_fetch_message_id_request<F>(
+    args: &TypedFetchArgs,
+    build: F,
+) -> Result<Request<'static>, TypedClientError>
+where
+    F: FnOnce(&str) -> Result<Request<'static>, protocol::InvalidMessageId>,
+{
+    let message_id = args
+        .message_id
+        .as_deref()
+        .ok_or(TypedClientError::MissingMessageId)?;
+    build(message_id).map_err(|_| TypedClientError::InvalidMessageId)
+}
+
+fn map_typed_client_error(err: TypedClientError) -> io::Error {
+    match err {
+        TypedClientError::Io(err) => err,
+        other => io::Error::new(io::ErrorKind::InvalidData, other),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -480,7 +611,7 @@ impl ClientSession {
         read_greeting(&mut stream, &mut read_buffer).await?;
 
         let mut write_buffer = vec![0; self.command_buffer_bytes].into_boxed_slice();
-        let mut scanner = MultilineScanner::default();
+        let mut framer = MultilineResponseFramer::default();
         let start_id = self.next_id;
         let mut issued = 0_u64;
         let mut completed = 0_u64;
@@ -520,7 +651,7 @@ impl ClientSession {
                 stop.store(true, Ordering::Release);
             }
 
-            let responses = scanner.count_terminators(&read_buffer[..read]);
+            let responses = framer.count_completed_responses(&read_buffer[..read]);
             if responses > in_flight {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -943,31 +1074,61 @@ fn count_client_commands(start_id: u64, count: u64, mix: ClientCommandMix) -> (u
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ResponseChunkRange {
+    start: usize,
+    end: usize,
+    started_before_chunk: bool,
+}
+
 #[derive(Debug, Default)]
-struct MultilineScanner {
+struct MultilineResponseFramer {
     tail: tail_buffer::TailBuffer,
 }
 
-impl MultilineScanner {
-    fn count_terminators(&mut self, input: &[u8]) -> usize {
+impl MultilineResponseFramer {
+    fn count_completed_responses(&mut self, input: &[u8]) -> usize {
+        let mut count = 0;
+        self.for_each_completed_range(input, |_| {
+            count += 1;
+        });
+        count
+    }
+
+    fn for_each_completed_range<F>(&mut self, input: &[u8], mut visit: F)
+    where
+        F: FnMut(ResponseChunkRange),
+    {
         if input.is_empty() {
-            return 0;
+            return;
         }
 
-        let mut count = 0;
         let mut last_end = 0;
         if let Some(end) = self.tail.find_spanning_terminator(input) {
-            count += 1;
             last_end = end;
+            visit(ResponseChunkRange {
+                start: 0,
+                end,
+                started_before_chunk: true,
+            });
         }
 
-        let (chunk_count, chunk_last_end) = count_in_chunk_terminators(&input[last_end..]);
-        if chunk_count != 0 {
-            count += chunk_count;
-            last_end += chunk_last_end;
-        }
+        let mut frame_start = last_end;
+        let scan_start = last_end;
+        let mut found_any = last_end != 0;
+        scan_chunk_terminator_ends(&input[scan_start..], |relative_end| {
+            let end = scan_start + relative_end;
+            visit(ResponseChunkRange {
+                start: frame_start,
+                end,
+                started_before_chunk: false,
+            });
+            frame_start = end;
+            last_end = end;
+            found_any = true;
+        });
 
-        if count == 0 {
+        if !found_any {
             self.tail.update(input);
         } else {
             self.tail = tail_buffer::TailBuffer::default();
@@ -975,14 +1136,13 @@ impl MultilineScanner {
                 self.tail.update(&input[last_end..]);
             }
         }
-        count
     }
 }
 
-fn count_in_chunk_terminators(input: &[u8]) -> (usize, usize) {
-    let mut count = 0;
-    let mut last_end = 0;
-
+fn scan_chunk_terminator_ends<F>(input: &[u8], mut visit: F)
+where
+    F: FnMut(usize),
+{
     for dot in memchr::memchr_iter(b'.', input) {
         if dot >= 2
             && dot + 2 < input.len()
@@ -991,12 +1151,9 @@ fn count_in_chunk_terminators(input: &[u8]) -> (usize, usize) {
             && input[dot + 1] == b'\r'
             && input[dot + 2] == b'\n'
         {
-            count += 1;
-            last_end = dot + TERMINATOR.len() - 2;
+            visit(dot + TERMINATOR.len() - 2);
         }
     }
-
-    (count, last_end)
 }
 
 pub async fn serve_session(
@@ -1025,14 +1182,7 @@ async fn serve_session_inner(
     let mut command_batch = CommandBatch::new();
     let mut pending_write = PendingWrite::new();
 
-    writer.write_all(GREETING).await?;
-    session_stats.bytes_sent += GREETING.len() as u64;
-    if config.flush {
-        #[cfg(not(coverage_nightly))]
-        writer.flush().await?;
-        #[cfg(coverage_nightly)]
-        let _ = writer.flush().await;
-    }
+    send_greeting(&mut writer, &config, session_stats).await?;
 
     loop {
         if !read_command_batch(
@@ -1046,51 +1196,78 @@ async fn serve_session_inner(
             break;
         }
 
-        session_stats.pipeline_batches += u64::from(command_batch.len() > 1);
-        for command in &command_batch {
-            let should_close = handle_command(
-                command,
-                &config,
-                session_stats,
-                &mut writer,
-                &mut pending_write,
-            )
-            .await?;
-            if should_close {
-                flush_pending(&mut writer, &mut pending_write).await?;
-                if config.flush {
-                    #[cfg(not(coverage_nightly))]
-                    writer.flush().await?;
-                    #[cfg(coverage_nightly)]
-                    let _ = writer.flush().await;
-                }
-                return Ok(());
-            }
-        }
-
-        flush_pending(&mut writer, &mut pending_write).await?;
-        if config.flush {
-            #[cfg(not(coverage_nightly))]
-            writer.flush().await?;
-            #[cfg(coverage_nightly)]
-            let _ = writer.flush().await;
+        if process_command_batch(
+            &command_batch,
+            &config,
+            session_stats,
+            &mut writer,
+            &mut pending_write,
+        )
+        .await?
+        .should_close()
+        {
+            return Ok(());
         }
     }
 
-    flush_pending(&mut writer, &mut pending_write).await?;
-    if config.flush {
-        #[cfg(not(coverage_nightly))]
-        writer.flush().await?;
-        #[cfg(coverage_nightly)]
-        let _ = writer.flush().await;
-    }
+    flush_session_writer(&mut writer, &mut pending_write, &config).await?;
 
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BatchOutcome {
+    Continue,
+    Close,
+}
+
+impl BatchOutcome {
+    const fn should_close(self) -> bool {
+        matches!(self, Self::Close)
+    }
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn send_greeting<W>(
+    writer: &mut W,
+    config: &ServerConfig,
+    session_stats: &mut SessionStats,
+) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    writer.write_all(GREETING).await?;
+    session_stats.bytes_sent += GREETING.len() as u64;
+    flush_writer_if_needed(writer, config.flush).await
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn process_command_batch<W>(
+    command_batch: &CommandBatch,
+    config: &ServerConfig,
+    session_stats: &mut SessionStats,
+    writer: &mut W,
+    pending_write: &mut PendingWrite,
+) -> io::Result<BatchOutcome>
+where
+    W: AsyncWrite + Unpin,
+{
+    session_stats.pipeline_batches += u64::from(command_batch.len() > 1);
+
+    for command in command_batch {
+        if handle_command(command, config, session_stats, writer, pending_write).await? {
+            flush_session_writer(writer, pending_write, config).await?;
+            return Ok(BatchOutcome::Close);
+        }
+    }
+
+    flush_session_writer(writer, pending_write, config).await?;
+    Ok(BatchOutcome::Continue)
+}
+
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn handle_command<W>(
-    command: &ParsedCommand,
+    command: &RequestKind,
     config: &ServerConfig,
     session_stats: &mut SessionStats,
     writer: &mut W,
@@ -1102,7 +1279,7 @@ where
     session_stats.commands += 1;
 
     match command {
-        ParsedCommand::Article => {
+        RequestKind::Article => {
             session_stats.article_requests += 1;
             write_response(
                 writer,
@@ -1113,12 +1290,12 @@ where
             .await?;
             Ok(false)
         }
-        ParsedCommand::Body => {
+        RequestKind::Body => {
             session_stats.body_requests += 1;
             write_response(writer, pending_write, config.body_response(), session_stats).await?;
             Ok(false)
         }
-        ParsedCommand::Capabilities => {
+        RequestKind::Capabilities => {
             write_response(
                 writer,
                 pending_write,
@@ -1128,15 +1305,15 @@ where
             .await?;
             Ok(false)
         }
-        ParsedCommand::Date => {
+        RequestKind::Date => {
             write_response(writer, pending_write, DATE_RESPONSE, session_stats).await?;
             Ok(false)
         }
-        ParsedCommand::ModeReader => {
+        RequestKind::ModeReader => {
             write_response(writer, pending_write, MODE_READER_RESPONSE, session_stats).await?;
             Ok(false)
         }
-        ParsedCommand::Quit => {
+        RequestKind::Quit => {
             write_response(
                 writer,
                 pending_write,
@@ -1146,7 +1323,7 @@ where
             .await?;
             Ok(true)
         }
-        ParsedCommand::Unknown => {
+        _ => {
             write_response(
                 writer,
                 pending_write,
@@ -1242,7 +1419,7 @@ where
 }
 
 pub fn process_command_to_buffer(
-    command: ParsedCommand,
+    command: RequestKind,
     config: &ServerConfig,
     stats: &Stats,
     output: &mut Vec<u8>,
@@ -1250,32 +1427,32 @@ pub fn process_command_to_buffer(
     stats.commands.fetch_add(1, Ordering::Relaxed);
 
     let response = match command {
-        ParsedCommand::Article => {
+        RequestKind::Article => {
             stats.article_requests.fetch_add(1, Ordering::Relaxed);
             config.article_response()
         }
-        ParsedCommand::Body => {
+        RequestKind::Body => {
             stats.body_requests.fetch_add(1, Ordering::Relaxed);
             config.body_response()
         }
-        ParsedCommand::Capabilities => b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n",
-        ParsedCommand::Date => DATE_RESPONSE,
-        ParsedCommand::ModeReader => MODE_READER_RESPONSE,
-        ParsedCommand::Quit => b"205 closing connection\r\n",
-        ParsedCommand::Unknown => b"500 unknown command\r\n",
+        RequestKind::Capabilities => b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n",
+        RequestKind::Date => DATE_RESPONSE,
+        RequestKind::ModeReader => MODE_READER_RESPONSE,
+        RequestKind::Quit => b"205 closing connection\r\n",
+        _ => b"500 unknown command\r\n",
     };
 
     stats
         .bytes_sent
         .fetch_add(response.len() as u64, Ordering::Relaxed);
     output.extend_from_slice(response);
-    matches!(command, ParsedCommand::Quit)
+    matches!(command, RequestKind::Quit)
 }
 
 pub fn parse_command_batch_bytes(
     input: &[u8],
     max_pipeline_depth: usize,
-    command_batch: &mut Vec<ParsedCommand>,
+    command_batch: &mut Vec<RequestKind>,
 ) -> usize {
     command_batch.clear();
     let mut start = 0;
@@ -1285,7 +1462,7 @@ pub fn parse_command_batch_bytes(
             break;
         };
         let end = start + relative_lf + 1;
-        command_batch.push(CommandLine::parse(trim_line_slice(&input[start..end])));
+        command_batch.push(RequestLine::parse(trim_line_slice(&input[start..end])).kind());
         start = end;
     }
 
@@ -1317,6 +1494,34 @@ where
     W: AsyncWrite + Unpin,
 {
     pending_write.flush(writer).await
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn flush_session_writer<W>(
+    writer: &mut W,
+    pending_write: &mut PendingWrite,
+    config: &ServerConfig,
+) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    flush_pending(writer, pending_write).await?;
+    flush_writer_if_needed(writer, config.flush).await
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn flush_writer_if_needed<W>(writer: &mut W, flush: bool) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    if flush {
+        #[cfg(not(coverage_nightly))]
+        writer.flush().await?;
+        #[cfg(coverage_nightly)]
+        let _ = writer.flush().await;
+    }
+
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -1528,42 +1733,7 @@ pub fn rate(count: u64, seconds: f64) -> f64 {
     count as f64 / seconds
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ParsedCommand {
-    Article,
-    Body,
-    Capabilities,
-    Date,
-    ModeReader,
-    Quit,
-    Unknown,
-}
-
-type CommandBatch = ArrayVec<ParsedCommand, MAX_SERVER_PIPELINE_DEPTH>;
-
-pub struct CommandLine;
-
-impl CommandLine {
-    pub fn parse(line: &[u8]) -> ParsedCommand {
-        let (verb, arg) = split_once_space(line).map_or((line, &[][..]), |(verb, arg)| (verb, arg));
-
-        if verb_eq(verb, b"ARTICLE") {
-            ParsedCommand::Article
-        } else if verb_eq(verb, b"BODY") {
-            ParsedCommand::Body
-        } else if verb_eq(verb, b"CAPABILITIES") {
-            ParsedCommand::Capabilities
-        } else if verb_eq(verb, b"DATE") {
-            ParsedCommand::Date
-        } else if verb_eq(verb, b"MODE") && verb_eq(arg, b"READER") {
-            ParsedCommand::ModeReader
-        } else if verb_eq(verb, b"QUIT") {
-            ParsedCommand::Quit
-        } else {
-            ParsedCommand::Unknown
-        }
-    }
-}
+type CommandBatch = ArrayVec<RequestKind, MAX_SERVER_PIPELINE_DEPTH>;
 
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn read_command_batch<R>(
@@ -1600,24 +1770,9 @@ fn push_command(command_buf: &mut Vec<u8>, command_batch: &mut CommandBatch) {
     command_batch.push(parse_command_buf(command_buf));
 }
 
-fn parse_command_buf(command_buf: &mut Vec<u8>) -> ParsedCommand {
+fn parse_command_buf(command_buf: &mut Vec<u8>) -> RequestKind {
     trim_command_line(command_buf);
-    CommandLine::parse(command_buf)
-}
-
-fn split_once_space(line: &[u8]) -> Option<(&[u8], &[u8])> {
-    let pos = memchr::memchr(b' ', line)?;
-    let verb = &line[..pos];
-    let arg = line[pos + 1..].trim_ascii();
-    Some((verb, arg))
-}
-
-fn verb_eq(actual: &[u8], expected_upper: &[u8]) -> bool {
-    actual.len() == expected_upper.len()
-        && actual
-            .iter()
-            .zip(expected_upper)
-            .all(|(left, right)| left.to_ascii_uppercase() == *right)
+    RequestLine::parse(command_buf).kind()
 }
 
 fn trim_command_line(line: &mut Vec<u8>) {
@@ -1738,6 +1893,20 @@ mod tests {
         }
     }
 
+    fn test_typed_fetch_args() -> TypedFetchArgs {
+        TypedFetchArgs {
+            connect: "127.0.0.1:1199".parse().unwrap(),
+            request: TypedRequestKind::Article,
+            message_id: Some("bench@test".to_string()),
+            threads: 1,
+            read_buffer_bytes: CLIENT_READER_CAPACITY,
+            pipeline_depth: 64,
+            nodelay: true,
+            socket_recv_buffer: HIGH_THROUGHPUT_SOCKET_BUFFER,
+            socket_send_buffer: HIGH_THROUGHPUT_SOCKET_BUFFER,
+        }
+    }
+
     fn write_temp_segments(name: &str, contents: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
         let unique = format!(
@@ -1846,7 +2015,7 @@ mod tests {
         let mut writer = FailingWriter;
 
         let err = handle_command(
-            &ParsedCommand::Article,
+            &RequestKind::Article,
             &config,
             &mut stats,
             &mut writer,
@@ -1871,7 +2040,7 @@ mod tests {
         );
         assert_eq!(
             command_batch.as_slice(),
-            &[ParsedCommand::Article, ParsedCommand::Body]
+            &[RequestKind::Article, RequestKind::Body]
         );
         assert!(
             !read_command_batch(&mut reader, &mut command_buf, &mut command_batch, 4)
@@ -2032,34 +2201,43 @@ mod tests {
     }
 
     #[test]
-    fn parses_supported_commands_case_insensitively() {
-        assert_eq!(CommandLine::parse(b"ARTICLE <x@y>"), ParsedCommand::Article);
-        assert_eq!(CommandLine::parse(b"ARTICLE"), ParsedCommand::Article);
-        assert_eq!(CommandLine::parse(b"body 123"), ParsedCommand::Body);
-        assert_eq!(CommandLine::parse(b"BoDy"), ParsedCommand::Body);
+    fn parses_request_kinds_case_insensitively() {
         assert_eq!(
-            CommandLine::parse(b"CAPABILITIES"),
-            ParsedCommand::Capabilities
+            RequestLine::parse(b"ARTICLE <x@y>").kind(),
+            RequestKind::Article
+        );
+        assert_eq!(RequestLine::parse(b"ARTICLE").kind(), RequestKind::Article);
+        assert_eq!(RequestLine::parse(b"body 123").kind(), RequestKind::Body);
+        assert_eq!(RequestLine::parse(b"BoDy").kind(), RequestKind::Body);
+        assert_eq!(
+            RequestLine::parse(b"CAPABILITIES").kind(),
+            RequestKind::Capabilities
         );
         assert_eq!(
-            CommandLine::parse(b"capabilities"),
-            ParsedCommand::Capabilities
+            RequestLine::parse(b"capabilities").kind(),
+            RequestKind::Capabilities
         );
-        assert_eq!(CommandLine::parse(b"DATE"), ParsedCommand::Date);
-        assert_eq!(CommandLine::parse(b"date"), ParsedCommand::Date);
+        assert_eq!(RequestLine::parse(b"DATE").kind(), RequestKind::Date);
+        assert_eq!(RequestLine::parse(b"date").kind(), RequestKind::Date);
         assert_eq!(
-            CommandLine::parse(b"MODE READER"),
-            ParsedCommand::ModeReader
+            RequestLine::parse(b"MODE READER").kind(),
+            RequestKind::ModeReader
         );
         assert_eq!(
-            CommandLine::parse(b"mode reader"),
-            ParsedCommand::ModeReader
+            RequestLine::parse(b"mode reader").kind(),
+            RequestKind::ModeReader
         );
-        assert_eq!(CommandLine::parse(b"QUIT"), ParsedCommand::Quit);
-        assert_eq!(CommandLine::parse(b"quit"), ParsedCommand::Quit);
-        assert_eq!(CommandLine::parse(b"HEAD 1"), ParsedCommand::Unknown);
-        assert_eq!(CommandLine::parse(b"ARTICLEZ 1"), ParsedCommand::Unknown);
-        assert_eq!(CommandLine::parse(b"MODE TRANSIT"), ParsedCommand::Unknown);
+        assert_eq!(RequestLine::parse(b"QUIT").kind(), RequestKind::Quit);
+        assert_eq!(RequestLine::parse(b"quit").kind(), RequestKind::Quit);
+        assert_eq!(RequestLine::parse(b"HEAD 1").kind(), RequestKind::Head);
+        assert_eq!(
+            RequestLine::parse(b"ARTICLEZ 1").kind(),
+            RequestKind::Unknown
+        );
+        assert_eq!(
+            RequestLine::parse(b"MODE TRANSIT").kind(),
+            RequestKind::Unknown
+        );
     }
 
     #[test]
@@ -2731,6 +2909,200 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fetch_typed_response_uses_typed_connection_path() {
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"201 fetch ready\r\n").await.unwrap();
+
+            let mut request = [0_u8; 128];
+            let read = stream.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"BODY <typed-fetch@test>\r\n");
+
+            stream
+                .write_all(b"222 1 <typed-fetch@test> body follows\r\nbody payload\r\n.\r\n")
+                .await
+                .unwrap();
+        });
+
+        let mut args = test_typed_fetch_args();
+        args.connect = addr;
+        args.request = TypedRequestKind::Body;
+        args.message_id = Some("typed-fetch@test".to_string());
+        args.read_buffer_bytes = 64;
+
+        let response = fetch_typed_response(&args).await.unwrap();
+        let article = response.parse_article().unwrap();
+
+        assert_eq!(response.kind(), RequestKind::Body);
+        assert_eq!(response.status().as_u16(), 222);
+        assert_eq!(article.message_id.as_str(), "<typed-fetch@test>");
+        assert_eq!(article.body, Some(&b"body payload\r\n"[..]));
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fetch_typed_response_supports_head_and_stat_requests() {
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut head_stream, _) = listener.accept().await.unwrap();
+            head_stream.write_all(b"201 fetch ready\r\n").await.unwrap();
+
+            let mut first = [0_u8; 128];
+            let read = head_stream.read(&mut first).await.unwrap();
+            assert_eq!(&first[..read], b"HEAD <typed-head@test>\r\n");
+            head_stream
+                .write_all(b"221 1 <typed-head@test> article retrieved\r\nSubject: Head\r\n.\r\n")
+                .await
+                .unwrap();
+
+            let (mut stat_stream, _) = listener.accept().await.unwrap();
+            stat_stream.write_all(b"201 fetch ready\r\n").await.unwrap();
+
+            let mut second = [0_u8; 128];
+            let read = stat_stream.read(&mut second).await.unwrap();
+            assert_eq!(&second[..read], b"STAT <typed-stat@test>\r\n");
+            stat_stream
+                .write_all(b"223 1 <typed-stat@test> article retrieved\r\n")
+                .await
+                .unwrap();
+        });
+
+        let mut head_args = test_typed_fetch_args();
+        head_args.connect = addr;
+        head_args.request = TypedRequestKind::Head;
+        head_args.message_id = Some("typed-head@test".to_string());
+        let head = fetch_typed_response(&head_args).await.unwrap();
+        assert_eq!(head.kind(), RequestKind::Head);
+        assert_eq!(head.status().as_u16(), 221);
+
+        let mut stat_args = test_typed_fetch_args();
+        stat_args.connect = addr;
+        stat_args.request = TypedRequestKind::Stat;
+        stat_args.message_id = Some("typed-stat@test".to_string());
+        let stat = fetch_typed_response(&stat_args).await.unwrap();
+        assert_eq!(stat.kind(), RequestKind::Stat);
+        assert_eq!(stat.status().as_u16(), 223);
+        assert_eq!(
+            stat.parse_article().unwrap().message_id.as_str(),
+            "<typed-stat@test>"
+        );
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fetch_typed_response_rejects_invalid_message_id() {
+        let mut args = test_typed_fetch_args();
+        args.message_id = Some("<bad id>".to_string());
+
+        let err = fetch_typed_response(&args).await.unwrap_err();
+        assert!(matches!(err, TypedClientError::InvalidMessageId));
+    }
+
+    #[tokio::test]
+    async fn fetch_typed_response_clamps_pipeline_depth_for_typed_engine() {
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"201 fetch ready\r\n").await.unwrap();
+
+            let mut request = [0_u8; 128];
+            let read = stream.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"ARTICLE <clamp@test>\r\n");
+
+            stream
+                .write_all(
+                    b"220 1 <clamp@test> article follows\r\nSubject: Clamp\r\n\r\nbody\r\n.\r\n",
+                )
+                .await
+                .unwrap();
+        });
+
+        let mut args = test_typed_fetch_args();
+        args.connect = addr;
+        args.message_id = Some("clamp@test".to_string());
+        args.pipeline_depth = 0;
+
+        let response = fetch_typed_response(&args).await.unwrap();
+        assert_eq!(response.status().as_u16(), 220);
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fetch_typed_response_supports_general_request_kinds_without_message_id() {
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            first.write_all(b"201 fetch ready\r\n").await.unwrap();
+
+            let mut request = [0_u8; 128];
+            let read = first.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"CAPABILITIES\r\n");
+            first
+                .write_all(b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n")
+                .await
+                .unwrap();
+
+            let (mut second, _) = listener.accept().await.unwrap();
+            second.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = second.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"DATE\r\n");
+            second.write_all(b"111 20260515120000\r\n").await.unwrap();
+
+            let (mut third, _) = listener.accept().await.unwrap();
+            third.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = third.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"MODE READER\r\n");
+            third
+                .write_all(b"201 posting not permitted\r\n")
+                .await
+                .unwrap();
+        });
+
+        let mut capabilities_args = test_typed_fetch_args();
+        capabilities_args.connect = addr;
+        capabilities_args.request = TypedRequestKind::Capabilities;
+        capabilities_args.message_id = None;
+        let capabilities = fetch_typed_response(&capabilities_args).await.unwrap();
+        assert_eq!(capabilities.kind(), RequestKind::Capabilities);
+        assert_eq!(capabilities.status().as_u16(), 101);
+
+        let mut date_args = test_typed_fetch_args();
+        date_args.connect = addr;
+        date_args.request = TypedRequestKind::Date;
+        date_args.message_id = None;
+        let date = fetch_typed_response(&date_args).await.unwrap();
+        assert_eq!(date.kind(), RequestKind::Date);
+        assert_eq!(date.status().as_u16(), 111);
+
+        let mut mode_reader_args = test_typed_fetch_args();
+        mode_reader_args.connect = addr;
+        mode_reader_args.request = TypedRequestKind::ModeReader;
+        mode_reader_args.message_id = None;
+        let mode_reader = fetch_typed_response(&mode_reader_args).await.unwrap();
+        assert_eq!(mode_reader.kind(), RequestKind::ModeReader);
+        assert_eq!(mode_reader.status().as_u16(), 201);
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fetch_typed_response_rejects_missing_message_id_for_article_style_requests() {
+        let mut args = test_typed_fetch_args();
+        args.message_id = None;
+
+        let err = fetch_typed_response(&args).await.unwrap_err();
+        assert!(matches!(err, TypedClientError::MissingMessageId));
+    }
+
+    #[tokio::test]
     async fn reads_pipelined_commands_in_fifo_order() {
         let (mut client, server) = tokio::io::duplex(1024);
         client
@@ -2750,11 +3122,11 @@ mod tests {
         assert_eq!(
             command_batch.as_slice(),
             &[
-                ParsedCommand::Article,
-                ParsedCommand::Body,
-                ParsedCommand::Date,
-                ParsedCommand::ModeReader,
-                ParsedCommand::Quit
+                RequestKind::Article,
+                RequestKind::Body,
+                RequestKind::Date,
+                RequestKind::ModeReader,
+                RequestKind::Quit
             ]
         );
     }
@@ -2789,7 +3161,7 @@ mod tests {
                 .await
                 .unwrap()
         );
-        assert_eq!(command_batch.as_slice(), &[ParsedCommand::Article]);
+        assert_eq!(command_batch.as_slice(), &[RequestKind::Article]);
     }
 
     #[tokio::test]
@@ -2811,7 +3183,7 @@ mod tests {
         );
         assert_eq!(
             command_batch.as_slice(),
-            &[ParsedCommand::Article, ParsedCommand::Body]
+            &[RequestKind::Article, RequestKind::Body]
         );
     }
 
@@ -2834,7 +3206,7 @@ mod tests {
         );
         assert_eq!(
             command_batch.as_slice(),
-            &[ParsedCommand::Article, ParsedCommand::Body]
+            &[RequestKind::Article, RequestKind::Body]
         );
 
         assert!(
@@ -2842,7 +3214,7 @@ mod tests {
                 .await
                 .unwrap()
         );
-        assert_eq!(command_batch.as_slice(), &[ParsedCommand::Quit]);
+        assert_eq!(command_batch.as_slice(), &[RequestKind::Quit]);
     }
 
     #[tokio::test]
@@ -3041,11 +3413,11 @@ mod tests {
         let consumed = parse_command_batch_bytes(b"ARTICLE 1\r\nBODY 2\r\nQUIT", 8, &mut batch);
 
         assert_eq!(consumed, b"ARTICLE 1\r\nBODY 2\r\n".len());
-        assert_eq!(batch, vec![ParsedCommand::Article, ParsedCommand::Body]);
+        assert_eq!(batch, vec![RequestKind::Article, RequestKind::Body]);
 
         let consumed = parse_command_batch_bytes(b"DATE\nMODE READER\n", 8, &mut batch);
         assert_eq!(consumed, b"DATE\nMODE READER\n".len());
-        assert_eq!(batch, vec![ParsedCommand::Date, ParsedCommand::ModeReader]);
+        assert_eq!(batch, vec![RequestKind::Date, RequestKind::ModeReader]);
     }
 
     #[test]
@@ -3055,13 +3427,13 @@ mod tests {
         let mut output = Vec::new();
 
         assert!(!process_command_to_buffer(
-            ParsedCommand::Article,
+            RequestKind::Article,
             &config,
             &stats,
             &mut output,
         ));
         assert!(process_command_to_buffer(
-            ParsedCommand::Quit,
+            RequestKind::Quit,
             &config,
             &stats,
             &mut output,
@@ -3081,13 +3453,13 @@ mod tests {
         let mut output = Vec::new();
 
         assert!(!process_command_to_buffer(
-            ParsedCommand::ModeReader,
+            RequestKind::ModeReader,
             &config,
             &stats,
             &mut output,
         ));
         assert!(!process_command_to_buffer(
-            ParsedCommand::Date,
+            RequestKind::Date,
             &config,
             &stats,
             &mut output,
@@ -3104,19 +3476,19 @@ mod tests {
         let mut output = Vec::new();
 
         assert!(!process_command_to_buffer(
-            ParsedCommand::Body,
+            RequestKind::Body,
             &config,
             &stats,
             &mut output,
         ));
         assert!(!process_command_to_buffer(
-            ParsedCommand::Capabilities,
+            RequestKind::Capabilities,
             &config,
             &stats,
             &mut output,
         ));
         assert!(!process_command_to_buffer(
-            ParsedCommand::Unknown,
+            RequestKind::Unknown,
             &config,
             &stats,
             &mut output,
@@ -3202,37 +3574,71 @@ BODY <bench.4@nntpbench.local>\r\n"
     }
 
     #[test]
-    fn multiline_scanner_uses_tail_buffer_across_boundaries() {
-        let mut scanner = MultilineScanner::default();
+    fn multiline_framer_uses_tail_buffer_across_boundaries() {
+        let mut framer = MultilineResponseFramer::default();
 
-        assert_eq!(scanner.count_terminators(b"222 body\r\npayload\r"), 0);
-        assert_eq!(scanner.count_terminators(b"\n.\r"), 0);
-        assert_eq!(scanner.count_terminators(b"\n220 article\r\n.\r\n"), 2);
+        assert_eq!(
+            framer.count_completed_responses(b"222 body\r\npayload\r"),
+            0
+        );
+        assert_eq!(framer.count_completed_responses(b"\n.\r"), 0);
+        assert_eq!(
+            framer.count_completed_responses(b"\n220 article\r\n.\r\n"),
+            2
+        );
     }
 
     #[test]
-    fn multiline_scanner_counts_packed_responses_in_one_pass() {
-        let mut scanner = MultilineScanner::default();
+    fn multiline_framer_surfaces_completed_chunk_ranges() {
+        let mut framer = MultilineResponseFramer::default();
+        let mut ranges = Vec::new();
+
+        framer.for_each_completed_range(b"222 body\r\npayload\r", |range| ranges.push(range));
+        assert!(ranges.is_empty());
+
+        framer.for_each_completed_range(b"\n.\r\n220 article\r\npayload\r\n.\r\n", |range| {
+            ranges.push(range);
+        });
+        assert_eq!(
+            ranges,
+            vec![
+                ResponseChunkRange {
+                    start: 0,
+                    end: 4,
+                    started_before_chunk: true
+                },
+                ResponseChunkRange {
+                    start: 4,
+                    end: 29,
+                    started_before_chunk: false
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn multiline_framer_counts_packed_responses_in_one_pass() {
+        let mut framer = MultilineResponseFramer::default();
 
         assert_eq!(
-            scanner.count_terminators(
+            framer.count_completed_responses(
                 b"222 body follows\r\npayload\r\n.\r\n220 article follows\r\npayload\r\n.\r\n"
             ),
             2
         );
-        assert_eq!(scanner.count_terminators(b".\r\n"), 0);
+        assert_eq!(framer.count_completed_responses(b".\r\n"), 0);
     }
 
     #[test]
-    fn in_chunk_terminator_counter_rejects_plain_dots() {
-        assert_eq!(
-            count_in_chunk_terminators(b"line.with.dots\r\nnot done\r\n"),
-            (0, 0)
-        );
+    fn chunk_terminator_scan_rejects_plain_dots() {
+        let mut ends = Vec::new();
+        scan_chunk_terminator_ends(b"line.with.dots\r\nnot done\r\n", |end| ends.push(end));
+        assert!(ends.is_empty());
 
-        assert_eq!(
-            count_in_chunk_terminators(b"one\r\n.\r\ntwo\r\n..\r\nthree\r\n.\r\npartial\r\n.\r"),
-            (2, 27)
+        scan_chunk_terminator_ends(
+            b"one\r\n.\r\ntwo\r\n..\r\nthree\r\n.\r\npartial\r\n.\r",
+            |end| ends.push(end),
         );
+        assert_eq!(ends, vec![8, 27]);
     }
 }

@@ -1,6 +1,4 @@
-//! Tail buffer for tracking the last few bytes of streamed data.
-//!
-//! Kept as the single terminator detector for streamed multiline NNTP responses.
+//! Tail buffer and terminator helpers for multiline NNTP responses.
 
 pub const TERMINATOR_TAIL_SIZE: usize = 4;
 
@@ -116,9 +114,22 @@ impl TailBuffer {
 /// Returns the position after the terminator, or None if not found.
 #[inline]
 fn find_terminator_end(data: &[u8]) -> Option<usize> {
-    const TERMINATOR: &[u8; 5] = b"\r\n.\r\n";
+    memchr::memmem::find(data, crate::TERMINATOR).map(|start| start + crate::TERMINATOR.len())
+}
 
-    memchr::memmem::find(data, TERMINATOR).map(|start| start + TERMINATOR.len())
+/// Find the content end for a complete multiline response frame.
+///
+/// For `body\r\n.\r\n`, this returns the index after `body\r\n`.
+/// For a response whose content is empty and starts directly with `.\r\n`,
+/// this returns `start`.
+#[inline]
+pub(crate) fn find_terminator_content_end(data: &[u8], start: usize) -> Option<usize> {
+    let slice = data.get(start..)?;
+    if slice.starts_with(b".\r\n") {
+        return Some(start);
+    }
+
+    find_terminator_end(slice).map(|end| start + end - 3)
 }
 
 /// Find spanning terminator across boundary between tail and current chunk.
@@ -235,5 +246,19 @@ mod tests {
         let mut tail = TailBuffer::default();
         tail.update(b"a\r\n.\r");
         assert_eq!(tail.find_spanning_terminator(b"\nx"), Some(1));
+    }
+
+    #[test]
+    fn terminator_content_end_handles_empty_and_non_empty_content() {
+        assert_eq!(find_terminator_content_end(b".\r\n", 0), Some(0));
+        assert_eq!(
+            find_terminator_content_end(b"body\r\n.\r\nnext", 0),
+            Some(b"body\r\n".len())
+        );
+        assert_eq!(
+            find_terminator_content_end(b"xxbody\r\n.\r\n", 2),
+            Some(2 + b"body\r\n".len())
+        );
+        assert_eq!(find_terminator_content_end(b"body", 0), None);
     }
 }
