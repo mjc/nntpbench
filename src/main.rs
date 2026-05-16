@@ -3,7 +3,10 @@
 use std::io;
 
 use clap::Parser;
-use nntpbench::{ClientArgs, ServerArgs, TypedFetchArgs, run_client, run_server, run_typed_fetch};
+use nntpbench::{
+    ClientArgs, ServerArgs, TypedClientArgs, TypedFetchArgs, run_client, run_server,
+    run_typed_client, run_typed_fetch,
+};
 use tokio::runtime::{Builder, Runtime};
 
 #[derive(Debug, Parser)]
@@ -21,6 +24,9 @@ enum Command {
     /// Send one typed ARTICLE/BODY request and print the raw response.
     Fetch(TypedFetchArgs),
 
+    /// Run the typed request/future benchmark client.
+    TypedClient(TypedClientArgs),
+
     /// Run the mock NNTP server.
     Server(ServerArgs),
 }
@@ -32,6 +38,7 @@ fn main() -> io::Result<()> {
     match args.command {
         Command::Client(args) => build_runtime(args.threads)?.block_on(run_client(args)),
         Command::Fetch(args) => build_runtime(args.threads)?.block_on(run_typed_fetch(args)),
+        Command::TypedClient(args) => build_runtime(args.threads)?.block_on(run_typed_client(args)),
         Command::Server(args) => build_runtime(args.threads)?.block_on(run_server(args)),
     }
 }
