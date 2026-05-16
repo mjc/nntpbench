@@ -46,20 +46,8 @@
         rustc = rustToolchain;
       };
 
-      package = rustPlatform.buildRustPackage {
-        pname = cargoToml.package.name;
-        version = cargoToml.package.version;
-        src = ./.;
-
-        cargoLock.lockFile = ./Cargo.lock;
-        cargoBuildFlags = ["--bin" cargoToml.package.name];
-
-        meta = with pkgs.lib; {
-          description = "Mock NNTP benchmark server and client";
-          license = licenses.mit;
-          mainProgram = cargoToml.package.name;
-          platforms = platforms.unix;
-        };
+      package = pkgs.callPackage ./nix/package.nix {
+        inherit cargoToml rustPlatform;
       };
     in {
       apps.default = {
