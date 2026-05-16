@@ -896,12 +896,12 @@ pub async fn serve_session(
 
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn serve_session_inner(
-    stream: TcpStream,
+    mut stream: TcpStream,
     _peer_addr: SocketAddr,
     config: Arc<ServerConfig>,
     session_stats: &mut SessionStats,
 ) -> io::Result<()> {
-    let (reader, mut writer) = stream.into_split();
+    let (reader, mut writer) = stream.split();
     let mut reader = BufReader::with_capacity(SERVER_READER_CAPACITY, reader);
     let max_pipeline_depth = config.max_pipeline_depth.min(MAX_SERVER_PIPELINE_DEPTH);
     let mut command_buf = Vec::with_capacity(MAX_COMMAND_LINE_BYTES);
