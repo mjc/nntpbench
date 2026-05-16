@@ -1598,11 +1598,13 @@ pub fn generate_body(target_bytes: usize) -> Box<[u8]> {
 
 fn body_payload(body: &[u8]) -> &[u8] {
     let header_end = memchr::memmem::find(body, CRLF).map_or(0, |idx| idx + CRLF.len());
-    &body[header_end..]
+    body[header_end..]
+        .strip_suffix(b".\r\n")
+        .unwrap_or(&body[header_end..])
 }
 
 const BODY_LINE: &[u8] =
-    b"This is synthetic NNTP article payload for throughput and latency benchmarking.\r\n";
+    b"This is synthetic NNTP article payload for throughput and latency benchmarking\r\n";
 
 fn append_repeated_payload(response: &mut Vec<u8>, line: &[u8], target_bytes: usize) {
     let target_before_dot_line = target_bytes.saturating_sub(b".\r\n".len());
@@ -2033,6 +2035,18 @@ mod tests {
     }
 
     #[test]
+    fn generated_multiline_payload_avoids_false_dot_candidates() {
+        let body = generate_body(4096);
+        let body_content = body_payload(&body);
+        assert!(!body_content.contains(&b'.'));
+
+        let article = generate_article(8192, &body);
+        let header_end = memchr::memmem::find(&article, b"\r\n\r\n").unwrap() + b"\r\n\r\n".len();
+        let article_content = article[header_end..].strip_suffix(b".\r\n").unwrap();
+        assert!(!article_content.contains(&b'.'));
+    }
+
+    #[test]
     fn generated_responses_are_near_target_size() {
         let body = generate_body(4096);
         let article = generate_article(8192, &body);
@@ -2065,6 +2079,10 @@ mod tests {
         assert_eq!(
             body_payload(b"payload-without-crlf"),
             b"payload-without-crlf"
+        );
+        assert_eq!(
+            body_payload(b"222 body follows\r\npayload\r\n.\r\n"),
+            b"payload\r\n"
         );
     }
 
