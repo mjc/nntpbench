@@ -28,6 +28,10 @@ harness = false
 name = "server_callgrind"
 harness = false
 
+[[bench]]
+name = "typed_client_roundtrip"
+harness = false
+
 [profile.release]
 debug = false
 strip = true
