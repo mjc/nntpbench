@@ -38,6 +38,9 @@ pub const TERMINATOR: &[u8] = b"\r\n.\r\n";
 pub const GREETING: &[u8] = b"201 nntpbench mock server ready\r\n";
 pub const MODE_READER_RESPONSE: &[u8] = b"201 posting not permitted\r\n";
 pub const DATE_RESPONSE: &[u8] = b"111 20260515120000\r\n";
+pub const HELP_RESPONSE: &[u8] =
+    b"100 help text follows\r\nCAPABILITIES\r\nDATE\r\nMODE-READER\r\nQUIT\r\n.\r\n";
+pub const QUIT_RESPONSE: &[u8] = b"205 closing connection\r\n";
 const MAX_COMMAND_LINE_BYTES: usize = 1024;
 const MAX_SERVER_PIPELINE_DEPTH: usize = 1024;
 const SERVER_READER_CAPACITY: usize = 256 * 1024;
@@ -361,9 +364,11 @@ pub enum TypedRequestKind {
     Body,
     Head,
     Stat,
+    Help,
     Capabilities,
     Date,
     ModeReader,
+    Quit,
 }
 
 #[derive(Debug)]
@@ -597,9 +602,11 @@ fn typed_fetch_request(args: &TypedFetchArgs) -> Result<Request<'static>, TypedC
         TypedRequestKind::Stat => {
             typed_fetch_message_id_request(args, |message_id| Request::stat(message_id))
         }
+        TypedRequestKind::Help => Ok(Request::help()),
         TypedRequestKind::Capabilities => Ok(Request::capabilities()),
         TypedRequestKind::Date => Ok(Request::date()),
         TypedRequestKind::ModeReader => Ok(Request::mode_reader()),
+        TypedRequestKind::Quit => Ok(Request::quit()),
     }
 }
 
@@ -1677,6 +1684,10 @@ where
             .await?;
             Ok(false)
         }
+        RequestKind::Help => {
+            write_response(writer, pending_write, HELP_RESPONSE, session_stats).await?;
+            Ok(false)
+        }
         RequestKind::Date => {
             write_response(writer, pending_write, DATE_RESPONSE, session_stats).await?;
             Ok(false)
@@ -1686,13 +1697,7 @@ where
             Ok(false)
         }
         RequestKind::Quit => {
-            write_response(
-                writer,
-                pending_write,
-                b"205 closing connection\r\n",
-                session_stats,
-            )
-            .await?;
+            write_response(writer, pending_write, QUIT_RESPONSE, session_stats).await?;
             Ok(true)
         }
         _ => {
@@ -1808,9 +1813,10 @@ pub fn process_command_to_buffer(
             config.body_response()
         }
         RequestKind::Capabilities => b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n",
+        RequestKind::Help => HELP_RESPONSE,
         RequestKind::Date => DATE_RESPONSE,
         RequestKind::ModeReader => MODE_READER_RESPONSE,
-        RequestKind::Quit => b"205 closing connection\r\n",
+        RequestKind::Quit => QUIT_RESPONSE,
         _ => b"500 unknown command\r\n",
     };
 
@@ -3534,27 +3540,47 @@ mod tests {
 
             let mut request = [0_u8; 128];
             let read = first.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"CAPABILITIES\r\n");
-            first
-                .write_all(b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n")
-                .await
-                .unwrap();
+            assert_eq!(&request[..read], b"HELP\r\n");
+            first.write_all(HELP_RESPONSE).await.unwrap();
 
             let (mut second, _) = listener.accept().await.unwrap();
             second.write_all(b"201 fetch ready\r\n").await.unwrap();
             let read = second.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"DATE\r\n");
-            second.write_all(b"111 20260515120000\r\n").await.unwrap();
+            assert_eq!(&request[..read], b"CAPABILITIES\r\n");
+            second
+                .write_all(b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n")
+                .await
+                .unwrap();
 
             let (mut third, _) = listener.accept().await.unwrap();
             third.write_all(b"201 fetch ready\r\n").await.unwrap();
             let read = third.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"DATE\r\n");
+            third.write_all(b"111 20260515120000\r\n").await.unwrap();
+
+            let (mut fourth, _) = listener.accept().await.unwrap();
+            fourth.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = fourth.read(&mut request).await.unwrap();
             assert_eq!(&request[..read], b"MODE READER\r\n");
-            third
+            fourth
                 .write_all(b"201 posting not permitted\r\n")
                 .await
                 .unwrap();
+
+            let (mut fifth, _) = listener.accept().await.unwrap();
+            fifth.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = fifth.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"QUIT\r\n");
+            fifth.write_all(QUIT_RESPONSE).await.unwrap();
         });
+
+        let mut help_args = test_typed_fetch_args();
+        help_args.connect = addr;
+        help_args.request = TypedRequestKind::Help;
+        help_args.message_id = None;
+        let help = fetch_typed_response(&help_args).await.unwrap();
+        assert_eq!(help.kind(), RequestKind::Help);
+        assert_eq!(help.status().as_u16(), 100);
 
         let mut capabilities_args = test_typed_fetch_args();
         capabilities_args.connect = addr;
@@ -3579,6 +3605,14 @@ mod tests {
         let mode_reader = fetch_typed_response(&mode_reader_args).await.unwrap();
         assert_eq!(mode_reader.kind(), RequestKind::ModeReader);
         assert_eq!(mode_reader.status().as_u16(), 201);
+
+        let mut quit_args = test_typed_fetch_args();
+        quit_args.connect = addr;
+        quit_args.request = TypedRequestKind::Quit;
+        quit_args.message_id = None;
+        let quit = fetch_typed_response(&quit_args).await.unwrap();
+        assert_eq!(quit.kind(), RequestKind::Quit);
+        assert_eq!(quit.status().as_u16(), 205);
 
         server.await.unwrap();
     }
@@ -3754,6 +3788,14 @@ mod tests {
             .concat()
         );
         assert_eq!(stats.snapshot().commands, 3);
+    }
+
+    #[tokio::test]
+    async fn serve_session_supports_help_and_quit_commands() {
+        let (output, stats) = run_session_with_input(test_config(), b"HELP\r\nQUIT\r\n").await;
+
+        assert_eq!(output, [GREETING, HELP_RESPONSE, QUIT_RESPONSE].concat());
+        assert_eq!(stats.snapshot().commands, 2);
     }
 
     #[tokio::test]
@@ -3943,6 +3985,12 @@ mod tests {
         let mut output = Vec::new();
 
         assert!(!process_command_to_buffer(
+            RequestKind::Help,
+            &config,
+            &stats,
+            &mut output,
+        ));
+        assert!(!process_command_to_buffer(
             RequestKind::ModeReader,
             &config,
             &stats,
@@ -3955,8 +4003,11 @@ mod tests {
             &mut output,
         ));
 
-        assert_eq!(output, [MODE_READER_RESPONSE, DATE_RESPONSE].concat());
-        assert_eq!(stats.snapshot().commands, 2);
+        assert_eq!(
+            output,
+            [HELP_RESPONSE, MODE_READER_RESPONSE, DATE_RESPONSE].concat()
+        );
+        assert_eq!(stats.snapshot().commands, 3);
     }
 
     #[test]

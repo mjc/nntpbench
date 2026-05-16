@@ -166,6 +166,16 @@ impl Client {
     }
 
     /// Send a CAPABILITIES request and return the owned raw response frame.
+    pub async fn help(&self) -> Result<OwnedResponse, TypedClientError> {
+        self.execute_raw(Request::help()).await
+    }
+
+    /// Send a HELP request and return the completed raw request/response pair.
+    pub async fn help_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+        self.execute_raw_exchange(Request::help()).await
+    }
+
+    /// Send a CAPABILITIES request and return the owned raw response frame.
     pub async fn capabilities(&self) -> Result<OwnedResponse, TypedClientError> {
         self.execute_raw(Request::capabilities()).await
     }
@@ -193,6 +203,16 @@ impl Client {
     /// Send a MODE READER request and return the completed raw request/response pair.
     pub async fn mode_reader_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
         self.execute_raw_exchange(Request::mode_reader()).await
+    }
+
+    /// Send a QUIT request and return the owned raw response frame.
+    pub async fn quit(&self) -> Result<OwnedResponse, TypedClientError> {
+        self.execute_raw(Request::quit()).await
+    }
+
+    /// Send a QUIT request and return the completed raw request/response pair.
+    pub async fn quit_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+        self.execute_raw_exchange(Request::quit()).await
     }
 
     /// Access the lower-level raw-frame connection.
@@ -333,6 +353,16 @@ impl TypedClientConnection {
     }
 
     /// Send a CAPABILITIES request and return the owned response frame.
+    pub async fn help(&self) -> Result<OwnedResponse, TypedClientError> {
+        self.execute(Request::Help).await
+    }
+
+    /// Send a HELP request and return the completed request/response pair.
+    pub async fn help_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+        self.execute_exchange(Request::Help).await
+    }
+
+    /// Send a CAPABILITIES request and return the owned response frame.
     pub async fn capabilities(&self) -> Result<OwnedResponse, TypedClientError> {
         self.execute(Request::Capabilities).await
     }
@@ -360,6 +390,16 @@ impl TypedClientConnection {
     /// Send a MODE READER request and return the completed request/response pair.
     pub async fn mode_reader_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
         self.execute_exchange(Request::ModeReader).await
+    }
+
+    /// Send a QUIT request and return the owned response frame.
+    pub async fn quit(&self) -> Result<OwnedResponse, TypedClientError> {
+        self.execute(Request::Quit).await
+    }
+
+    /// Send a QUIT request and return the completed request/response pair.
+    pub async fn quit_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+        self.execute_exchange(Request::Quit).await
     }
 
     /// Execute a typed request on this connection.
@@ -1246,7 +1286,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn typed_connection_fetches_capabilities_date_and_mode_reader_frames() {
+    async fn typed_connection_fetches_help_capabilities_date_mode_reader_and_quit_frames() {
         let listener = crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -1254,6 +1294,10 @@ mod tests {
             stream.write_all(b"201 typed ready\r\n").await.unwrap();
 
             let mut request = [0_u8; 128];
+            let read = stream.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"HELP\r\n");
+            stream.write_all(crate::HELP_RESPONSE).await.unwrap();
+
             let read = stream.read(&mut request).await.unwrap();
             assert_eq!(&request[..read], b"CAPABILITIES\r\n");
             stream
@@ -1271,12 +1315,22 @@ mod tests {
                 .write_all(b"201 posting not permitted\r\n")
                 .await
                 .unwrap();
+
+            let read = stream.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"QUIT\r\n");
+            stream.write_all(crate::QUIT_RESPONSE).await.unwrap();
         });
 
         let connection = TypedClientConnection::connect(addr).await.unwrap();
+        let help = connection.help().await.unwrap();
         let capabilities = connection.capabilities().await.unwrap();
         let date = connection.date().await.unwrap();
         let mode_reader = connection.mode_reader().await.unwrap();
+        let quit = connection.quit().await.unwrap();
+
+        assert_eq!(help.kind(), RequestKind::Help);
+        assert_eq!(help.status().as_u16(), 100);
+        assert_eq!(help.as_bytes(), crate::HELP_RESPONSE);
 
         assert_eq!(capabilities.kind(), RequestKind::Capabilities);
         assert_eq!(capabilities.status().as_u16(), 101);
@@ -1292,6 +1346,10 @@ mod tests {
         assert_eq!(mode_reader.kind(), RequestKind::ModeReader);
         assert_eq!(mode_reader.status().as_u16(), 201);
         assert_eq!(mode_reader.as_bytes(), b"201 posting not permitted\r\n");
+
+        assert_eq!(quit.kind(), RequestKind::Quit);
+        assert_eq!(quit.status().as_u16(), 205);
+        assert_eq!(quit.as_bytes(), crate::QUIT_RESPONSE);
 
         server.await.unwrap();
     }
