@@ -194,6 +194,51 @@ fn validate_article_selector(value: &str) -> Result<(), InvalidArticleSelector> 
     Ok(())
 }
 
+/// Validated group name for GROUP/LISTGROUP requests.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct GroupName<'a>(Cow<'a, str>);
+
+impl<'a> GroupName<'a> {
+    /// Construct a borrowed group name after validation.
+    pub fn from_borrowed(value: &'a str) -> Result<Self, InvalidGroupName> {
+        validate_group_name(value)?;
+        Ok(Self(Cow::Borrowed(value)))
+    }
+
+    /// Construct an owned group name after validation.
+    pub fn from_owned(value: impl AsRef<str>) -> Result<GroupName<'static>, InvalidGroupName> {
+        let value = value.as_ref();
+        validate_group_name(value)?;
+        Ok(GroupName(Cow::Owned(value.to_owned())))
+    }
+
+    /// Borrow the validated string.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidGroupName;
+
+fn validate_group_name(value: &str) -> Result<(), InvalidGroupName> {
+    if value.is_empty()
+        || value.starts_with('.')
+        || value.ends_with('.')
+        || value.contains("..")
+        || value.bytes().any(|byte| {
+            byte.is_ascii_whitespace()
+                || byte.is_ascii_control()
+                || matches!(byte, b'<' | b'>' | b'*' | b'?' | b'[' | b']' | b'\\')
+        })
+    {
+        return Err(InvalidGroupName);
+    }
+
+    Ok(())
+}
+
 /// Typed request kind for the currently-supported command set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestKind {
@@ -266,6 +311,14 @@ pub enum Request<'a> {
     Stat {
         message_id: MessageId<'a>,
     },
+    Group {
+        group: GroupName<'a>,
+    },
+    ListGroup {
+        group: GroupName<'a>,
+    },
+    Last,
+    Next,
     Over {
         selector: ArticleSelector<'a>,
     },
@@ -297,6 +350,10 @@ impl<'a> Request<'a> {
             Self::Body { .. } => RequestKind::Body,
             Self::Head { .. } => RequestKind::Head,
             Self::Stat { .. } => RequestKind::Stat,
+            Self::Group { .. } => RequestKind::Group,
+            Self::ListGroup { .. } => RequestKind::ListGroup,
+            Self::Last => RequestKind::Last,
+            Self::Next => RequestKind::Next,
             Self::Over { .. } => RequestKind::Over,
             Self::Xover { .. } => RequestKind::Xover,
             Self::Hdr { .. } => RequestKind::Hdr,
@@ -317,6 +374,12 @@ impl<'a> Request<'a> {
             Self::Body { message_id } => write_request_wire(output, b"BODY ", message_id),
             Self::Head { message_id } => write_request_wire(output, b"HEAD ", message_id),
             Self::Stat { message_id } => write_request_wire(output, b"STAT ", message_id),
+            Self::Group { group } => write_one_arg_request_wire(output, b"GROUP ", group.as_str()),
+            Self::ListGroup { group } => {
+                write_one_arg_request_wire(output, b"LISTGROUP ", group.as_str())
+            }
+            Self::Last => write_simple_request_wire(output, b"LAST"),
+            Self::Next => write_simple_request_wire(output, b"NEXT"),
             Self::Over { selector } => {
                 write_one_arg_request_wire(output, b"OVER ", selector.as_str())
             }
@@ -346,7 +409,14 @@ impl<'a> Request<'a> {
             | Self::Body { message_id }
             | Self::Head { message_id }
             | Self::Stat { message_id } => Some(message_id),
-            Self::Over { .. } | Self::Xover { .. } | Self::Hdr { .. } | Self::Xhdr { .. } => None,
+            Self::Group { .. }
+            | Self::ListGroup { .. }
+            | Self::Last
+            | Self::Next
+            | Self::Over { .. }
+            | Self::Xover { .. }
+            | Self::Hdr { .. }
+            | Self::Xhdr { .. } => None,
             Self::List
             | Self::Help
             | Self::Capabilities
@@ -363,7 +433,22 @@ impl<'a> Request<'a> {
             Self::Hdr { header, selector } | Self::Xhdr { header, selector } => {
                 Some((header, selector))
             }
-            _ => None,
+            Self::Article { .. }
+            | Self::Body { .. }
+            | Self::Head { .. }
+            | Self::Stat { .. }
+            | Self::Group { .. }
+            | Self::ListGroup { .. }
+            | Self::Last
+            | Self::Next
+            | Self::Over { .. }
+            | Self::Xover { .. }
+            | Self::List
+            | Self::Help
+            | Self::Capabilities
+            | Self::Date
+            | Self::ModeReader
+            | Self::Quit => None,
         }
     }
 
@@ -372,7 +457,46 @@ impl<'a> Request<'a> {
     pub const fn overview_selector(&self) -> Option<&ArticleSelector<'a>> {
         match self {
             Self::Over { selector } | Self::Xover { selector } => Some(selector),
-            _ => None,
+            Self::Article { .. }
+            | Self::Body { .. }
+            | Self::Head { .. }
+            | Self::Stat { .. }
+            | Self::Group { .. }
+            | Self::ListGroup { .. }
+            | Self::Last
+            | Self::Next
+            | Self::Hdr { .. }
+            | Self::Xhdr { .. }
+            | Self::List
+            | Self::Help
+            | Self::Capabilities
+            | Self::Date
+            | Self::ModeReader
+            | Self::Quit => None,
+        }
+    }
+
+    /// Borrow the validated group name carried by this request, if any.
+    #[must_use]
+    pub const fn group_name(&self) -> Option<&GroupName<'a>> {
+        match self {
+            Self::Group { group } | Self::ListGroup { group } => Some(group),
+            Self::Article { .. }
+            | Self::Body { .. }
+            | Self::Head { .. }
+            | Self::Stat { .. }
+            | Self::Last
+            | Self::Next
+            | Self::Over { .. }
+            | Self::Xover { .. }
+            | Self::Hdr { .. }
+            | Self::Xhdr { .. }
+            | Self::List
+            | Self::Help
+            | Self::Capabilities
+            | Self::Date
+            | Self::ModeReader
+            | Self::Quit => None,
         }
     }
 }
@@ -404,6 +528,32 @@ impl Request<'static> {
         Ok(Self::Stat {
             message_id: MessageId::from_str_or_wrap(message_id)?,
         })
+    }
+
+    /// Build a GROUP request.
+    pub fn group(group: impl AsRef<str>) -> Result<Self, InvalidGroupName> {
+        Ok(Self::Group {
+            group: GroupName::from_owned(group)?,
+        })
+    }
+
+    /// Build a LISTGROUP request.
+    pub fn listgroup(group: impl AsRef<str>) -> Result<Self, InvalidGroupName> {
+        Ok(Self::ListGroup {
+            group: GroupName::from_owned(group)?,
+        })
+    }
+
+    /// Build a LAST request.
+    #[must_use]
+    pub const fn last() -> Self {
+        Self::Last
+    }
+
+    /// Build a NEXT request.
+    #[must_use]
+    pub const fn next() -> Self {
+        Self::Next
     }
 
     /// Build an OVER request.
@@ -819,14 +969,6 @@ mod tests {
             (b"XOVER 1-10".as_slice(), RequestKind::Xover),
             (b"HDR Subject 1-10".as_slice(), RequestKind::Hdr),
             (b"XHDR Subject 1-10".as_slice(), RequestKind::Xhdr),
-            (
-                b"NEWGROUPS 20260101 000000 GMT".as_slice(),
-                RequestKind::NewGroups,
-            ),
-            (
-                b"NEWNEWS * 20260101 000000 GMT".as_slice(),
-                RequestKind::NewNews,
-            ),
             (b"POST".as_slice(), RequestKind::Post),
             (b"IHAVE <a@b>".as_slice(), RequestKind::Ihave),
             (b"CHECK <a@b>".as_slice(), RequestKind::Check),
@@ -865,6 +1007,10 @@ mod tests {
         assert!(RequestKind::Article.expects_multiline_response(StatusCode(220)));
         assert!(RequestKind::Head.expects_multiline_response(StatusCode(221)));
         assert!(RequestKind::Body.expects_multiline_response(StatusCode(222)));
+        assert!(!RequestKind::Group.expects_multiline_response(StatusCode(211)));
+        assert!(RequestKind::ListGroup.expects_multiline_response(StatusCode(211)));
+        assert!(!RequestKind::Last.expects_multiline_response(StatusCode(223)));
+        assert!(!RequestKind::Next.expects_multiline_response(StatusCode(223)));
         assert!(RequestKind::List.expects_multiline_response(StatusCode(215)));
         assert!(RequestKind::Over.expects_multiline_response(StatusCode(224)));
         assert!(RequestKind::Xhdr.expects_multiline_response(StatusCode(225)));
@@ -889,6 +1035,14 @@ mod tests {
         let stat = Request::Stat {
             message_id: MessageId::from_borrowed("<g@h>").unwrap(),
         };
+        let group = Request::Group {
+            group: GroupName::from_borrowed("alt.test").unwrap(),
+        };
+        let listgroup = Request::ListGroup {
+            group: GroupName::from_borrowed("alt.test").unwrap(),
+        };
+        let last = Request::Last;
+        let next = Request::Next;
         let over = Request::Over {
             selector: ArticleSelector::from_borrowed("1-10").unwrap(),
         };
@@ -929,6 +1083,26 @@ mod tests {
         stat.write_wire_to(&mut wire);
         assert_eq!(stat.kind(), RequestKind::Stat);
         assert_eq!(wire, b"STAT <g@h>\r\n");
+
+        wire.clear();
+        group.write_wire_to(&mut wire);
+        assert_eq!(group.kind(), RequestKind::Group);
+        assert_eq!(wire, b"GROUP alt.test\r\n");
+
+        wire.clear();
+        listgroup.write_wire_to(&mut wire);
+        assert_eq!(listgroup.kind(), RequestKind::ListGroup);
+        assert_eq!(wire, b"LISTGROUP alt.test\r\n");
+
+        wire.clear();
+        last.write_wire_to(&mut wire);
+        assert_eq!(last.kind(), RequestKind::Last);
+        assert_eq!(wire, b"LAST\r\n");
+
+        wire.clear();
+        next.write_wire_to(&mut wire);
+        assert_eq!(next.kind(), RequestKind::Next);
+        assert_eq!(wire, b"NEXT\r\n");
 
         wire.clear();
         over.write_wire_to(&mut wire);
@@ -987,6 +1161,10 @@ mod tests {
         let body = Request::body("<c@d>").unwrap();
         let head = Request::head("e@f").unwrap();
         let stat = Request::stat("<g@h>").unwrap();
+        let group = Request::group("alt.test").unwrap();
+        let listgroup = Request::listgroup("alt.test").unwrap();
+        let last = Request::last();
+        let next = Request::next();
         let over = Request::over("1-10").unwrap();
         let xover = Request::xover("<g@h>").unwrap();
         let hdr = Request::hdr("Subject", "1-10").unwrap();
@@ -1006,6 +1184,17 @@ mod tests {
         assert_eq!(head.message_id().unwrap().as_str(), "<e@f>");
         assert_eq!(stat.kind(), RequestKind::Stat);
         assert_eq!(stat.message_id().unwrap().as_str(), "<g@h>");
+        assert_eq!(group.kind(), RequestKind::Group);
+        assert_eq!(group.group_name().map(GroupName::as_str), Some("alt.test"));
+        assert_eq!(listgroup.kind(), RequestKind::ListGroup);
+        assert_eq!(
+            listgroup.group_name().map(GroupName::as_str),
+            Some("alt.test")
+        );
+        assert_eq!(last.kind(), RequestKind::Last);
+        assert!(last.group_name().is_none());
+        assert_eq!(next.kind(), RequestKind::Next);
+        assert!(next.group_name().is_none());
         assert_eq!(over.kind(), RequestKind::Over);
         assert_eq!(
             over.overview_selector().map(ArticleSelector::as_str),
@@ -1041,6 +1230,8 @@ mod tests {
         assert_eq!(quit.kind(), RequestKind::Quit);
         assert!(quit.message_id().is_none());
         assert!(Request::article("<bad id>").is_err());
+        assert!(Request::group("").is_err());
+        assert!(Request::listgroup("<a@b>").is_err());
         assert!(Request::over("1 2").is_err());
         assert!(Request::xover("").is_err());
         assert!(Request::hdr("Bad Header", "1").is_err());
@@ -1054,6 +1245,10 @@ mod tests {
             Request::body("c@d").unwrap(),
             Request::head("e@f").unwrap(),
             Request::stat("g@h").unwrap(),
+            Request::group("alt.test").unwrap(),
+            Request::listgroup("alt.test").unwrap(),
+            Request::last(),
+            Request::next(),
             Request::over("1-10").unwrap(),
             Request::xover("<i@j>").unwrap(),
             Request::hdr("Subject", "1-10").unwrap(),

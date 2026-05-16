@@ -25,8 +25,8 @@ pub mod tail_buffer;
 pub mod typed_client;
 
 pub use protocol::{
-    Article, ArticleNumber, ArticleParseError, ArticleSelector, HeaderIter, HeaderName, Headers,
-    MessageId, Request, RequestKind, RequestLine, StatusCode,
+    Article, ArticleNumber, ArticleParseError, ArticleSelector, GroupName, HeaderIter, HeaderName,
+    Headers, MessageId, Request, RequestKind, RequestLine, StatusCode,
 };
 pub use typed_client::{
     Client, OwnedArticle, OwnedArticleExchange, OwnedExchange, OwnedResponse,
@@ -40,6 +40,12 @@ pub const MODE_READER_RESPONSE: &[u8] = b"201 posting not permitted\r\n";
 pub const DATE_RESPONSE: &[u8] = b"111 20260515120000\r\n";
 pub const LIST_RESPONSE: &[u8] =
     b"215 list of newsgroups follows\r\ncomp.lang.rust 0000000001 0000000001 y\r\n.\r\n";
+pub const GROUP_RESPONSE: &[u8] = b"211 3 1 3 alt.test\r\n";
+pub const LISTGROUP_RESPONSE: &[u8] = b"211 3 1 3 alt.test\r\n1\r\n2\r\n3\r\n.\r\n";
+pub const LAST_RESPONSE: &[u8] =
+    b"223 1 <prev@alt.test> article retrieved - request text separately\r\n";
+pub const NEXT_RESPONSE: &[u8] =
+    b"223 2 <next@alt.test> article retrieved - request text separately\r\n";
 pub const OVER_RESPONSE: &[u8] = b"224 Overview information follows\r\n1\tSubject one\tone@example.com\tFri, 16 May 2026 12:00:00 +0000\t<one@example.com>\t\t123\t4\r\n.\r\n";
 pub const XOVER_RESPONSE: &[u8] = b"224 Overview information follows\r\n2\tSubject two\ttwo@example.com\tFri, 16 May 2026 12:00:01 +0000\t<two@example.com>\t<ref@example.com>\t456\t8\r\n.\r\n";
 pub const HDR_RESPONSE: &[u8] =
@@ -345,6 +351,10 @@ pub struct TypedFetchArgs {
     #[arg(long)]
     pub header: Option<String>,
 
+    /// Group name for GROUP/LISTGROUP requests.
+    #[arg(long)]
+    pub group: Option<String>,
+
     /// Article selector for OVER/XOVER/HDR/XHDR requests, such as 1, 1-10, or <message@id>.
     #[arg(long)]
     pub selector: Option<String>,
@@ -380,6 +390,10 @@ pub enum TypedRequestKind {
     Body,
     Head,
     Stat,
+    Group,
+    Listgroup,
+    Last,
+    Next,
     Over,
     Xover,
     Hdr,
@@ -623,6 +637,12 @@ fn typed_fetch_request(args: &TypedFetchArgs) -> Result<Request<'static>, TypedC
         TypedRequestKind::Stat => {
             typed_fetch_message_id_request(args, |message_id| Request::stat(message_id))
         }
+        TypedRequestKind::Group => typed_fetch_group_request(args, |group| Request::group(group)),
+        TypedRequestKind::Listgroup => {
+            typed_fetch_group_request(args, |group| Request::listgroup(group))
+        }
+        TypedRequestKind::Last => Ok(Request::last()),
+        TypedRequestKind::Next => Ok(Request::next()),
         TypedRequestKind::Over => {
             typed_fetch_selector_request(args, |selector| Request::over(selector))
         }
@@ -674,6 +694,20 @@ where
         .as_deref()
         .ok_or(TypedClientError::MissingArticleSelector)?;
     build(header, selector).map_err(TypedClientError::from)
+}
+
+fn typed_fetch_group_request<F>(
+    args: &TypedFetchArgs,
+    build: F,
+) -> Result<Request<'static>, TypedClientError>
+where
+    F: FnOnce(&str) -> Result<Request<'static>, crate::protocol::InvalidGroupName>,
+{
+    let group = args
+        .group
+        .as_deref()
+        .ok_or(TypedClientError::MissingGroupName)?;
+    build(group).map_err(|_| TypedClientError::InvalidGroupName)
 }
 
 fn typed_fetch_selector_request<F>(
@@ -1740,6 +1774,22 @@ where
             write_response(writer, pending_write, config.body_response(), session_stats).await?;
             Ok(false)
         }
+        RequestKind::Group => {
+            write_response(writer, pending_write, GROUP_RESPONSE, session_stats).await?;
+            Ok(false)
+        }
+        RequestKind::ListGroup => {
+            write_response(writer, pending_write, LISTGROUP_RESPONSE, session_stats).await?;
+            Ok(false)
+        }
+        RequestKind::Last => {
+            write_response(writer, pending_write, LAST_RESPONSE, session_stats).await?;
+            Ok(false)
+        }
+        RequestKind::Next => {
+            write_response(writer, pending_write, NEXT_RESPONSE, session_stats).await?;
+            Ok(false)
+        }
         RequestKind::Over => {
             write_response(writer, pending_write, OVER_RESPONSE, session_stats).await?;
             Ok(false)
@@ -1898,6 +1948,10 @@ pub fn process_command_to_buffer(
             stats.body_requests.fetch_add(1, Ordering::Relaxed);
             config.body_response()
         }
+        RequestKind::Group => GROUP_RESPONSE,
+        RequestKind::ListGroup => LISTGROUP_RESPONSE,
+        RequestKind::Last => LAST_RESPONSE,
+        RequestKind::Next => NEXT_RESPONSE,
         RequestKind::Over => OVER_RESPONSE,
         RequestKind::Xover => XOVER_RESPONSE,
         RequestKind::Hdr => HDR_RESPONSE,
@@ -2368,6 +2422,7 @@ mod tests {
             request: TypedRequestKind::Article,
             message_id: Some("bench@test".to_string()),
             header: None,
+            group: None,
             selector: None,
             threads: 1,
             read_buffer_bytes: CLIENT_READER_CAPACITY,
@@ -3809,6 +3864,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fetch_typed_response_supports_group_navigation_request_kinds() {
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            first.write_all(b"201 fetch ready\r\n").await.unwrap();
+
+            let mut request = [0_u8; 128];
+            let read = first.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"GROUP alt.test\r\n");
+            first.write_all(GROUP_RESPONSE).await.unwrap();
+
+            let (mut second, _) = listener.accept().await.unwrap();
+            second.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = second.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"LISTGROUP alt.test\r\n");
+            second.write_all(LISTGROUP_RESPONSE).await.unwrap();
+
+            let (mut third, _) = listener.accept().await.unwrap();
+            third.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = third.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"LAST\r\n");
+            third.write_all(LAST_RESPONSE).await.unwrap();
+
+            let (mut fourth, _) = listener.accept().await.unwrap();
+            fourth.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = fourth.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"NEXT\r\n");
+            fourth.write_all(NEXT_RESPONSE).await.unwrap();
+        });
+
+        let mut group_args = test_typed_fetch_args();
+        group_args.connect = addr;
+        group_args.request = TypedRequestKind::Group;
+        group_args.message_id = None;
+        group_args.group = Some("alt.test".to_string());
+        let group = fetch_typed_response(&group_args).await.unwrap();
+        assert_eq!(group.kind(), RequestKind::Group);
+        assert_eq!(group.status().as_u16(), 211);
+
+        let mut listgroup_args = test_typed_fetch_args();
+        listgroup_args.connect = addr;
+        listgroup_args.request = TypedRequestKind::Listgroup;
+        listgroup_args.message_id = None;
+        listgroup_args.group = Some("alt.test".to_string());
+        let listgroup = fetch_typed_response(&listgroup_args).await.unwrap();
+        assert_eq!(listgroup.kind(), RequestKind::ListGroup);
+        assert_eq!(listgroup.status().as_u16(), 211);
+
+        let mut last_args = test_typed_fetch_args();
+        last_args.connect = addr;
+        last_args.request = TypedRequestKind::Last;
+        last_args.message_id = None;
+        let last = fetch_typed_response(&last_args).await.unwrap();
+        assert_eq!(last.kind(), RequestKind::Last);
+        assert_eq!(last.status().as_u16(), 223);
+
+        let mut next_args = test_typed_fetch_args();
+        next_args.connect = addr;
+        next_args.request = TypedRequestKind::Next;
+        next_args.message_id = None;
+        let next = fetch_typed_response(&next_args).await.unwrap();
+        assert_eq!(next.kind(), RequestKind::Next);
+        assert_eq!(next.status().as_u16(), 223);
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn fetch_typed_response_rejects_missing_message_id_for_article_style_requests() {
         let mut args = test_typed_fetch_args();
         args.message_id = None;
@@ -3847,6 +3971,19 @@ mod tests {
         assert!(matches!(
             fetch_typed_response(&args).await.unwrap_err(),
             TypedClientError::MissingArticleSelector
+        ));
+    }
+
+    #[tokio::test]
+    async fn fetch_typed_response_rejects_missing_group_argument() {
+        let mut args = test_typed_fetch_args();
+        args.request = TypedRequestKind::Group;
+        args.message_id = None;
+        args.group = None;
+
+        assert!(matches!(
+            fetch_typed_response(&args).await.unwrap_err(),
+            TypedClientError::MissingGroupName
         ));
     }
 
@@ -4033,6 +4170,28 @@ mod tests {
 
         assert_eq!(output, [GREETING, OVER_RESPONSE, XOVER_RESPONSE].concat());
         assert_eq!(stats.snapshot().commands, 2);
+    }
+
+    #[tokio::test]
+    async fn serve_session_supports_group_navigation_commands() {
+        let (output, stats) = run_session_with_input(
+            test_config(),
+            b"GROUP alt.test\r\nLISTGROUP alt.test\r\nLAST\r\nNEXT\r\n",
+        )
+        .await;
+
+        assert_eq!(
+            output,
+            [
+                GREETING,
+                GROUP_RESPONSE,
+                LISTGROUP_RESPONSE,
+                LAST_RESPONSE,
+                NEXT_RESPONSE,
+            ]
+            .concat()
+        );
+        assert_eq!(stats.snapshot().commands, 4);
     }
 
     #[tokio::test]
@@ -4280,6 +4439,50 @@ mod tests {
 
         assert_eq!(output, [OVER_RESPONSE, XOVER_RESPONSE].concat());
         assert_eq!(stats.snapshot().commands, 2);
+    }
+
+    #[test]
+    fn process_command_to_buffer_supports_group_navigation_commands() {
+        let config = test_config();
+        let stats = Stats::new();
+        let mut output = Vec::new();
+
+        assert!(!process_command_to_buffer(
+            RequestKind::Group,
+            &config,
+            &stats,
+            &mut output,
+        ));
+        assert!(!process_command_to_buffer(
+            RequestKind::ListGroup,
+            &config,
+            &stats,
+            &mut output,
+        ));
+        assert!(!process_command_to_buffer(
+            RequestKind::Last,
+            &config,
+            &stats,
+            &mut output,
+        ));
+        assert!(!process_command_to_buffer(
+            RequestKind::Next,
+            &config,
+            &stats,
+            &mut output,
+        ));
+
+        assert_eq!(
+            output,
+            [
+                GROUP_RESPONSE,
+                LISTGROUP_RESPONSE,
+                LAST_RESPONSE,
+                NEXT_RESPONSE
+            ]
+            .concat()
+        );
+        assert_eq!(stats.snapshot().commands, 4);
     }
 
     #[test]

@@ -12,7 +12,8 @@ use tokio::task::JoinHandle;
 use crate::protocol::Request;
 use crate::tail_buffer::{TailBuffer, TerminatorStatus};
 use crate::{
-    Article, ArticleParseError, ArticleSelector, HeaderName, MessageId, RequestKind, StatusCode,
+    Article, ArticleParseError, ArticleSelector, GroupName, HeaderName, MessageId, RequestKind,
+    StatusCode,
 };
 
 /// Options for the typed one-connection client prototype.
@@ -165,6 +166,59 @@ impl Client {
     ) -> Result<OwnedArticleExchange, TypedClientError> {
         let request = Request::stat(message_id).map_err(|_| TypedClientError::InvalidMessageId)?;
         self.execute_exchange(request).await
+    }
+
+    /// Send a GROUP request and return the owned raw response frame.
+    pub async fn group(&self, group: impl AsRef<str>) -> Result<OwnedResponse, TypedClientError> {
+        let request = Request::group(group).map_err(|_| TypedClientError::InvalidGroupName)?;
+        self.execute_raw(request).await
+    }
+
+    /// Send a GROUP request and return the completed raw request/response pair.
+    pub async fn group_exchange(
+        &self,
+        group: impl AsRef<str>,
+    ) -> Result<OwnedExchange, TypedClientError> {
+        let request = Request::group(group).map_err(|_| TypedClientError::InvalidGroupName)?;
+        self.execute_raw_exchange(request).await
+    }
+
+    /// Send a LISTGROUP request and return the owned raw response frame.
+    pub async fn listgroup(
+        &self,
+        group: impl AsRef<str>,
+    ) -> Result<OwnedResponse, TypedClientError> {
+        let request = Request::listgroup(group).map_err(|_| TypedClientError::InvalidGroupName)?;
+        self.execute_raw(request).await
+    }
+
+    /// Send a LISTGROUP request and return the completed raw request/response pair.
+    pub async fn listgroup_exchange(
+        &self,
+        group: impl AsRef<str>,
+    ) -> Result<OwnedExchange, TypedClientError> {
+        let request = Request::listgroup(group).map_err(|_| TypedClientError::InvalidGroupName)?;
+        self.execute_raw_exchange(request).await
+    }
+
+    /// Send a LAST request and return the owned raw response frame.
+    pub async fn last(&self) -> Result<OwnedResponse, TypedClientError> {
+        self.execute_raw(Request::last()).await
+    }
+
+    /// Send a LAST request and return the completed raw request/response pair.
+    pub async fn last_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+        self.execute_raw_exchange(Request::last()).await
+    }
+
+    /// Send a NEXT request and return the owned raw response frame.
+    pub async fn next(&self) -> Result<OwnedResponse, TypedClientError> {
+        self.execute_raw(Request::next()).await
+    }
+
+    /// Send a NEXT request and return the completed raw request/response pair.
+    pub async fn next_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+        self.execute_raw_exchange(Request::next()).await
     }
 
     /// Send an OVER request and return the owned raw response frame.
@@ -436,6 +490,58 @@ impl TypedClientConnection {
         message_id: MessageId<'static>,
     ) -> Result<OwnedExchange, TypedClientError> {
         self.execute_exchange(Request::Stat { message_id }).await
+    }
+
+    /// Send a GROUP request and return the owned response frame.
+    pub async fn group(
+        &self,
+        group: GroupName<'static>,
+    ) -> Result<OwnedResponse, TypedClientError> {
+        self.execute(Request::Group { group }).await
+    }
+
+    /// Send a GROUP request and return the completed request/response pair.
+    pub async fn group_exchange(
+        &self,
+        group: GroupName<'static>,
+    ) -> Result<OwnedExchange, TypedClientError> {
+        self.execute_exchange(Request::Group { group }).await
+    }
+
+    /// Send a LISTGROUP request and return the owned response frame.
+    pub async fn listgroup(
+        &self,
+        group: GroupName<'static>,
+    ) -> Result<OwnedResponse, TypedClientError> {
+        self.execute(Request::ListGroup { group }).await
+    }
+
+    /// Send a LISTGROUP request and return the completed request/response pair.
+    pub async fn listgroup_exchange(
+        &self,
+        group: GroupName<'static>,
+    ) -> Result<OwnedExchange, TypedClientError> {
+        self.execute_exchange(Request::ListGroup { group }).await
+    }
+
+    /// Send a LAST request and return the owned response frame.
+    pub async fn last(&self) -> Result<OwnedResponse, TypedClientError> {
+        self.execute(Request::Last).await
+    }
+
+    /// Send a LAST request and return the completed request/response pair.
+    pub async fn last_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+        self.execute_exchange(Request::Last).await
+    }
+
+    /// Send a NEXT request and return the owned response frame.
+    pub async fn next(&self) -> Result<OwnedResponse, TypedClientError> {
+        self.execute(Request::Next).await
+    }
+
+    /// Send a NEXT request and return the completed request/response pair.
+    pub async fn next_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+        self.execute_exchange(Request::Next).await
     }
 
     /// Send an OVER request and return the owned response frame.
@@ -783,6 +889,8 @@ pub enum TypedClientError {
     InvalidStatusLine,
     InvalidMessageId,
     MissingMessageId,
+    InvalidGroupName,
+    MissingGroupName,
     InvalidHeaderName,
     MissingHeaderName,
     InvalidArticleSelector,
@@ -802,6 +910,8 @@ impl fmt::Display for TypedClientError {
             Self::InvalidStatusLine => write!(f, "invalid NNTP status line"),
             Self::InvalidMessageId => write!(f, "invalid message-id"),
             Self::MissingMessageId => write!(f, "message-id is required for this request"),
+            Self::InvalidGroupName => write!(f, "invalid group name"),
+            Self::MissingGroupName => write!(f, "group is required for this request"),
             Self::InvalidHeaderName => write!(f, "invalid header name"),
             Self::MissingHeaderName => write!(f, "header is required for this request"),
             Self::InvalidArticleSelector => write!(f, "invalid article selector"),
@@ -1108,6 +1218,8 @@ fn shared_engine_error_from_typed(err: TypedClientError) -> SharedEngineError {
         TypedClientError::ConnectionClosed => SharedEngineError::ConnectionClosed,
         TypedClientError::InvalidMessageId
         | TypedClientError::MissingMessageId
+        | TypedClientError::InvalidGroupName
+        | TypedClientError::MissingGroupName
         | TypedClientError::InvalidHeaderName
         | TypedClientError::MissingHeaderName
         | TypedClientError::InvalidArticleSelector
@@ -1487,6 +1599,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn typed_connection_fetches_group_listgroup_last_and_next_frames() {
+        let listener = crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"201 typed ready\r\n").await.unwrap();
+
+            let mut request = [0_u8; 128];
+            let read = stream.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"GROUP alt.test\r\n");
+            stream.write_all(crate::GROUP_RESPONSE).await.unwrap();
+
+            let read = stream.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"LISTGROUP alt.test\r\n");
+            stream.write_all(crate::LISTGROUP_RESPONSE).await.unwrap();
+
+            let read = stream.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"LAST\r\n");
+            stream.write_all(crate::LAST_RESPONSE).await.unwrap();
+
+            let read = stream.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"NEXT\r\n");
+            stream.write_all(crate::NEXT_RESPONSE).await.unwrap();
+        });
+
+        let connection = TypedClientConnection::connect(addr).await.unwrap();
+        let group = connection
+            .group(GroupName::from_owned("alt.test").unwrap())
+            .await
+            .unwrap();
+        let listgroup = connection
+            .listgroup(GroupName::from_owned("alt.test").unwrap())
+            .await
+            .unwrap();
+        let last = connection.last().await.unwrap();
+        let next = connection.next().await.unwrap();
+
+        assert_eq!(group.kind(), RequestKind::Group);
+        assert_eq!(group.status().as_u16(), 211);
+        assert_eq!(group.as_bytes(), crate::GROUP_RESPONSE);
+        assert_eq!(listgroup.kind(), RequestKind::ListGroup);
+        assert_eq!(listgroup.status().as_u16(), 211);
+        assert_eq!(listgroup.as_bytes(), crate::LISTGROUP_RESPONSE);
+        assert_eq!(last.kind(), RequestKind::Last);
+        assert_eq!(last.status().as_u16(), 223);
+        assert_eq!(last.as_bytes(), crate::LAST_RESPONSE);
+        assert_eq!(next.kind(), RequestKind::Next);
+        assert_eq!(next.status().as_u16(), 223);
+        assert_eq!(next.as_bytes(), crate::NEXT_RESPONSE);
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn typed_connection_fetches_hdr_and_xhdr_frames() {
         let listener = crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1717,6 +1883,51 @@ mod tests {
         assert_eq!(capabilities.status().as_u16(), 101);
         assert_eq!(exchange.request(), &Request::Date);
         assert_eq!(exchange.response().status().as_u16(), 111);
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn client_group_navigation_methods_expose_general_request_surface() {
+        let listener = crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"201 typed ready\r\n").await.unwrap();
+
+            let mut request = [0_u8; 128];
+            let read = stream.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"GROUP alt.test\r\n");
+            stream.write_all(crate::GROUP_RESPONSE).await.unwrap();
+
+            let read = stream.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"LISTGROUP alt.test\r\n");
+            stream.write_all(crate::LISTGROUP_RESPONSE).await.unwrap();
+
+            let read = stream.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"LAST\r\n");
+            stream.write_all(crate::LAST_RESPONSE).await.unwrap();
+
+            let read = stream.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"NEXT\r\n");
+            stream.write_all(crate::NEXT_RESPONSE).await.unwrap();
+        });
+
+        let client = Client::connect(addr).await.unwrap();
+        let group = client.group("alt.test").await.unwrap();
+        let listgroup = client.listgroup("alt.test").await.unwrap();
+        let last = client.last().await.unwrap();
+        let next = client.next_exchange().await.unwrap();
+
+        assert_eq!(group.kind(), RequestKind::Group);
+        assert_eq!(group.status().as_u16(), 211);
+        assert_eq!(listgroup.kind(), RequestKind::ListGroup);
+        assert_eq!(listgroup.status().as_u16(), 211);
+        assert_eq!(last.kind(), RequestKind::Last);
+        assert_eq!(last.status().as_u16(), 223);
+        assert_eq!(next.request(), &Request::Next);
+        assert_eq!(next.response().kind(), RequestKind::Next);
+        assert_eq!(next.response().status().as_u16(), 223);
 
         server.await.unwrap();
     }
