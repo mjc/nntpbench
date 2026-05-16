@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 use arrayvec::ArrayVec;
 use clap::{Parser, ValueEnum};
 use socket2::{Domain, Protocol, SockRef, Socket, Type};
-use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio::time;
@@ -210,11 +210,11 @@ pub struct ClientArgs {
     pub nodelay: bool,
 
     /// Socket receive buffer size in bytes. Use 0 to leave the OS default.
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, default_value_t = HIGH_THROUGHPUT_SOCKET_BUFFER)]
     pub socket_recv_buffer: usize,
 
     /// Socket send buffer size in bytes. Use 0 to leave the OS default.
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, default_value_t = HIGH_THROUGHPUT_SOCKET_BUFFER)]
     pub socket_send_buffer: usize,
 
     /// Print final machine-readable CSV: requests,bytes,elapsed_s,cpu_s,rss_kib.
@@ -464,7 +464,13 @@ impl ClientSession {
     }
 
     async fn run_inner(&mut self, stats: &Stats, stop: &AtomicBool) -> io::Result<()> {
-        let mut stream = TcpStream::connect(self.connect).await?;
+        let mut stream = connect_client_socket(
+            self.connect,
+            self.nodelay,
+            self.socket_recv_buffer,
+            self.socket_send_buffer,
+        )
+        .await?;
         #[cfg(not(coverage_nightly))]
         self.optimize_stream(&stream)?;
         #[cfg(coverage_nightly)]
@@ -508,15 +514,7 @@ impl ClientSession {
             let mut responses = 0_usize;
             let mut received = 0_u64;
             while responses < batch {
-                let read = stream
-                    .readable()
-                    .await
-                    .and_then(|()| stream.try_read(&mut read_buffer));
-                let read = match read {
-                    Ok(read) => read,
-                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => continue,
-                    Err(err) => return Err(err),
-                };
+                let read = stream.read(&mut read_buffer).await?;
                 if read == 0 {
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
@@ -639,7 +637,45 @@ fn optimize_client_socket(
     if send_buffer != 0 {
         socket.set_send_buffer_size(send_buffer)?;
     }
+    socket.set_linger(Some(TCP_LINGER_TIMEOUT))?;
+
+    #[cfg(target_os = "linux")]
+    {
+        let _ = socket.set_tcp_user_timeout(Some(TCP_USER_TIMEOUT));
+        let _ = socket.set_tos_v4(TOS_THROUGHPUT);
+    }
+
     Ok(())
+}
+
+async fn connect_client_socket(
+    addr: SocketAddr,
+    nodelay: bool,
+    recv_buffer: usize,
+    send_buffer: usize,
+) -> io::Result<TcpStream> {
+    let socket = if addr.is_ipv4() {
+        TcpSocket::new_v4()?
+    } else {
+        TcpSocket::new_v6()?
+    };
+    if recv_buffer != 0 {
+        socket.set_recv_buffer_size(socket_buffer_size_u32(recv_buffer)?)?;
+    }
+    if send_buffer != 0 {
+        socket.set_send_buffer_size(socket_buffer_size_u32(send_buffer)?)?;
+    }
+    socket.set_nodelay(nodelay)?;
+    socket.connect(addr).await
+}
+
+fn socket_buffer_size_u32(size: usize) -> io::Result<u32> {
+    u32::try_from(size).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "socket buffer size exceeds u32::MAX",
+        )
+    })
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -720,15 +756,7 @@ async fn read_greeting(stream: &mut TcpStream, buffer: &mut [u8]) -> io::Result<
             ));
         }
 
-        let read = stream
-            .readable()
-            .await
-            .and_then(|()| stream.try_read(&mut buffer[total..]));
-        let read = match read {
-            Ok(read) => read,
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => continue,
-            Err(err) => return Err(err),
-        };
+        let read = stream.read(&mut buffer[total..]).await?;
         if read == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -1585,8 +1613,8 @@ mod tests {
             backlog: 128,
             reuse_port: false,
             nodelay: true,
-            socket_recv_buffer: 0,
-            socket_send_buffer: 0,
+            socket_recv_buffer: HIGH_THROUGHPUT_SOCKET_BUFFER,
+            socket_send_buffer: HIGH_THROUGHPUT_SOCKET_BUFFER,
             stats_interval_secs: 0,
             flush: false,
         }
@@ -1613,8 +1641,8 @@ mod tests {
             start_id: 1,
             read_buffer_bytes: CLIENT_READER_CAPACITY,
             nodelay: true,
-            socket_recv_buffer: 0,
-            socket_send_buffer: 0,
+            socket_recv_buffer: HIGH_THROUGHPUT_SOCKET_BUFFER,
+            socket_send_buffer: HIGH_THROUGHPUT_SOCKET_BUFFER,
             csv: false,
             stats_interval_secs: 0,
         }
@@ -2243,6 +2271,17 @@ mod tests {
 
         optimize_client_socket(&client, true, 4096, 4096).unwrap();
         optimize_client_socket(&client, false, 0, 0).unwrap();
+    }
+
+    #[test]
+    fn socket_buffer_size_rejects_values_too_large_for_tcp_socket() {
+        assert_eq!(socket_buffer_size_u32(4096).unwrap(), 4096);
+        assert_eq!(
+            socket_buffer_size_u32(u32::MAX as usize + 1)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
     }
 
     #[tokio::test]
