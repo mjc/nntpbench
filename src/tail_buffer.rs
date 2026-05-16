@@ -2,7 +2,7 @@
 //!
 //! Kept as the single terminator detector for streamed multiline NNTP responses.
 
-pub const TERMINATOR_TAIL_SIZE: usize = 5;
+pub const TERMINATOR_TAIL_SIZE: usize = 4;
 
 /// Status of terminator detection in a chunk.
 #[derive(Debug, Clone, Copy)]
@@ -115,8 +115,8 @@ impl TailBuffer {
 ///
 /// Returns the position after the terminator, or None if not found.
 #[inline]
-pub fn find_terminator_end(data: &[u8]) -> Option<usize> {
-    const TERMINATOR: &[u8; TERMINATOR_TAIL_SIZE] = b"\r\n.\r\n";
+fn find_terminator_end(data: &[u8]) -> Option<usize> {
+    const TERMINATOR: &[u8; 5] = b"\r\n.\r\n";
 
     memchr::memmem::find(data, TERMINATOR).map(|start| start + TERMINATOR.len())
 }
@@ -191,13 +191,13 @@ mod tests {
         assert_eq!(tail.len(), 4);
 
         tail.update(b"ef");
-        assert_eq!(tail.as_slice(), b"bcdef");
+        assert_eq!(tail.as_slice(), b"cdef");
 
         tail.update(b"012345");
-        assert_eq!(tail.as_slice(), b"12345");
+        assert_eq!(tail.as_slice(), b"2345");
 
         tail.update(b"");
-        assert_eq!(tail.as_slice(), b"12345");
+        assert_eq!(tail.as_slice(), b"2345");
     }
 
     #[test]

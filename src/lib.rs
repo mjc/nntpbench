@@ -29,6 +29,7 @@ pub const DATE_RESPONSE: &[u8] = b"111 20260515120000\r\n";
 const MAX_COMMAND_LINE_BYTES: usize = 1024;
 const MAX_SERVER_PIPELINE_DEPTH: usize = 1024;
 const SERVER_READER_CAPACITY: usize = 256 * 1024;
+const CLIENT_READER_CAPACITY: usize = 1024 * 1024;
 const MAX_PENDING_WRITE_BYTES: usize = 64 * 1024;
 const MAX_CLIENT_COMMAND_BYTES: usize = 64;
 const HIGH_THROUGHPUT_SOCKET_BUFFER: usize = 16 * 1024 * 1024;
@@ -201,7 +202,7 @@ pub struct ClientArgs {
     pub start_id: u64,
 
     /// Per-connection read buffer size.
-    #[arg(long, default_value_t = 256 * 1024)]
+    #[arg(long, default_value_t = CLIENT_READER_CAPACITY)]
     pub read_buffer_bytes: usize,
 
     /// Set TCP_NODELAY on client sockets.
@@ -1610,7 +1611,7 @@ mod tests {
             pipeline_depth: 64,
             command_mix: ClientCommandMix::Alternate,
             start_id: 1,
-            read_buffer_bytes: 256 * 1024,
+            read_buffer_bytes: CLIENT_READER_CAPACITY,
             nodelay: true,
             socket_recv_buffer: 0,
             socket_send_buffer: 0,
