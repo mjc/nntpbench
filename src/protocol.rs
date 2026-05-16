@@ -639,6 +639,43 @@ mod tests {
     }
 
     #[test]
+    fn status_code_categories_and_parsing_cover_rfc_examples() {
+        for code in [100, 199] {
+            let status = StatusCode(code);
+            assert!(status.is_informational(), "{code}");
+            assert!(!status.is_success(), "{code}");
+            assert!(!status.is_error(), "{code}");
+        }
+
+        for code in [200, 205, 220, 281, 381, 399] {
+            let status = StatusCode(code);
+            assert!(status.is_success(), "{code}");
+            assert!(!status.is_error(), "{code}");
+        }
+
+        for code in [400, 430, 500, 599] {
+            let status = StatusCode(code);
+            assert!(status.is_error(), "{code}");
+            assert!(!status.is_success(), "{code}");
+        }
+
+        for (input, expected) in [
+            (b"200 Service ready\r\n".as_slice(), Some(StatusCode(200))),
+            (b"000".as_slice(), Some(StatusCode(0))),
+            (b"999 message\r\n".as_slice(), Some(StatusCode(999))),
+            (b"211 42 1 100 alt.test".as_slice(), Some(StatusCode(211))),
+            ("200 Привет мир\r\n".as_bytes(), Some(StatusCode(200))),
+            (b"".as_slice(), None),
+            (b"20".as_slice(), None),
+            (b"2X0 Error\r\n".as_slice(), None),
+            (b"ABC Invalid\r\n".as_slice(), None),
+            (b" 200 Error\r\n".as_slice(), None),
+        ] {
+            assert_eq!(StatusCode::parse(input), expected, "{input:?}");
+        }
+    }
+
+    #[test]
     fn message_id_validates_and_wraps() {
         assert_eq!(MessageId::from_borrowed("<a@b>").unwrap().as_str(), "<a@b>");
         assert!(MessageId::from_borrowed("a@b").is_err());
@@ -647,6 +684,15 @@ mod tests {
             MessageId::from_str_or_wrap("a@b").unwrap().as_str(),
             "<a@b>"
         );
+    }
+
+    #[test]
+    fn message_id_validation_covers_rfc_edge_shapes() {
+        assert!(MessageId::from_borrowed("<a>").is_ok());
+        assert!(MessageId::from_borrowed("<>").is_err());
+        assert!(MessageId::from_borrowed("<no-end").is_err());
+        assert!(MessageId::from_borrowed("no-start>").is_err());
+        assert!(MessageId::from_str_or_wrap("").is_err());
     }
 
     #[test]
@@ -706,6 +752,51 @@ mod tests {
             RequestLine::parse(b"MODE TRANSIT").kind(),
             RequestKind::Unknown
         );
+    }
+
+    #[test]
+    fn request_line_classifies_rfc_command_matrix_case_insensitively() {
+        for (line, expected) in [
+            (b"ARTICLE <a@b>".as_slice(), RequestKind::Article),
+            (b"BODY <a@b>".as_slice(), RequestKind::Body),
+            (b"HEAD <a@b>".as_slice(), RequestKind::Head),
+            (b"STAT <a@b>".as_slice(), RequestKind::Stat),
+            (b"ARTICLE 12345".as_slice(), RequestKind::Article),
+            (b"GROUP alt.test".as_slice(), RequestKind::Group),
+            (b"LISTGROUP alt.test".as_slice(), RequestKind::ListGroup),
+            (b"LAST".as_slice(), RequestKind::Last),
+            (b"NEXT".as_slice(), RequestKind::Next),
+            (b"LIST".as_slice(), RequestKind::List),
+            (b"DATE".as_slice(), RequestKind::Date),
+            (b"HELP".as_slice(), RequestKind::Help),
+            (b"CAPABILITIES".as_slice(), RequestKind::Capabilities),
+            (b"MODE READER".as_slice(), RequestKind::ModeReader),
+            (b"QUIT".as_slice(), RequestKind::Quit),
+            (b"OVER 1-10".as_slice(), RequestKind::Over),
+            (b"XOVER 1-10".as_slice(), RequestKind::Xover),
+            (b"HDR Subject 1-10".as_slice(), RequestKind::Hdr),
+            (b"XHDR Subject 1-10".as_slice(), RequestKind::Xhdr),
+            (
+                b"NEWGROUPS 20260101 000000 GMT".as_slice(),
+                RequestKind::NewGroups,
+            ),
+            (
+                b"NEWNEWS * 20260101 000000 GMT".as_slice(),
+                RequestKind::NewNews,
+            ),
+            (b"POST".as_slice(), RequestKind::Post),
+            (b"IHAVE <a@b>".as_slice(), RequestKind::Ihave),
+            (b"CHECK <a@b>".as_slice(), RequestKind::Check),
+            (b"TAKETHIS <a@b>".as_slice(), RequestKind::TakeThis),
+            (b"AUTHINFO USER test".as_slice(), RequestKind::AuthInfo),
+            (b"STARTTLS".as_slice(), RequestKind::StartTls),
+            (b"article <a@b>".as_slice(), RequestKind::Article),
+            (b"authinfo user test".as_slice(), RequestKind::AuthInfo),
+            (b"quit".as_slice(), RequestKind::Quit),
+            (b"XYZZY".as_slice(), RequestKind::Unknown),
+        ] {
+            assert_eq!(RequestLine::parse(line).kind(), expected, "{line:?}");
+        }
     }
 
     #[test]
@@ -881,5 +972,34 @@ mod tests {
         assert!(Request::article("<bad id>").is_err());
         assert!(Request::hdr("Bad Header", "1").is_err());
         assert!(Request::xhdr("Subject", "1 2").is_err());
+    }
+
+    #[test]
+    fn request_wire_uses_one_crlf_terminator() {
+        let requests = [
+            Request::article("a@b").unwrap(),
+            Request::body("c@d").unwrap(),
+            Request::head("e@f").unwrap(),
+            Request::stat("g@h").unwrap(),
+            Request::hdr("Subject", "1-10").unwrap(),
+            Request::xhdr("Message-ID", "<i@j>").unwrap(),
+            Request::list(),
+            Request::help(),
+            Request::capabilities(),
+            Request::date(),
+            Request::mode_reader(),
+            Request::quit(),
+        ];
+
+        for request in requests {
+            let mut wire = Vec::new();
+            request.write_wire_to(&mut wire);
+            assert!(wire.ends_with(b"\r\n"), "{wire:?}");
+            assert_eq!(
+                wire.windows(2).filter(|window| *window == b"\r\n").count(),
+                1,
+                "{wire:?}"
+            );
+        }
     }
 }

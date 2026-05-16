@@ -374,6 +374,47 @@ fn validate_headers(data: &[u8]) -> Result<(), ArticleParseError> {
 mod tests {
     use super::*;
 
+    const VALID_ARTICLE_TEXT: &[u8] = b"220 12345 <test@example.com>\r\n\
+Subject: Test Article\r\n\
+From: test@example.com\r\n\
+Date: Sat, 30 Nov 2024 12:00:00 +0000\r\n\
+Message-ID: <test@example.com>\r\n\
+\r\n\
+This is the article body.\r\n\
+Multiple lines of text.\r\n\
+.\r\n";
+
+    const VALID_HEAD: &[u8] = b"221 12345 <test@example.com>\r\n\
+Subject: Test Article\r\n\
+From: test@example.com\r\n\
+Date: Sat, 30 Nov 2024 12:00:00 +0000\r\n\
+Message-ID: <test@example.com>\r\n\
+.\r\n";
+
+    const VALID_BODY: &[u8] = b"222 12345 <test@example.com>\r\n\
+This is the article body.\r\n\
+Multiple lines of text.\r\n\
+.\r\n";
+
+    const VALID_STAT: &[u8] = b"223 12345 <test@example.com>\r\n";
+
+    const ARTICLE_BY_MSGID: &[u8] = b"220 0 <msgid@example.com>\r\n\
+Subject: Retrieved by message-ID\r\n\
+\r\n\
+Body\r\n\
+.\r\n";
+
+    const FOLDED_HEADER: &[u8] = concat!(
+        "220 12345 <test@example.com>\r\n",
+        "Subject: This is a long subject\r\n",
+        " that continues on the next line\r\n",
+        "From: test@example.com\r\n",
+        "\r\n",
+        "Body\r\n",
+        ".\r\n"
+    )
+    .as_bytes();
+
     #[test]
     fn parse_article_response_220() {
         let buf =
@@ -433,5 +474,146 @@ mod tests {
             Headers::parse(data),
             Err(ArticleParseError::InvalidHeader(_))
         ));
+    }
+
+    #[test]
+    fn parses_rfc_style_article_shapes() {
+        for (input, article_number, message_id, has_headers, has_body) in [
+            (
+                VALID_ARTICLE_TEXT,
+                Some(ArticleNumber(12345)),
+                "<test@example.com>",
+                true,
+                true,
+            ),
+            (
+                VALID_HEAD,
+                Some(ArticleNumber(12345)),
+                "<test@example.com>",
+                true,
+                false,
+            ),
+            (
+                VALID_BODY,
+                Some(ArticleNumber(12345)),
+                "<test@example.com>",
+                false,
+                true,
+            ),
+            (
+                VALID_STAT,
+                Some(ArticleNumber(12345)),
+                "<test@example.com>",
+                false,
+                false,
+            ),
+            (
+                ARTICLE_BY_MSGID,
+                Some(ArticleNumber(0)),
+                "<msgid@example.com>",
+                true,
+                true,
+            ),
+        ] {
+            let article = Article::parse(input).unwrap();
+            assert_eq!(article.article_number, article_number);
+            assert_eq!(article.message_id.as_str(), message_id);
+            assert_eq!(article.headers.is_some(), has_headers);
+            assert_eq!(article.body.is_some(), has_body);
+        }
+    }
+
+    #[test]
+    fn article_content_accessors_match_rfc_examples() {
+        let article = Article::parse(VALID_ARTICLE_TEXT).unwrap();
+        let headers = article.headers.unwrap();
+        assert_eq!(headers.get("Subject"), Some(&b"Test Article"[..]));
+        assert_eq!(headers.get("From"), Some(&b"test@example.com"[..]));
+        assert_eq!(headers.get("subject"), headers.get("Subject"));
+        assert_eq!(headers.get("FROM"), headers.get("From"));
+        assert!(
+            article
+                .body
+                .unwrap()
+                .starts_with(b"This is the article body.")
+        );
+    }
+
+    #[test]
+    fn article_parse_rejects_rfc_error_shapes() {
+        for (input, expected) in [
+            (
+                b"220 12345 <test@example.com>\r\nSubject: Bad\r\nBody without separator\r\n.\r\n"
+                    .as_slice(),
+                ArticleParseError::MissingSeparator,
+            ),
+            (
+                b"220 12345 <test@example.com>\r\nSubject: Test\r\n\r\nBody without terminator\r\n"
+                    .as_slice(),
+                ArticleParseError::MissingTerminator,
+            ),
+            (
+                b"220 12345 <test@example.com>\r\nSubject: Valid\r\nInvalidHeaderNoColon\r\n\r\nBody\r\n.\r\n"
+                    .as_slice(),
+                ArticleParseError::InvalidHeader("".to_string()),
+            ),
+            (
+                b"221 12345 <test@example.com>\r\nSubject: Test\r\n\r\nThis body should not be here\r\n.\r\n"
+                    .as_slice(),
+                ArticleParseError::UnexpectedBody,
+            ),
+            (
+                b"430 No such article\r\n".as_slice(),
+                ArticleParseError::InvalidStatusCode(430),
+            ),
+        ] {
+            let err = Article::parse(input).unwrap_err();
+            match (err, expected) {
+                (ArticleParseError::InvalidHeader(_), ArticleParseError::InvalidHeader(_)) => {}
+                (actual, expected) => assert_eq!(actual, expected),
+            }
+        }
+    }
+
+    #[test]
+    fn folded_headers_and_large_headers_parse() {
+        let folded = Article::parse(FOLDED_HEADER).unwrap();
+        let headers = folded.headers.unwrap();
+        assert_eq!(headers.get("Subject"), Some(&b"This is a long subject"[..]));
+        assert_eq!(headers.iter().count(), 2);
+
+        let long_header = format!(
+            "220 123 <test@example.com>\r\nSubject: {}\r\n\r\nBody\r\n.\r\n",
+            "A".repeat(10000)
+        );
+        let article = Article::parse(long_header.as_bytes()).unwrap();
+        assert_eq!(
+            article.headers.unwrap().get("Subject").unwrap().len(),
+            10000
+        );
+    }
+
+    #[test]
+    fn article_body_edge_cases_and_zero_copy_hold() {
+        let empty_body = Article::parse(b"222 123 <test@example.com>\r\n.\r\n").unwrap();
+        assert_eq!(empty_body.body, Some(&b""[..]));
+
+        let mut binary_article = b"222 123 <test@example.com>\r\n".to_vec();
+        binary_article.extend_from_slice(&[0xFF, 0xFE, 0xFD, 0xFC, 0xFB]);
+        binary_article.extend_from_slice(b"\r\n.\r\n");
+        let binary = Article::parse(&binary_article).unwrap();
+        assert_eq!(
+            binary.body.unwrap(),
+            &[0xFF, 0xFE, 0xFD, 0xFC, 0xFB, b'\r', b'\n']
+        );
+
+        let article = Article::parse(VALID_ARTICLE_TEXT).unwrap();
+        let headers_ptr = article.headers.unwrap().as_bytes().as_ptr() as usize;
+        let body_ptr = article.body.unwrap().as_ptr() as usize;
+        let original_start = VALID_ARTICLE_TEXT.as_ptr() as usize;
+        let original_end = original_start + VALID_ARTICLE_TEXT.len();
+
+        assert!((original_start..original_end).contains(&headers_ptr));
+        assert!((original_start..original_end).contains(&body_ptr));
     }
 }
