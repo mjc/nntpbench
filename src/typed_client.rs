@@ -167,6 +167,43 @@ impl Client {
         self.execute_exchange(request).await
     }
 
+    /// Send an OVER request and return the owned raw response frame.
+    pub async fn over(&self, selector: impl AsRef<str>) -> Result<OwnedResponse, TypedClientError> {
+        let request =
+            Request::over(selector).map_err(|_| TypedClientError::InvalidArticleSelector)?;
+        self.execute_raw(request).await
+    }
+
+    /// Send an OVER request and return the completed raw request/response pair.
+    pub async fn over_exchange(
+        &self,
+        selector: impl AsRef<str>,
+    ) -> Result<OwnedExchange, TypedClientError> {
+        let request =
+            Request::over(selector).map_err(|_| TypedClientError::InvalidArticleSelector)?;
+        self.execute_raw_exchange(request).await
+    }
+
+    /// Send an XOVER request and return the owned raw response frame.
+    pub async fn xover(
+        &self,
+        selector: impl AsRef<str>,
+    ) -> Result<OwnedResponse, TypedClientError> {
+        let request =
+            Request::xover(selector).map_err(|_| TypedClientError::InvalidArticleSelector)?;
+        self.execute_raw(request).await
+    }
+
+    /// Send an XOVER request and return the completed raw request/response pair.
+    pub async fn xover_exchange(
+        &self,
+        selector: impl AsRef<str>,
+    ) -> Result<OwnedExchange, TypedClientError> {
+        let request =
+            Request::xover(selector).map_err(|_| TypedClientError::InvalidArticleSelector)?;
+        self.execute_raw_exchange(request).await
+    }
+
     /// Send an HDR request and return the owned raw response frame.
     pub async fn hdr(
         &self,
@@ -402,6 +439,38 @@ impl TypedClientConnection {
         message_id: MessageId<'static>,
     ) -> Result<OwnedExchange, TypedClientError> {
         self.execute_exchange(Request::Stat { message_id }).await
+    }
+
+    /// Send an OVER request and return the owned response frame.
+    pub async fn over(
+        &self,
+        selector: ArticleSelector<'static>,
+    ) -> Result<OwnedResponse, TypedClientError> {
+        self.execute(Request::Over { selector }).await
+    }
+
+    /// Send an OVER request and return the completed request/response pair.
+    pub async fn over_exchange(
+        &self,
+        selector: ArticleSelector<'static>,
+    ) -> Result<OwnedExchange, TypedClientError> {
+        self.execute_exchange(Request::Over { selector }).await
+    }
+
+    /// Send an XOVER request and return the owned response frame.
+    pub async fn xover(
+        &self,
+        selector: ArticleSelector<'static>,
+    ) -> Result<OwnedResponse, TypedClientError> {
+        self.execute(Request::Xover { selector }).await
+    }
+
+    /// Send an XOVER request and return the completed request/response pair.
+    pub async fn xover_exchange(
+        &self,
+        selector: ArticleSelector<'static>,
+    ) -> Result<OwnedExchange, TypedClientError> {
+        self.execute_exchange(Request::Xover { selector }).await
     }
 
     /// Send an HDR request and return the owned response frame.
@@ -1531,6 +1600,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn typed_connection_fetches_over_and_xover_frames() {
+        let listener = crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"201 typed ready\r\n").await.unwrap();
+
+            let mut request = [0_u8; 128];
+            let read = stream.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"OVER 1-10\r\n");
+            stream.write_all(crate::OVER_RESPONSE).await.unwrap();
+
+            let read = stream.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"XOVER <overview@test>\r\n");
+            stream.write_all(crate::XOVER_RESPONSE).await.unwrap();
+        });
+
+        let connection = TypedClientConnection::connect(addr).await.unwrap();
+        let over = connection
+            .over(ArticleSelector::from_owned("1-10").unwrap())
+            .await
+            .unwrap();
+        let xover = connection
+            .xover(ArticleSelector::from_owned("<overview@test>").unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(over.kind(), RequestKind::Over);
+        assert_eq!(over.status().as_u16(), 224);
+        assert_eq!(over.as_bytes(), crate::OVER_RESPONSE);
+        assert_eq!(xover.kind(), RequestKind::Xover);
+        assert_eq!(xover.status().as_u16(), 224);
+        assert_eq!(xover.as_bytes(), crate::XOVER_RESPONSE);
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn client_article_returns_typed_owned_article_surface() {
         let listener = crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1718,6 +1825,43 @@ mod tests {
         );
         assert_eq!(xhdr.response().kind(), RequestKind::Xhdr);
         assert_eq!(xhdr.response().status().as_u16(), 225);
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn client_overview_methods_expose_general_request_surface() {
+        let listener = crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"201 typed ready\r\n").await.unwrap();
+
+            let mut request = [0_u8; 128];
+            let read = stream.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"OVER 1-10\r\n");
+            stream.write_all(crate::OVER_RESPONSE).await.unwrap();
+
+            let read = stream.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"XOVER <overview@test>\r\n");
+            stream.write_all(crate::XOVER_RESPONSE).await.unwrap();
+        });
+
+        let client = Client::connect(addr).await.unwrap();
+        let over = client.over("1-10").await.unwrap();
+        let xover = client.xover_exchange("<overview@test>").await.unwrap();
+
+        assert_eq!(over.kind(), RequestKind::Over);
+        assert_eq!(over.status().as_u16(), 224);
+        assert_eq!(
+            xover
+                .request()
+                .overview_selector()
+                .map(ArticleSelector::as_str),
+            Some("<overview@test>")
+        );
+        assert_eq!(xover.response().kind(), RequestKind::Xover);
+        assert_eq!(xover.response().status().as_u16(), 224);
 
         server.await.unwrap();
     }

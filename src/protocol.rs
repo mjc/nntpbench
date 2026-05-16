@@ -266,6 +266,12 @@ pub enum Request<'a> {
     Stat {
         message_id: MessageId<'a>,
     },
+    Over {
+        selector: ArticleSelector<'a>,
+    },
+    Xover {
+        selector: ArticleSelector<'a>,
+    },
     Hdr {
         header: HeaderName<'a>,
         selector: ArticleSelector<'a>,
@@ -291,6 +297,8 @@ impl<'a> Request<'a> {
             Self::Body { .. } => RequestKind::Body,
             Self::Head { .. } => RequestKind::Head,
             Self::Stat { .. } => RequestKind::Stat,
+            Self::Over { .. } => RequestKind::Over,
+            Self::Xover { .. } => RequestKind::Xover,
             Self::Hdr { .. } => RequestKind::Hdr,
             Self::Xhdr { .. } => RequestKind::Xhdr,
             Self::List => RequestKind::List,
@@ -309,6 +317,12 @@ impl<'a> Request<'a> {
             Self::Body { message_id } => write_request_wire(output, b"BODY ", message_id),
             Self::Head { message_id } => write_request_wire(output, b"HEAD ", message_id),
             Self::Stat { message_id } => write_request_wire(output, b"STAT ", message_id),
+            Self::Over { selector } => {
+                write_one_arg_request_wire(output, b"OVER ", selector.as_str())
+            }
+            Self::Xover { selector } => {
+                write_one_arg_request_wire(output, b"XOVER ", selector.as_str())
+            }
             Self::Hdr { header, selector } => {
                 write_two_arg_request_wire(output, b"HDR ", header.as_str(), selector.as_str())
             }
@@ -332,7 +346,7 @@ impl<'a> Request<'a> {
             | Self::Body { message_id }
             | Self::Head { message_id }
             | Self::Stat { message_id } => Some(message_id),
-            Self::Hdr { .. } | Self::Xhdr { .. } => None,
+            Self::Over { .. } | Self::Xover { .. } | Self::Hdr { .. } | Self::Xhdr { .. } => None,
             Self::List
             | Self::Help
             | Self::Capabilities
@@ -349,6 +363,15 @@ impl<'a> Request<'a> {
             Self::Hdr { header, selector } | Self::Xhdr { header, selector } => {
                 Some((header, selector))
             }
+            _ => None,
+        }
+    }
+
+    /// Borrow the validated overview selector carried by this request, if any.
+    #[must_use]
+    pub const fn overview_selector(&self) -> Option<&ArticleSelector<'a>> {
+        match self {
+            Self::Over { selector } | Self::Xover { selector } => Some(selector),
             _ => None,
         }
     }
@@ -380,6 +403,20 @@ impl Request<'static> {
     pub fn stat(message_id: impl AsRef<str>) -> Result<Self, InvalidMessageId> {
         Ok(Self::Stat {
             message_id: MessageId::from_str_or_wrap(message_id)?,
+        })
+    }
+
+    /// Build an OVER request.
+    pub fn over(selector: impl AsRef<str>) -> Result<Self, InvalidArticleSelector> {
+        Ok(Self::Over {
+            selector: ArticleSelector::from_owned(selector)?,
+        })
+    }
+
+    /// Build an XOVER request.
+    pub fn xover(selector: impl AsRef<str>) -> Result<Self, InvalidArticleSelector> {
+        Ok(Self::Xover {
+            selector: ArticleSelector::from_owned(selector)?,
         })
     }
 
@@ -604,6 +641,12 @@ const fn status_implies_multiline(code: u16) -> bool {
 fn write_request_wire(output: &mut Vec<u8>, verb: &[u8], message_id: &MessageId<'_>) {
     output.extend_from_slice(verb);
     output.extend_from_slice(message_id.as_str().as_bytes());
+    output.extend_from_slice(b"\r\n");
+}
+
+fn write_one_arg_request_wire(output: &mut Vec<u8>, verb: &[u8], arg: &str) {
+    output.extend_from_slice(verb);
+    output.extend_from_slice(arg.as_bytes());
     output.extend_from_slice(b"\r\n");
 }
 
@@ -846,6 +889,12 @@ mod tests {
         let stat = Request::Stat {
             message_id: MessageId::from_borrowed("<g@h>").unwrap(),
         };
+        let over = Request::Over {
+            selector: ArticleSelector::from_borrowed("1-10").unwrap(),
+        };
+        let xover = Request::Xover {
+            selector: ArticleSelector::from_borrowed("<o@v>").unwrap(),
+        };
         let hdr = Request::Hdr {
             header: HeaderName::from_borrowed("Subject").unwrap(),
             selector: ArticleSelector::from_borrowed("1-10").unwrap(),
@@ -880,6 +929,16 @@ mod tests {
         stat.write_wire_to(&mut wire);
         assert_eq!(stat.kind(), RequestKind::Stat);
         assert_eq!(wire, b"STAT <g@h>\r\n");
+
+        wire.clear();
+        over.write_wire_to(&mut wire);
+        assert_eq!(over.kind(), RequestKind::Over);
+        assert_eq!(wire, b"OVER 1-10\r\n");
+
+        wire.clear();
+        xover.write_wire_to(&mut wire);
+        assert_eq!(xover.kind(), RequestKind::Xover);
+        assert_eq!(wire, b"XOVER <o@v>\r\n");
 
         wire.clear();
         hdr.write_wire_to(&mut wire);
@@ -928,6 +987,8 @@ mod tests {
         let body = Request::body("<c@d>").unwrap();
         let head = Request::head("e@f").unwrap();
         let stat = Request::stat("<g@h>").unwrap();
+        let over = Request::over("1-10").unwrap();
+        let xover = Request::xover("<g@h>").unwrap();
         let hdr = Request::hdr("Subject", "1-10").unwrap();
         let xhdr = Request::xhdr("Message-ID", "<g@h>").unwrap();
         let list = Request::list();
@@ -945,6 +1006,16 @@ mod tests {
         assert_eq!(head.message_id().unwrap().as_str(), "<e@f>");
         assert_eq!(stat.kind(), RequestKind::Stat);
         assert_eq!(stat.message_id().unwrap().as_str(), "<g@h>");
+        assert_eq!(over.kind(), RequestKind::Over);
+        assert_eq!(
+            over.overview_selector().map(ArticleSelector::as_str),
+            Some("1-10")
+        );
+        assert_eq!(xover.kind(), RequestKind::Xover);
+        assert_eq!(
+            xover.overview_selector().map(ArticleSelector::as_str),
+            Some("<g@h>")
+        );
         assert_eq!(hdr.kind(), RequestKind::Hdr);
         assert_eq!(
             hdr.header_query()
@@ -970,6 +1041,8 @@ mod tests {
         assert_eq!(quit.kind(), RequestKind::Quit);
         assert!(quit.message_id().is_none());
         assert!(Request::article("<bad id>").is_err());
+        assert!(Request::over("1 2").is_err());
+        assert!(Request::xover("").is_err());
         assert!(Request::hdr("Bad Header", "1").is_err());
         assert!(Request::xhdr("Subject", "1 2").is_err());
     }
@@ -981,6 +1054,8 @@ mod tests {
             Request::body("c@d").unwrap(),
             Request::head("e@f").unwrap(),
             Request::stat("g@h").unwrap(),
+            Request::over("1-10").unwrap(),
+            Request::xover("<i@j>").unwrap(),
             Request::hdr("Subject", "1-10").unwrap(),
             Request::xhdr("Message-ID", "<i@j>").unwrap(),
             Request::list(),

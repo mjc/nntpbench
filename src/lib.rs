@@ -40,6 +40,8 @@ pub const MODE_READER_RESPONSE: &[u8] = b"201 posting not permitted\r\n";
 pub const DATE_RESPONSE: &[u8] = b"111 20260515120000\r\n";
 pub const LIST_RESPONSE: &[u8] =
     b"215 list of newsgroups follows\r\ncomp.lang.rust 0000000001 0000000001 y\r\n.\r\n";
+pub const OVER_RESPONSE: &[u8] = b"224 Overview information follows\r\n1\tSubject one\tone@example.com\tFri, 16 May 2026 12:00:00 +0000\t<one@example.com>\t\t123\t4\r\n.\r\n";
+pub const XOVER_RESPONSE: &[u8] = b"224 Overview information follows\r\n2\tSubject two\ttwo@example.com\tFri, 16 May 2026 12:00:01 +0000\t<two@example.com>\t<ref@example.com>\t456\t8\r\n.\r\n";
 pub const HDR_RESPONSE: &[u8] =
     b"225 headers follow\r\n1 Subject: example one\r\n2 Subject: example two\r\n.\r\n";
 pub const XHDR_RESPONSE: &[u8] =
@@ -343,7 +345,7 @@ pub struct TypedFetchArgs {
     #[arg(long)]
     pub header: Option<String>,
 
-    /// Article selector for HDR/XHDR requests, such as 1, 1-10, or <message@id>.
+    /// Article selector for OVER/XOVER/HDR/XHDR requests, such as 1, 1-10, or <message@id>.
     #[arg(long)]
     pub selector: Option<String>,
 
@@ -378,6 +380,8 @@ pub enum TypedRequestKind {
     Body,
     Head,
     Stat,
+    Over,
+    Xover,
     Hdr,
     Xhdr,
     List,
@@ -619,6 +623,12 @@ fn typed_fetch_request(args: &TypedFetchArgs) -> Result<Request<'static>, TypedC
         TypedRequestKind::Stat => {
             typed_fetch_message_id_request(args, |message_id| Request::stat(message_id))
         }
+        TypedRequestKind::Over => {
+            typed_fetch_selector_request(args, |selector| Request::over(selector))
+        }
+        TypedRequestKind::Xover => {
+            typed_fetch_selector_request(args, |selector| Request::xover(selector))
+        }
         TypedRequestKind::Hdr => {
             typed_fetch_header_request(args, |header, selector| Request::hdr(header, selector))
         }
@@ -664,6 +674,20 @@ where
         .as_deref()
         .ok_or(TypedClientError::MissingArticleSelector)?;
     build(header, selector).map_err(TypedClientError::from)
+}
+
+fn typed_fetch_selector_request<F>(
+    args: &TypedFetchArgs,
+    build: F,
+) -> Result<Request<'static>, TypedClientError>
+where
+    F: FnOnce(&str) -> Result<Request<'static>, crate::protocol::InvalidArticleSelector>,
+{
+    let selector = args
+        .selector
+        .as_deref()
+        .ok_or(TypedClientError::MissingArticleSelector)?;
+    build(selector).map_err(|_| TypedClientError::InvalidArticleSelector)
 }
 
 fn map_typed_client_error(err: TypedClientError) -> io::Error {
@@ -1716,6 +1740,14 @@ where
             write_response(writer, pending_write, config.body_response(), session_stats).await?;
             Ok(false)
         }
+        RequestKind::Over => {
+            write_response(writer, pending_write, OVER_RESPONSE, session_stats).await?;
+            Ok(false)
+        }
+        RequestKind::Xover => {
+            write_response(writer, pending_write, XOVER_RESPONSE, session_stats).await?;
+            Ok(false)
+        }
         RequestKind::Hdr => {
             write_response(writer, pending_write, HDR_RESPONSE, session_stats).await?;
             Ok(false)
@@ -1866,6 +1898,8 @@ pub fn process_command_to_buffer(
             stats.body_requests.fetch_add(1, Ordering::Relaxed);
             config.body_response()
         }
+        RequestKind::Over => OVER_RESPONSE,
+        RequestKind::Xover => XOVER_RESPONSE,
         RequestKind::Hdr => HDR_RESPONSE,
         RequestKind::Xhdr => XHDR_RESPONSE,
         RequestKind::List => LIST_RESPONSE,
@@ -3734,6 +3768,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fetch_typed_response_supports_overview_request_kinds() {
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            first.write_all(b"201 fetch ready\r\n").await.unwrap();
+
+            let mut request = [0_u8; 128];
+            let read = first.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"OVER 1-10\r\n");
+            first.write_all(OVER_RESPONSE).await.unwrap();
+
+            let (mut second, _) = listener.accept().await.unwrap();
+            second.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = second.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"XOVER <overview@test>\r\n");
+            second.write_all(XOVER_RESPONSE).await.unwrap();
+        });
+
+        let mut over_args = test_typed_fetch_args();
+        over_args.connect = addr;
+        over_args.request = TypedRequestKind::Over;
+        over_args.message_id = None;
+        over_args.selector = Some("1-10".to_string());
+        let over = fetch_typed_response(&over_args).await.unwrap();
+        assert_eq!(over.kind(), RequestKind::Over);
+        assert_eq!(over.status().as_u16(), 224);
+
+        let mut xover_args = test_typed_fetch_args();
+        xover_args.connect = addr;
+        xover_args.request = TypedRequestKind::Xover;
+        xover_args.message_id = None;
+        xover_args.selector = Some("<overview@test>".to_string());
+        let xover = fetch_typed_response(&xover_args).await.unwrap();
+        assert_eq!(xover.kind(), RequestKind::Xover);
+        assert_eq!(xover.status().as_u16(), 224);
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn fetch_typed_response_rejects_missing_message_id_for_article_style_requests() {
         let mut args = test_typed_fetch_args();
         args.message_id = None;
@@ -3756,6 +3831,19 @@ mod tests {
 
         args.header = Some("Subject".to_string());
         args.selector = None;
+        assert!(matches!(
+            fetch_typed_response(&args).await.unwrap_err(),
+            TypedClientError::MissingArticleSelector
+        ));
+    }
+
+    #[tokio::test]
+    async fn fetch_typed_response_rejects_missing_overview_selector() {
+        let mut args = test_typed_fetch_args();
+        args.request = TypedRequestKind::Over;
+        args.message_id = None;
+        args.selector = None;
+
         assert!(matches!(
             fetch_typed_response(&args).await.unwrap_err(),
             TypedClientError::MissingArticleSelector
@@ -3936,6 +4024,15 @@ mod tests {
             [GREETING, LIST_RESPONSE, HELP_RESPONSE, QUIT_RESPONSE].concat()
         );
         assert_eq!(stats.snapshot().commands, 3);
+    }
+
+    #[tokio::test]
+    async fn serve_session_supports_overview_commands() {
+        let (output, stats) =
+            run_session_with_input(test_config(), b"OVER 1-10\r\nXOVER <overview@test>\r\n").await;
+
+        assert_eq!(output, [GREETING, OVER_RESPONSE, XOVER_RESPONSE].concat());
+        assert_eq!(stats.snapshot().commands, 2);
     }
 
     #[tokio::test]
@@ -4160,6 +4257,29 @@ mod tests {
             .concat()
         );
         assert_eq!(stats.snapshot().commands, 4);
+    }
+
+    #[test]
+    fn process_command_to_buffer_supports_overview_commands() {
+        let config = test_config();
+        let stats = Stats::new();
+        let mut output = Vec::new();
+
+        assert!(!process_command_to_buffer(
+            RequestKind::Over,
+            &config,
+            &stats,
+            &mut output,
+        ));
+        assert!(!process_command_to_buffer(
+            RequestKind::Xover,
+            &config,
+            &stats,
+            &mut output,
+        ));
+
+        assert_eq!(output, [OVER_RESPONSE, XOVER_RESPONSE].concat());
+        assert_eq!(stats.snapshot().commands, 2);
     }
 
     #[test]
