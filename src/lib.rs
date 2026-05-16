@@ -902,9 +902,10 @@ impl MultilineScanner {
             last_end = end;
         }
 
-        for end in find_in_chunk_terminator_ends(&input[last_end..]) {
-            count += 1;
-            last_end += end;
+        let (chunk_count, chunk_last_end) = count_in_chunk_terminators(&input[last_end..]);
+        if chunk_count != 0 {
+            count += chunk_count;
+            last_end += chunk_last_end;
         }
 
         if count == 0 {
@@ -919,16 +920,24 @@ impl MultilineScanner {
     }
 }
 
-fn find_in_chunk_terminator_ends(input: &[u8]) -> impl Iterator<Item = usize> + '_ {
-    memchr::memchr_iter(b'.', input).filter_map(|dot| {
-        (dot >= 2
+fn count_in_chunk_terminators(input: &[u8]) -> (usize, usize) {
+    let mut count = 0;
+    let mut last_end = 0;
+
+    for dot in memchr::memchr_iter(b'.', input) {
+        if dot >= 2
             && dot + 2 < input.len()
             && input[dot - 2] == b'\r'
             && input[dot - 1] == b'\n'
             && input[dot + 1] == b'\r'
-            && input[dot + 2] == b'\n')
-            .then_some(dot + TERMINATOR.len() - 2)
-    })
+            && input[dot + 2] == b'\n'
+        {
+            count += 1;
+            last_end = dot + TERMINATOR.len() - 2;
+        }
+    }
+
+    (count, last_end)
 }
 
 pub async fn serve_session(
@@ -3078,13 +3087,14 @@ BODY <bench.4@nntpbench.local>\r\n"
 
     #[test]
     fn in_chunk_terminator_counter_rejects_plain_dots() {
-        let ends: Vec<_> =
-            find_in_chunk_terminator_ends(b"line.with.dots\r\nnot done\r\n").collect();
-        assert!(ends.is_empty());
+        assert_eq!(
+            count_in_chunk_terminators(b"line.with.dots\r\nnot done\r\n"),
+            (0, 0)
+        );
 
-        let ends: Vec<_> =
-            find_in_chunk_terminator_ends(b"one\r\n.\r\ntwo\r\n..\r\nthree\r\n.\r\npartial\r\n.\r")
-                .collect();
-        assert_eq!(ends, vec![8, 27]);
+        assert_eq!(
+            count_in_chunk_terminators(b"one\r\n.\r\ntwo\r\n..\r\nthree\r\n.\r\npartial\r\n.\r"),
+            (2, 27)
+        );
     }
 }
