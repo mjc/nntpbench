@@ -2,6 +2,8 @@
 
 Small async mock NNTP server and client for throughput, latency, and profiling work.
 
+The current focus is hot-path throughput and typed protocol/client work, with the longer-term goal of growing this into a more fully featured NNTP implementation.
+
 ## Latest direct benchmark snapshot
 
 Direct `nntpbench client -> nntpbench server` run with no proxy in the middle.
@@ -45,11 +47,6 @@ Command shape:
   --stats-interval-secs 0 \
   --csv
 ```
-
-Profiles from earlier direct localhost runs:
-
-- [server flamegraph](./profiles/nntpbench-direct-server-run3.svg)
-- [client flamegraph](./profiles/nntpbench-direct-client-run7.svg)
 
 ## Profiling
 
