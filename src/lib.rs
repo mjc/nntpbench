@@ -1,13 +1,16 @@
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
 use std::fs;
-use std::io;
+use std::future::poll_fn;
+use std::io::{self, IoSlice};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use arrayvec::ArrayVec;
 use clap::{Parser, ValueEnum};
 use socket2::{Domain, Protocol, SockRef, Socket, Type};
 use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
@@ -24,6 +27,7 @@ pub const GREETING: &[u8] = b"201 nntpbench mock server ready\r\n";
 pub const MODE_READER_RESPONSE: &[u8] = b"201 posting not permitted\r\n";
 pub const DATE_RESPONSE: &[u8] = b"111 20260515120000\r\n";
 const MAX_COMMAND_LINE_BYTES: usize = 1024;
+const MAX_SERVER_PIPELINE_DEPTH: usize = 1024;
 const SERVER_READER_CAPACITY: usize = 64 * 1024;
 const MAX_PENDING_WRITE_BYTES: usize = 64 * 1024;
 const MAX_CLIENT_COMMAND_BYTES: usize = 64;
@@ -899,9 +903,9 @@ async fn serve_session_inner(
 ) -> io::Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::with_capacity(SERVER_READER_CAPACITY, reader);
-    let max_pipeline_depth = config.max_pipeline_depth;
+    let max_pipeline_depth = config.max_pipeline_depth.min(MAX_SERVER_PIPELINE_DEPTH);
     let mut command_buf = Vec::with_capacity(MAX_COMMAND_LINE_BYTES);
-    let mut command_batch = Vec::with_capacity(max_pipeline_depth);
+    let mut command_batch = CommandBatch::new();
     let mut pending_write = PendingWrite::new();
 
     writer.write_all(GREETING).await?;
@@ -1057,8 +1061,7 @@ impl PendingWrite {
         W: AsyncWrite + Unpin,
     {
         if response.len() > self.buf.len() {
-            self.flush(writer).await?;
-            writer.write_all(response).await?;
+            self.write_with_response(writer, response).await?;
             return Ok(());
         }
 
@@ -1069,6 +1072,21 @@ impl PendingWrite {
         let end = self.len + response.len();
         self.buf[self.len..end].copy_from_slice(response);
         self.len = end;
+        Ok(())
+    }
+
+    async fn write_with_response<W>(&mut self, writer: &mut W, response: &[u8]) -> io::Result<()>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        if self.len == 0 {
+            writer.write_all(response).await?;
+            return Ok(());
+        }
+
+        let mut slices = [IoSlice::new(&self.buf[..self.len]), IoSlice::new(response)];
+        write_all_vectored(writer, &mut slices).await?;
+        self.len = 0;
         Ok(())
     }
 
@@ -1084,6 +1102,26 @@ impl PendingWrite {
         self.len = 0;
         Ok(())
     }
+}
+
+async fn write_all_vectored<W>(writer: &mut W, slices: &mut [IoSlice<'_>]) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut remaining = slices;
+    while !remaining.is_empty() {
+        let written =
+            poll_fn(|cx| Pin::new(&mut *writer).poll_write_vectored(cx, remaining)).await?;
+        if written == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "failed to write buffers",
+            ));
+        }
+        IoSlice::advance_slices(&mut remaining, written);
+    }
+
+    Ok(())
 }
 
 pub fn process_command_to_buffer(
@@ -1154,8 +1192,7 @@ where
         return Ok(());
     }
 
-    pending_write.flush(writer).await?;
-    writer.write_all(response).await
+    pending_write.write_with_response(writer, response).await
 }
 
 async fn flush_pending<W>(writer: &mut W, pending_write: &mut PendingWrite) -> io::Result<()>
@@ -1385,6 +1422,8 @@ pub enum ParsedCommand {
     Unknown,
 }
 
+type CommandBatch = ArrayVec<ParsedCommand, MAX_SERVER_PIPELINE_DEPTH>;
+
 pub struct CommandLine;
 
 impl CommandLine {
@@ -1410,10 +1449,10 @@ impl CommandLine {
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
-pub async fn read_command_batch<R>(
+async fn read_command_batch<R>(
     reader: &mut BufReader<R>,
     command_buf: &mut Vec<u8>,
-    command_batch: &mut Vec<ParsedCommand>,
+    command_batch: &mut CommandBatch,
     max_pipeline_depth: usize,
 ) -> io::Result<bool>
 where
@@ -1440,7 +1479,7 @@ where
     Ok(true)
 }
 
-fn push_command(command_buf: &mut Vec<u8>, command_batch: &mut Vec<ParsedCommand>) {
+fn push_command(command_buf: &mut Vec<u8>, command_batch: &mut CommandBatch) {
     command_batch.push(parse_command_buf(command_buf));
 }
 
@@ -1659,6 +1698,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_write_vectors_pending_prefix_with_large_response() {
+        let mut writer = VectoredWriter::default();
+        let mut pending = PendingWrite::new();
+
+        pending.push(&mut writer, DATE_RESPONSE).await.unwrap();
+        pending
+            .write_with_response(&mut writer, b"220 large response\r\nbody\r\n.\r\n")
+            .await
+            .unwrap();
+
+        assert_eq!(pending.len, 0);
+        assert_eq!(writer.vectored_writes, 1);
+        assert_eq!(writer.write_calls, 1);
+        assert_eq!(
+            writer.bytes,
+            [DATE_RESPONSE, b"220 large response\r\nbody\r\n.\r\n"].concat()
+        );
+    }
+
+    #[tokio::test]
     async fn handle_command_reports_large_response_write_error() {
         let mut args = test_args();
         args.article_bytes = 8192;
@@ -1685,15 +1744,15 @@ mod tests {
         let server = ChunkedRead::new(&[b"ART".as_slice(), b"ICLE 1\r\nBODY 2\r\n".as_slice()]);
         let mut reader = BufReader::with_capacity(32, server);
         let mut command_buf = Vec::with_capacity(MAX_COMMAND_LINE_BYTES);
-        let mut command_batch = Vec::with_capacity(4);
+        let mut command_batch = CommandBatch::new();
         assert!(
             read_command_batch(&mut reader, &mut command_buf, &mut command_batch, 4)
                 .await
                 .unwrap()
         );
         assert_eq!(
-            command_batch,
-            vec![ParsedCommand::Article, ParsedCommand::Body]
+            command_batch.as_slice(),
+            &[ParsedCommand::Article, ParsedCommand::Body]
         );
         assert!(
             !read_command_batch(&mut reader, &mut command_buf, &mut command_batch, 4)
@@ -1706,7 +1765,7 @@ mod tests {
     async fn read_command_batch_reports_reader_error() {
         let mut reader = BufReader::with_capacity(32, FailingRead);
         let mut command_buf = Vec::new();
-        let mut command_batch = Vec::new();
+        let mut command_batch = CommandBatch::new();
 
         let err = read_command_batch(&mut reader, &mut command_buf, &mut command_batch, 1)
             .await
@@ -1719,6 +1778,13 @@ mod tests {
     struct PendingOnceWriter {
         pending_once: bool,
         written: usize,
+    }
+
+    #[derive(Default)]
+    struct VectoredWriter {
+        write_calls: usize,
+        vectored_writes: usize,
+        bytes: Vec<u8>,
     }
 
     struct FailingWriter;
@@ -1755,6 +1821,45 @@ mod tests {
 
             self.written += buf.len();
             Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl tokio::io::AsyncWrite for VectoredWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.write_calls += 1;
+            self.bytes.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_write_vectored(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            bufs: &[IoSlice<'_>],
+        ) -> Poll<io::Result<usize>> {
+            self.write_calls += 1;
+            self.vectored_writes += 1;
+            let mut written = 0;
+            for buf in bufs {
+                self.bytes.extend_from_slice(buf);
+                written += buf.len();
+            }
+            Poll::Ready(Ok(written))
+        }
+
+        fn is_write_vectored(&self) -> bool {
+            true
         }
 
         fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -2428,7 +2533,7 @@ mod tests {
 
         let mut reader = BufReader::with_capacity(1024, server);
         let mut command_buf = Vec::with_capacity(1024);
-        let mut command_batch = Vec::with_capacity(8);
+        let mut command_batch = CommandBatch::new();
 
         assert!(
             read_command_batch(&mut reader, &mut command_buf, &mut command_batch, 8)
@@ -2436,8 +2541,8 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(
-            command_batch,
-            vec![
+            command_batch.as_slice(),
+            &[
                 ParsedCommand::Article,
                 ParsedCommand::Body,
                 ParsedCommand::Date,
@@ -2453,7 +2558,7 @@ mod tests {
         drop(client);
         let mut reader = BufReader::with_capacity(1024, server);
         let mut command_buf = Vec::with_capacity(1024);
-        let mut command_batch = Vec::with_capacity(8);
+        let mut command_batch = CommandBatch::new();
 
         assert!(
             !read_command_batch(&mut reader, &mut command_buf, &mut command_batch, 8)
@@ -2470,14 +2575,14 @@ mod tests {
 
         let mut reader = BufReader::with_capacity(1024, server);
         let mut command_buf = Vec::with_capacity(1024);
-        let mut command_batch = Vec::with_capacity(8);
+        let mut command_batch = CommandBatch::new();
 
         assert!(
             read_command_batch(&mut reader, &mut command_buf, &mut command_batch, 8)
                 .await
                 .unwrap()
         );
-        assert_eq!(command_batch, vec![ParsedCommand::Article]);
+        assert_eq!(command_batch.as_slice(), &[ParsedCommand::Article]);
     }
 
     #[tokio::test]
@@ -2490,7 +2595,7 @@ mod tests {
 
         let mut reader = BufReader::with_capacity(1024, server);
         let mut command_buf = Vec::with_capacity(1024);
-        let mut command_batch = Vec::with_capacity(8);
+        let mut command_batch = CommandBatch::new();
 
         assert!(
             read_command_batch(&mut reader, &mut command_buf, &mut command_batch, 2)
@@ -2498,8 +2603,8 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(
-            command_batch,
-            vec![ParsedCommand::Article, ParsedCommand::Body]
+            command_batch.as_slice(),
+            &[ParsedCommand::Article, ParsedCommand::Body]
         );
     }
 
@@ -2513,7 +2618,7 @@ mod tests {
 
         let mut reader = BufReader::with_capacity(1024, server);
         let mut command_buf = Vec::with_capacity(1024);
-        let mut command_batch = Vec::with_capacity(2);
+        let mut command_batch = CommandBatch::new();
 
         assert!(
             read_command_batch(&mut reader, &mut command_buf, &mut command_batch, 2)
@@ -2521,8 +2626,8 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(
-            command_batch,
-            vec![ParsedCommand::Article, ParsedCommand::Body]
+            command_batch.as_slice(),
+            &[ParsedCommand::Article, ParsedCommand::Body]
         );
 
         assert!(
@@ -2530,7 +2635,7 @@ mod tests {
                 .await
                 .unwrap()
         );
-        assert_eq!(command_batch, vec![ParsedCommand::Quit]);
+        assert_eq!(command_batch.as_slice(), &[ParsedCommand::Quit]);
     }
 
     #[tokio::test]

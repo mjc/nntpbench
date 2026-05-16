@@ -4,13 +4,14 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+arrayvec = "0.7.6"
 clap = { version = "4.6.1", features = ["derive"] }
 memchr = "2.8.0"
 socket2 = "0.6.3"
 tokio = { version = "1.52.3", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 
 [dev-dependencies]
-divan = "0.1"
+divan = "0.1.21"
 
 [target.'cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))'.dev-dependencies]
 iai-callgrind = "0.16.1"
