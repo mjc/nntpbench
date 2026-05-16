@@ -545,6 +545,7 @@ impl ClientSession {
             }
 
             while !stop.load(Ordering::Acquire)
+                && in_flight <= self.pipeline_low_watermark()
                 && in_flight < self.pipeline_depth
                 && (self.requests == 0 || issued < self.requests)
                 && !transfer_limit_reached(stats, self.transfer_bytes)
@@ -574,6 +575,10 @@ impl ClientSession {
         } else {
             self.requests.saturating_sub(issued).min(available as u64) as usize
         }
+    }
+
+    fn pipeline_low_watermark(&self) -> usize {
+        self.pipeline_depth / 2
     }
 
     async fn write_command_batch<W>(
