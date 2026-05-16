@@ -1736,15 +1736,17 @@ where
         let end = start + relative_lf + 1;
         let line = trim_line_slice(&input[start..end]);
         let request = RequestLine::parse(line);
-        visit(request);
-        count += 1;
         if matches!(request.kind(), RequestKind::TakeThis) {
             let Some(body_end) = find_dot_terminated_block_end(input, end) else {
                 break;
             };
+            visit(request);
+            count += 1;
             start = body_end;
             continue;
         }
+        visit(request);
+        count += 1;
         start = end;
     }
 
@@ -4566,6 +4568,18 @@ mod tests {
             b"TAKETHIS <take@test>\r\nHeader: value\r\n\r\nbody\r\n.\r\nQUIT\r\n".len()
         );
         assert_eq!(batch, vec![RequestKind::TakeThis, RequestKind::Quit]);
+    }
+
+    #[test]
+    fn for_each_request_line_in_batch_skips_incomplete_takethis_until_body_finishes() {
+        let mut batch = Vec::with_capacity(4);
+        let input = b"TAKETHIS <take@test>\r\nHeader: value\r\n\r\nbody\r\nQUIT\r\n";
+        let consumed = for_each_request_line_in_batch(input, 8, |request| {
+            batch.push(request.kind());
+        });
+
+        assert_eq!(consumed, 0);
+        assert!(batch.is_empty());
     }
 
     #[test]
