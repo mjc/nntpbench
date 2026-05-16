@@ -2276,6 +2276,28 @@ mod tests {
         }
     }
 
+    fn test_typed_client_args() -> TypedClientArgs {
+        TypedClientArgs {
+            connect: "127.0.0.1:1199".parse().unwrap(),
+            requests: 0,
+            transfer_bytes: 0,
+            duration_secs: 0,
+            connections: 1,
+            client_offset: 0,
+            total_clients: 0,
+            threads: 1,
+            pipeline_depth: 64,
+            command_mix: ClientCommandMix::Alternate,
+            start_id: 1,
+            read_buffer_bytes: CLIENT_READER_CAPACITY,
+            nodelay: true,
+            socket_recv_buffer: HIGH_THROUGHPUT_SOCKET_BUFFER,
+            socket_send_buffer: HIGH_THROUGHPUT_SOCKET_BUFFER,
+            csv: false,
+            stats_interval_secs: 0,
+        }
+    }
+
     fn write_temp_segments(name: &str, contents: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
         let unique = format!(
@@ -2848,6 +2870,44 @@ mod tests {
     }
 
     #[test]
+    fn typed_client_config_from_args_clamps_and_copies_fields() {
+        let mut args = test_typed_client_args();
+        args.requests = 17;
+        args.transfer_bytes = 8192;
+        args.duration_secs = 3;
+        args.connections = 0;
+        args.client_offset = 4;
+        args.total_clients = 0;
+        args.pipeline_depth = 0;
+        args.command_mix = ClientCommandMix::Body;
+        args.start_id = 99;
+        args.read_buffer_bytes = 1;
+        args.nodelay = false;
+        args.socket_recv_buffer = 4096;
+        args.socket_send_buffer = 8192;
+        args.csv = true;
+        args.stats_interval_secs = 2;
+
+        let config = TypedClientConfig::from_args(args);
+
+        assert_eq!(config.requests, 17);
+        assert_eq!(config.transfer_bytes, 8192);
+        assert_eq!(config.duration, Duration::from_secs(3));
+        assert_eq!(config.connections, 1);
+        assert_eq!(config.client_offset, 4);
+        assert_eq!(config.total_clients, 1);
+        assert_eq!(config.pipeline_depth, 1);
+        assert_eq!(config.command_mix, ClientCommandMix::Body);
+        assert_eq!(config.start_id, 99);
+        assert_eq!(config.read_buffer_bytes, tail_buffer::TERMINATOR_TAIL_SIZE);
+        assert!(!config.nodelay);
+        assert_eq!(config.socket_recv_buffer, 4096);
+        assert_eq!(config.socket_send_buffer, 8192);
+        assert!(config.csv);
+        assert_eq!(config.stats_interval, Duration::from_secs(2));
+    }
+
+    #[test]
     fn client_limit_and_distribution_helpers_cover_edge_cases() {
         let stats = Stats::new();
         assert!(!transfer_limit_reached(&stats, 0));
@@ -3026,6 +3086,64 @@ mod tests {
         args.read_buffer_bytes = 64;
         let config = ClientConfig::from_args(args).unwrap();
         let session = ClientSession::new(&config, 0, 1, 2);
+        let stats = Arc::new(Stats::new());
+        let stop = Arc::new(AtomicBool::new(false));
+
+        session.run(stats.clone(), stop.clone()).await.unwrap();
+        server.await.unwrap();
+
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.accepted_connections, 1);
+        assert_eq!(snapshot.active_connections, 0);
+        assert_eq!(snapshot.commands, 2);
+        assert_eq!(snapshot.article_requests, 1);
+        assert_eq!(snapshot.body_requests, 1);
+        assert_eq!(snapshot.pipeline_batches, 1);
+        assert!(snapshot.bytes_sent > 0);
+        assert!(!stop.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn typed_client_session_runs_pipelined_requests_against_loopback_server() {
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"201 loopback ready\r\n").await.unwrap();
+
+            let mut scratch = [0_u8; 128];
+            let mut pending = Vec::new();
+            while pending.iter().filter(|byte| **byte == b'\n').count() < 2 {
+                let read = stream.read(&mut scratch).await.unwrap();
+                assert_ne!(read, 0);
+                pending.extend_from_slice(&scratch[..read]);
+            }
+
+            assert_eq!(
+                &pending[..],
+                b"ARTICLE <bench.article@nntpbench.local>\r\nBODY <bench.body@nntpbench.local>\r\n"
+            );
+
+            stream
+                .write_all(
+                    b"220 1 <bench.article@nntpbench.local> article follows\r\nSubject: Bench\r\n\r\none\r\n.\r\n",
+                )
+                .await
+                .unwrap();
+            stream
+                .write_all(b"222 1 <bench.body@nntpbench.local> body follows\r\ntwo\r\n.\r\n")
+                .await
+                .unwrap();
+        });
+
+        let mut args = test_typed_client_args();
+        args.connect = addr;
+        args.requests = 2;
+        args.pipeline_depth = 2;
+        args.command_mix = ClientCommandMix::Alternate;
+        args.read_buffer_bytes = 64;
+        let config = TypedClientConfig::from_args(args);
+        let session = TypedClientSession::new(&config, 0, 1, 2);
         let stats = Arc::new(Stats::new());
         let stop = Arc::new(AtomicBool::new(false));
 
