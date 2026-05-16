@@ -239,6 +239,90 @@ fn validate_group_name(value: &str) -> Result<(), InvalidGroupName> {
     Ok(())
 }
 
+/// Validated AUTHINFO argument value.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AuthInfoValue<'a>(Cow<'a, str>);
+
+impl<'a> AuthInfoValue<'a> {
+    /// Construct a borrowed AUTHINFO value after validation.
+    pub fn from_borrowed(value: &'a str) -> Result<Self, InvalidAuthInfoValue> {
+        validate_auth_info_value(value)?;
+        Ok(Self(Cow::Borrowed(value)))
+    }
+
+    /// Construct an owned AUTHINFO value after validation.
+    pub fn from_owned(
+        value: impl AsRef<str>,
+    ) -> Result<AuthInfoValue<'static>, InvalidAuthInfoValue> {
+        let value = value.as_ref();
+        validate_auth_info_value(value)?;
+        Ok(AuthInfoValue(Cow::Owned(value.to_owned())))
+    }
+
+    /// Borrow the validated string.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidAuthInfoValue;
+
+fn validate_auth_info_value(value: &str) -> Result<(), InvalidAuthInfoValue> {
+    if value.is_empty()
+        || value
+            .bytes()
+            .any(|byte| matches!(byte, b'\0' | b'\r' | b'\n'))
+    {
+        return Err(InvalidAuthInfoValue);
+    }
+
+    Ok(())
+}
+
+/// AUTHINFO command families currently supported by the typed surface.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AuthInfoKind {
+    User,
+    Pass,
+}
+
+impl AuthInfoKind {
+    #[must_use]
+    pub const fn as_wire(self) -> &'static [u8] {
+        match self {
+            Self::User => b"USER",
+            Self::Pass => b"PASS",
+        }
+    }
+}
+
+/// Raw TAKETHIS article payload bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArticleTransfer<'a>(Cow<'a, [u8]>);
+
+impl<'a> ArticleTransfer<'a> {
+    /// Construct a borrowed article transfer payload.
+    #[must_use]
+    pub fn from_borrowed(value: &'a [u8]) -> Self {
+        Self(Cow::Borrowed(value))
+    }
+
+    /// Construct an owned article transfer payload.
+    #[must_use]
+    pub fn from_owned(value: impl AsRef<[u8]>) -> ArticleTransfer<'static> {
+        ArticleTransfer(Cow::Owned(value.as_ref().to_vec()))
+    }
+
+    /// Borrow the raw payload bytes.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
 /// Validated NNTP date argument for NEWGROUPS/NEWNEWS.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct NntpDate<'a>(Cow<'a, str>);
@@ -495,6 +579,22 @@ pub enum Request<'a> {
         time: NntpTime<'a>,
         gmt: bool,
     },
+    Post,
+    Ihave {
+        message_id: MessageId<'a>,
+    },
+    Check {
+        message_id: MessageId<'a>,
+    },
+    TakeThis {
+        message_id: MessageId<'a>,
+        article: ArticleTransfer<'a>,
+    },
+    AuthInfo {
+        kind: AuthInfoKind,
+        value: AuthInfoValue<'a>,
+    },
+    StartTls,
     List,
     Help,
     Capabilities,
@@ -522,6 +622,12 @@ impl<'a> Request<'a> {
             Self::Xhdr { .. } => RequestKind::Xhdr,
             Self::NewGroups { .. } => RequestKind::NewGroups,
             Self::NewNews { .. } => RequestKind::NewNews,
+            Self::Post => RequestKind::Post,
+            Self::Ihave { .. } => RequestKind::Ihave,
+            Self::Check { .. } => RequestKind::Check,
+            Self::TakeThis { .. } => RequestKind::TakeThis,
+            Self::AuthInfo { .. } => RequestKind::AuthInfo,
+            Self::StartTls => RequestKind::StartTls,
             Self::List => RequestKind::List,
             Self::Help => RequestKind::Help,
             Self::Capabilities => RequestKind::Capabilities,
@@ -575,6 +681,17 @@ impl<'a> Request<'a> {
                 time.as_str(),
                 *gmt,
             ),
+            Self::Post => write_simple_request_wire(output, b"POST"),
+            Self::Ihave { message_id } => write_request_wire(output, b"IHAVE ", message_id),
+            Self::Check { message_id } => write_request_wire(output, b"CHECK ", message_id),
+            Self::TakeThis {
+                message_id,
+                article,
+            } => write_transfer_request_wire(output, b"TAKETHIS ", message_id, article),
+            Self::AuthInfo { kind, value } => {
+                write_authinfo_request_wire(output, *kind, value.as_str())
+            }
+            Self::StartTls => write_simple_request_wire(output, b"STARTTLS"),
             Self::List => write_simple_request_wire(output, b"LIST"),
             Self::Help => write_simple_request_wire(output, b"HELP"),
             Self::Capabilities => write_simple_request_wire(output, b"CAPABILITIES"),
@@ -591,7 +708,10 @@ impl<'a> Request<'a> {
             Self::Article { message_id }
             | Self::Body { message_id }
             | Self::Head { message_id }
-            | Self::Stat { message_id } => Some(message_id),
+            | Self::Stat { message_id }
+            | Self::Ihave { message_id }
+            | Self::Check { message_id }
+            | Self::TakeThis { message_id, .. } => Some(message_id),
             Self::Group { .. }
             | Self::ListGroup { .. }
             | Self::Last
@@ -601,7 +721,10 @@ impl<'a> Request<'a> {
             | Self::Hdr { .. }
             | Self::Xhdr { .. }
             | Self::NewGroups { .. }
-            | Self::NewNews { .. } => None,
+            | Self::NewNews { .. }
+            | Self::Post
+            | Self::AuthInfo { .. }
+            | Self::StartTls => None,
             Self::List
             | Self::Help
             | Self::Capabilities
@@ -630,6 +753,12 @@ impl<'a> Request<'a> {
             | Self::Xover { .. }
             | Self::NewGroups { .. }
             | Self::NewNews { .. }
+            | Self::Post
+            | Self::Ihave { .. }
+            | Self::Check { .. }
+            | Self::TakeThis { .. }
+            | Self::AuthInfo { .. }
+            | Self::StartTls
             | Self::List
             | Self::Help
             | Self::Capabilities
@@ -656,6 +785,12 @@ impl<'a> Request<'a> {
             | Self::Xhdr { .. }
             | Self::NewGroups { .. }
             | Self::NewNews { .. }
+            | Self::Post
+            | Self::Ihave { .. }
+            | Self::Check { .. }
+            | Self::TakeThis { .. }
+            | Self::AuthInfo { .. }
+            | Self::StartTls
             | Self::List
             | Self::Help
             | Self::Capabilities
@@ -682,6 +817,12 @@ impl<'a> Request<'a> {
             | Self::Xhdr { .. }
             | Self::NewGroups { .. }
             | Self::NewNews { .. }
+            | Self::Post
+            | Self::Ihave { .. }
+            | Self::Check { .. }
+            | Self::TakeThis { .. }
+            | Self::AuthInfo { .. }
+            | Self::StartTls
             | Self::List
             | Self::Help
             | Self::Capabilities
@@ -711,6 +852,12 @@ impl<'a> Request<'a> {
             | Self::Xover { .. }
             | Self::Hdr { .. }
             | Self::Xhdr { .. }
+            | Self::Post
+            | Self::Ihave { .. }
+            | Self::Check { .. }
+            | Self::TakeThis { .. }
+            | Self::AuthInfo { .. }
+            | Self::StartTls
             | Self::List
             | Self::Help
             | Self::Capabilities
@@ -738,6 +885,78 @@ impl<'a> Request<'a> {
             | Self::Hdr { .. }
             | Self::Xhdr { .. }
             | Self::NewGroups { .. }
+            | Self::Post
+            | Self::Ihave { .. }
+            | Self::Check { .. }
+            | Self::TakeThis { .. }
+            | Self::AuthInfo { .. }
+            | Self::StartTls
+            | Self::List
+            | Self::Help
+            | Self::Capabilities
+            | Self::Date
+            | Self::ModeReader
+            | Self::Quit => None,
+        }
+    }
+
+    /// Borrow AUTHINFO kind/value carried by this request, if any.
+    #[must_use]
+    pub const fn auth_info(&self) -> Option<(AuthInfoKind, &AuthInfoValue<'a>)> {
+        match self {
+            Self::AuthInfo { kind, value } => Some((*kind, value)),
+            Self::Article { .. }
+            | Self::Body { .. }
+            | Self::Head { .. }
+            | Self::Stat { .. }
+            | Self::Group { .. }
+            | Self::ListGroup { .. }
+            | Self::Last
+            | Self::Next
+            | Self::Over { .. }
+            | Self::Xover { .. }
+            | Self::Hdr { .. }
+            | Self::Xhdr { .. }
+            | Self::NewGroups { .. }
+            | Self::NewNews { .. }
+            | Self::Post
+            | Self::Ihave { .. }
+            | Self::Check { .. }
+            | Self::TakeThis { .. }
+            | Self::StartTls
+            | Self::List
+            | Self::Help
+            | Self::Capabilities
+            | Self::Date
+            | Self::ModeReader
+            | Self::Quit => None,
+        }
+    }
+
+    /// Borrow TAKETHIS article payload carried by this request, if any.
+    #[must_use]
+    pub const fn article_transfer(&self) -> Option<&ArticleTransfer<'a>> {
+        match self {
+            Self::TakeThis { article, .. } => Some(article),
+            Self::Article { .. }
+            | Self::Body { .. }
+            | Self::Head { .. }
+            | Self::Stat { .. }
+            | Self::Group { .. }
+            | Self::ListGroup { .. }
+            | Self::Last
+            | Self::Next
+            | Self::Over { .. }
+            | Self::Xover { .. }
+            | Self::Hdr { .. }
+            | Self::Xhdr { .. }
+            | Self::NewGroups { .. }
+            | Self::NewNews { .. }
+            | Self::Post
+            | Self::Ihave { .. }
+            | Self::Check { .. }
+            | Self::AuthInfo { .. }
+            | Self::StartTls
             | Self::List
             | Self::Help
             | Self::Capabilities
@@ -867,6 +1086,59 @@ impl Request<'static> {
             time: NntpTime::from_owned(time).map_err(InvalidDiscoveryArguments::Time)?,
             gmt,
         })
+    }
+
+    /// Build a POST request.
+    #[must_use]
+    pub const fn post() -> Self {
+        Self::Post
+    }
+
+    /// Build an IHAVE request from a borrowed or bare message-id string.
+    pub fn ihave(message_id: impl AsRef<str>) -> Result<Self, InvalidMessageId> {
+        Ok(Self::Ihave {
+            message_id: MessageId::from_str_or_wrap(message_id)?,
+        })
+    }
+
+    /// Build a CHECK request from a borrowed or bare message-id string.
+    pub fn check(message_id: impl AsRef<str>) -> Result<Self, InvalidMessageId> {
+        Ok(Self::Check {
+            message_id: MessageId::from_str_or_wrap(message_id)?,
+        })
+    }
+
+    /// Build a TAKETHIS request from a message-id and article payload.
+    pub fn takethis(
+        message_id: impl AsRef<str>,
+        article: impl AsRef<[u8]>,
+    ) -> Result<Self, InvalidMessageId> {
+        Ok(Self::TakeThis {
+            message_id: MessageId::from_str_or_wrap(message_id)?,
+            article: ArticleTransfer::from_owned(article),
+        })
+    }
+
+    /// Build an AUTHINFO USER request.
+    pub fn authinfo_user(value: impl AsRef<str>) -> Result<Self, InvalidAuthInfoValue> {
+        Ok(Self::AuthInfo {
+            kind: AuthInfoKind::User,
+            value: AuthInfoValue::from_owned(value)?,
+        })
+    }
+
+    /// Build an AUTHINFO PASS request.
+    pub fn authinfo_pass(value: impl AsRef<str>) -> Result<Self, InvalidAuthInfoValue> {
+        Ok(Self::AuthInfo {
+            kind: AuthInfoKind::Pass,
+            value: AuthInfoValue::from_owned(value)?,
+        })
+    }
+
+    /// Build a STARTTLS request.
+    #[must_use]
+    pub const fn starttls() -> Self {
+        Self::StartTls
     }
 
     /// Build a LIST request.
@@ -1119,6 +1391,43 @@ fn write_newnews_request_wire(
     output.extend_from_slice(b"\r\n");
 }
 
+fn write_authinfo_request_wire(output: &mut Vec<u8>, kind: AuthInfoKind, value: &str) {
+    output.extend_from_slice(b"AUTHINFO ");
+    output.extend_from_slice(kind.as_wire());
+    output.push(b' ');
+    output.extend_from_slice(value.as_bytes());
+    output.extend_from_slice(b"\r\n");
+}
+
+fn write_transfer_request_wire(
+    output: &mut Vec<u8>,
+    verb: &[u8],
+    message_id: &MessageId<'_>,
+    article: &ArticleTransfer<'_>,
+) {
+    output.extend_from_slice(verb);
+    output.extend_from_slice(message_id.as_str().as_bytes());
+    output.extend_from_slice(b"\r\n");
+
+    let payload = article.as_bytes();
+    if payload.is_empty() {
+        output.extend_from_slice(b".\r\n");
+        return;
+    }
+
+    for raw_line in payload.split_inclusive(|byte| *byte == b'\n') {
+        let line = raw_line.strip_suffix(b"\n").unwrap_or(raw_line);
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.starts_with(b".") {
+            output.push(b'.');
+        }
+        output.extend_from_slice(line);
+        output.extend_from_slice(b"\r\n");
+    }
+
+    output.extend_from_slice(b".\r\n");
+}
+
 fn write_simple_request_wire(output: &mut Vec<u8>, verb: &[u8]) {
     output.extend_from_slice(verb);
     output.extend_from_slice(b"\r\n");
@@ -1254,6 +1563,21 @@ mod tests {
     }
 
     #[test]
+    fn auth_info_values_validate() {
+        assert_eq!(
+            AuthInfoValue::from_borrowed("user name").unwrap().as_str(),
+            "user name"
+        );
+        assert_eq!(
+            AuthInfoValue::from_borrowed("pass\tword").unwrap().as_str(),
+            "pass\tword"
+        );
+        assert!(AuthInfoValue::from_borrowed("").is_err());
+        assert!(AuthInfoValue::from_borrowed("bad\rvalue").is_err());
+        assert!(AuthInfoValue::from_borrowed("bad\nvalue").is_err());
+    }
+
+    #[test]
     fn request_line_parses_current_command_set() {
         assert_eq!(
             RequestLine::parse(b"ARTICLE <a@b>").kind(),
@@ -1377,6 +1701,12 @@ mod tests {
         assert!(RequestKind::Xhdr.expects_multiline_response(StatusCode(225)));
         assert!(RequestKind::NewGroups.expects_multiline_response(StatusCode(231)));
         assert!(RequestKind::NewNews.expects_multiline_response(StatusCode(230)));
+        assert!(!RequestKind::Post.expects_multiline_response(StatusCode(340)));
+        assert!(!RequestKind::Ihave.expects_multiline_response(StatusCode(335)));
+        assert!(!RequestKind::Check.expects_multiline_response(StatusCode(238)));
+        assert!(!RequestKind::TakeThis.expects_multiline_response(StatusCode(239)));
+        assert!(!RequestKind::AuthInfo.expects_multiline_response(StatusCode(381)));
+        assert!(!RequestKind::StartTls.expects_multiline_response(StatusCode(382)));
         assert!(RequestKind::Capabilities.expects_multiline_response(StatusCode(101)));
         assert!(!RequestKind::Date.expects_multiline_response(StatusCode(111)));
         assert!(!RequestKind::ModeReader.expects_multiline_response(StatusCode(201)));
@@ -1431,6 +1761,28 @@ mod tests {
             time: NntpTime::from_borrowed("000000").unwrap(),
             gmt: false,
         };
+        let post = Request::Post;
+        let ihave = Request::Ihave {
+            message_id: MessageId::from_borrowed("<ihave@test>").unwrap(),
+        };
+        let check = Request::Check {
+            message_id: MessageId::from_borrowed("<check@test>").unwrap(),
+        };
+        let takethis = Request::TakeThis {
+            message_id: MessageId::from_borrowed("<take@test>").unwrap(),
+            article: ArticleTransfer::from_borrowed(
+                b"Subject: test\r\n\r\npayload line\r\n.leading dot\r\n",
+            ),
+        };
+        let authinfo_user = Request::AuthInfo {
+            kind: AuthInfoKind::User,
+            value: AuthInfoValue::from_borrowed("user name").unwrap(),
+        };
+        let authinfo_pass = Request::AuthInfo {
+            kind: AuthInfoKind::Pass,
+            value: AuthInfoValue::from_borrowed("pass word").unwrap(),
+        };
+        let starttls = Request::StartTls;
         let list = Request::List;
         let help = Request::Help;
         let capabilities = Request::Capabilities;
@@ -1509,6 +1861,44 @@ mod tests {
         assert_eq!(wire, b"NEWNEWS comp.lang.*,alt.test 20260101 000000\r\n");
 
         wire.clear();
+        post.write_wire_to(&mut wire);
+        assert_eq!(post.kind(), RequestKind::Post);
+        assert_eq!(wire, b"POST\r\n");
+
+        wire.clear();
+        ihave.write_wire_to(&mut wire);
+        assert_eq!(ihave.kind(), RequestKind::Ihave);
+        assert_eq!(wire, b"IHAVE <ihave@test>\r\n");
+
+        wire.clear();
+        check.write_wire_to(&mut wire);
+        assert_eq!(check.kind(), RequestKind::Check);
+        assert_eq!(wire, b"CHECK <check@test>\r\n");
+
+        wire.clear();
+        takethis.write_wire_to(&mut wire);
+        assert_eq!(takethis.kind(), RequestKind::TakeThis);
+        assert_eq!(
+            wire,
+            b"TAKETHIS <take@test>\r\nSubject: test\r\n\r\npayload line\r\n..leading dot\r\n.\r\n"
+        );
+
+        wire.clear();
+        authinfo_user.write_wire_to(&mut wire);
+        assert_eq!(authinfo_user.kind(), RequestKind::AuthInfo);
+        assert_eq!(wire, b"AUTHINFO USER user name\r\n");
+
+        wire.clear();
+        authinfo_pass.write_wire_to(&mut wire);
+        assert_eq!(authinfo_pass.kind(), RequestKind::AuthInfo);
+        assert_eq!(wire, b"AUTHINFO PASS pass word\r\n");
+
+        wire.clear();
+        starttls.write_wire_to(&mut wire);
+        assert_eq!(starttls.kind(), RequestKind::StartTls);
+        assert_eq!(wire, b"STARTTLS\r\n");
+
+        wire.clear();
         list.write_wire_to(&mut wire);
         assert_eq!(list.kind(), RequestKind::List);
         assert_eq!(wire, b"LIST\r\n");
@@ -1556,6 +1946,13 @@ mod tests {
         let newgroups = Request::newgroups("20260101", "000000", true).unwrap();
         let newnews =
             Request::newnews("comp.lang.*,alt.test", "20260101", "000000", false).unwrap();
+        let post = Request::post();
+        let ihave = Request::ihave("ihave@test").unwrap();
+        let check = Request::check("check@test").unwrap();
+        let takethis = Request::takethis("take@test", b"Subject: one\r\n\r\nbody").unwrap();
+        let authinfo_user = Request::authinfo_user("user name").unwrap();
+        let authinfo_pass = Request::authinfo_pass("pass\tword").unwrap();
+        let starttls = Request::starttls();
         let list = Request::list();
         let help = Request::help();
         let capabilities = Request::capabilities();
@@ -1627,6 +2024,43 @@ mod tests {
             )),
             Some(("20260101", "000000", false))
         );
+        assert_eq!(post.kind(), RequestKind::Post);
+        assert!(post.message_id().is_none());
+        assert_eq!(ihave.kind(), RequestKind::Ihave);
+        assert_eq!(
+            ihave.message_id().map(MessageId::as_str),
+            Some("<ihave@test>")
+        );
+        assert_eq!(check.kind(), RequestKind::Check);
+        assert_eq!(
+            check.message_id().map(MessageId::as_str),
+            Some("<check@test>")
+        );
+        assert_eq!(takethis.kind(), RequestKind::TakeThis);
+        assert_eq!(
+            takethis.message_id().map(MessageId::as_str),
+            Some("<take@test>")
+        );
+        assert_eq!(
+            takethis.article_transfer().map(ArticleTransfer::as_bytes),
+            Some(&b"Subject: one\r\n\r\nbody"[..])
+        );
+        assert_eq!(authinfo_user.kind(), RequestKind::AuthInfo);
+        assert_eq!(
+            authinfo_user
+                .auth_info()
+                .map(|(kind, value)| (kind, value.as_str())),
+            Some((AuthInfoKind::User, "user name"))
+        );
+        assert_eq!(authinfo_pass.kind(), RequestKind::AuthInfo);
+        assert_eq!(
+            authinfo_pass
+                .auth_info()
+                .map(|(kind, value)| (kind, value.as_str())),
+            Some((AuthInfoKind::Pass, "pass\tword"))
+        );
+        assert_eq!(starttls.kind(), RequestKind::StartTls);
+        assert!(starttls.message_id().is_none());
         assert_eq!(list.kind(), RequestKind::List);
         assert!(list.message_id().is_none());
         assert_eq!(help.kind(), RequestKind::Help);
@@ -1648,6 +2082,8 @@ mod tests {
         assert!(Request::xhdr("Subject", "1 2").is_err());
         assert!(Request::newgroups("20261301", "000000", true).is_err());
         assert!(Request::newnews("", "20260101", "000000", false).is_err());
+        assert!(Request::authinfo_user("").is_err());
+        assert!(Request::authinfo_pass("bad\nvalue").is_err());
     }
 
     #[test]
@@ -1667,6 +2103,12 @@ mod tests {
             Request::xhdr("Message-ID", "<i@j>").unwrap(),
             Request::newgroups("20260101", "000000", true).unwrap(),
             Request::newnews("comp.lang.*", "20260101", "000000", false).unwrap(),
+            Request::post(),
+            Request::ihave("ihave@test").unwrap(),
+            Request::check("check@test").unwrap(),
+            Request::authinfo_user("user").unwrap(),
+            Request::authinfo_pass("pass").unwrap(),
+            Request::starttls(),
             Request::list(),
             Request::help(),
             Request::capabilities(),
@@ -1685,5 +2127,16 @@ mod tests {
                 "{wire:?}"
             );
         }
+
+        let mut wire = Vec::new();
+        Request::takethis("take@test", b"Subject: wire\r\n\r\n.line\r\nbody")
+            .unwrap()
+            .write_wire_to(&mut wire);
+        assert!(wire.ends_with(b".\r\n"), "{wire:?}");
+        assert!(wire.starts_with(b"TAKETHIS <take@test>\r\n"), "{wire:?}");
+        assert!(
+            wire.windows(8).any(|window| window == b"..line\r\n"),
+            "{wire:?}"
+        );
     }
 }

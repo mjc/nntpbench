@@ -12,8 +12,8 @@ use tokio::task::JoinHandle;
 use crate::protocol::Request;
 use crate::tail_buffer::{TailBuffer, TerminatorStatus};
 use crate::{
-    Article, ArticleParseError, ArticleSelector, GroupName, HeaderName, MessageId, NntpDate,
-    NntpTime, RequestKind, StatusCode, Wildmat,
+    Article, ArticleParseError, ArticleSelector, ArticleTransfer, AuthInfoValue, GroupName,
+    HeaderName, MessageId, NntpDate, NntpTime, RequestKind, StatusCode, Wildmat,
 };
 
 /// Options for the typed one-connection client prototype.
@@ -265,6 +265,124 @@ impl Client {
     ) -> Result<OwnedExchange, TypedClientError> {
         let request = Request::newnews(wildmat, date, time, gmt).map_err(TypedClientError::from)?;
         self.execute_raw_exchange(request).await
+    }
+
+    /// Send a POST request and return the owned raw response frame.
+    pub async fn post(&self) -> Result<OwnedResponse, TypedClientError> {
+        self.execute_raw(Request::post()).await
+    }
+
+    /// Send a POST request and return the completed raw request/response pair.
+    pub async fn post_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+        self.execute_raw_exchange(Request::post()).await
+    }
+
+    /// Send an IHAVE request and return the owned raw response frame.
+    pub async fn ihave(
+        &self,
+        message_id: impl AsRef<str>,
+    ) -> Result<OwnedResponse, TypedClientError> {
+        let request = Request::ihave(message_id).map_err(|_| TypedClientError::InvalidMessageId)?;
+        self.execute_raw(request).await
+    }
+
+    /// Send an IHAVE request and return the completed raw request/response pair.
+    pub async fn ihave_exchange(
+        &self,
+        message_id: impl AsRef<str>,
+    ) -> Result<OwnedExchange, TypedClientError> {
+        let request = Request::ihave(message_id).map_err(|_| TypedClientError::InvalidMessageId)?;
+        self.execute_raw_exchange(request).await
+    }
+
+    /// Send a CHECK request and return the owned raw response frame.
+    pub async fn check(
+        &self,
+        message_id: impl AsRef<str>,
+    ) -> Result<OwnedResponse, TypedClientError> {
+        let request = Request::check(message_id).map_err(|_| TypedClientError::InvalidMessageId)?;
+        self.execute_raw(request).await
+    }
+
+    /// Send a CHECK request and return the completed raw request/response pair.
+    pub async fn check_exchange(
+        &self,
+        message_id: impl AsRef<str>,
+    ) -> Result<OwnedExchange, TypedClientError> {
+        let request = Request::check(message_id).map_err(|_| TypedClientError::InvalidMessageId)?;
+        self.execute_raw_exchange(request).await
+    }
+
+    /// Send a TAKETHIS request and return the owned raw response frame.
+    pub async fn takethis(
+        &self,
+        message_id: impl AsRef<str>,
+        article: impl AsRef<[u8]>,
+    ) -> Result<OwnedResponse, TypedClientError> {
+        let request = Request::takethis(message_id, article)
+            .map_err(|_| TypedClientError::InvalidMessageId)?;
+        self.execute_raw(request).await
+    }
+
+    /// Send a TAKETHIS request and return the completed raw request/response pair.
+    pub async fn takethis_exchange(
+        &self,
+        message_id: impl AsRef<str>,
+        article: impl AsRef<[u8]>,
+    ) -> Result<OwnedExchange, TypedClientError> {
+        let request = Request::takethis(message_id, article)
+            .map_err(|_| TypedClientError::InvalidMessageId)?;
+        self.execute_raw_exchange(request).await
+    }
+
+    /// Send an AUTHINFO USER request and return the owned raw response frame.
+    pub async fn authinfo_user(
+        &self,
+        value: impl AsRef<str>,
+    ) -> Result<OwnedResponse, TypedClientError> {
+        let request =
+            Request::authinfo_user(value).map_err(|_| TypedClientError::InvalidAuthInfoValue)?;
+        self.execute_raw(request).await
+    }
+
+    /// Send an AUTHINFO USER request and return the completed raw request/response pair.
+    pub async fn authinfo_user_exchange(
+        &self,
+        value: impl AsRef<str>,
+    ) -> Result<OwnedExchange, TypedClientError> {
+        let request =
+            Request::authinfo_user(value).map_err(|_| TypedClientError::InvalidAuthInfoValue)?;
+        self.execute_raw_exchange(request).await
+    }
+
+    /// Send an AUTHINFO PASS request and return the owned raw response frame.
+    pub async fn authinfo_pass(
+        &self,
+        value: impl AsRef<str>,
+    ) -> Result<OwnedResponse, TypedClientError> {
+        let request =
+            Request::authinfo_pass(value).map_err(|_| TypedClientError::InvalidAuthInfoValue)?;
+        self.execute_raw(request).await
+    }
+
+    /// Send an AUTHINFO PASS request and return the completed raw request/response pair.
+    pub async fn authinfo_pass_exchange(
+        &self,
+        value: impl AsRef<str>,
+    ) -> Result<OwnedExchange, TypedClientError> {
+        let request =
+            Request::authinfo_pass(value).map_err(|_| TypedClientError::InvalidAuthInfoValue)?;
+        self.execute_raw_exchange(request).await
+    }
+
+    /// Send a STARTTLS request and return the owned raw response frame.
+    pub async fn starttls(&self) -> Result<OwnedResponse, TypedClientError> {
+        self.execute_raw(Request::starttls()).await
+    }
+
+    /// Send a STARTTLS request and return the completed raw request/response pair.
+    pub async fn starttls_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+        self.execute_raw_exchange(Request::starttls()).await
     }
 
     /// Send an OVER request and return the owned raw response frame.
@@ -645,6 +763,132 @@ impl TypedClientConnection {
         .await
     }
 
+    /// Send a POST request and return the owned response frame.
+    pub async fn post(&self) -> Result<OwnedResponse, TypedClientError> {
+        self.execute(Request::Post).await
+    }
+
+    /// Send a POST request and return the completed request/response pair.
+    pub async fn post_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+        self.execute_exchange(Request::Post).await
+    }
+
+    /// Send an IHAVE request and return the owned response frame.
+    pub async fn ihave(
+        &self,
+        message_id: MessageId<'static>,
+    ) -> Result<OwnedResponse, TypedClientError> {
+        self.execute(Request::Ihave { message_id }).await
+    }
+
+    /// Send an IHAVE request and return the completed request/response pair.
+    pub async fn ihave_exchange(
+        &self,
+        message_id: MessageId<'static>,
+    ) -> Result<OwnedExchange, TypedClientError> {
+        self.execute_exchange(Request::Ihave { message_id }).await
+    }
+
+    /// Send a CHECK request and return the owned response frame.
+    pub async fn check(
+        &self,
+        message_id: MessageId<'static>,
+    ) -> Result<OwnedResponse, TypedClientError> {
+        self.execute(Request::Check { message_id }).await
+    }
+
+    /// Send a CHECK request and return the completed request/response pair.
+    pub async fn check_exchange(
+        &self,
+        message_id: MessageId<'static>,
+    ) -> Result<OwnedExchange, TypedClientError> {
+        self.execute_exchange(Request::Check { message_id }).await
+    }
+
+    /// Send a TAKETHIS request and return the owned response frame.
+    pub async fn takethis(
+        &self,
+        message_id: MessageId<'static>,
+        article: ArticleTransfer<'static>,
+    ) -> Result<OwnedResponse, TypedClientError> {
+        self.execute(Request::TakeThis {
+            message_id,
+            article,
+        })
+        .await
+    }
+
+    /// Send a TAKETHIS request and return the completed request/response pair.
+    pub async fn takethis_exchange(
+        &self,
+        message_id: MessageId<'static>,
+        article: ArticleTransfer<'static>,
+    ) -> Result<OwnedExchange, TypedClientError> {
+        self.execute_exchange(Request::TakeThis {
+            message_id,
+            article,
+        })
+        .await
+    }
+
+    /// Send an AUTHINFO USER request and return the owned response frame.
+    pub async fn authinfo_user(
+        &self,
+        value: AuthInfoValue<'static>,
+    ) -> Result<OwnedResponse, TypedClientError> {
+        self.execute(Request::AuthInfo {
+            kind: crate::protocol::AuthInfoKind::User,
+            value,
+        })
+        .await
+    }
+
+    /// Send an AUTHINFO USER request and return the completed request/response pair.
+    pub async fn authinfo_user_exchange(
+        &self,
+        value: AuthInfoValue<'static>,
+    ) -> Result<OwnedExchange, TypedClientError> {
+        self.execute_exchange(Request::AuthInfo {
+            kind: crate::protocol::AuthInfoKind::User,
+            value,
+        })
+        .await
+    }
+
+    /// Send an AUTHINFO PASS request and return the owned response frame.
+    pub async fn authinfo_pass(
+        &self,
+        value: AuthInfoValue<'static>,
+    ) -> Result<OwnedResponse, TypedClientError> {
+        self.execute(Request::AuthInfo {
+            kind: crate::protocol::AuthInfoKind::Pass,
+            value,
+        })
+        .await
+    }
+
+    /// Send an AUTHINFO PASS request and return the completed request/response pair.
+    pub async fn authinfo_pass_exchange(
+        &self,
+        value: AuthInfoValue<'static>,
+    ) -> Result<OwnedExchange, TypedClientError> {
+        self.execute_exchange(Request::AuthInfo {
+            kind: crate::protocol::AuthInfoKind::Pass,
+            value,
+        })
+        .await
+    }
+
+    /// Send a STARTTLS request and return the owned response frame.
+    pub async fn starttls(&self) -> Result<OwnedResponse, TypedClientError> {
+        self.execute(Request::StartTls).await
+    }
+
+    /// Send a STARTTLS request and return the completed request/response pair.
+    pub async fn starttls_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+        self.execute_exchange(Request::StartTls).await
+    }
+
     /// Send an OVER request and return the owned response frame.
     pub async fn over(
         &self,
@@ -998,6 +1242,9 @@ pub enum TypedClientError {
     MissingDate,
     InvalidTime,
     MissingTime,
+    InvalidAuthInfoValue,
+    MissingAuthInfoValue,
+    MissingArticleBody,
     InvalidHeaderName,
     MissingHeaderName,
     InvalidArticleSelector,
@@ -1025,6 +1272,9 @@ impl fmt::Display for TypedClientError {
             Self::MissingDate => write!(f, "date is required for this request"),
             Self::InvalidTime => write!(f, "invalid NNTP time"),
             Self::MissingTime => write!(f, "time is required for this request"),
+            Self::InvalidAuthInfoValue => write!(f, "invalid authinfo value"),
+            Self::MissingAuthInfoValue => write!(f, "authinfo value is required for this request"),
+            Self::MissingArticleBody => write!(f, "article body is required for this request"),
             Self::InvalidHeaderName => write!(f, "invalid header name"),
             Self::MissingHeaderName => write!(f, "header is required for this request"),
             Self::InvalidArticleSelector => write!(f, "invalid article selector"),
@@ -1076,6 +1326,12 @@ impl From<crate::protocol::InvalidDiscoveryArguments> for TypedClientError {
             crate::protocol::InvalidDiscoveryArguments::Date(_) => Self::InvalidDate,
             crate::protocol::InvalidDiscoveryArguments::Time(_) => Self::InvalidTime,
         }
+    }
+}
+
+impl From<crate::protocol::InvalidAuthInfoValue> for TypedClientError {
+    fn from(_: crate::protocol::InvalidAuthInfoValue) -> Self {
+        Self::InvalidAuthInfoValue
     }
 }
 
@@ -1349,6 +1605,9 @@ fn shared_engine_error_from_typed(err: TypedClientError) -> SharedEngineError {
         | TypedClientError::MissingDate
         | TypedClientError::InvalidTime
         | TypedClientError::MissingTime
+        | TypedClientError::InvalidAuthInfoValue
+        | TypedClientError::MissingAuthInfoValue
+        | TypedClientError::MissingArticleBody
         | TypedClientError::InvalidHeaderName
         | TypedClientError::MissingHeaderName
         | TypedClientError::InvalidArticleSelector
@@ -1832,6 +2091,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn typed_connection_fetches_remaining_rfc_frames() {
+        let listener = crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"201 typed ready\r\n").await.unwrap();
+
+            let mut request = [0_u8; 256];
+            let read = stream.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"POST\r\n");
+            stream.write_all(crate::POST_RESPONSE).await.unwrap();
+
+            let read = stream.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"IHAVE <ihave@test>\r\n");
+            stream.write_all(crate::IHAVE_RESPONSE).await.unwrap();
+
+            let read = stream.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"CHECK <check@test>\r\n");
+            stream.write_all(crate::CHECK_RESPONSE).await.unwrap();
+
+            let read = stream.read(&mut request).await.unwrap();
+            assert_eq!(
+                &request[..read],
+                b"TAKETHIS <take@test>\r\nSubject: Take\r\n\r\n..line\r\nbody\r\n.\r\n"
+            );
+            stream.write_all(crate::TAKETHIS_RESPONSE).await.unwrap();
+
+            let read = stream.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"AUTHINFO USER bench user\r\n");
+            stream.write_all(crate::AUTHINFO_RESPONSE).await.unwrap();
+
+            let read = stream.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"AUTHINFO PASS bench pass\r\n");
+            stream.write_all(crate::AUTHINFO_RESPONSE).await.unwrap();
+
+            let read = stream.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"STARTTLS\r\n");
+            stream.write_all(crate::STARTTLS_RESPONSE).await.unwrap();
+        });
+
+        let connection = TypedClientConnection::connect(addr).await.unwrap();
+        let post = connection.post().await.unwrap();
+        let ihave = connection
+            .ihave(MessageId::from_str_or_wrap("ihave@test").unwrap())
+            .await
+            .unwrap();
+        let check = connection
+            .check(MessageId::from_str_or_wrap("check@test").unwrap())
+            .await
+            .unwrap();
+        let takethis = connection
+            .takethis(
+                MessageId::from_str_or_wrap("take@test").unwrap(),
+                ArticleTransfer::from_owned(b"Subject: Take\r\n\r\n.line\r\nbody"),
+            )
+            .await
+            .unwrap();
+        let auth_user = connection
+            .authinfo_user(AuthInfoValue::from_owned("bench user").unwrap())
+            .await
+            .unwrap();
+        let auth_pass = connection
+            .authinfo_pass(AuthInfoValue::from_owned("bench pass").unwrap())
+            .await
+            .unwrap();
+        let starttls = connection.starttls().await.unwrap();
+
+        assert_eq!(post.kind(), RequestKind::Post);
+        assert_eq!(post.status().as_u16(), 340);
+        assert_eq!(ihave.kind(), RequestKind::Ihave);
+        assert_eq!(ihave.status().as_u16(), 335);
+        assert_eq!(check.kind(), RequestKind::Check);
+        assert_eq!(check.status().as_u16(), 238);
+        assert_eq!(takethis.kind(), RequestKind::TakeThis);
+        assert_eq!(takethis.status().as_u16(), 239);
+        assert_eq!(auth_user.kind(), RequestKind::AuthInfo);
+        assert_eq!(auth_user.status().as_u16(), 281);
+        assert_eq!(auth_pass.kind(), RequestKind::AuthInfo);
+        assert_eq!(auth_pass.status().as_u16(), 281);
+        assert_eq!(starttls.kind(), RequestKind::StartTls);
+        assert_eq!(starttls.status().as_u16(), 382);
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn typed_connection_fetches_hdr_and_xhdr_frames() {
         let listener = crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2154,6 +2499,81 @@ mod tests {
         );
         assert_eq!(newnews.response().kind(), RequestKind::NewNews);
         assert_eq!(newnews.response().status().as_u16(), 230);
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn client_remaining_rfc_methods_expose_general_request_surface() {
+        let listener = crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"201 typed ready\r\n").await.unwrap();
+
+            let mut request = [0_u8; 256];
+            let read = stream.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"POST\r\n");
+            stream.write_all(crate::POST_RESPONSE).await.unwrap();
+
+            let read = stream.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"IHAVE <ihave-surface@test>\r\n");
+            stream.write_all(crate::IHAVE_RESPONSE).await.unwrap();
+
+            let read = stream.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"CHECK <check-surface@test>\r\n");
+            stream.write_all(crate::CHECK_RESPONSE).await.unwrap();
+
+            let read = stream.read(&mut request).await.unwrap();
+            assert_eq!(
+                &request[..read],
+                b"TAKETHIS <take-surface@test>\r\nSubject: Surface\r\n\r\n..line\r\nbody\r\n.\r\n"
+            );
+            stream.write_all(crate::TAKETHIS_RESPONSE).await.unwrap();
+
+            let read = stream.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"AUTHINFO USER bench user\r\n");
+            stream.write_all(crate::AUTHINFO_RESPONSE).await.unwrap();
+
+            let read = stream.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"AUTHINFO PASS bench pass\r\n");
+            stream.write_all(crate::AUTHINFO_RESPONSE).await.unwrap();
+
+            let read = stream.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"STARTTLS\r\n");
+            stream.write_all(crate::STARTTLS_RESPONSE).await.unwrap();
+        });
+
+        let client = Client::connect(addr).await.unwrap();
+        let post = client.post().await.unwrap();
+        let ihave = client.ihave("ihave-surface@test").await.unwrap();
+        let check = client.check("check-surface@test").await.unwrap();
+        let takethis = client
+            .takethis(
+                "take-surface@test",
+                b"Subject: Surface\r\n\r\n.line\r\nbody",
+            )
+            .await
+            .unwrap();
+        let auth_user = client.authinfo_user("bench user").await.unwrap();
+        let auth_pass = client.authinfo_pass("bench pass").await.unwrap();
+        let starttls = client.starttls_exchange().await.unwrap();
+
+        assert_eq!(post.kind(), RequestKind::Post);
+        assert_eq!(post.status().as_u16(), 340);
+        assert_eq!(ihave.kind(), RequestKind::Ihave);
+        assert_eq!(ihave.status().as_u16(), 335);
+        assert_eq!(check.kind(), RequestKind::Check);
+        assert_eq!(check.status().as_u16(), 238);
+        assert_eq!(takethis.kind(), RequestKind::TakeThis);
+        assert_eq!(takethis.status().as_u16(), 239);
+        assert_eq!(auth_user.kind(), RequestKind::AuthInfo);
+        assert_eq!(auth_user.status().as_u16(), 281);
+        assert_eq!(auth_pass.kind(), RequestKind::AuthInfo);
+        assert_eq!(auth_pass.status().as_u16(), 281);
+        assert_eq!(starttls.request(), &Request::StartTls);
+        assert_eq!(starttls.response().kind(), RequestKind::StartTls);
+        assert_eq!(starttls.response().status().as_u16(), 382);
 
         server.await.unwrap();
     }

@@ -25,8 +25,9 @@ pub mod tail_buffer;
 pub mod typed_client;
 
 pub use protocol::{
-    Article, ArticleNumber, ArticleParseError, ArticleSelector, GroupName, HeaderIter, HeaderName,
-    Headers, MessageId, NntpDate, NntpTime, Request, RequestKind, RequestLine, StatusCode, Wildmat,
+    Article, ArticleNumber, ArticleParseError, ArticleSelector, ArticleTransfer, AuthInfoKind,
+    AuthInfoValue, GroupName, HeaderIter, HeaderName, Headers, MessageId, NntpDate, NntpTime,
+    Request, RequestKind, RequestLine, StatusCode, Wildmat,
 };
 pub use typed_client::{
     Client, OwnedArticle, OwnedArticleExchange, OwnedExchange, OwnedResponse,
@@ -50,6 +51,12 @@ pub const NEWGROUPS_RESPONSE: &[u8] =
     b"231 list of new newsgroups follows\r\ncomp.lang.rust 0000000003 0000000001 y\r\nalt.test 0000000003 0000000001 y\r\n.\r\n";
 pub const NEWNEWS_RESPONSE: &[u8] =
     b"230 list of new articles follows\r\n<one@alt.test>\r\n<two@alt.test>\r\n.\r\n";
+pub const POST_RESPONSE: &[u8] = b"340 send article to be posted\r\n";
+pub const IHAVE_RESPONSE: &[u8] = b"335 send article to be transferred\r\n";
+pub const CHECK_RESPONSE: &[u8] = b"238 send article to be transferred\r\n";
+pub const TAKETHIS_RESPONSE: &[u8] = b"239 article transferred ok\r\n";
+pub const AUTHINFO_RESPONSE: &[u8] = b"281 authentication accepted\r\n";
+pub const STARTTLS_RESPONSE: &[u8] = b"382 continue with TLS negotiation\r\n";
 pub const OVER_RESPONSE: &[u8] = b"224 Overview information follows\r\n1\tSubject one\tone@example.com\tFri, 16 May 2026 12:00:00 +0000\t<one@example.com>\t\t123\t4\r\n.\r\n";
 pub const XOVER_RESPONSE: &[u8] = b"224 Overview information follows\r\n2\tSubject two\ttwo@example.com\tFri, 16 May 2026 12:00:01 +0000\t<two@example.com>\t<ref@example.com>\t456\t8\r\n.\r\n";
 pub const HDR_RESPONSE: &[u8] =
@@ -351,6 +358,14 @@ pub struct TypedFetchArgs {
     #[arg(long)]
     pub message_id: Option<String>,
 
+    /// Article body for TAKETHIS requests.
+    #[arg(long)]
+    pub article_body: Option<String>,
+
+    /// AUTHINFO value for AUTHINFO USER/PASS requests.
+    #[arg(long)]
+    pub auth_value: Option<String>,
+
     /// Header name for HDR/XHDR requests.
     #[arg(long)]
     pub header: Option<String>,
@@ -416,6 +431,13 @@ pub enum TypedRequestKind {
     Next,
     Newgroups,
     Newnews,
+    Post,
+    Ihave,
+    Check,
+    Takethis,
+    AuthinfoUser,
+    AuthinfoPass,
+    Starttls,
     Over,
     Xover,
     Hdr,
@@ -667,6 +689,21 @@ fn typed_fetch_request(args: &TypedFetchArgs) -> Result<Request<'static>, TypedC
         TypedRequestKind::Next => Ok(Request::next()),
         TypedRequestKind::Newgroups => typed_fetch_newgroups_request(args),
         TypedRequestKind::Newnews => typed_fetch_newnews_request(args),
+        TypedRequestKind::Post => Ok(Request::post()),
+        TypedRequestKind::Ihave => {
+            typed_fetch_message_id_request(args, |message_id| Request::ihave(message_id))
+        }
+        TypedRequestKind::Check => {
+            typed_fetch_message_id_request(args, |message_id| Request::check(message_id))
+        }
+        TypedRequestKind::Takethis => typed_fetch_takethis_request(args),
+        TypedRequestKind::AuthinfoUser => {
+            typed_fetch_authinfo_request(args, |value| Request::authinfo_user(value))
+        }
+        TypedRequestKind::AuthinfoPass => {
+            typed_fetch_authinfo_request(args, |value| Request::authinfo_pass(value))
+        }
+        TypedRequestKind::Starttls => Ok(Request::starttls()),
         TypedRequestKind::Over => {
             typed_fetch_selector_request(args, |selector| Request::over(selector))
         }
@@ -766,6 +803,35 @@ where
         .as_deref()
         .ok_or(TypedClientError::MissingArticleSelector)?;
     build(selector).map_err(|_| TypedClientError::InvalidArticleSelector)
+}
+
+fn typed_fetch_authinfo_request<F>(
+    args: &TypedFetchArgs,
+    build: F,
+) -> Result<Request<'static>, TypedClientError>
+where
+    F: FnOnce(&str) -> Result<Request<'static>, crate::protocol::InvalidAuthInfoValue>,
+{
+    let value = args
+        .auth_value
+        .as_deref()
+        .ok_or(TypedClientError::MissingAuthInfoValue)?;
+    build(value).map_err(TypedClientError::from)
+}
+
+fn typed_fetch_takethis_request(
+    args: &TypedFetchArgs,
+) -> Result<Request<'static>, TypedClientError> {
+    let message_id = args
+        .message_id
+        .as_deref()
+        .ok_or(TypedClientError::MissingMessageId)?;
+    let article = args
+        .article_body
+        .as_deref()
+        .ok_or(TypedClientError::MissingArticleBody)?;
+    Request::takethis(message_id, article.as_bytes())
+        .map_err(|_| TypedClientError::InvalidMessageId)
 }
 
 fn map_typed_client_error(err: TypedClientError) -> io::Error {
@@ -1842,6 +1908,30 @@ where
             write_response(writer, pending_write, NEWNEWS_RESPONSE, session_stats).await?;
             Ok(false)
         }
+        RequestKind::Post => {
+            write_response(writer, pending_write, POST_RESPONSE, session_stats).await?;
+            Ok(false)
+        }
+        RequestKind::Ihave => {
+            write_response(writer, pending_write, IHAVE_RESPONSE, session_stats).await?;
+            Ok(false)
+        }
+        RequestKind::Check => {
+            write_response(writer, pending_write, CHECK_RESPONSE, session_stats).await?;
+            Ok(false)
+        }
+        RequestKind::TakeThis => {
+            write_response(writer, pending_write, TAKETHIS_RESPONSE, session_stats).await?;
+            Ok(false)
+        }
+        RequestKind::AuthInfo => {
+            write_response(writer, pending_write, AUTHINFO_RESPONSE, session_stats).await?;
+            Ok(false)
+        }
+        RequestKind::StartTls => {
+            write_response(writer, pending_write, STARTTLS_RESPONSE, session_stats).await?;
+            Ok(false)
+        }
         RequestKind::Over => {
             write_response(writer, pending_write, OVER_RESPONSE, session_stats).await?;
             Ok(false)
@@ -2006,6 +2096,12 @@ pub fn process_command_to_buffer(
         RequestKind::Next => NEXT_RESPONSE,
         RequestKind::NewGroups => NEWGROUPS_RESPONSE,
         RequestKind::NewNews => NEWNEWS_RESPONSE,
+        RequestKind::Post => POST_RESPONSE,
+        RequestKind::Ihave => IHAVE_RESPONSE,
+        RequestKind::Check => CHECK_RESPONSE,
+        RequestKind::TakeThis => TAKETHIS_RESPONSE,
+        RequestKind::AuthInfo => AUTHINFO_RESPONSE,
+        RequestKind::StartTls => STARTTLS_RESPONSE,
         RequestKind::Over => OVER_RESPONSE,
         RequestKind::Xover => XOVER_RESPONSE,
         RequestKind::Hdr => HDR_RESPONSE,
@@ -2039,11 +2135,33 @@ pub fn parse_command_batch_bytes(
             break;
         };
         let end = start + relative_lf + 1;
-        command_batch.push(RequestLine::parse(trim_line_slice(&input[start..end])).kind());
+        let line = trim_line_slice(&input[start..end]);
+        let kind = RequestLine::parse(line).kind();
+        if matches!(kind, RequestKind::TakeThis) {
+            let Some(body_end) = find_dot_terminated_block_end(input, end) else {
+                break;
+            };
+            command_batch.push(kind);
+            start = body_end;
+            continue;
+        }
+        command_batch.push(kind);
         start = end;
     }
 
     start
+}
+
+fn find_dot_terminated_block_end(input: &[u8], start: usize) -> Option<usize> {
+    let mut cursor = start;
+    loop {
+        let relative_lf = memchr::memchr(b'\n', &input[cursor..])?;
+        let end = cursor + relative_lf + 1;
+        if trim_line_slice(&input[cursor..end]) == b"." {
+            return Some(end);
+        }
+        cursor = end;
+    }
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -2328,7 +2446,7 @@ where
     if read == 0 {
         return Ok(false);
     }
-    push_command(command_buf, command_batch);
+    push_command(reader, command_buf, command_batch).await?;
 
     while command_batch.len() < max_pipeline_depth {
         if memchr::memchr(b'\n', reader.buffer()).is_none() {
@@ -2337,14 +2455,26 @@ where
 
         command_buf.clear();
         reader.read_until(b'\n', command_buf).await?;
-        push_command(command_buf, command_batch);
+        push_command(reader, command_buf, command_batch).await?;
     }
 
     Ok(true)
 }
 
-fn push_command(command_buf: &mut Vec<u8>, command_batch: &mut CommandBatch) {
-    command_batch.push(parse_command_buf(command_buf));
+async fn push_command<R>(
+    reader: &mut BufReader<R>,
+    command_buf: &mut Vec<u8>,
+    command_batch: &mut CommandBatch,
+) -> io::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let kind = parse_command_buf(command_buf);
+    if matches!(kind, RequestKind::TakeThis) {
+        read_dot_terminated_body(reader, command_buf).await?;
+    }
+    command_batch.push(kind);
+    Ok(())
 }
 
 fn parse_command_buf(command_buf: &mut Vec<u8>) -> RequestKind {
@@ -2359,6 +2489,34 @@ fn trim_command_line(line: &mut Vec<u8>) {
 }
 
 fn trim_line_slice(line: &[u8]) -> &[u8] {
+    line.strip_suffix(b"\r\n")
+        .or_else(|| line.strip_suffix(b"\n"))
+        .unwrap_or(line)
+}
+
+async fn read_dot_terminated_body<R>(
+    reader: &mut BufReader<R>,
+    command_buf: &mut Vec<u8>,
+) -> io::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    loop {
+        command_buf.clear();
+        let read = reader.read_until(b'\n', command_buf).await?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "truncated TAKETHIS body",
+            ));
+        }
+        if trim_command_terminator(command_buf) == b"." {
+            return Ok(());
+        }
+    }
+}
+
+fn trim_command_terminator(line: &[u8]) -> &[u8] {
     line.strip_suffix(b"\r\n")
         .or_else(|| line.strip_suffix(b"\n"))
         .unwrap_or(line)
@@ -2475,6 +2633,8 @@ mod tests {
             connect: "127.0.0.1:1199".parse().unwrap(),
             request: TypedRequestKind::Article,
             message_id: Some("bench@test".to_string()),
+            article_body: None,
+            auth_value: None,
             header: None,
             group: None,
             wildmat: None,
@@ -4028,6 +4188,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fetch_typed_response_supports_remaining_rfc_request_kinds() {
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            first.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let mut request = [0_u8; 256];
+            let read = first.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"POST\r\n");
+            first.write_all(POST_RESPONSE).await.unwrap();
+
+            let (mut second, _) = listener.accept().await.unwrap();
+            second.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = second.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"IHAVE <ihave@test>\r\n");
+            second.write_all(IHAVE_RESPONSE).await.unwrap();
+
+            let (mut third, _) = listener.accept().await.unwrap();
+            third.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = third.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"CHECK <check@test>\r\n");
+            third.write_all(CHECK_RESPONSE).await.unwrap();
+
+            let (mut fourth, _) = listener.accept().await.unwrap();
+            fourth.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = fourth.read(&mut request).await.unwrap();
+            assert_eq!(
+                &request[..read],
+                b"TAKETHIS <take@test>\r\nSubject: Taken\r\n\r\n..dot line\r\npayload\r\n.\r\n"
+            );
+            fourth.write_all(TAKETHIS_RESPONSE).await.unwrap();
+
+            let (mut fifth, _) = listener.accept().await.unwrap();
+            fifth.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = fifth.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"AUTHINFO USER bench user\r\n");
+            fifth.write_all(AUTHINFO_RESPONSE).await.unwrap();
+
+            let (mut sixth, _) = listener.accept().await.unwrap();
+            sixth.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = sixth.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"AUTHINFO PASS bench pass\r\n");
+            sixth.write_all(AUTHINFO_RESPONSE).await.unwrap();
+
+            let (mut seventh, _) = listener.accept().await.unwrap();
+            seventh.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = seventh.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"STARTTLS\r\n");
+            seventh.write_all(STARTTLS_RESPONSE).await.unwrap();
+        });
+
+        let mut post_args = test_typed_fetch_args();
+        post_args.connect = addr;
+        post_args.request = TypedRequestKind::Post;
+        post_args.message_id = None;
+        let post = fetch_typed_response(&post_args).await.unwrap();
+        assert_eq!(post.kind(), RequestKind::Post);
+        assert_eq!(post.status().as_u16(), 340);
+
+        let mut ihave_args = test_typed_fetch_args();
+        ihave_args.connect = addr;
+        ihave_args.request = TypedRequestKind::Ihave;
+        ihave_args.message_id = Some("ihave@test".to_string());
+        let ihave = fetch_typed_response(&ihave_args).await.unwrap();
+        assert_eq!(ihave.kind(), RequestKind::Ihave);
+        assert_eq!(ihave.status().as_u16(), 335);
+
+        let mut check_args = test_typed_fetch_args();
+        check_args.connect = addr;
+        check_args.request = TypedRequestKind::Check;
+        check_args.message_id = Some("check@test".to_string());
+        let check = fetch_typed_response(&check_args).await.unwrap();
+        assert_eq!(check.kind(), RequestKind::Check);
+        assert_eq!(check.status().as_u16(), 238);
+
+        let mut takethis_args = test_typed_fetch_args();
+        takethis_args.connect = addr;
+        takethis_args.request = TypedRequestKind::Takethis;
+        takethis_args.message_id = Some("take@test".to_string());
+        takethis_args.article_body = Some("Subject: Taken\r\n\r\n.dot line\r\npayload".to_string());
+        let takethis = fetch_typed_response(&takethis_args).await.unwrap();
+        assert_eq!(takethis.kind(), RequestKind::TakeThis);
+        assert_eq!(takethis.status().as_u16(), 239);
+
+        let mut auth_user_args = test_typed_fetch_args();
+        auth_user_args.connect = addr;
+        auth_user_args.request = TypedRequestKind::AuthinfoUser;
+        auth_user_args.message_id = None;
+        auth_user_args.auth_value = Some("bench user".to_string());
+        let auth_user = fetch_typed_response(&auth_user_args).await.unwrap();
+        assert_eq!(auth_user.kind(), RequestKind::AuthInfo);
+        assert_eq!(auth_user.status().as_u16(), 281);
+
+        let mut auth_pass_args = test_typed_fetch_args();
+        auth_pass_args.connect = addr;
+        auth_pass_args.request = TypedRequestKind::AuthinfoPass;
+        auth_pass_args.message_id = None;
+        auth_pass_args.auth_value = Some("bench pass".to_string());
+        let auth_pass = fetch_typed_response(&auth_pass_args).await.unwrap();
+        assert_eq!(auth_pass.kind(), RequestKind::AuthInfo);
+        assert_eq!(auth_pass.status().as_u16(), 281);
+
+        let mut starttls_args = test_typed_fetch_args();
+        starttls_args.connect = addr;
+        starttls_args.request = TypedRequestKind::Starttls;
+        starttls_args.message_id = None;
+        let starttls = fetch_typed_response(&starttls_args).await.unwrap();
+        assert_eq!(starttls.kind(), RequestKind::StartTls);
+        assert_eq!(starttls.status().as_u16(), 382);
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn fetch_typed_response_rejects_missing_message_id_for_article_style_requests() {
         let mut args = test_typed_fetch_args();
         args.message_id = None;
@@ -4110,6 +4384,26 @@ mod tests {
         assert!(matches!(
             fetch_typed_response(&newnews_args).await.unwrap_err(),
             TypedClientError::MissingWildmat
+        ));
+    }
+
+    #[tokio::test]
+    async fn fetch_typed_response_rejects_missing_remaining_rfc_arguments() {
+        let mut takethis_args = test_typed_fetch_args();
+        takethis_args.request = TypedRequestKind::Takethis;
+        takethis_args.article_body = None;
+        assert!(matches!(
+            fetch_typed_response(&takethis_args).await.unwrap_err(),
+            TypedClientError::MissingArticleBody
+        ));
+
+        let mut auth_args = test_typed_fetch_args();
+        auth_args.request = TypedRequestKind::AuthinfoUser;
+        auth_args.message_id = None;
+        auth_args.auth_value = None;
+        assert!(matches!(
+            fetch_typed_response(&auth_args).await.unwrap_err(),
+            TypedClientError::MissingAuthInfoValue
         ));
     }
 
@@ -4229,6 +4523,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_command_batch_consumes_takethis_payload_as_one_command() {
+        let (mut client, server) = tokio::io::duplex(1024);
+        client
+            .write_all(b"TAKETHIS <take@test>\r\nHeader: value\r\n\r\nbody\r\n.\r\nQUIT\r\n")
+            .await
+            .unwrap();
+
+        let mut reader = BufReader::with_capacity(1024, server);
+        let mut command_buf = Vec::with_capacity(1024);
+        let mut command_batch = CommandBatch::new();
+
+        assert!(
+            read_command_batch(&mut reader, &mut command_buf, &mut command_batch, 8)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            command_batch.as_slice(),
+            &[RequestKind::TakeThis, RequestKind::Quit]
+        );
+    }
+
+    #[tokio::test]
     async fn serve_session_returns_pipelined_responses_in_order_and_counts_stats() {
         let (output, stats) = run_session_with_input(
             test_config(),
@@ -4333,6 +4650,30 @@ mod tests {
             [GREETING, NEWGROUPS_RESPONSE, NEWNEWS_RESPONSE].concat()
         );
         assert_eq!(stats.snapshot().commands, 2);
+    }
+
+    #[tokio::test]
+    async fn serve_session_supports_remaining_rfc_commands() {
+        let (output, stats) = run_session_with_input(
+            test_config(),
+            b"POST\r\nIHAVE <ihave@test>\r\nCHECK <check@test>\r\nTAKETHIS <take@test>\r\nHeader: value\r\n\r\nbody\r\n.\r\nAUTHINFO USER bench\r\nSTARTTLS\r\n",
+        )
+        .await;
+
+        assert_eq!(
+            output,
+            [
+                GREETING,
+                POST_RESPONSE,
+                IHAVE_RESPONSE,
+                CHECK_RESPONSE,
+                TAKETHIS_RESPONSE,
+                AUTHINFO_RESPONSE,
+                STARTTLS_RESPONSE,
+            ]
+            .concat()
+        );
+        assert_eq!(stats.snapshot().commands, 6);
     }
 
     #[tokio::test]
@@ -4487,6 +4828,17 @@ mod tests {
         let consumed = parse_command_batch_bytes(b"DATE\nMODE READER\n", 8, &mut batch);
         assert_eq!(consumed, b"DATE\nMODE READER\n".len());
         assert_eq!(batch, vec![RequestKind::Date, RequestKind::ModeReader]);
+
+        let consumed = parse_command_batch_bytes(
+            b"TAKETHIS <take@test>\r\nHeader: value\r\n\r\nbody\r\n.\r\nQUIT\r\n",
+            8,
+            &mut batch,
+        );
+        assert_eq!(
+            consumed,
+            b"TAKETHIS <take@test>\r\nHeader: value\r\n\r\nbody\r\n.\r\nQUIT\r\n".len()
+        );
+        assert_eq!(batch, vec![RequestKind::TakeThis, RequestKind::Quit]);
     }
 
     #[test]
@@ -4557,6 +4909,64 @@ mod tests {
             .concat()
         );
         assert_eq!(stats.snapshot().commands, 4);
+    }
+
+    #[test]
+    fn process_command_to_buffer_supports_remaining_rfc_commands() {
+        let config = test_config();
+        let stats = Stats::new();
+        let mut output = Vec::new();
+
+        assert!(!process_command_to_buffer(
+            RequestKind::Post,
+            &config,
+            &stats,
+            &mut output,
+        ));
+        assert!(!process_command_to_buffer(
+            RequestKind::Ihave,
+            &config,
+            &stats,
+            &mut output,
+        ));
+        assert!(!process_command_to_buffer(
+            RequestKind::Check,
+            &config,
+            &stats,
+            &mut output,
+        ));
+        assert!(!process_command_to_buffer(
+            RequestKind::TakeThis,
+            &config,
+            &stats,
+            &mut output,
+        ));
+        assert!(!process_command_to_buffer(
+            RequestKind::AuthInfo,
+            &config,
+            &stats,
+            &mut output,
+        ));
+        assert!(!process_command_to_buffer(
+            RequestKind::StartTls,
+            &config,
+            &stats,
+            &mut output,
+        ));
+
+        assert_eq!(
+            output,
+            [
+                POST_RESPONSE,
+                IHAVE_RESPONSE,
+                CHECK_RESPONSE,
+                TAKETHIS_RESPONSE,
+                AUTHINFO_RESPONSE,
+                STARTTLS_RESPONSE,
+            ]
+            .concat()
+        );
+        assert_eq!(stats.snapshot().commands, 6);
     }
 
     #[test]
