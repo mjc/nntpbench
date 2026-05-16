@@ -2166,9 +2166,9 @@ mod tests {
         assert_eq!(check.status().as_u16(), 238);
         assert_eq!(takethis.kind(), RequestKind::TakeThis);
         assert_eq!(takethis.status().as_u16(), 239);
-        assert_eq!(auth_user.kind(), RequestKind::AuthInfo);
+        assert_eq!(auth_user.kind(), RequestKind::AuthInfoUser);
         assert_eq!(auth_user.status().as_u16(), 281);
-        assert_eq!(auth_pass.kind(), RequestKind::AuthInfo);
+        assert_eq!(auth_pass.kind(), RequestKind::AuthInfoPass);
         assert_eq!(auth_pass.status().as_u16(), 281);
         assert_eq!(starttls.kind(), RequestKind::StartTls);
         assert_eq!(starttls.status().as_u16(), 382);
@@ -2567,9 +2567,9 @@ mod tests {
         assert_eq!(check.status().as_u16(), 238);
         assert_eq!(takethis.kind(), RequestKind::TakeThis);
         assert_eq!(takethis.status().as_u16(), 239);
-        assert_eq!(auth_user.kind(), RequestKind::AuthInfo);
+        assert_eq!(auth_user.kind(), RequestKind::AuthInfoUser);
         assert_eq!(auth_user.status().as_u16(), 281);
-        assert_eq!(auth_pass.kind(), RequestKind::AuthInfo);
+        assert_eq!(auth_pass.kind(), RequestKind::AuthInfoPass);
         assert_eq!(auth_pass.status().as_u16(), 281);
         assert_eq!(starttls.request(), &Request::StartTls);
         assert_eq!(starttls.response().kind(), RequestKind::StartTls);

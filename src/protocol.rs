@@ -499,6 +499,8 @@ pub enum RequestKind {
     Ihave,
     Check,
     TakeThis,
+    AuthInfoUser,
+    AuthInfoPass,
     AuthInfo,
     StartTls,
     ModeReader,
@@ -626,7 +628,10 @@ impl<'a> Request<'a> {
             Self::Ihave { .. } => RequestKind::Ihave,
             Self::Check { .. } => RequestKind::Check,
             Self::TakeThis { .. } => RequestKind::TakeThis,
-            Self::AuthInfo { .. } => RequestKind::AuthInfo,
+            Self::AuthInfo { kind, .. } => match kind {
+                AuthInfoKind::User => RequestKind::AuthInfoUser,
+                AuthInfoKind::Pass => RequestKind::AuthInfoPass,
+            },
             Self::StartTls => RequestKind::StartTls,
             Self::List => RequestKind::List,
             Self::Help => RequestKind::Help,
@@ -1270,13 +1275,24 @@ fn classify_verb(verb: &[u8], arg: &[u8]) -> RequestKind {
         5 if eq_ignore_ascii_case_const(verb, b"XOVER") => RequestKind::Xover,
         7 if eq_ignore_ascii_case_const(verb, b"ARTICLE") => RequestKind::Article,
         7 if eq_ignore_ascii_case_const(verb, b"NEWNEWS") => RequestKind::NewNews,
-        8 if eq_ignore_ascii_case_const(verb, b"AUTHINFO") => RequestKind::AuthInfo,
+        8 if eq_ignore_ascii_case_const(verb, b"AUTHINFO") => classify_authinfo_kind(arg),
         8 if eq_ignore_ascii_case_const(verb, b"STARTTLS") => RequestKind::StartTls,
         8 if eq_ignore_ascii_case_const(verb, b"TAKETHIS") => RequestKind::TakeThis,
         9 if eq_ignore_ascii_case_const(verb, b"LISTGROUP") => RequestKind::ListGroup,
         9 if eq_ignore_ascii_case_const(verb, b"NEWGROUPS") => RequestKind::NewGroups,
         12 if eq_ignore_ascii_case_const(verb, b"CAPABILITIES") => RequestKind::Capabilities,
         _ => RequestKind::Unknown,
+    }
+}
+
+fn classify_authinfo_kind(arg: &[u8]) -> RequestKind {
+    let subcommand = arg
+        .split(|byte| byte.is_ascii_whitespace())
+        .find(|segment| !segment.is_empty());
+    match subcommand {
+        Some(segment) if eq_ignore_ascii_case_const(segment, b"USER") => RequestKind::AuthInfoUser,
+        Some(segment) if eq_ignore_ascii_case_const(segment, b"PASS") => RequestKind::AuthInfoPass,
+        _ => RequestKind::AuthInfo,
     }
 }
 
@@ -1658,10 +1674,12 @@ mod tests {
             (b"IHAVE <a@b>".as_slice(), RequestKind::Ihave),
             (b"CHECK <a@b>".as_slice(), RequestKind::Check),
             (b"TAKETHIS <a@b>".as_slice(), RequestKind::TakeThis),
-            (b"AUTHINFO USER test".as_slice(), RequestKind::AuthInfo),
+            (b"AUTHINFO USER test".as_slice(), RequestKind::AuthInfoUser),
+            (b"AUTHINFO PASS test".as_slice(), RequestKind::AuthInfoPass),
+            (b"AUTHINFO SASL test".as_slice(), RequestKind::AuthInfo),
             (b"STARTTLS".as_slice(), RequestKind::StartTls),
             (b"article <a@b>".as_slice(), RequestKind::Article),
-            (b"authinfo user test".as_slice(), RequestKind::AuthInfo),
+            (b"authinfo user test".as_slice(), RequestKind::AuthInfoUser),
             (b"quit".as_slice(), RequestKind::Quit),
             (b"XYZZY".as_slice(), RequestKind::Unknown),
         ] {
@@ -1705,7 +1723,9 @@ mod tests {
         assert!(!RequestKind::Ihave.expects_multiline_response(StatusCode(335)));
         assert!(!RequestKind::Check.expects_multiline_response(StatusCode(238)));
         assert!(!RequestKind::TakeThis.expects_multiline_response(StatusCode(239)));
-        assert!(!RequestKind::AuthInfo.expects_multiline_response(StatusCode(381)));
+        assert!(!RequestKind::AuthInfoUser.expects_multiline_response(StatusCode(381)));
+        assert!(!RequestKind::AuthInfoPass.expects_multiline_response(StatusCode(281)));
+        assert!(!RequestKind::AuthInfo.expects_multiline_response(StatusCode(281)));
         assert!(!RequestKind::StartTls.expects_multiline_response(StatusCode(382)));
         assert!(RequestKind::Capabilities.expects_multiline_response(StatusCode(101)));
         assert!(!RequestKind::Date.expects_multiline_response(StatusCode(111)));
@@ -1885,12 +1905,12 @@ mod tests {
 
         wire.clear();
         authinfo_user.write_wire_to(&mut wire);
-        assert_eq!(authinfo_user.kind(), RequestKind::AuthInfo);
+        assert_eq!(authinfo_user.kind(), RequestKind::AuthInfoUser);
         assert_eq!(wire, b"AUTHINFO USER user name\r\n");
 
         wire.clear();
         authinfo_pass.write_wire_to(&mut wire);
-        assert_eq!(authinfo_pass.kind(), RequestKind::AuthInfo);
+        assert_eq!(authinfo_pass.kind(), RequestKind::AuthInfoPass);
         assert_eq!(wire, b"AUTHINFO PASS pass word\r\n");
 
         wire.clear();
@@ -2045,14 +2065,14 @@ mod tests {
             takethis.article_transfer().map(ArticleTransfer::as_bytes),
             Some(&b"Subject: one\r\n\r\nbody"[..])
         );
-        assert_eq!(authinfo_user.kind(), RequestKind::AuthInfo);
+        assert_eq!(authinfo_user.kind(), RequestKind::AuthInfoUser);
         assert_eq!(
             authinfo_user
                 .auth_info()
                 .map(|(kind, value)| (kind, value.as_str())),
             Some((AuthInfoKind::User, "user name"))
         );
-        assert_eq!(authinfo_pass.kind(), RequestKind::AuthInfo);
+        assert_eq!(authinfo_pass.kind(), RequestKind::AuthInfoPass);
         assert_eq!(
             authinfo_pass
                 .auth_info()

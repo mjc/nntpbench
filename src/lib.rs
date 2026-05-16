@@ -5,6 +5,7 @@ use std::fs;
 use std::future::poll_fn;
 use std::io::{self, IoSlice, Write};
 use std::net::SocketAddr;
+use std::ops::Range;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -55,6 +56,7 @@ pub const POST_RESPONSE: &[u8] = b"340 send article to be posted\r\n";
 pub const IHAVE_RESPONSE: &[u8] = b"335 send article to be transferred\r\n";
 pub const CHECK_RESPONSE: &[u8] = b"238 send article to be transferred\r\n";
 pub const TAKETHIS_RESPONSE: &[u8] = b"239 article transferred ok\r\n";
+pub const AUTHINFO_USER_RESPONSE: &[u8] = b"381 more authentication information required\r\n";
 pub const AUTHINFO_RESPONSE: &[u8] = b"281 authentication accepted\r\n";
 pub const STARTTLS_RESPONSE: &[u8] = b"382 continue with TLS negotiation\r\n";
 pub const OVER_RESPONSE: &[u8] = b"224 Overview information follows\r\n1\tSubject one\tone@example.com\tFri, 16 May 2026 12:00:00 +0000\t<one@example.com>\t\t123\t4\r\n.\r\n";
@@ -1767,7 +1769,9 @@ async fn serve_session_inner(
     let (reader, mut writer) = stream.split();
     let mut reader = BufReader::with_capacity(SERVER_READER_CAPACITY, reader);
     let max_pipeline_depth = config.max_pipeline_depth.min(MAX_SERVER_PIPELINE_DEPTH);
-    let mut command_buf = Vec::with_capacity(MAX_COMMAND_LINE_BYTES);
+    let mut command_arena =
+        Vec::with_capacity(MAX_COMMAND_LINE_BYTES.saturating_mul(max_pipeline_depth));
+    let mut command_scratch = Vec::with_capacity(MAX_COMMAND_LINE_BYTES);
     let mut command_batch = CommandBatch::new();
     let mut pending_write = PendingWrite::new();
 
@@ -1776,7 +1780,8 @@ async fn serve_session_inner(
     loop {
         if !read_command_batch(
             &mut reader,
-            &mut command_buf,
+            &mut command_arena,
+            &mut command_scratch,
             &mut command_batch,
             max_pipeline_depth,
         )
@@ -1787,6 +1792,7 @@ async fn serve_session_inner(
 
         if process_command_batch(
             &command_batch,
+            &command_arena,
             &config,
             session_stats,
             &mut writer,
@@ -1833,6 +1839,7 @@ where
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn process_command_batch<W>(
     command_batch: &CommandBatch,
+    command_arena: &[u8],
     config: &ServerConfig,
     session_stats: &mut SessionStats,
     writer: &mut W,
@@ -1844,7 +1851,16 @@ where
     session_stats.pipeline_batches += u64::from(command_batch.len() > 1);
 
     for command in command_batch {
-        if handle_command(command, config, session_stats, writer, pending_write).await? {
+        if handle_command(
+            command,
+            command_arena,
+            config,
+            session_stats,
+            writer,
+            pending_write,
+        )
+        .await?
+        {
             flush_session_writer(writer, pending_write, config).await?;
             return Ok(BatchOutcome::Close);
         }
@@ -1856,7 +1872,8 @@ where
 
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn handle_command<W>(
-    command: &RequestKind,
+    command: &ParsedCommand,
+    command_arena: &[u8],
     config: &ServerConfig,
     session_stats: &mut SessionStats,
     writer: &mut W,
@@ -1866,8 +1883,9 @@ where
     W: AsyncWrite + Unpin,
 {
     session_stats.commands += 1;
+    let request = command.request_line(command_arena);
 
-    match command {
+    match request.kind() {
         RequestKind::Article => {
             session_stats.article_requests += 1;
             write_response(
@@ -1922,6 +1940,14 @@ where
         }
         RequestKind::TakeThis => {
             write_response(writer, pending_write, TAKETHIS_RESPONSE, session_stats).await?;
+            Ok(false)
+        }
+        RequestKind::AuthInfoUser => {
+            write_response(writer, pending_write, AUTHINFO_USER_RESPONSE, session_stats).await?;
+            Ok(false)
+        }
+        RequestKind::AuthInfoPass => {
+            write_response(writer, pending_write, AUTHINFO_RESPONSE, session_stats).await?;
             Ok(false)
         }
         RequestKind::AuthInfo => {
@@ -2100,6 +2126,8 @@ pub fn process_command_to_buffer(
         RequestKind::Ihave => IHAVE_RESPONSE,
         RequestKind::Check => CHECK_RESPONSE,
         RequestKind::TakeThis => TAKETHIS_RESPONSE,
+        RequestKind::AuthInfoUser => AUTHINFO_RESPONSE,
+        RequestKind::AuthInfoPass => AUTHINFO_RESPONSE,
         RequestKind::AuthInfo => AUTHINFO_RESPONSE,
         RequestKind::StartTls => STARTTLS_RESPONSE,
         RequestKind::Over => OVER_RESPONSE,
@@ -2428,12 +2456,25 @@ pub fn rate(count: u64, seconds: f64) -> f64 {
     count as f64 / seconds
 }
 
-type CommandBatch = ArrayVec<RequestKind, MAX_SERVER_PIPELINE_DEPTH>;
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedCommand {
+    kind: RequestKind,
+    line_range: Range<usize>,
+}
+
+impl ParsedCommand {
+    fn request_line<'a>(&self, command_arena: &'a [u8]) -> RequestLine<'a> {
+        RequestLine::parse(&command_arena[self.line_range.clone()])
+    }
+}
+
+type CommandBatch = ArrayVec<ParsedCommand, MAX_SERVER_PIPELINE_DEPTH>;
 
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn read_command_batch<R>(
     reader: &mut BufReader<R>,
-    command_buf: &mut Vec<u8>,
+    command_arena: &mut Vec<u8>,
+    command_scratch: &mut Vec<u8>,
     command_batch: &mut CommandBatch,
     max_pipeline_depth: usize,
 ) -> io::Result<bool>
@@ -2441,21 +2482,36 @@ where
     R: tokio::io::AsyncRead + Unpin,
 {
     command_batch.clear();
-    command_buf.clear();
-    let read = reader.read_until(b'\n', command_buf).await?;
+    command_arena.clear();
+    let line_start = command_arena.len();
+    let read = reader.read_until(b'\n', command_arena).await?;
     if read == 0 {
         return Ok(false);
     }
-    push_command(reader, command_buf, command_batch).await?;
+    push_command(
+        reader,
+        command_arena,
+        line_start,
+        command_scratch,
+        command_batch,
+    )
+    .await?;
 
     while command_batch.len() < max_pipeline_depth {
         if memchr::memchr(b'\n', reader.buffer()).is_none() {
             break;
         }
 
-        command_buf.clear();
-        reader.read_until(b'\n', command_buf).await?;
-        push_command(reader, command_buf, command_batch).await?;
+        let line_start = command_arena.len();
+        reader.read_until(b'\n', command_arena).await?;
+        push_command(
+            reader,
+            command_arena,
+            line_start,
+            command_scratch,
+            command_batch,
+        )
+        .await?;
     }
 
     Ok(true)
@@ -2463,25 +2519,40 @@ where
 
 async fn push_command<R>(
     reader: &mut BufReader<R>,
-    command_buf: &mut Vec<u8>,
+    command_arena: &[u8],
+    line_start: usize,
+    command_scratch: &mut Vec<u8>,
     command_batch: &mut CommandBatch,
 ) -> io::Result<()>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
-    let kind = parse_command_buf(command_buf);
+    let command = parse_command_line(command_arena, line_start);
+    let kind = command.kind;
     if matches!(kind, RequestKind::TakeThis) {
-        read_dot_terminated_body(reader, command_buf).await?;
+        read_dot_terminated_body(reader, command_scratch).await?;
     }
-    command_batch.push(kind);
+    command_batch.push(command);
     Ok(())
 }
 
-fn parse_command_buf(command_buf: &mut Vec<u8>) -> RequestKind {
-    trim_command_line(command_buf);
-    RequestLine::parse(command_buf).kind()
+fn parse_command_line(command_arena: &[u8], line_start: usize) -> ParsedCommand {
+    let line_end = line_start + trim_command_len(&command_arena[line_start..]);
+    ParsedCommand {
+        kind: RequestLine::parse(&command_arena[line_start..line_end]).kind(),
+        line_range: line_start..line_end,
+    }
 }
 
+fn trim_command_len(line: &[u8]) -> usize {
+    let mut end = line.len();
+    while end > 0 && matches!(line[end - 1], b'\r' | b'\n') {
+        end -= 1;
+    }
+    end
+}
+
+#[cfg(test)]
 fn trim_command_line(line: &mut Vec<u8>) {
     while matches!(line.last(), Some(b'\r' | b'\n')) {
         line.pop();
@@ -2496,21 +2567,21 @@ fn trim_line_slice(line: &[u8]) -> &[u8] {
 
 async fn read_dot_terminated_body<R>(
     reader: &mut BufReader<R>,
-    command_buf: &mut Vec<u8>,
+    command_scratch: &mut Vec<u8>,
 ) -> io::Result<()>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
     loop {
-        command_buf.clear();
-        let read = reader.read_until(b'\n', command_buf).await?;
+        command_scratch.clear();
+        let read = reader.read_until(b'\n', command_scratch).await?;
         if read == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "truncated TAKETHIS body",
             ));
         }
-        if trim_command_terminator(command_buf) == b"." {
+        if trim_command_terminator(command_scratch) == b"." {
             return Ok(());
         }
     }
@@ -2779,9 +2850,15 @@ mod tests {
         let mut stats = SessionStats::default();
         let mut pending = PendingWrite::new();
         let mut writer = FailingWriter;
+        let command_arena = b"ARTICLE 1".to_vec();
+        let command = ParsedCommand {
+            kind: RequestKind::Article,
+            line_range: 0..command_arena.len(),
+        };
 
         let err = handle_command(
-            &RequestKind::Article,
+            &command,
+            &command_arena,
             &config,
             &mut stats,
             &mut writer,
@@ -2798,20 +2875,36 @@ mod tests {
         let server = ChunkedRead::new(&[b"ART".as_slice(), b"ICLE 1\r\nBODY 2\r\n".as_slice()]);
         let mut reader = BufReader::with_capacity(32, server);
         let mut command_buf = Vec::with_capacity(MAX_COMMAND_LINE_BYTES);
+        let mut command_scratch = Vec::with_capacity(MAX_COMMAND_LINE_BYTES);
         let mut command_batch = CommandBatch::new();
         assert!(
-            read_command_batch(&mut reader, &mut command_buf, &mut command_batch, 4)
-                .await
-                .unwrap()
+            read_command_batch(
+                &mut reader,
+                &mut command_buf,
+                &mut command_scratch,
+                &mut command_batch,
+                4,
+            )
+            .await
+            .unwrap()
         );
         assert_eq!(
-            command_batch.as_slice(),
-            &[RequestKind::Article, RequestKind::Body]
+            command_batch
+                .iter()
+                .map(|command| command.kind)
+                .collect::<Vec<_>>(),
+            vec![RequestKind::Article, RequestKind::Body]
         );
         assert!(
-            !read_command_batch(&mut reader, &mut command_buf, &mut command_batch, 4)
-                .await
-                .unwrap()
+            !read_command_batch(
+                &mut reader,
+                &mut command_buf,
+                &mut command_scratch,
+                &mut command_batch,
+                4,
+            )
+            .await
+            .unwrap()
         );
     }
 
@@ -2819,11 +2912,18 @@ mod tests {
     async fn read_command_batch_reports_reader_error() {
         let mut reader = BufReader::with_capacity(32, FailingRead);
         let mut command_buf = Vec::new();
+        let mut command_scratch = Vec::new();
         let mut command_batch = CommandBatch::new();
 
-        let err = read_command_batch(&mut reader, &mut command_buf, &mut command_batch, 1)
-            .await
-            .unwrap_err();
+        let err = read_command_batch(
+            &mut reader,
+            &mut command_buf,
+            &mut command_scratch,
+            &mut command_batch,
+            1,
+        )
+        .await
+        .unwrap_err();
 
         assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
     }
@@ -4278,7 +4378,7 @@ mod tests {
         auth_user_args.message_id = None;
         auth_user_args.auth_value = Some("bench user".to_string());
         let auth_user = fetch_typed_response(&auth_user_args).await.unwrap();
-        assert_eq!(auth_user.kind(), RequestKind::AuthInfo);
+        assert_eq!(auth_user.kind(), RequestKind::AuthInfoUser);
         assert_eq!(auth_user.status().as_u16(), 281);
 
         let mut auth_pass_args = test_typed_fetch_args();
@@ -4287,7 +4387,7 @@ mod tests {
         auth_pass_args.message_id = None;
         auth_pass_args.auth_value = Some("bench pass".to_string());
         let auth_pass = fetch_typed_response(&auth_pass_args).await.unwrap();
-        assert_eq!(auth_pass.kind(), RequestKind::AuthInfo);
+        assert_eq!(auth_pass.kind(), RequestKind::AuthInfoPass);
         assert_eq!(auth_pass.status().as_u16(), 281);
 
         let mut starttls_args = test_typed_fetch_args();
@@ -4417,16 +4517,26 @@ mod tests {
 
         let mut reader = BufReader::with_capacity(1024, server);
         let mut command_buf = Vec::with_capacity(1024);
+        let mut command_scratch = Vec::with_capacity(1024);
         let mut command_batch = CommandBatch::new();
 
         assert!(
-            read_command_batch(&mut reader, &mut command_buf, &mut command_batch, 8)
-                .await
-                .unwrap()
+            read_command_batch(
+                &mut reader,
+                &mut command_buf,
+                &mut command_scratch,
+                &mut command_batch,
+                8,
+            )
+            .await
+            .unwrap()
         );
         assert_eq!(
-            command_batch.as_slice(),
-            &[
+            command_batch
+                .iter()
+                .map(|command| command.kind)
+                .collect::<Vec<_>>(),
+            vec![
                 RequestKind::Article,
                 RequestKind::Body,
                 RequestKind::Date,
@@ -4442,12 +4552,19 @@ mod tests {
         drop(client);
         let mut reader = BufReader::with_capacity(1024, server);
         let mut command_buf = Vec::with_capacity(1024);
+        let mut command_scratch = Vec::with_capacity(1024);
         let mut command_batch = CommandBatch::new();
 
         assert!(
-            !read_command_batch(&mut reader, &mut command_buf, &mut command_batch, 8)
-                .await
-                .unwrap()
+            !read_command_batch(
+                &mut reader,
+                &mut command_buf,
+                &mut command_scratch,
+                &mut command_batch,
+                8,
+            )
+            .await
+            .unwrap()
         );
         assert!(command_batch.is_empty());
     }
@@ -4459,14 +4576,27 @@ mod tests {
 
         let mut reader = BufReader::with_capacity(1024, server);
         let mut command_buf = Vec::with_capacity(1024);
+        let mut command_scratch = Vec::with_capacity(1024);
         let mut command_batch = CommandBatch::new();
 
         assert!(
-            read_command_batch(&mut reader, &mut command_buf, &mut command_batch, 8)
-                .await
-                .unwrap()
+            read_command_batch(
+                &mut reader,
+                &mut command_buf,
+                &mut command_scratch,
+                &mut command_batch,
+                8,
+            )
+            .await
+            .unwrap()
         );
-        assert_eq!(command_batch.as_slice(), &[RequestKind::Article]);
+        assert_eq!(
+            command_batch
+                .iter()
+                .map(|command| command.kind)
+                .collect::<Vec<_>>(),
+            vec![RequestKind::Article]
+        );
     }
 
     #[tokio::test]
@@ -4479,16 +4609,26 @@ mod tests {
 
         let mut reader = BufReader::with_capacity(1024, server);
         let mut command_buf = Vec::with_capacity(1024);
+        let mut command_scratch = Vec::with_capacity(1024);
         let mut command_batch = CommandBatch::new();
 
         assert!(
-            read_command_batch(&mut reader, &mut command_buf, &mut command_batch, 2)
-                .await
-                .unwrap()
+            read_command_batch(
+                &mut reader,
+                &mut command_buf,
+                &mut command_scratch,
+                &mut command_batch,
+                2,
+            )
+            .await
+            .unwrap()
         );
         assert_eq!(
-            command_batch.as_slice(),
-            &[RequestKind::Article, RequestKind::Body]
+            command_batch
+                .iter()
+                .map(|command| command.kind)
+                .collect::<Vec<_>>(),
+            vec![RequestKind::Article, RequestKind::Body]
         );
     }
 
@@ -4502,24 +4642,46 @@ mod tests {
 
         let mut reader = BufReader::with_capacity(1024, server);
         let mut command_buf = Vec::with_capacity(1024);
+        let mut command_scratch = Vec::with_capacity(1024);
         let mut command_batch = CommandBatch::new();
 
         assert!(
-            read_command_batch(&mut reader, &mut command_buf, &mut command_batch, 2)
-                .await
-                .unwrap()
+            read_command_batch(
+                &mut reader,
+                &mut command_buf,
+                &mut command_scratch,
+                &mut command_batch,
+                2,
+            )
+            .await
+            .unwrap()
         );
         assert_eq!(
-            command_batch.as_slice(),
-            &[RequestKind::Article, RequestKind::Body]
+            command_batch
+                .iter()
+                .map(|command| command.kind)
+                .collect::<Vec<_>>(),
+            vec![RequestKind::Article, RequestKind::Body]
         );
 
         assert!(
-            read_command_batch(&mut reader, &mut command_buf, &mut command_batch, 2)
-                .await
-                .unwrap()
+            read_command_batch(
+                &mut reader,
+                &mut command_buf,
+                &mut command_scratch,
+                &mut command_batch,
+                2,
+            )
+            .await
+            .unwrap()
         );
-        assert_eq!(command_batch.as_slice(), &[RequestKind::Quit]);
+        assert_eq!(
+            command_batch
+                .iter()
+                .map(|command| command.kind)
+                .collect::<Vec<_>>(),
+            vec![RequestKind::Quit]
+        );
     }
 
     #[tokio::test]
@@ -4532,16 +4694,26 @@ mod tests {
 
         let mut reader = BufReader::with_capacity(1024, server);
         let mut command_buf = Vec::with_capacity(1024);
+        let mut command_scratch = Vec::with_capacity(1024);
         let mut command_batch = CommandBatch::new();
 
         assert!(
-            read_command_batch(&mut reader, &mut command_buf, &mut command_batch, 8)
-                .await
-                .unwrap()
+            read_command_batch(
+                &mut reader,
+                &mut command_buf,
+                &mut command_scratch,
+                &mut command_batch,
+                8,
+            )
+            .await
+            .unwrap()
         );
         assert_eq!(
-            command_batch.as_slice(),
-            &[RequestKind::TakeThis, RequestKind::Quit]
+            command_batch
+                .iter()
+                .map(|command| command.kind)
+                .collect::<Vec<_>>(),
+            vec![RequestKind::TakeThis, RequestKind::Quit]
         );
     }
 
@@ -4656,7 +4828,7 @@ mod tests {
     async fn serve_session_supports_remaining_rfc_commands() {
         let (output, stats) = run_session_with_input(
             test_config(),
-            b"POST\r\nIHAVE <ihave@test>\r\nCHECK <check@test>\r\nTAKETHIS <take@test>\r\nHeader: value\r\n\r\nbody\r\n.\r\nAUTHINFO USER bench\r\nSTARTTLS\r\n",
+            b"POST\r\nIHAVE <ihave@test>\r\nCHECK <check@test>\r\nTAKETHIS <take@test>\r\nHeader: value\r\n\r\nbody\r\n.\r\nAUTHINFO USER bench\r\nAUTHINFO PASS bench\r\nSTARTTLS\r\n",
         )
         .await;
 
@@ -4668,12 +4840,13 @@ mod tests {
                 IHAVE_RESPONSE,
                 CHECK_RESPONSE,
                 TAKETHIS_RESPONSE,
+                AUTHINFO_USER_RESPONSE,
                 AUTHINFO_RESPONSE,
                 STARTTLS_RESPONSE,
             ]
             .concat()
         );
-        assert_eq!(stats.snapshot().commands, 6);
+        assert_eq!(stats.snapshot().commands, 7);
     }
 
     #[tokio::test]
@@ -4942,6 +5115,18 @@ mod tests {
             &mut output,
         ));
         assert!(!process_command_to_buffer(
+            RequestKind::AuthInfoUser,
+            &config,
+            &stats,
+            &mut output,
+        ));
+        assert!(!process_command_to_buffer(
+            RequestKind::AuthInfoPass,
+            &config,
+            &stats,
+            &mut output,
+        ));
+        assert!(!process_command_to_buffer(
             RequestKind::AuthInfo,
             &config,
             &stats,
@@ -4962,11 +5147,13 @@ mod tests {
                 CHECK_RESPONSE,
                 TAKETHIS_RESPONSE,
                 AUTHINFO_RESPONSE,
+                AUTHINFO_RESPONSE,
+                AUTHINFO_RESPONSE,
                 STARTTLS_RESPONSE,
             ]
             .concat()
         );
-        assert_eq!(stats.snapshot().commands, 6);
+        assert_eq!(stats.snapshot().commands, 8);
     }
 
     #[test]
