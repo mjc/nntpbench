@@ -28,6 +28,7 @@ const SERVER_READER_CAPACITY: usize = 64 * 1024;
 const MAX_PENDING_WRITE_BYTES: usize = 64 * 1024;
 const MAX_CLIENT_COMMAND_BYTES: usize = 64;
 const HIGH_THROUGHPUT_SOCKET_BUFFER: usize = 16 * 1024 * 1024;
+const PROCESS_CLOCK_TICK: Duration = Duration::from_millis(10);
 const TCP_LINGER_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(target_os = "linux")]
 const TCP_USER_TIMEOUT: Duration = Duration::from_secs(30);
@@ -677,13 +678,7 @@ fn cpu_seconds_since(start: Option<u64>) -> f64 {
         return 0.0;
     };
 
-    let ticks_per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
-    let ticks_per_second = if ticks_per_second <= 0 {
-        100.0
-    } else {
-        ticks_per_second as f64
-    };
-    end.saturating_sub(start) as f64 / ticks_per_second
+    end.saturating_sub(start) as f64 * PROCESS_CLOCK_TICK.as_secs_f64()
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
