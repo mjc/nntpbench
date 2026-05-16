@@ -365,6 +365,13 @@ impl TypedClientConnection {
         &self,
         request: Request<'static>,
     ) -> Result<OwnedResponse, TypedClientError> {
+        self.queue_request(request).await?.receive().await
+    }
+
+    pub(crate) async fn queue_request(
+        &self,
+        request: Request<'static>,
+    ) -> Result<PendingResponse, TypedClientError> {
         let (response_tx, response_rx) = oneshot::channel();
         self.inner
             .request_tx
@@ -375,12 +382,10 @@ impl TypedClientConnection {
             .await
             .map_err(|_| TypedClientError::ConnectionClosed)?;
 
-        let response = match response_rx.await {
-            Ok(response) => response,
-            Err(_) => return Err(self.engine_error().await),
-        };
-
-        response.map_err(Into::into)
+        Ok(PendingResponse {
+            inner: self.inner.clone(),
+            response_rx,
+        })
     }
 
     /// Execute a typed request and return the completed request/response pair.
@@ -390,16 +395,6 @@ impl TypedClientConnection {
     ) -> Result<OwnedExchange, TypedClientError> {
         let response = self.execute(request.clone()).await?;
         Ok(OwnedExchange { request, response })
-    }
-
-    async fn engine_error(&self) -> TypedClientError {
-        self.inner
-            .poisoned
-            .lock()
-            .await
-            .clone()
-            .map(Into::into)
-            .unwrap_or(TypedClientError::ConnectionClosed)
     }
 }
 
@@ -625,7 +620,7 @@ impl From<SharedEngineError> for TypedClientError {
 #[derive(Debug)]
 struct ResponseDecoder {
     kind: RequestKind,
-    frame: Vec<u8>,
+    buffered_len: usize,
     status: Option<(StatusCode, usize)>,
     tail: TailBuffer,
 }
@@ -634,29 +629,29 @@ impl ResponseDecoder {
     fn new(kind: RequestKind) -> Self {
         Self {
             kind,
-            frame: Vec::new(),
+            buffered_len: 0,
             status: None,
             tail: TailBuffer::default(),
         }
     }
 
-    fn push(&mut self, chunk: &[u8]) -> Result<DecodeProgress, TypedClientError> {
-        let chunk_start = self.frame.len();
-        self.frame.extend_from_slice(chunk);
+    fn push(&mut self, buffer: &[u8]) -> Result<DecodeProgress, TypedClientError> {
+        let chunk_start = self.buffered_len;
+        self.buffered_len = buffer.len();
 
         let (status, status_end) = match self.status {
             Some(value) => value,
             None => {
-                let Some(status_end) = status_line_end(&self.frame) else {
+                let Some(status_end) = status_line_end(buffer) else {
                     return Ok(DecodeProgress::NeedMore);
                 };
                 let status =
-                    StatusCode::parse(&self.frame).ok_or(TypedClientError::InvalidStatusLine)?;
+                    StatusCode::parse(buffer).ok_or(TypedClientError::InvalidStatusLine)?;
                 self.status = Some((status, status_end));
                 if !self.kind.expects_multiline_response(status) {
                     return Ok(DecodeProgress::Complete {
-                        response: self.finish(status, status_end),
-                        consumed: status_end.saturating_sub(chunk_start),
+                        response: self.finish(buffer, status, status_end),
+                        consumed: status_end,
                     });
                 }
                 (status, status_end)
@@ -664,15 +659,15 @@ impl ResponseDecoder {
         };
 
         let content_chunk_start = chunk_start.max(status_end);
-        if content_chunk_start >= self.frame.len() {
+        if content_chunk_start >= buffer.len() {
             return Ok(DecodeProgress::NeedMore);
         }
 
-        let content_chunk = &self.frame[content_chunk_start..];
+        let content_chunk = &buffer[content_chunk_start..];
         match self.tail.detect_terminator(content_chunk) {
             TerminatorStatus::FoundAt(end) => Ok(DecodeProgress::Complete {
-                response: self.finish(status, content_chunk_start + end),
-                consumed: content_chunk_start + end - chunk_start,
+                response: self.finish(buffer, status, content_chunk_start + end),
+                consumed: content_chunk_start + end,
             }),
             TerminatorStatus::NotFound => {
                 self.tail.update(content_chunk);
@@ -681,12 +676,11 @@ impl ResponseDecoder {
         }
     }
 
-    fn finish(&mut self, status: StatusCode, end: usize) -> OwnedResponse {
-        self.frame.truncate(end);
+    fn finish(&mut self, buffer: &[u8], status: StatusCode, end: usize) -> OwnedResponse {
         OwnedResponse {
             kind: self.kind,
             status,
-            bytes: std::mem::take(&mut self.frame).into_boxed_slice(),
+            bytes: buffer[..end].to_vec().into_boxed_slice(),
         }
     }
 }
@@ -704,6 +698,32 @@ enum DecodeProgress {
 struct QueuedRequest {
     request: Request<'static>,
     response_tx: oneshot::Sender<Result<OwnedResponse, SharedEngineError>>,
+}
+
+#[derive(Debug)]
+pub(crate) struct PendingResponse {
+    inner: Arc<ConnectionHandle>,
+    response_rx: oneshot::Receiver<Result<OwnedResponse, SharedEngineError>>,
+}
+
+impl PendingResponse {
+    pub(crate) async fn receive(self) -> Result<OwnedResponse, TypedClientError> {
+        let response = match self.response_rx.await {
+            Ok(response) => response,
+            Err(_) => {
+                return Err(self
+                    .inner
+                    .poisoned
+                    .lock()
+                    .await
+                    .clone()
+                    .map(TypedClientError::from)
+                    .unwrap_or(TypedClientError::ConnectionClosed));
+            }
+        };
+
+        response.map_err(Into::into)
+    }
 }
 
 #[derive(Debug)]
@@ -783,7 +803,8 @@ async fn run_reader_task(
     poisoned: Arc<Mutex<Option<SharedEngineError>>>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
-    let mut pending_read = Vec::new();
+    let mut pending_read = Vec::with_capacity(read_buffer.len().saturating_mul(2));
+    let mut pending_read_start = 0;
 
     loop {
         let Some(inflight_request) =
@@ -795,11 +816,12 @@ async fn run_reader_task(
         let response_tx = inflight_request.response_tx;
 
         loop {
-            if !pending_read.is_empty() {
-                match decoder.push(&pending_read) {
-                    Ok(DecodeProgress::NeedMore) => pending_read.clear(),
+            if pending_read_start < pending_read.len() {
+                match decoder.push(&pending_read[pending_read_start..]) {
+                    Ok(DecodeProgress::NeedMore) => {}
                     Ok(DecodeProgress::Complete { response, consumed }) => {
-                        pending_read.drain(..consumed);
+                        pending_read_start += consumed;
+                        compact_pending_read(&mut pending_read, &mut pending_read_start);
                         let _ = response_tx.send(Ok(response));
                         break;
                     }
@@ -848,8 +870,28 @@ async fn run_reader_task(
                 return;
             }
 
+            compact_pending_read(&mut pending_read, &mut pending_read_start);
             pending_read.extend_from_slice(&read_buffer[..read]);
         }
+    }
+}
+
+fn compact_pending_read(buffer: &mut Vec<u8>, start: &mut usize) {
+    if *start == 0 {
+        return;
+    }
+
+    let len = buffer.len();
+    if *start >= len {
+        buffer.clear();
+        *start = 0;
+        return;
+    }
+
+    if *start >= len / 2 {
+        buffer.copy_within(*start.., 0);
+        buffer.truncate(len - *start);
+        *start = 0;
     }
 }
 
@@ -969,16 +1011,17 @@ mod tests {
     #[test]
     fn decoder_completes_multiline_response_across_chunks() {
         let mut decoder = ResponseDecoder::new(RequestKind::Body);
+        let mut buffer = b"222 1 <a@b> body follows\r\nbody\r".to_vec();
         assert!(matches!(
-            decoder.push(b"222 1 <a@b> body follows\r\nbody\r").unwrap(),
+            decoder.push(&buffer).unwrap(),
             DecodeProgress::NeedMore
         ));
-        let DecodeProgress::Complete { response, consumed } = decoder.push(b"\n.\r\n").unwrap()
-        else {
+        buffer.extend_from_slice(b"\n.\r\n");
+        let DecodeProgress::Complete { response, consumed } = decoder.push(&buffer).unwrap() else {
             panic!("decoder should complete");
         };
 
-        assert_eq!(consumed, b"\n.\r\n".len());
+        assert_eq!(consumed, b"222 1 <a@b> body follows\r\nbody\r\n.\r\n".len());
         assert_eq!(response.status().as_u16(), 222);
         assert_eq!(
             response.as_bytes(),
@@ -1011,6 +1054,21 @@ mod tests {
         };
         assert_eq!(second_consumed, chunk.len() - consumed);
         assert_eq!(second_response.status().as_u16(), 220);
+    }
+
+    #[test]
+    fn compact_pending_read_keeps_live_suffix_without_front_drain() {
+        let mut buffer = b"consumed-live-bytes".to_vec();
+        let mut start = b"consumed-".len();
+        compact_pending_read(&mut buffer, &mut start);
+        assert_eq!(&buffer, b"live-bytes");
+        assert_eq!(start, 0);
+
+        let mut untouched = b"abcdef".to_vec();
+        let mut untouched_start = 2;
+        compact_pending_read(&mut untouched, &mut untouched_start);
+        assert_eq!(&untouched, b"abcdef");
+        assert_eq!(untouched_start, 2);
     }
 
     #[tokio::test]

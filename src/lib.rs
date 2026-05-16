@@ -1,5 +1,6 @@
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
+use std::collections::VecDeque;
 use std::fs;
 use std::future::poll_fn;
 use std::io::{self, IoSlice, Write};
@@ -1015,17 +1016,21 @@ impl TypedClientSession {
         .await
         .map_err(map_typed_client_error)?;
 
-        let mut pending = JoinSet::new();
+        let mut pending = VecDeque::with_capacity(self.pipeline_depth);
         let mut issued = 0_u64;
 
-        self.fill_typed_pipeline(&connection, &mut pending, issued, stats, stop)?;
+        self.fill_typed_pipeline(&connection, &mut pending, issued, stats, stop)
+            .await?;
         if pending.len() > 1 {
             stats.pipeline_batches.fetch_add(1, Ordering::Relaxed);
         }
         issued = issued.wrapping_add(pending.len() as u64);
 
-        while let Some(result) = pending.join_next().await {
-            let (command_id, response) = result.map_err(io::Error::other)??;
+        while let Some((command_id, pending_response)) = pending.pop_front() {
+            let response = pending_response
+                .receive()
+                .await
+                .map_err(map_typed_client_error)?;
 
             stats
                 .bytes_sent
@@ -1047,7 +1052,8 @@ impl TypedClientSession {
             }
 
             let before = pending.len();
-            self.fill_typed_pipeline(&connection, &mut pending, issued, stats, stop)?;
+            self.fill_typed_pipeline(&connection, &mut pending, issued, stats, stop)
+                .await?;
             let added = pending.len().saturating_sub(before);
             if added > 1 {
                 stats.pipeline_batches.fetch_add(1, Ordering::Relaxed);
@@ -1058,10 +1064,10 @@ impl TypedClientSession {
         Ok(())
     }
 
-    fn fill_typed_pipeline(
+    async fn fill_typed_pipeline(
         &self,
         connection: &TypedClientConnection,
-        pending: &mut JoinSet<io::Result<(u64, OwnedResponse)>>,
+        pending: &mut VecDeque<(u64, crate::typed_client::PendingResponse)>,
         issued: u64,
         stats: &Stats,
         stop: &AtomicBool,
@@ -1079,14 +1085,11 @@ impl TypedClientSession {
                 .wrapping_add(issued)
                 .wrapping_add(pending.len() as u64);
             let request = typed_request_for_command(command_id, self.command_mix)?;
-            let connection = connection.clone();
-            pending.spawn(async move {
-                let response = connection
-                    .execute(request)
-                    .await
-                    .map_err(map_typed_client_error)?;
-                Ok((command_id, response))
-            });
+            let pending_response = connection
+                .queue_request(request)
+                .await
+                .map_err(map_typed_client_error)?;
+            pending.push_back((command_id, pending_response));
         }
 
         Ok(())
