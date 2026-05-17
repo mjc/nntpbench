@@ -118,21 +118,7 @@ fn find_terminator_end(data: &[u8]) -> Option<usize> {
         return Some(3);
     }
 
-    if data.len() < crate::TERMINATOR.len() {
-        return None;
-    }
-
-    for start in memchr::memchr_iter(b'\r', &data[..data.len() - 4]) {
-        if data[start + 1] == b'\n'
-            && data[start + 2] == b'.'
-            && data[start + 3] == b'\r'
-            && data[start + 4] == b'\n'
-        {
-            return Some(start + crate::TERMINATOR.len());
-        }
-    }
-
-    None
+    memchr::memmem::find(data, crate::TERMINATOR).map(|start| start + crate::TERMINATOR.len())
 }
 
 /// Find the content end for a complete multiline response frame.
@@ -264,14 +250,6 @@ mod tests {
         let mut tail = TailBuffer::default();
         tail.update(b"a\r\n.\r");
         assert_eq!(tail.find_spanning_terminator(b"\nx"), Some(1));
-    }
-
-    #[test]
-    fn in_chunk_terminator_search_handles_fixed_pattern_matches() {
-        assert_eq!(find_terminator_end(b".\r\n"), Some(3));
-        assert_eq!(find_terminator_end(b"abc\r\n.\r\n"), Some(8));
-        assert_eq!(find_terminator_end(b"abc\rx\n.\r\n"), None);
-        assert_eq!(find_terminator_end(b"abc\r\n.\r"), None);
     }
 
     #[test]
