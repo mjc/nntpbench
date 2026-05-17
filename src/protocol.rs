@@ -61,6 +61,1019 @@ impl StatusCode {
     }
 }
 
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::collection::vec;
+    use proptest::prelude::*;
+    use proptest::string::string_regex;
+
+    fn token_atom_strategy() -> BoxedStrategy<String> {
+        string_regex("[A-Za-z0-9][A-Za-z0-9._-]{0,15}")
+            .unwrap()
+            .boxed()
+    }
+
+    fn message_id_inner_strategy() -> BoxedStrategy<String> {
+        (
+            token_atom_strategy(),
+            token_atom_strategy(),
+            token_atom_strategy(),
+        )
+            .prop_map(|(local, domain, tld)| format!("{local}@{domain}.{tld}"))
+            .boxed()
+    }
+
+    fn message_id_strategy() -> BoxedStrategy<String> {
+        message_id_inner_strategy()
+            .prop_map(|inner| format!("<{inner}>"))
+            .boxed()
+    }
+
+    fn invalid_message_id_strategy() -> BoxedStrategy<String> {
+        prop_oneof![
+            message_id_inner_strategy(),
+            message_id_inner_strategy().prop_map(|inner| format!("<{inner} >")),
+            message_id_inner_strategy().prop_map(|inner| format!("<{inner}")),
+            Just("<>".to_string()),
+        ]
+        .boxed()
+    }
+
+    fn article_number_strategy() -> BoxedStrategy<u64> {
+        (1_u64..=2_147_483_647_u64).boxed()
+    }
+
+    fn article_number_token_strategy() -> BoxedStrategy<String> {
+        article_number_strategy()
+            .prop_map(|number| number.to_string())
+            .boxed()
+    }
+
+    fn header_name_strategy() -> BoxedStrategy<String> {
+        string_regex("[A-Za-z0-9-]{1,20}").unwrap().boxed()
+    }
+
+    fn invalid_header_name_strategy() -> BoxedStrategy<String> {
+        prop_oneof![
+            Just(String::new()),
+            header_name_strategy().prop_map(|name| format!("{name}:")),
+            header_name_strategy().prop_map(|name| format!("{name} bad")),
+        ]
+        .boxed()
+    }
+
+    fn article_selector_strategy() -> BoxedStrategy<String> {
+        prop_oneof![
+            message_id_strategy(),
+            article_number_token_strategy(),
+            listgroup_range_strategy(),
+        ]
+        .boxed()
+    }
+
+    fn invalid_article_selector_strategy() -> BoxedStrategy<String> {
+        prop_oneof![
+            Just(String::new()),
+            article_selector_strategy().prop_map(|selector| format!("{selector} ")),
+            Just("1 2".to_string()),
+            Just("1\r\nQUIT".to_string()),
+        ]
+        .boxed()
+    }
+
+    fn listgroup_range_strategy() -> BoxedStrategy<String> {
+        prop_oneof![
+            article_number_token_strategy(),
+            (
+                article_number_token_strategy(),
+                article_number_token_strategy()
+            )
+                .prop_map(|(start, end)| format!("{start}-{end}")),
+            article_number_token_strategy().prop_map(|start| format!("{start}-")),
+        ]
+        .boxed()
+    }
+
+    fn invalid_listgroup_range_strategy() -> BoxedStrategy<String> {
+        prop_oneof![
+            Just(String::new()),
+            Just("0".to_string()),
+            Just("-10".to_string()),
+            Just("1-10-20".to_string()),
+            Just("1 10".to_string()),
+            Just("2147483648".to_string()),
+        ]
+        .boxed()
+    }
+
+    fn group_name_strategy() -> BoxedStrategy<String> {
+        vec(string_regex("[A-Za-z0-9-]{1,8}").unwrap(), 1..=4)
+            .prop_map(|segments| segments.join("."))
+            .boxed()
+    }
+
+    fn invalid_group_name_strategy() -> BoxedStrategy<String> {
+        prop_oneof![
+            Just(String::new()),
+            group_name_strategy().prop_map(|name| format!(".{name}")),
+            group_name_strategy().prop_map(|name| format!("{name}.")),
+            group_name_strategy().prop_map(|name| format!("{name}..bad")),
+            group_name_strategy().prop_map(|name| format!("{name}*")),
+        ]
+        .boxed()
+    }
+
+    fn auth_info_value_strategy() -> BoxedStrategy<String> {
+        string_regex("[ -~]{1,20}").unwrap().boxed()
+    }
+
+    fn nntp_date_strategy() -> BoxedStrategy<String> {
+        prop_oneof![
+            (0_u8..=99, 1_u8..=12, 1_u8..=31)
+                .prop_map(|(year, month, day)| format!("{year:02}{month:02}{day:02}")),
+            (2000_u16..=2099, 1_u8..=12, 1_u8..=31)
+                .prop_map(|(year, month, day)| format!("{year:04}{month:02}{day:02}")),
+        ]
+        .boxed()
+    }
+
+    fn invalid_nntp_date_strategy() -> BoxedStrategy<String> {
+        prop_oneof![
+            Just("20261301".to_string()),
+            Just("20260132".to_string()),
+            Just("2026010".to_string()),
+            Just("20ab0101".to_string()),
+        ]
+        .boxed()
+    }
+
+    fn nntp_time_strategy() -> BoxedStrategy<String> {
+        (0_u8..=23, 0_u8..=59, 0_u8..=60)
+            .prop_map(|(hour, minute, second)| format!("{hour:02}{minute:02}{second:02}"))
+            .boxed()
+    }
+
+    fn invalid_nntp_time_strategy() -> BoxedStrategy<String> {
+        prop_oneof![
+            Just("240000".to_string()),
+            Just("126100".to_string()),
+            Just("125961".to_string()),
+            Just("12596".to_string()),
+        ]
+        .boxed()
+    }
+
+    fn wildmat_pattern_strategy() -> BoxedStrategy<String> {
+        string_regex("[A-Za-z0-9*?._-]{1,12}").unwrap().boxed()
+    }
+
+    fn wildmat_strategy() -> BoxedStrategy<String> {
+        vec(wildmat_pattern_strategy(), 1..=4)
+            .prop_map(|patterns| patterns.join(","))
+            .boxed()
+    }
+
+    fn invalid_wildmat_strategy() -> BoxedStrategy<String> {
+        prop_oneof![
+            Just(String::new()),
+            wildmat_strategy().prop_map(|wildmat| format!("{wildmat},,")),
+            Just("!".to_string()),
+            Just("alt.test,!".to_string()),
+            Just("alt test".to_string()),
+        ]
+        .boxed()
+    }
+
+    fn mixed_case(input: &str, mask: &[bool]) -> String {
+        let mut bytes = input.as_bytes().to_vec();
+        for (byte, uppercase) in bytes.iter_mut().zip(mask.iter().copied()) {
+            if byte.is_ascii_alphabetic() && uppercase {
+                *byte ^= 0x20;
+            }
+        }
+        String::from_utf8(bytes).unwrap()
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum ArticleFamily {
+        Article,
+        Body,
+        Head,
+        Stat,
+    }
+
+    impl ArticleFamily {
+        fn as_verb(self) -> &'static str {
+            match self {
+                Self::Article => "ARTICLE",
+                Self::Body => "BODY",
+                Self::Head => "HEAD",
+                Self::Stat => "STAT",
+            }
+        }
+
+        fn as_kind(self) -> RequestKind {
+            match self {
+                Self::Article => RequestKind::Article,
+                Self::Body => RequestKind::Body,
+                Self::Head => RequestKind::Head,
+                Self::Stat => RequestKind::Stat,
+            }
+        }
+    }
+
+    fn article_family_strategy() -> BoxedStrategy<ArticleFamily> {
+        prop_oneof![
+            Just(ArticleFamily::Article),
+            Just(ArticleFamily::Body),
+            Just(ArticleFamily::Head),
+            Just(ArticleFamily::Stat),
+        ]
+        .boxed()
+    }
+
+    #[derive(Debug, Clone)]
+    enum SelectorCase {
+        Current,
+        Number(String),
+        MessageId(String),
+    }
+
+    fn selector_case_strategy() -> BoxedStrategy<SelectorCase> {
+        prop_oneof![
+            Just(SelectorCase::Current),
+            article_number_token_strategy().prop_map(SelectorCase::Number),
+            message_id_strategy().prop_map(SelectorCase::MessageId),
+        ]
+        .boxed()
+    }
+
+    fn build_article_family_request(
+        family: ArticleFamily,
+        selector: &SelectorCase,
+    ) -> Request<'static> {
+        match (family, selector) {
+            (ArticleFamily::Article, SelectorCase::Current) => Request::article_current(),
+            (ArticleFamily::Article, SelectorCase::Number(number)) => {
+                Request::article_number(number.parse().unwrap()).unwrap()
+            }
+            (ArticleFamily::Article, SelectorCase::MessageId(message_id)) => {
+                Request::article(message_id).unwrap()
+            }
+            (ArticleFamily::Body, SelectorCase::Current) => Request::body_current(),
+            (ArticleFamily::Body, SelectorCase::Number(number)) => {
+                Request::body_number(number.parse().unwrap()).unwrap()
+            }
+            (ArticleFamily::Body, SelectorCase::MessageId(message_id)) => {
+                Request::body(message_id).unwrap()
+            }
+            (ArticleFamily::Head, SelectorCase::Current) => Request::head_current(),
+            (ArticleFamily::Head, SelectorCase::Number(number)) => {
+                Request::head_number(number.parse().unwrap()).unwrap()
+            }
+            (ArticleFamily::Head, SelectorCase::MessageId(message_id)) => {
+                Request::head(message_id).unwrap()
+            }
+            (ArticleFamily::Stat, SelectorCase::Current) => Request::stat_current(),
+            (ArticleFamily::Stat, SelectorCase::Number(number)) => {
+                Request::stat_number(number.parse().unwrap()).unwrap()
+            }
+            (ArticleFamily::Stat, SelectorCase::MessageId(message_id)) => {
+                Request::stat(message_id).unwrap()
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum FixedCommand {
+        Post,
+        StartTls,
+        List,
+        Help,
+        Capabilities,
+        Date,
+        ModeReader,
+        Quit,
+        Last,
+        Next,
+    }
+
+    impl FixedCommand {
+        fn canonical_line(self) -> &'static str {
+            match self {
+                Self::Post => "POST",
+                Self::StartTls => "STARTTLS",
+                Self::List => "LIST",
+                Self::Help => "HELP",
+                Self::Capabilities => "CAPABILITIES",
+                Self::Date => "DATE",
+                Self::ModeReader => "MODE READER",
+                Self::Quit => "QUIT",
+                Self::Last => "LAST",
+                Self::Next => "NEXT",
+            }
+        }
+
+        fn kind(self) -> RequestKind {
+            match self {
+                Self::Post => RequestKind::Post,
+                Self::StartTls => RequestKind::StartTls,
+                Self::List => RequestKind::List,
+                Self::Help => RequestKind::Help,
+                Self::Capabilities => RequestKind::Capabilities,
+                Self::Date => RequestKind::Date,
+                Self::ModeReader => RequestKind::ModeReader,
+                Self::Quit => RequestKind::Quit,
+                Self::Last => RequestKind::Last,
+                Self::Next => RequestKind::Next,
+            }
+        }
+
+        fn request(self) -> Request<'static> {
+            match self {
+                Self::Post => Request::post(),
+                Self::StartTls => Request::starttls(),
+                Self::List => Request::list(),
+                Self::Help => Request::help(),
+                Self::Capabilities => Request::capabilities(),
+                Self::Date => Request::date(),
+                Self::ModeReader => Request::mode_reader(),
+                Self::Quit => Request::quit(),
+                Self::Last => Request::last(),
+                Self::Next => Request::next(),
+            }
+        }
+    }
+
+    fn fixed_command_strategy() -> BoxedStrategy<FixedCommand> {
+        prop_oneof![
+            Just(FixedCommand::Post),
+            Just(FixedCommand::StartTls),
+            Just(FixedCommand::List),
+            Just(FixedCommand::Help),
+            Just(FixedCommand::Capabilities),
+            Just(FixedCommand::Date),
+            Just(FixedCommand::ModeReader),
+            Just(FixedCommand::Quit),
+            Just(FixedCommand::Last),
+            Just(FixedCommand::Next),
+        ]
+        .boxed()
+    }
+
+    #[derive(Debug, Clone)]
+    enum ListCase {
+        Active(Option<String>),
+        ActiveTimes(Option<String>),
+        Newsgroups(Option<String>),
+        OverviewFmt,
+        Headers,
+        DistribPats,
+    }
+
+    fn list_case_strategy() -> BoxedStrategy<ListCase> {
+        prop_oneof![
+            prop_oneof![Just(None), wildmat_strategy().prop_map(Some),].prop_map(ListCase::Active),
+            prop_oneof![Just(None), wildmat_strategy().prop_map(Some),]
+                .prop_map(ListCase::ActiveTimes),
+            prop_oneof![Just(None), wildmat_strategy().prop_map(Some),]
+                .prop_map(ListCase::Newsgroups),
+            Just(ListCase::OverviewFmt),
+            Just(ListCase::Headers),
+            Just(ListCase::DistribPats),
+        ]
+        .boxed()
+    }
+
+    impl ListCase {
+        fn canonical_line(&self) -> String {
+            match self {
+                Self::Active(None) => "LIST ACTIVE".to_string(),
+                Self::Active(Some(wildmat)) => format!("LIST ACTIVE {wildmat}"),
+                Self::ActiveTimes(None) => "LIST ACTIVE.TIMES".to_string(),
+                Self::ActiveTimes(Some(wildmat)) => format!("LIST ACTIVE.TIMES {wildmat}"),
+                Self::Newsgroups(None) => "LIST NEWSGROUPS".to_string(),
+                Self::Newsgroups(Some(wildmat)) => format!("LIST NEWSGROUPS {wildmat}"),
+                Self::OverviewFmt => "LIST OVERVIEW.FMT".to_string(),
+                Self::Headers => "LIST HEADERS".to_string(),
+                Self::DistribPats => "LIST DISTRIB.PATS".to_string(),
+            }
+        }
+
+        fn kind(&self) -> RequestKind {
+            match self {
+                Self::Active(_) => RequestKind::ListActive,
+                Self::ActiveTimes(_) => RequestKind::ListActiveTimes,
+                Self::Newsgroups(_) => RequestKind::ListNewsgroups,
+                Self::OverviewFmt => RequestKind::ListOverviewFmt,
+                Self::Headers => RequestKind::ListHeaders,
+                Self::DistribPats => RequestKind::ListDistribPats,
+            }
+        }
+
+        fn request(&self) -> Request<'static> {
+            match self {
+                Self::Active(None) => Request::list_active(),
+                Self::Active(Some(wildmat)) => Request::list_active_wildmat(wildmat).unwrap(),
+                Self::ActiveTimes(None) => Request::list_active_times(),
+                Self::ActiveTimes(Some(wildmat)) => {
+                    Request::list_active_times_wildmat(wildmat).unwrap()
+                }
+                Self::Newsgroups(None) => Request::list_newsgroups(),
+                Self::Newsgroups(Some(wildmat)) => {
+                    Request::list_newsgroups_wildmat(wildmat).unwrap()
+                }
+                Self::OverviewFmt => Request::list_overview_fmt(),
+                Self::Headers => Request::list_headers(),
+                Self::DistribPats => Request::list_distrib_pats(),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    enum AuthCase {
+        User(String),
+        Pass(String),
+    }
+
+    fn auth_case_strategy() -> BoxedStrategy<AuthCase> {
+        prop_oneof![
+            auth_info_value_strategy().prop_map(AuthCase::User),
+            auth_info_value_strategy().prop_map(AuthCase::Pass),
+        ]
+        .boxed()
+    }
+
+    impl AuthCase {
+        fn canonical_line(&self) -> String {
+            match self {
+                Self::User(value) => format!("AUTHINFO USER {value}"),
+                Self::Pass(value) => format!("AUTHINFO PASS {value}"),
+            }
+        }
+
+        fn kind(&self) -> RequestKind {
+            match self {
+                Self::User(_) => RequestKind::AuthInfoUser,
+                Self::Pass(_) => RequestKind::AuthInfoPass,
+            }
+        }
+
+        fn request(&self) -> Request<'static> {
+            match self {
+                Self::User(value) => Request::authinfo_user(value).unwrap(),
+                Self::Pass(value) => Request::authinfo_pass(value).unwrap(),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    enum TransferCase {
+        Ihave(String),
+        Check(String),
+        TakeThis(String, Vec<u8>),
+    }
+
+    fn payload_line_strategy() -> BoxedStrategy<String> {
+        string_regex("[A-Za-z0-9 ._!?-]{0,20}").unwrap().boxed()
+    }
+
+    fn transfer_payload_strategy() -> BoxedStrategy<Vec<u8>> {
+        vec(payload_line_strategy(), 0..=5)
+            .prop_map(|lines| lines.join("\n").into_bytes())
+            .boxed()
+    }
+
+    fn transfer_case_strategy() -> BoxedStrategy<TransferCase> {
+        prop_oneof![
+            message_id_strategy().prop_map(TransferCase::Ihave),
+            message_id_strategy().prop_map(TransferCase::Check),
+            (message_id_strategy(), transfer_payload_strategy())
+                .prop_map(|(message_id, payload)| TransferCase::TakeThis(message_id, payload)),
+        ]
+        .boxed()
+    }
+
+    impl TransferCase {
+        fn first_line(&self) -> String {
+            match self {
+                Self::Ihave(message_id) => format!("IHAVE {message_id}"),
+                Self::Check(message_id) => format!("CHECK {message_id}"),
+                Self::TakeThis(message_id, _) => format!("TAKETHIS {message_id}"),
+            }
+        }
+
+        fn kind(&self) -> RequestKind {
+            match self {
+                Self::Ihave(_) => RequestKind::Ihave,
+                Self::Check(_) => RequestKind::Check,
+                Self::TakeThis(_, _) => RequestKind::TakeThis,
+            }
+        }
+
+        fn request(&self) -> Request<'static> {
+            match self {
+                Self::Ihave(message_id) => Request::ihave(message_id).unwrap(),
+                Self::Check(message_id) => Request::check(message_id).unwrap(),
+                Self::TakeThis(message_id, payload) => {
+                    Request::takethis(message_id, payload).unwrap()
+                }
+            }
+        }
+    }
+
+    fn expected_transfer_wire(first_line: &str, payload: &[u8]) -> Vec<u8> {
+        let mut expected = Vec::new();
+        expected.extend_from_slice(first_line.as_bytes());
+        expected.extend_from_slice(b"\r\n");
+        if payload.is_empty() {
+            expected.extend_from_slice(b".\r\n");
+            return expected;
+        }
+
+        for raw_line in payload.split_inclusive(|byte| *byte == b'\n') {
+            let line = raw_line.strip_suffix(b"\n").unwrap_or(raw_line);
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            if line.starts_with(b".") {
+                expected.push(b'.');
+            }
+            expected.extend_from_slice(line);
+            expected.extend_from_slice(b"\r\n");
+        }
+        expected.extend_from_slice(b".\r\n");
+        expected
+    }
+
+    fn request_kind_strategy() -> BoxedStrategy<RequestKind> {
+        prop_oneof![
+            Just(RequestKind::Article),
+            Just(RequestKind::Body),
+            Just(RequestKind::Head),
+            Just(RequestKind::Stat),
+            Just(RequestKind::ListActive),
+            Just(RequestKind::ListActiveTimes),
+            Just(RequestKind::ListNewsgroups),
+            Just(RequestKind::ListOverviewFmt),
+            Just(RequestKind::ListHeaders),
+            Just(RequestKind::ListDistribPats),
+            Just(RequestKind::Group),
+            Just(RequestKind::ListGroup),
+            Just(RequestKind::Last),
+            Just(RequestKind::Next),
+            Just(RequestKind::List),
+            Just(RequestKind::Help),
+            Just(RequestKind::Capabilities),
+            Just(RequestKind::Date),
+            Just(RequestKind::Over),
+            Just(RequestKind::Xover),
+            Just(RequestKind::Hdr),
+            Just(RequestKind::Xhdr),
+            Just(RequestKind::NewGroups),
+            Just(RequestKind::NewNews),
+            Just(RequestKind::Post),
+            Just(RequestKind::Ihave),
+            Just(RequestKind::Check),
+            Just(RequestKind::TakeThis),
+            Just(RequestKind::AuthInfoUser),
+            Just(RequestKind::AuthInfoPass),
+            Just(RequestKind::AuthInfo),
+            Just(RequestKind::StartTls),
+            Just(RequestKind::ModeReader),
+            Just(RequestKind::Quit),
+            Just(RequestKind::Unknown),
+        ]
+        .boxed()
+    }
+
+    fn expected_multiline(kind: RequestKind, code: u16) -> bool {
+        if (400..600).contains(&code) {
+            return false;
+        }
+
+        match kind {
+            RequestKind::Article => code == 220,
+            RequestKind::Head => code == 221,
+            RequestKind::Body => code == 222,
+            RequestKind::ListGroup => code == 211,
+            RequestKind::Help => code == 100,
+            RequestKind::Capabilities => code == 101,
+            RequestKind::List
+            | RequestKind::ListActive
+            | RequestKind::ListActiveTimes
+            | RequestKind::ListNewsgroups
+            | RequestKind::ListOverviewFmt
+            | RequestKind::ListHeaders
+            | RequestKind::ListDistribPats => code == 215,
+            RequestKind::Over | RequestKind::Xover => code == 224,
+            RequestKind::Hdr | RequestKind::Xhdr => code == 225,
+            RequestKind::NewNews => code == 230,
+            RequestKind::NewGroups => code == 231,
+            RequestKind::Unknown => status_implies_multiline(code),
+            _ => false,
+        }
+    }
+
+    fn ascii_suffix_strategy() -> BoxedStrategy<Vec<u8>> {
+        vec(0x20_u8..=0x7e_u8, 0..=12).boxed()
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn status_code_parse_accepts_any_three_digit_prefix(
+            d0 in 0_u8..=9,
+            d1 in 0_u8..=9,
+            d2 in 0_u8..=9,
+            suffix in ascii_suffix_strategy(),
+        ) {
+            let mut input = vec![b'0' + d0, b'0' + d1, b'0' + d2];
+            input.extend_from_slice(&suffix);
+            let expected = u16::from(d0) * 100 + u16::from(d1) * 10 + u16::from(d2);
+            prop_assert_eq!(StatusCode::parse(&input), Some(StatusCode(expected)));
+        }
+
+        #[test]
+        fn status_code_parse_rejects_non_digit_prefix_bytes(
+            pos in 0_usize..3,
+            bad in prop_oneof![0_u8..=47_u8, 58_u8..=255_u8],
+            suffix in ascii_suffix_strategy(),
+        ) {
+            let mut input = vec![b'2', b'0', b'0'];
+            input[pos] = bad;
+            input.extend_from_slice(&suffix);
+            prop_assert_eq!(StatusCode::parse(&input), None);
+        }
+
+        #[test]
+        fn message_id_valid_inputs_round_trip(value in message_id_strategy()) {
+            let borrowed = MessageId::from_borrowed(&value).unwrap();
+            let owned = MessageId::from_str_or_wrap(&value).unwrap();
+            let reborrowed = MessageId::from_borrowed(borrowed.as_str()).unwrap();
+            prop_assert_eq!(borrowed.as_str(), value.as_str());
+            prop_assert_eq!(owned.as_str(), value.as_str());
+            prop_assert_eq!(reborrowed.as_str(), value.as_str());
+        }
+
+        #[test]
+        fn message_id_invalid_inputs_are_rejected(value in invalid_message_id_strategy()) {
+            prop_assert!(MessageId::from_borrowed(&value).is_err());
+        }
+
+        #[test]
+        fn article_refs_follow_numeric_and_message_id_selectors(
+            number in article_number_strategy(),
+            message_id in message_id_strategy(),
+        ) {
+            let message_ref = ArticleRef::from_selector(&message_id).unwrap();
+            prop_assert_eq!(ArticleRef::from_number(number).unwrap(), ArticleRef::Number(number));
+            prop_assert_eq!(
+                ArticleRef::from_selector(number.to_string()).unwrap(),
+                ArticleRef::Number(number),
+            );
+            prop_assert_eq!(message_ref.message_id().unwrap().as_str(), message_id.as_str());
+        }
+
+        #[test]
+        fn header_names_round_trip_and_invalid_forms_fail(
+            valid in header_name_strategy(),
+            invalid in invalid_header_name_strategy(),
+        ) {
+            let borrowed = HeaderName::from_borrowed(&valid).unwrap();
+            let owned = HeaderName::from_owned(&valid).unwrap();
+            prop_assert_eq!(borrowed.as_str(), valid.as_str());
+            prop_assert_eq!(owned.as_str(), valid.as_str());
+            prop_assert!(HeaderName::from_borrowed(&invalid).is_err());
+        }
+
+        #[test]
+        fn article_selectors_round_trip_and_invalid_forms_fail(
+            valid in article_selector_strategy(),
+            invalid in invalid_article_selector_strategy(),
+        ) {
+            let borrowed = ArticleSelector::from_borrowed(&valid).unwrap();
+            let owned = ArticleSelector::from_owned(&valid).unwrap();
+            prop_assert_eq!(borrowed.as_str(), valid.as_str());
+            prop_assert_eq!(owned.as_str(), valid.as_str());
+            prop_assert!(ArticleSelector::from_borrowed(&invalid).is_err());
+        }
+
+        #[test]
+        fn listgroup_ranges_round_trip_and_invalid_forms_fail(
+            valid in listgroup_range_strategy(),
+            invalid in invalid_listgroup_range_strategy(),
+        ) {
+            let borrowed = ListGroupRange::from_borrowed(&valid).unwrap();
+            let owned = ListGroupRange::from_owned(&valid).unwrap();
+            prop_assert_eq!(borrowed.as_str(), valid.as_str());
+            prop_assert_eq!(owned.as_str(), valid.as_str());
+            prop_assert!(ListGroupRange::from_borrowed(&invalid).is_err());
+        }
+
+        #[test]
+        fn group_names_round_trip_and_invalid_forms_fail(
+            valid in group_name_strategy(),
+            invalid in invalid_group_name_strategy(),
+        ) {
+            let borrowed = GroupName::from_borrowed(&valid).unwrap();
+            let owned = GroupName::from_owned(&valid).unwrap();
+            prop_assert_eq!(borrowed.as_str(), valid.as_str());
+            prop_assert_eq!(owned.as_str(), valid.as_str());
+            prop_assert!(GroupName::from_borrowed(&invalid).is_err());
+        }
+
+        #[test]
+        fn auth_info_values_round_trip(valid in auth_info_value_strategy()) {
+            let borrowed = AuthInfoValue::from_borrowed(&valid).unwrap();
+            let owned = AuthInfoValue::from_owned(&valid).unwrap();
+            prop_assert_eq!(borrowed.as_str(), valid.as_str());
+            prop_assert_eq!(owned.as_str(), valid.as_str());
+        }
+
+        #[test]
+        fn discovery_arguments_accept_valid_and_reject_invalid_forms(
+            date in nntp_date_strategy(),
+            time in nntp_time_strategy(),
+            wildmat in wildmat_strategy(),
+            invalid_date in invalid_nntp_date_strategy(),
+            invalid_time in invalid_nntp_time_strategy(),
+            invalid_wildmat in invalid_wildmat_strategy(),
+        ) {
+            let valid_date = NntpDate::from_borrowed(&date).unwrap();
+            let valid_time = NntpTime::from_borrowed(&time).unwrap();
+            let valid_wildmat = Wildmat::from_borrowed(&wildmat).unwrap();
+            prop_assert_eq!(valid_date.as_str(), date.as_str());
+            prop_assert_eq!(valid_time.as_str(), time.as_str());
+            prop_assert_eq!(valid_wildmat.as_str(), wildmat.as_str());
+            prop_assert!(NntpDate::from_borrowed(&invalid_date).is_err());
+            prop_assert!(NntpTime::from_borrowed(&invalid_time).is_err());
+            prop_assert!(Wildmat::from_borrowed(&invalid_wildmat).is_err());
+        }
+
+        #[test]
+        fn request_line_article_family_preserves_kind_args_and_message_id(
+            family in article_family_strategy(),
+            selector in selector_case_strategy(),
+            mask in vec(any::<bool>(), 4..=7),
+            spacing in prop_oneof![Just(" ".to_string()), Just("   ".to_string())],
+            suffix in prop_oneof![Just("".to_string()), Just("\r\n".to_string()), Just(" \r\n".to_string())],
+        ) {
+            let verb = mixed_case(family.as_verb(), &mask);
+            let selector_text = match &selector {
+                SelectorCase::Current => String::new(),
+                SelectorCase::Number(number) | SelectorCase::MessageId(number) => number.clone(),
+            };
+            let line = if selector_text.is_empty() {
+                format!("{verb}{suffix}")
+            } else {
+                format!("{verb}{spacing}{selector_text}{suffix}")
+            };
+
+            let parsed = RequestLine::parse(line.as_bytes());
+            prop_assert_eq!(parsed.kind(), family.as_kind());
+            prop_assert_eq!(parsed.verb(), verb.as_bytes());
+            prop_assert_eq!(parsed.args(), selector_text.as_bytes());
+            match selector {
+                SelectorCase::MessageId(message_id) => {
+                    let parsed_message_id = parsed.message_id().unwrap();
+                    prop_assert_eq!(parsed_message_id.as_str(), message_id.as_str());
+                }
+                SelectorCase::Current | SelectorCase::Number(_) => {
+                    prop_assert!(parsed.message_id().is_none());
+                }
+            }
+        }
+
+        #[test]
+        fn article_family_requests_preserve_rfc_wire_selector_forms(
+            family in article_family_strategy(),
+            selector in selector_case_strategy(),
+        ) {
+            let request = build_article_family_request(family, &selector);
+            let mut wire = Vec::new();
+            request.write_wire_to(&mut wire);
+            let parsed = RequestLine::parse(&wire);
+            let expected_args = match &selector {
+                SelectorCase::Current => "",
+                SelectorCase::Number(number) | SelectorCase::MessageId(number) => number.as_str(),
+            };
+
+            prop_assert_eq!(parsed.kind(), family.as_kind());
+            prop_assert_eq!(parsed.verb(), family.as_verb().as_bytes());
+            prop_assert_eq!(parsed.args(), expected_args.as_bytes());
+            prop_assert!(wire.ends_with(b"\r\n"));
+            prop_assert_eq!(wire.windows(2).filter(|window| *window == b"\r\n").count(), 1);
+        }
+
+        #[test]
+        fn overview_and_header_requests_preserve_rfc_wire_forms(
+            selector in article_selector_strategy(),
+            header in header_name_strategy(),
+        ) {
+            let over = Request::over(&selector).unwrap();
+            let xover = Request::xover(&selector).unwrap();
+            let hdr = Request::hdr(&header, &selector).unwrap();
+            let xhdr = Request::xhdr(&header, &selector).unwrap();
+
+            for (request, expected_kind, expected_args) in [
+                (over, RequestKind::Over, selector.clone()),
+                (xover, RequestKind::Xover, selector.clone()),
+                (hdr, RequestKind::Hdr, format!("{header} {selector}")),
+                (xhdr, RequestKind::Xhdr, format!("{header} {selector}")),
+            ] {
+                let mut wire = Vec::new();
+                request.write_wire_to(&mut wire);
+                let parsed = RequestLine::parse(&wire);
+                prop_assert_eq!(parsed.kind(), expected_kind);
+                prop_assert_eq!(std::str::from_utf8(parsed.args()).unwrap(), expected_args);
+            }
+        }
+
+        #[test]
+        fn listgroup_and_discovery_requests_preserve_rfc_wire_forms(
+            group in group_name_strategy(),
+            range in listgroup_range_strategy(),
+            date in nntp_date_strategy(),
+            time in nntp_time_strategy(),
+            wildmat in wildmat_strategy(),
+            gmt in any::<bool>(),
+        ) {
+            let requests = [
+                (
+                    Request::listgroup(&group).unwrap(),
+                    format!("LISTGROUP {group}\r\n"),
+                ),
+                (
+                    Request::listgroup_range(&range).unwrap(),
+                    format!("LISTGROUP {range}\r\n"),
+                ),
+                (
+                    Request::listgroup_group_range(&group, &range).unwrap(),
+                    format!("LISTGROUP {group} {range}\r\n"),
+                ),
+                (
+                    Request::newgroups(&date, &time, gmt).unwrap(),
+                    if gmt {
+                        format!("NEWGROUPS {date} {time} GMT\r\n")
+                    } else {
+                        format!("NEWGROUPS {date} {time}\r\n")
+                    },
+                ),
+                (
+                    Request::newnews(&wildmat, &date, &time, gmt).unwrap(),
+                    if gmt {
+                        format!("NEWNEWS {wildmat} {date} {time} GMT\r\n")
+                    } else {
+                        format!("NEWNEWS {wildmat} {date} {time}\r\n")
+                    },
+                ),
+            ];
+
+            for (request, expected_wire) in requests {
+                let mut wire = Vec::new();
+                request.write_wire_to(&mut wire);
+                prop_assert_eq!(std::str::from_utf8(&wire).unwrap(), expected_wire);
+            }
+        }
+
+        #[test]
+        fn fixed_commands_parse_case_insensitively_and_serialize_canonically(
+            command in fixed_command_strategy(),
+            mask in vec(any::<bool>(), 3..=12),
+        ) {
+            let line = mixed_case(command.canonical_line(), &mask);
+            let parsed = RequestLine::parse(line.as_bytes());
+            prop_assert_eq!(parsed.kind(), command.kind());
+            let mut wire = Vec::new();
+            command.request().write_wire_to(&mut wire);
+            prop_assert_eq!(
+                std::str::from_utf8(&wire).unwrap(),
+                format!("{}\r\n", command.canonical_line())
+            );
+        }
+
+        #[test]
+        fn list_command_matrix_parses_case_insensitively_and_serializes_canonically(
+            list_case in list_case_strategy(),
+            mask in vec(any::<bool>(), 4..=32),
+        ) {
+            let canonical = list_case.canonical_line();
+            let line = mixed_case(&canonical, &mask);
+            let parsed = RequestLine::parse(line.as_bytes());
+            prop_assert_eq!(parsed.kind(), list_case.kind());
+            let mut wire = Vec::new();
+            list_case.request().write_wire_to(&mut wire);
+            prop_assert_eq!(std::str::from_utf8(&wire).unwrap(), format!("{canonical}\r\n"));
+        }
+
+        #[test]
+        fn authinfo_commands_parse_case_insensitively_and_serializes_canonically(
+            auth_case in auth_case_strategy(),
+            mask in vec(any::<bool>(), 13..=32),
+        ) {
+            let canonical = auth_case.canonical_line();
+            let line = mixed_case(&canonical, &mask);
+            let parsed = RequestLine::parse(line.as_bytes());
+            prop_assert_eq!(parsed.kind(), auth_case.kind());
+            let mut wire = Vec::new();
+            auth_case.request().write_wire_to(&mut wire);
+            prop_assert_eq!(std::str::from_utf8(&wire).unwrap(), format!("{canonical}\r\n"));
+        }
+
+        #[test]
+        fn transfer_commands_preserve_message_id_and_wire_forms(
+            transfer_case in transfer_case_strategy(),
+            mask in vec(any::<bool>(), 5..=24),
+        ) {
+            let first_line = transfer_case.first_line();
+            let (verb, rest) = first_line
+                .split_once(' ')
+                .map_or((first_line.as_str(), ""), |(verb, rest)| (verb, rest));
+            let line = if rest.is_empty() {
+                mixed_case(verb, &mask)
+            } else {
+                format!("{} {}", mixed_case(verb, &mask), rest)
+            };
+            let parsed = RequestLine::parse(line.as_bytes());
+            prop_assert_eq!(parsed.kind(), transfer_case.kind());
+            let parsed_message_id = parsed.message_id().unwrap();
+            let mut wire = Vec::new();
+            let request = transfer_case.request();
+            request.write_wire_to(&mut wire);
+            prop_assert_eq!(parsed_message_id.as_str(), request.message_id().unwrap().as_str());
+
+            match &transfer_case {
+                TransferCase::Ihave(_) | TransferCase::Check(_) => {
+                    prop_assert_eq!(std::str::from_utf8(&wire).unwrap(), format!("{first_line}\r\n"));
+                }
+                TransferCase::TakeThis(_, payload) => {
+                    prop_assert_eq!(wire, expected_transfer_wire(&first_line, payload));
+                }
+            }
+        }
+
+        #[test]
+        fn multiline_response_expectations_match_command_matrix(
+            kind in request_kind_strategy(),
+            code in 100_u16..600,
+        ) {
+            let status = StatusCode(code);
+            prop_assert_eq!(kind.expects_multiline_response(status), expected_multiline(kind, code));
+        }
+
+        #[test]
+        fn request_accessors_match_constructed_payloads(
+            group in group_name_strategy(),
+            range in listgroup_range_strategy(),
+            selector in article_selector_strategy(),
+            header in header_name_strategy(),
+            message_id in message_id_strategy(),
+            payload in transfer_payload_strategy(),
+        ) {
+            let listgroup = Request::listgroup_group_range(&group, &range).unwrap();
+            prop_assert_eq!(listgroup.group_name().map(GroupName::as_str), Some(group.as_str()));
+            prop_assert_eq!(
+                listgroup.listgroup_range_arg().map(ListGroupRange::as_str),
+                Some(range.as_str())
+            );
+
+            let over = Request::over(&selector).unwrap();
+            let xover = Request::xover(&selector).unwrap();
+            prop_assert_eq!(
+                over.overview_selector().map(ArticleSelector::as_str),
+                Some(selector.as_str())
+            );
+            prop_assert_eq!(
+                xover.overview_selector().map(ArticleSelector::as_str),
+                Some(selector.as_str())
+            );
+
+            let hdr = Request::hdr(&header, &selector).unwrap();
+            let xhdr = Request::xhdr(&header, &selector).unwrap();
+            prop_assert_eq!(
+                hdr.header_query().map(|(header, selector)| (header.as_str(), selector.as_str())),
+                Some((header.as_str(), selector.as_str()))
+            );
+            prop_assert_eq!(
+                xhdr.header_query().map(|(header, selector)| (header.as_str(), selector.as_str())),
+                Some((header.as_str(), selector.as_str()))
+            );
+
+            let ihave = Request::ihave(&message_id).unwrap();
+            let check = Request::check(&message_id).unwrap();
+            let takethis = Request::takethis(&message_id, &payload).unwrap();
+            prop_assert_eq!(ihave.message_id().map(MessageId::as_str), Some(message_id.as_str()));
+            prop_assert_eq!(check.message_id().map(MessageId::as_str), Some(message_id.as_str()));
+            prop_assert_eq!(takethis.message_id().map(MessageId::as_str), Some(message_id.as_str()));
+            prop_assert_eq!(
+                takethis.article_transfer().map(ArticleTransfer::as_bytes),
+                Some(payload.as_slice())
+            );
+        }
+    }
+}
+
 /// Validated NNTP message-id.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MessageId<'a>(Cow<'a, str>);
@@ -2315,12 +3328,43 @@ mod tests {
             "<a@b>"
         );
         assert!(RequestLine::parse(b"ARTICLE").message_id().is_none());
+        assert!(RequestLine::parse(b"ARTICLE 1").message_id().is_none());
+        assert!(RequestLine::parse(b"BODY 2").message_id().is_none());
+        assert!(RequestLine::parse(b"HEAD 3").message_id().is_none());
+        assert!(RequestLine::parse(b"STAT 4").message_id().is_none());
         assert!(RequestLine::parse(b"ARTICLE <a b>").message_id().is_none());
         assert!(
             RequestLine::parse(b"ARTICLE <a@b> extra")
                 .message_id()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn request_line_preserves_rfc_selector_arguments() {
+        for (line, expected_verb, expected_args) in [
+            (b"ARTICLE".as_slice(), b"ARTICLE".as_slice(), b"".as_slice()),
+            (
+                b"ARTICLE 42".as_slice(),
+                b"ARTICLE".as_slice(),
+                b"42".as_slice(),
+            ),
+            (
+                b"BODY <body@test>\r\n".as_slice(),
+                b"BODY".as_slice(),
+                b"<body@test>".as_slice(),
+            ),
+            (b"HEAD 9".as_slice(), b"HEAD".as_slice(), b"9".as_slice()),
+            (
+                b"STAT <stat@test>".as_slice(),
+                b"STAT".as_slice(),
+                b"<stat@test>".as_slice(),
+            ),
+        ] {
+            let parsed = RequestLine::parse(line);
+            assert_eq!(parsed.verb(), expected_verb, "{line:?}");
+            assert_eq!(parsed.args(), expected_args, "{line:?}");
+        }
     }
 
     #[test]
@@ -2891,6 +3935,36 @@ mod tests {
         assert!(Request::list_active_wildmat("").is_err());
         assert!(Request::authinfo_user("").is_err());
         assert!(Request::authinfo_pass("bad\nvalue").is_err());
+    }
+
+    #[test]
+    fn article_family_request_wires_follow_rfc_selector_forms() {
+        let requests = [
+            (Request::article_current(), b"ARTICLE\r\n".as_slice()),
+            (
+                Request::article_number(42).unwrap(),
+                b"ARTICLE 42\r\n".as_slice(),
+            ),
+            (
+                Request::article("a@b").unwrap(),
+                b"ARTICLE <a@b>\r\n".as_slice(),
+            ),
+            (Request::body_current(), b"BODY\r\n".as_slice()),
+            (Request::body_number(7).unwrap(), b"BODY 7\r\n".as_slice()),
+            (Request::body("c@d").unwrap(), b"BODY <c@d>\r\n".as_slice()),
+            (Request::head_current(), b"HEAD\r\n".as_slice()),
+            (Request::head_number(9).unwrap(), b"HEAD 9\r\n".as_slice()),
+            (Request::head("e@f").unwrap(), b"HEAD <e@f>\r\n".as_slice()),
+            (Request::stat_current(), b"STAT\r\n".as_slice()),
+            (Request::stat_number(11).unwrap(), b"STAT 11\r\n".as_slice()),
+            (Request::stat("g@h").unwrap(), b"STAT <g@h>\r\n".as_slice()),
+        ];
+
+        for (request, expected_wire) in requests {
+            let mut wire = Vec::new();
+            request.write_wire_to(&mut wire);
+            assert_eq!(wire, expected_wire);
+        }
     }
 
     #[test]

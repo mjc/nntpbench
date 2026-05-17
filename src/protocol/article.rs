@@ -18,6 +18,785 @@ pub enum ArticleParseError {
     InvalidMessageId,
 }
 
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::collection::vec;
+    use proptest::prelude::*;
+    use proptest::string::string_regex;
+
+    fn header_name_strategy() -> BoxedStrategy<String> {
+        string_regex("[A-Za-z0-9-]{1,12}").unwrap().boxed()
+    }
+
+    fn header_value_strategy() -> BoxedStrategy<String> {
+        string_regex("[ -~]{0,20}").unwrap().boxed()
+    }
+
+    fn message_id_strategy() -> BoxedStrategy<String> {
+        (
+            string_regex("[A-Za-z0-9][A-Za-z0-9._-]{0,7}").unwrap(),
+            string_regex("[A-Za-z0-9][A-Za-z0-9._-]{0,7}").unwrap(),
+        )
+            .prop_map(|(local, domain)| format!("<{local}@{domain}.test>"))
+            .boxed()
+    }
+
+    fn body_line_strategy() -> BoxedStrategy<String> {
+        string_regex("[A-Za-z0-9 !?_-]{1,24}").unwrap().boxed()
+    }
+
+    fn first_line_suffix_strategy() -> BoxedStrategy<String> {
+        prop_oneof![
+            Just(String::new()),
+            string_regex(" [A-Za-z0-9 ._-]{1,20}").unwrap(),
+        ]
+        .boxed()
+    }
+
+    fn invalid_article_number_token_strategy() -> BoxedStrategy<String> {
+        string_regex("[A-Za-z][A-Za-z0-9_-]{0,12}").unwrap().boxed()
+    }
+
+    fn overflowing_article_number_token_strategy() -> BoxedStrategy<String> {
+        string_regex("[0-9]{21,32}")
+            .unwrap()
+            .prop_filter("must overflow u64", |value| value.parse::<u64>().is_err())
+            .boxed()
+    }
+
+    fn header_pairs_strategy() -> BoxedStrategy<Vec<(String, String)>> {
+        vec((header_name_strategy(), header_value_strategy()), 1..=6).boxed()
+    }
+
+    fn unsupported_status_strategy() -> BoxedStrategy<u16> {
+        (100_u16..600_u16)
+            .prop_filter("exclude article-family statuses", |code| {
+                !matches!(*code, 220..=223)
+            })
+            .boxed()
+    }
+
+    fn invalid_status_prefix_buffer_strategy() -> BoxedStrategy<Vec<u8>> {
+        vec(any::<u8>(), 0..=12)
+            .prop_filter("exclude valid three-digit status prefixes", |buf| {
+                buf.len() < 3 || !buf[..3].iter().all(|byte| byte.is_ascii_digit())
+            })
+            .boxed()
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(48))]
+
+        #[test]
+        fn headers_parse_iter_and_lookup_stay_consistent(
+            pairs in header_pairs_strategy(),
+        ) {
+            let mut data = Vec::new();
+            for (name, value) in &pairs {
+                data.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
+            }
+
+            let headers = Headers::parse(&data).unwrap();
+            let iterated: Vec<_> = headers.iter().collect();
+            prop_assert_eq!(iterated.len(), pairs.len());
+
+            for ((expected_name, expected_value), (actual_name, actual_value)) in pairs.iter().zip(iterated.iter()) {
+                let trimmed_value = expected_value.trim_start_matches([' ', '\t']);
+                prop_assert_eq!(*actual_name, expected_name.as_bytes());
+                prop_assert_eq!(*actual_value, trimmed_value.as_bytes());
+            }
+
+            for (name, _) in &pairs {
+                let trimmed_value = pairs
+                    .iter()
+                    .find(|(expected_name, _)| expected_name == name)
+                    .map(|(_, expected_value)| expected_value.trim_start_matches([' ', '\t']))
+                    .unwrap();
+                prop_assert_eq!(headers.get(name), Some(trimmed_value.as_bytes()));
+                prop_assert_eq!(
+                    headers.get(&name.to_ascii_lowercase()),
+                    Some(trimmed_value.as_bytes())
+                );
+                prop_assert_eq!(
+                    headers.get(&name.to_ascii_uppercase()),
+                    Some(trimmed_value.as_bytes())
+                );
+            }
+        }
+
+        #[test]
+        fn headers_parse_remains_zero_copy_for_iter_and_lookup(
+            pairs in header_pairs_strategy(),
+        ) {
+            let mut data = Vec::new();
+            for (name, value) in &pairs {
+                data.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
+            }
+
+            let headers = Headers::parse(&data).unwrap();
+            let start = data.as_ptr() as usize;
+            let end = start + data.len();
+            let iterated: Vec<_> = headers.iter().collect();
+
+            for (name, value) in &iterated {
+                let name_ptr = name.as_ptr() as usize;
+                let value_ptr = value.as_ptr() as usize;
+                prop_assert!((start..end).contains(&name_ptr));
+                prop_assert!((start..end).contains(&value_ptr));
+            }
+
+            for (query_name, _) in &pairs {
+                let expected = iterated
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case(query_name.as_bytes()))
+                    .map(|(_, value)| *value);
+                let actual = headers.get(query_name);
+                prop_assert_eq!(actual, expected);
+                if let Some(value) = actual {
+                    prop_assert!((start..end).contains(&(value.as_ptr() as usize)));
+                }
+            }
+        }
+
+        #[test]
+        fn generated_article_family_frames_parse_consistently(
+            message_id in message_id_strategy(),
+            article_number in 0_u32..=999_999,
+            headers in header_pairs_strategy(),
+            body_lines in vec(body_line_strategy(), 1..=5),
+        ) {
+            let mut header_block = String::new();
+            for (name, value) in &headers {
+                header_block.push_str(name);
+                header_block.push_str(": ");
+                header_block.push_str(value);
+                header_block.push_str("\r\n");
+            }
+            let body = format!("{}\r\n", body_lines.join("\r\n"));
+
+            let article_frame = format!(
+                "220 {article_number} {message_id}\r\n{header_block}\r\n{body}.\r\n"
+            );
+            let article = Article::parse(article_frame.as_bytes()).unwrap();
+            prop_assert_eq!(article.message_id.as_str(), message_id.as_str());
+            prop_assert_eq!(article.article_number, Some(ArticleNumber::from(article_number as u64)));
+            prop_assert_eq!(article.body, Some(body.as_bytes()));
+            let parsed_headers = article.headers.unwrap();
+            for (name, _) in &headers {
+                let expected = headers
+                    .iter()
+                    .find(|(expected_name, _)| expected_name.eq_ignore_ascii_case(name))
+                    .map(|(_, expected_value)| {
+                        expected_value
+                            .trim_start_matches([' ', '\t'])
+                            .as_bytes()
+                    });
+                prop_assert_eq!(parsed_headers.get(name), expected);
+            }
+
+            let head_frame =
+                format!("221 {article_number} {message_id}\r\n{header_block}.\r\n");
+            let head = Article::parse(head_frame.as_bytes()).unwrap();
+            prop_assert_eq!(head.message_id.as_str(), message_id.as_str());
+            prop_assert_eq!(head.article_number, Some(ArticleNumber::from(article_number as u64)));
+            prop_assert!(head.body.is_none());
+            let head_headers = head.headers.unwrap();
+            for (name, _) in &headers {
+                let expected = headers
+                    .iter()
+                    .find(|(expected_name, _)| expected_name.eq_ignore_ascii_case(name))
+                    .map(|(_, expected_value)| {
+                        expected_value
+                            .trim_start_matches([' ', '\t'])
+                            .as_bytes()
+                    });
+                prop_assert_eq!(head_headers.get(name), expected);
+            }
+
+            let body_frame = format!("222 {article_number} {message_id}\r\n{body}.\r\n");
+            let parsed_body = Article::parse(body_frame.as_bytes()).unwrap();
+            prop_assert_eq!(parsed_body.message_id.as_str(), message_id.as_str());
+            prop_assert_eq!(
+                parsed_body.article_number,
+                Some(ArticleNumber::from(article_number as u64))
+            );
+            prop_assert!(parsed_body.headers.is_none());
+            prop_assert_eq!(parsed_body.body, Some(body.as_bytes()));
+
+            let stat_frame = format!("223 {article_number} {message_id}\r\n.\r\n");
+            let stat = Article::parse(stat_frame.as_bytes()).unwrap();
+            prop_assert_eq!(stat.message_id.as_str(), message_id.as_str());
+            prop_assert_eq!(stat.article_number, Some(ArticleNumber::from(article_number as u64)));
+            prop_assert!(stat.headers.is_none());
+            prop_assert!(stat.body.is_none());
+        }
+
+        #[test]
+        fn generated_response_first_lines_preserve_message_id_and_optional_number(
+            message_id in message_id_strategy(),
+            article_number in 0_u32..=999_999,
+            include_number in any::<bool>(),
+            headers in header_pairs_strategy(),
+            body_lines in vec(body_line_strategy(), 1..=3),
+        ) {
+            let mut header_block = String::new();
+            for (name, value) in &headers {
+                header_block.push_str(name);
+                header_block.push_str(": ");
+                header_block.push_str(value);
+                header_block.push_str("\r\n");
+            }
+            let body = format!("{}\r\n", body_lines.join("\r\n"));
+            let first_line = if include_number {
+                format!("{article_number} {message_id}")
+            } else {
+                message_id.clone()
+            };
+            let expected_number = include_number.then_some(ArticleNumber::from(article_number as u64));
+            let article_frame = format!("220 {first_line}\r\n{header_block}\r\n{body}.\r\n");
+            let head_frame = format!("221 {first_line}\r\n{header_block}.\r\n");
+            let body_frame = format!("222 {first_line}\r\n{body}.\r\n");
+            let stat_frame = format!("223 {first_line}\r\n.\r\n");
+
+            let article = Article::parse(article_frame.as_bytes()).unwrap();
+            prop_assert_eq!(article.message_id.as_str(), message_id.as_str());
+            prop_assert_eq!(article.article_number, expected_number);
+
+            let head = Article::parse(head_frame.as_bytes()).unwrap();
+            prop_assert_eq!(head.message_id.as_str(), message_id.as_str());
+            prop_assert_eq!(head.article_number, expected_number);
+
+            let parsed_body = Article::parse(body_frame.as_bytes()).unwrap();
+            prop_assert_eq!(parsed_body.message_id.as_str(), message_id.as_str());
+            prop_assert_eq!(parsed_body.article_number, expected_number);
+
+            let stat = Article::parse(stat_frame.as_bytes()).unwrap();
+            prop_assert_eq!(stat.message_id.as_str(), message_id.as_str());
+            prop_assert_eq!(stat.article_number, expected_number);
+        }
+
+        #[test]
+        fn generated_empty_content_shapes_parse_consistently(
+            message_id in message_id_strategy(),
+            article_number in 0_u32..=999_999,
+            include_number in any::<bool>(),
+        ) {
+            let first_line = if include_number {
+                format!("{article_number} {message_id}")
+            } else {
+                message_id.clone()
+            };
+            let expected_number = include_number.then_some(ArticleNumber::from(article_number as u64));
+
+            let article_frame = format!("220 {first_line}\r\n\r\n\r\n.\r\n");
+            let article = Article::parse(article_frame.as_bytes()).unwrap();
+            prop_assert_eq!(article.message_id.as_str(), message_id.as_str());
+            prop_assert_eq!(article.article_number, expected_number);
+            prop_assert_eq!(article.headers.unwrap().iter().count(), 0);
+            prop_assert_eq!(article.body, Some(&b""[..]));
+
+            let head_frame = format!("221 {first_line}\r\n.\r\n");
+            let head = Article::parse(head_frame.as_bytes()).unwrap();
+            prop_assert_eq!(head.message_id.as_str(), message_id.as_str());
+            prop_assert_eq!(head.article_number, expected_number);
+            prop_assert_eq!(head.headers.unwrap().iter().count(), 0);
+            prop_assert!(head.body.is_none());
+
+            let body_frame = format!("222 {first_line}\r\n.\r\n");
+            let parsed_body = Article::parse(body_frame.as_bytes()).unwrap();
+            prop_assert_eq!(parsed_body.message_id.as_str(), message_id.as_str());
+            prop_assert_eq!(parsed_body.article_number, expected_number);
+            prop_assert!(parsed_body.headers.is_none());
+            prop_assert_eq!(parsed_body.body, Some(&b""[..]));
+        }
+
+        #[test]
+        fn generated_numbered_response_first_lines_ignore_trailing_text(
+            message_id in message_id_strategy(),
+            article_number in 0_u32..=999_999,
+            suffix in first_line_suffix_strategy(),
+            headers in header_pairs_strategy(),
+            body_lines in vec(body_line_strategy(), 1..=3),
+        ) {
+            let mut header_block = String::new();
+            for (name, value) in &headers {
+                header_block.push_str(name);
+                header_block.push_str(": ");
+                header_block.push_str(value);
+                header_block.push_str("\r\n");
+            }
+            let body = format!("{}\r\n", body_lines.join("\r\n"));
+            let first_line = format!("{article_number} {message_id}{suffix}");
+            let article_frame = format!("220 {first_line}\r\n{header_block}\r\n{body}.\r\n");
+            let head_frame = format!("221 {first_line}\r\n{header_block}.\r\n");
+            let body_frame = format!("222 {first_line}\r\n{body}.\r\n");
+            let stat_frame = format!("223 {first_line}\r\n.\r\n");
+
+            let article = Article::parse(article_frame.as_bytes()).unwrap();
+            prop_assert_eq!(article.message_id.as_str(), message_id.as_str());
+            prop_assert_eq!(article.article_number, Some(ArticleNumber::from(article_number as u64)));
+
+            let head = Article::parse(head_frame.as_bytes()).unwrap();
+            prop_assert_eq!(head.message_id.as_str(), message_id.as_str());
+            prop_assert_eq!(head.article_number, Some(ArticleNumber::from(article_number as u64)));
+
+            let parsed_body = Article::parse(body_frame.as_bytes()).unwrap();
+            prop_assert_eq!(parsed_body.message_id.as_str(), message_id.as_str());
+            prop_assert_eq!(parsed_body.article_number, Some(ArticleNumber::from(article_number as u64)));
+
+            let stat = Article::parse(stat_frame.as_bytes()).unwrap();
+            prop_assert_eq!(stat.message_id.as_str(), message_id.as_str());
+            prop_assert_eq!(stat.article_number, Some(ArticleNumber::from(article_number as u64)));
+        }
+
+        #[test]
+        fn generated_no_number_response_first_lines_reject_trailing_text(
+            message_id in message_id_strategy(),
+            suffix in string_regex(" [A-Za-z0-9._-]{1,20}").unwrap(),
+            headers in header_pairs_strategy(),
+            body_lines in vec(body_line_strategy(), 1..=3),
+        ) {
+            let mut header_block = String::new();
+            for (name, value) in &headers {
+                header_block.push_str(name);
+                header_block.push_str(": ");
+                header_block.push_str(value);
+                header_block.push_str("\r\n");
+            }
+            let body = format!("{}\r\n", body_lines.join("\r\n"));
+            let first_line = format!("{message_id}{suffix}");
+
+            for frame in [
+                format!("220 {first_line}\r\n{header_block}\r\n{body}.\r\n"),
+                format!("221 {first_line}\r\n{header_block}.\r\n"),
+                format!("222 {first_line}\r\n{body}.\r\n"),
+                format!("223 {first_line}\r\n.\r\n"),
+            ] {
+                prop_assert_eq!(
+                    Article::parse(frame.as_bytes()).unwrap_err(),
+                    ArticleParseError::InvalidMessageId
+                );
+            }
+        }
+
+        #[test]
+        fn stat_accepts_minimal_and_dot_terminated_forms_equivalently(
+            message_id in message_id_strategy(),
+            article_number in 0_u32..=999_999,
+            include_number in any::<bool>(),
+        ) {
+            let first_line = if include_number {
+                format!("{article_number} {message_id}")
+            } else {
+                message_id.clone()
+            };
+            let minimal = format!("223 {first_line}\r\n");
+            let dot_terminated = format!("223 {first_line}\r\n.\r\n");
+
+            prop_assert_eq!(
+                Article::parse(minimal.as_bytes()),
+                Article::parse(dot_terminated.as_bytes())
+            );
+        }
+
+        #[test]
+        fn generated_response_first_lines_treat_overflowing_article_numbers_as_missing(
+            message_id in message_id_strategy(),
+            overflowing_number in overflowing_article_number_token_strategy(),
+            headers in header_pairs_strategy(),
+            body_lines in vec(body_line_strategy(), 1..=3),
+        ) {
+            let mut header_block = String::new();
+            for (name, value) in &headers {
+                header_block.push_str(name);
+                header_block.push_str(": ");
+                header_block.push_str(value);
+                header_block.push_str("\r\n");
+            }
+            let body = format!("{}\r\n", body_lines.join("\r\n"));
+            let first_line = format!("{overflowing_number} {message_id}");
+            let article_frame = format!("220 {first_line}\r\n{header_block}\r\n{body}.\r\n");
+            let head_frame = format!("221 {first_line}\r\n{header_block}.\r\n");
+            let body_frame = format!("222 {first_line}\r\n{body}.\r\n");
+            let stat_frame = format!("223 {first_line}\r\n.\r\n");
+
+            let article = Article::parse(article_frame.as_bytes()).unwrap();
+            prop_assert_eq!(article.message_id.as_str(), message_id.as_str());
+            prop_assert_eq!(article.article_number, None);
+
+            let head = Article::parse(head_frame.as_bytes()).unwrap();
+            prop_assert_eq!(head.message_id.as_str(), message_id.as_str());
+            prop_assert_eq!(head.article_number, None);
+
+            let parsed_body = Article::parse(body_frame.as_bytes()).unwrap();
+            prop_assert_eq!(parsed_body.message_id.as_str(), message_id.as_str());
+            prop_assert_eq!(parsed_body.article_number, None);
+
+            let stat = Article::parse(stat_frame.as_bytes()).unwrap();
+            prop_assert_eq!(stat.message_id.as_str(), message_id.as_str());
+            prop_assert_eq!(stat.article_number, None);
+        }
+
+        #[test]
+        fn generated_invalid_response_shapes_fail_with_expected_kinds(
+            invalid_message_id in prop_oneof![
+                Just("bad-id".to_string()),
+                Just("<bad id>".to_string()),
+                Just("<>".to_string()),
+            ],
+            headers in header_pairs_strategy(),
+            body_lines in vec(body_line_strategy(), 1..=3),
+        ) {
+            let mut header_block = String::new();
+            for (name, value) in &headers {
+                header_block.push_str(name);
+                header_block.push_str(": ");
+                header_block.push_str(value);
+                header_block.push_str("\r\n");
+            }
+            let body = format!("{}\r\n", body_lines.join("\r\n"));
+
+            for frame in [
+                format!("220 1 {invalid_message_id}\r\n{header_block}\r\n{body}.\r\n"),
+                format!("221 1 {invalid_message_id}\r\n{header_block}.\r\n"),
+                format!("222 1 {invalid_message_id}\r\n{body}.\r\n"),
+                format!("223 1 {invalid_message_id}\r\n.\r\n"),
+            ] {
+                prop_assert_eq!(Article::parse(frame.as_bytes()).unwrap_err(), ArticleParseError::InvalidMessageId);
+            }
+
+            let valid_message_id = "<valid@test>";
+            prop_assert_eq!(
+                Article::parse(format!("220 1 {valid_message_id}\r\n{header_block}{body}.\r\n").as_bytes()).unwrap_err(),
+                ArticleParseError::MissingSeparator
+            );
+            prop_assert_eq!(
+                Article::parse(format!("220 1 {valid_message_id}\r\n{header_block}\r\n{body}").as_bytes()).unwrap_err(),
+                ArticleParseError::MissingTerminator
+            );
+            prop_assert_eq!(
+                Article::parse(format!("221 1 {valid_message_id}\r\n{header_block}\r\n{body}.\r\n").as_bytes()).unwrap_err(),
+                ArticleParseError::UnexpectedBody
+            );
+            prop_assert_eq!(
+                Article::parse(format!("223 1 {valid_message_id}\r\nnot-empty\r\n").as_bytes()).unwrap_err(),
+                ArticleParseError::UnexpectedBody
+            );
+        }
+
+        #[test]
+        fn article_try_from_matches_parse_for_generated_article_family_frames(
+            message_id in message_id_strategy(),
+            article_number in 0_u32..=999_999,
+            headers in header_pairs_strategy(),
+            body_lines in vec(body_line_strategy(), 1..=3),
+        ) {
+            let mut header_block = String::new();
+            for (name, value) in &headers {
+                header_block.push_str(name);
+                header_block.push_str(": ");
+                header_block.push_str(value);
+                header_block.push_str("\r\n");
+            }
+            let body = format!("{}\r\n", body_lines.join("\r\n"));
+
+            for frame in [
+                format!("220 {article_number} {message_id}\r\n{header_block}\r\n{body}.\r\n"),
+                format!("221 {article_number} {message_id}\r\n{header_block}.\r\n"),
+                format!("222 {article_number} {message_id}\r\n{body}.\r\n"),
+                format!("223 {article_number} {message_id}\r\n.\r\n"),
+            ] {
+                prop_assert_eq!(
+                    Article::try_from(frame.as_bytes()),
+                    Article::parse(frame.as_bytes())
+                );
+            }
+        }
+
+        #[test]
+        fn article_try_from_matches_parse_for_generated_invalid_entrypoints(
+            invalid_prefix in invalid_status_prefix_buffer_strategy(),
+            unsupported_status in unsupported_status_strategy(),
+            message_id in message_id_strategy(),
+            article_number in 0_u32..=999_999,
+        ) {
+            prop_assert_eq!(
+                Article::try_from(invalid_prefix.as_slice()),
+                Article::parse(invalid_prefix.as_slice())
+            );
+
+            let unsupported_frame = format!("{unsupported_status} {article_number} {message_id}\r\n.\r\n");
+            prop_assert_eq!(
+                Article::try_from(unsupported_frame.as_bytes()),
+                Article::parse(unsupported_frame.as_bytes())
+            );
+        }
+
+        #[test]
+        fn parse_first_line_extracts_optional_article_numbers_and_ignores_trailing_text(
+            status in prop_oneof![Just("220"), Just("221"), Just("222"), Just("223")],
+            message_id in message_id_strategy(),
+            article_number in 0_u32..=999_999,
+            include_number in any::<bool>(),
+            suffix in first_line_suffix_strategy(),
+        ) {
+            let line = if include_number {
+                format!("{status} {article_number} {message_id}{suffix}")
+            } else {
+                format!("{status} {message_id}")
+            };
+
+            let (parsed_message_id, parsed_number) = parse_first_line(line.as_bytes()).unwrap();
+            let line_start = line.as_ptr() as usize;
+            let line_end = line_start + line.len();
+            prop_assert_eq!(parsed_message_id.as_str(), message_id.as_str());
+            prop_assert!((line_start..line_end).contains(&(parsed_message_id.as_str().as_ptr() as usize)));
+            prop_assert_eq!(
+                parsed_number,
+                include_number.then_some(ArticleNumber::from(article_number as u64))
+            );
+        }
+
+        #[test]
+        fn parse_first_line_rejects_trailing_text_without_article_number(
+            status in prop_oneof![Just("220"), Just("221"), Just("222"), Just("223")],
+            message_id in message_id_strategy(),
+            suffix in string_regex(" [A-Za-z0-9._-]{1,20}").unwrap(),
+        ) {
+            let line = format!("{status} {message_id}{suffix}");
+            prop_assert_eq!(
+                parse_first_line(line.as_bytes()).unwrap_err(),
+                ArticleParseError::InvalidMessageId
+            );
+        }
+
+        #[test]
+        fn parse_first_line_treats_non_numeric_middle_tokens_as_missing_article_numbers(
+            status in prop_oneof![Just("220"), Just("221"), Just("222"), Just("223")],
+            invalid_number in invalid_article_number_token_strategy(),
+            message_id in message_id_strategy(),
+            suffix in first_line_suffix_strategy(),
+        ) {
+            let line = format!("{status} {invalid_number} {message_id}{suffix}");
+
+            let (parsed_message_id, parsed_number) = parse_first_line(line.as_bytes()).unwrap();
+            let line_start = line.as_ptr() as usize;
+            let line_end = line_start + line.len();
+            prop_assert_eq!(parsed_message_id.as_str(), message_id.as_str());
+            prop_assert!((line_start..line_end).contains(&(parsed_message_id.as_str().as_ptr() as usize)));
+            prop_assert_eq!(parsed_number, None);
+        }
+
+        #[test]
+        fn parse_first_line_treats_overflowing_article_numbers_as_missing(
+            status in prop_oneof![Just("220"), Just("221"), Just("222"), Just("223")],
+            overflowing_number in overflowing_article_number_token_strategy(),
+            message_id in message_id_strategy(),
+            suffix in first_line_suffix_strategy(),
+        ) {
+            let line = format!("{status} {overflowing_number} {message_id}{suffix}");
+
+            let (parsed_message_id, parsed_number) = parse_first_line(line.as_bytes()).unwrap();
+            let line_start = line.as_ptr() as usize;
+            let line_end = line_start + line.len();
+            prop_assert_eq!(parsed_message_id.as_str(), message_id.as_str());
+            prop_assert!((line_start..line_end).contains(&(parsed_message_id.as_str().as_ptr() as usize)));
+            prop_assert_eq!(parsed_number, None);
+        }
+
+        #[test]
+        fn parse_first_line_rejects_invalid_message_id_shapes(
+            status in prop_oneof![Just("220"), Just("221"), Just("222"), Just("223")],
+            invalid_message_id in prop_oneof![
+                Just("bad-id".to_string()),
+                Just("<bad id>".to_string()),
+                Just("<>".to_string()),
+                Just("<missing".to_string()),
+            ],
+            article_number in 0_u32..=999_999,
+            include_number in any::<bool>(),
+        ) {
+            let line = if include_number {
+                format!("{status} {article_number} {invalid_message_id}")
+            } else {
+                format!("{status} {invalid_message_id}")
+            };
+
+            prop_assert_eq!(
+                parse_first_line(line.as_bytes()).unwrap_err(),
+                ArticleParseError::InvalidMessageId
+            );
+        }
+
+        #[test]
+        fn headers_parse_rejects_leading_folds_and_missing_colons(
+            name in header_name_strategy(),
+            value in header_value_strategy(),
+            fold in prop_oneof![Just(" ".to_string()), Just("\t".to_string())],
+        ) {
+            let leading_fold = format!("{fold}{value}\r\n{name}: {value}\r\n");
+            prop_assert!(matches!(
+                Headers::parse(leading_fold.as_bytes()),
+                Err(ArticleParseError::InvalidHeader(_))
+            ));
+
+            let missing_colon = format!("{name} {value}\r\n");
+            prop_assert!(matches!(
+                Headers::parse(missing_colon.as_bytes()),
+                Err(ArticleParseError::InvalidHeader(_))
+            ));
+        }
+
+        #[test]
+        fn article_parse_reports_unsupported_status_codes(
+            status in unsupported_status_strategy(),
+            message_id in message_id_strategy(),
+            article_number in 0_u32..=999_999,
+            headers in header_pairs_strategy(),
+            body_lines in vec(body_line_strategy(), 1..=3),
+        ) {
+            let mut header_block = String::new();
+            for (name, value) in &headers {
+                header_block.push_str(name);
+                header_block.push_str(": ");
+                header_block.push_str(value);
+                header_block.push_str("\r\n");
+            }
+            let body = format!("{}\r\n", body_lines.join("\r\n"));
+            let frame = format!("{status} {article_number} {message_id}\r\n{header_block}\r\n{body}.\r\n");
+
+            prop_assert_eq!(
+                Article::parse(frame.as_bytes()).unwrap_err(),
+                ArticleParseError::InvalidStatusCode(status)
+            );
+        }
+
+        #[test]
+        fn article_parse_rejects_invalid_status_prefixes_before_other_parsing(
+            buf in invalid_status_prefix_buffer_strategy(),
+        ) {
+            prop_assert_eq!(
+                Article::parse(&buf).unwrap_err(),
+                ArticleParseError::InvalidStatusPrefix
+            );
+        }
+
+        #[test]
+        fn article_family_responses_without_crlf_first_line_are_buffer_too_short(
+            status in prop_oneof![Just("220"), Just("221"), Just("222"), Just("223")],
+            message_id in message_id_strategy(),
+            article_number in 0_u32..=999_999,
+        ) {
+            let frame = format!("{status} {article_number} {message_id}");
+            prop_assert_eq!(
+                Article::parse(frame.as_bytes()).unwrap_err(),
+                ArticleParseError::BufferTooShort
+            );
+        }
+
+        #[test]
+        fn headers_parse_accepts_folded_continuations_without_creating_extra_headers(
+            first_name in header_name_strategy(),
+            first_value in header_value_strategy(),
+            folded_values in vec(header_value_strategy(), 1..=3),
+            second_name in header_name_strategy(),
+            second_value in header_value_strategy(),
+            fold in prop_oneof![Just(" ".to_string()), Just("\t".to_string())],
+        ) {
+            prop_assume!(first_name != second_name);
+            let mut data = format!("{first_name}: {first_value}\r\n");
+            for value in &folded_values {
+                data.push_str(&fold);
+                data.push_str(value);
+                data.push_str("\r\n");
+            }
+            data.push_str(&format!("{second_name}: {second_value}\r\n"));
+
+            let headers = Headers::parse(data.as_bytes()).unwrap();
+            let items: Vec<_> = headers.iter().collect();
+            prop_assert_eq!(items.len(), 2);
+            prop_assert_eq!(items[0].0, first_name.as_bytes());
+            prop_assert_eq!(
+                items[0].1,
+                first_value.trim_start_matches([' ', '\t']).as_bytes()
+            );
+            prop_assert_eq!(items[1].0, second_name.as_bytes());
+            prop_assert_eq!(
+                items[1].1,
+                second_value.trim_start_matches([' ', '\t']).as_bytes()
+            );
+            prop_assert_eq!(
+                headers.get(&first_name),
+                Some(first_value.trim_start_matches([' ', '\t']).as_bytes())
+            );
+            prop_assert_eq!(
+                headers.get(&second_name),
+                Some(second_value.trim_start_matches([' ', '\t']).as_bytes())
+            );
+        }
+
+        #[test]
+        fn generated_article_family_frames_remain_zero_copy(
+            message_id in message_id_strategy(),
+            article_number in 1_u32..=999_999,
+            headers in header_pairs_strategy(),
+            body_lines in vec(body_line_strategy(), 1..=4),
+        ) {
+            let mut header_block = String::new();
+            for (name, value) in &headers {
+                header_block.push_str(name);
+                header_block.push_str(": ");
+                header_block.push_str(value);
+                header_block.push_str("\r\n");
+            }
+            let body = format!("{}\r\n", body_lines.join("\r\n"));
+
+            let article_frame =
+                format!("220 {article_number} {message_id}\r\n{header_block}\r\n{body}.\r\n");
+            let article = Article::parse(article_frame.as_bytes()).unwrap();
+            let article_start = article_frame.as_ptr() as usize;
+            let article_end = article_start + article_frame.len();
+            let article_message_id = article.message_id.as_str();
+            let article_headers = article.headers.unwrap().as_bytes();
+            let article_body = article.body.unwrap();
+            prop_assert!((article_start..article_end).contains(&(article_message_id.as_ptr() as usize)));
+            prop_assert!((article_start..article_end).contains(&(article_headers.as_ptr() as usize)));
+            prop_assert!((article_start..article_end).contains(&(article_body.as_ptr() as usize)));
+
+            let head_frame =
+                format!("221 {article_number} {message_id}\r\n{header_block}.\r\n");
+            let head = Article::parse(head_frame.as_bytes()).unwrap();
+            let head_start = head_frame.as_ptr() as usize;
+            let head_end = head_start + head_frame.len();
+            let head_message_id = head.message_id.as_str();
+            let head_headers = head.headers.unwrap().as_bytes();
+            prop_assert!((head_start..head_end).contains(&(head_message_id.as_ptr() as usize)));
+            prop_assert!((head_start..head_end).contains(&(head_headers.as_ptr() as usize)));
+            prop_assert!(head.body.is_none());
+
+            let body_frame = format!("222 {article_number} {message_id}\r\n{body}.\r\n");
+            let parsed_body = Article::parse(body_frame.as_bytes()).unwrap();
+            let body_start = body_frame.as_ptr() as usize;
+            let body_end = body_start + body_frame.len();
+            let body_message_id = parsed_body.message_id.as_str();
+            let body_slice = parsed_body.body.unwrap();
+            prop_assert!((body_start..body_end).contains(&(body_message_id.as_ptr() as usize)));
+            prop_assert!((body_start..body_end).contains(&(body_slice.as_ptr() as usize)));
+            prop_assert!(parsed_body.headers.is_none());
+
+            let stat_frame = format!("223 {article_number} {message_id}\r\n.\r\n");
+            let stat = Article::parse(stat_frame.as_bytes()).unwrap();
+            let stat_start = stat_frame.as_ptr() as usize;
+            let stat_end = stat_start + stat_frame.len();
+            let stat_message_id = stat.message_id.as_str();
+            prop_assert!((stat_start..stat_end).contains(&(stat_message_id.as_ptr() as usize)));
+            prop_assert!(stat.headers.is_none());
+            prop_assert!(stat.body.is_none());
+        }
+    }
+}
+
 impl fmt::Display for ArticleParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

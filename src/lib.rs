@@ -150,6 +150,85 @@ pub struct ServerArgs {
     pub flush: bool,
 }
 
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::collection::vec;
+    use proptest::prelude::*;
+    use proptest::string::string_regex;
+
+    fn message_id_strategy() -> BoxedStrategy<String> {
+        (
+            string_regex("[A-Za-z0-9][A-Za-z0-9._-]{0,7}").unwrap(),
+            string_regex("[A-Za-z0-9][A-Za-z0-9._-]{0,7}").unwrap(),
+        )
+            .prop_map(|(local, domain)| format!("<{local}@{domain}.test>"))
+            .boxed()
+    }
+
+    fn segment_set_strategy() -> BoxedStrategy<SegmentSet> {
+        vec(message_id_strategy(), 1..=4)
+            .prop_map(|ids| SegmentSet {
+                ids: ids
+                    .into_iter()
+                    .map(|id| id.into_bytes().into_boxed_slice())
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            })
+            .boxed()
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(48))]
+
+        #[test]
+        fn typed_request_for_command_uses_numeric_selectors_for_nonzero_synthetic_ids(
+            command_id in 1_u64..=10_000,
+            mix in prop_oneof![
+                Just(ClientCommandMix::Article),
+                Just(ClientCommandMix::Body),
+                Just(ClientCommandMix::Alternate),
+            ],
+        ) {
+            let request = typed_request_for_command(command_id, 0, mix, None, 0, 1).unwrap();
+            let expected_kind = client_command_kind(command_id, mix);
+
+            match expected_kind {
+                ClientCommandMix::Article | ClientCommandMix::Alternate => {
+                    prop_assert_eq!(request.kind(), RequestKind::Article);
+                    prop_assert_eq!(request.article_ref(), Some(&ArticleRef::Number(command_id)));
+                }
+                ClientCommandMix::Body => {
+                    prop_assert_eq!(request.kind(), RequestKind::Body);
+                    prop_assert_eq!(request.article_ref(), Some(&ArticleRef::Number(command_id)));
+                }
+            }
+            prop_assert!(request.message_id().is_none());
+        }
+
+        #[test]
+        fn typed_request_for_command_uses_message_ids_for_zero_and_segment_inputs(
+            mix in prop_oneof![
+                Just(ClientCommandMix::Article),
+                Just(ClientCommandMix::Body),
+                Just(ClientCommandMix::Alternate),
+            ],
+            request_index in 0_u64..32,
+            client_index in 0_usize..4,
+            total_clients in 1_usize..4,
+            segments in segment_set_strategy(),
+        ) {
+            let zero_request = typed_request_for_command(0, request_index, mix, None, client_index, total_clients).unwrap();
+            prop_assert!(zero_request.message_id().is_some());
+            prop_assert_eq!(zero_request.message_id().unwrap().as_str(), "<bench.0@nntpbench.local>");
+
+            let segmented = typed_request_for_command(17, request_index, mix, Some(&segments), client_index, total_clients).unwrap();
+            let expected = std::str::from_utf8(segment_for_request(&segments, client_index, total_clients, request_index)).unwrap();
+            prop_assert_eq!(segmented.message_id().unwrap().as_str(), expected);
+        }
+    }
+}
+
 #[cfg_attr(coverage_nightly, coverage(off))]
 pub async fn run_server(args: ServerArgs) -> io::Result<()> {
     let listener = bind_listener(args.listen, args.backlog, args.reuse_port)?;
@@ -3165,6 +3244,10 @@ mod tests {
         let article =
             typed_request_for_command(42, 0, ClientCommandMix::Article, None, 0, 1).unwrap();
         let body = typed_request_for_command(7, 0, ClientCommandMix::Body, None, 0, 1).unwrap();
+        let alternate_article =
+            typed_request_for_command(1, 0, ClientCommandMix::Alternate, None, 0, 1).unwrap();
+        let alternate_body =
+            typed_request_for_command(2, 0, ClientCommandMix::Alternate, None, 0, 1).unwrap();
 
         assert_eq!(article.kind(), RequestKind::Article);
         assert_eq!(article.article_ref(), Some(&ArticleRef::Number(42)));
@@ -3172,25 +3255,55 @@ mod tests {
         assert_eq!(body.kind(), RequestKind::Body);
         assert_eq!(body.article_ref(), Some(&ArticleRef::Number(7)));
         assert!(body.message_id().is_none());
+        assert_eq!(alternate_article.kind(), RequestKind::Article);
+        assert_eq!(
+            alternate_article.article_ref(),
+            Some(&ArticleRef::Number(1))
+        );
+        assert!(alternate_article.message_id().is_none());
+        assert_eq!(alternate_body.kind(), RequestKind::Body);
+        assert_eq!(alternate_body.article_ref(), Some(&ArticleRef::Number(2)));
+        assert!(alternate_body.message_id().is_none());
     }
 
     #[test]
     fn typed_request_for_command_keeps_message_ids_for_segments_and_zero_id() {
-        let path = write_temp_segments("typed-request", "1\tsegment@test\n");
+        let path = write_temp_segments("typed-request", "1\tsegment@test\n2\tbody@test\n");
         let segments = read_segments(&path).unwrap();
         fs::remove_file(path).unwrap();
 
         let segmented =
             typed_request_for_command(11, 0, ClientCommandMix::Article, Some(&segments), 0, 1)
                 .unwrap();
-        let zero = typed_request_for_command(0, 0, ClientCommandMix::Article, None, 0, 1).unwrap();
+        let segmented_body =
+            typed_request_for_command(12, 1, ClientCommandMix::Body, Some(&segments), 0, 1)
+                .unwrap();
+        let zero_article =
+            typed_request_for_command(0, 0, ClientCommandMix::Article, None, 0, 1).unwrap();
+        let zero_body =
+            typed_request_for_command(0, 0, ClientCommandMix::Body, None, 0, 1).unwrap();
+        let zero_alternate =
+            typed_request_for_command(0, 0, ClientCommandMix::Alternate, None, 0, 1).unwrap();
 
         assert_eq!(
             segmented.message_id().map(MessageId::as_str),
             Some("<segment@test>")
         );
         assert_eq!(
-            zero.message_id().map(MessageId::as_str),
+            segmented_body.message_id().map(MessageId::as_str),
+            Some("<body@test>")
+        );
+        assert_eq!(
+            zero_article.message_id().map(MessageId::as_str),
+            Some("<bench.0@nntpbench.local>")
+        );
+        assert_eq!(
+            zero_body.message_id().map(MessageId::as_str),
+            Some("<bench.0@nntpbench.local>")
+        );
+        assert_eq!(zero_alternate.kind(), RequestKind::Body);
+        assert_eq!(
+            zero_alternate.message_id().map(MessageId::as_str),
             Some("<bench.0@nntpbench.local>")
         );
     }
@@ -3393,6 +3506,121 @@ mod tests {
         assert_eq!(snapshot.pipeline_batches, 1);
         assert!(snapshot.bytes_sent > 0);
         assert!(!stop.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn typed_client_session_uses_segment_message_ids_on_wire() {
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"201 loopback ready\r\n").await.unwrap();
+
+            let mut scratch = [0_u8; 128];
+            let mut pending = Vec::new();
+            while pending.iter().filter(|byte| **byte == b'\n').count() < 2 {
+                let read = stream.read(&mut scratch).await.unwrap();
+                assert_ne!(read, 0);
+                pending.extend_from_slice(&scratch[..read]);
+            }
+
+            assert_eq!(
+                &pending[..],
+                b"ARTICLE <segment-1@test>\r\nBODY <segment-2@test>\r\n"
+            );
+
+            stream
+                .write_all(
+                    b"220 1 <segment-1@test> article follows\r\nSubject: Bench\r\n\r\none\r\n.\r\n",
+                )
+                .await
+                .unwrap();
+            stream
+                .write_all(b"222 1 <segment-2@test> body follows\r\ntwo\r\n.\r\n")
+                .await
+                .unwrap();
+        });
+
+        let path = write_temp_segments(
+            "typed-session-wire",
+            "1\tsegment-1@test\n2\tsegment-2@test\n",
+        );
+        let mut args = test_typed_client_args();
+        args.connect = addr;
+        args.requests = 2;
+        args.pipeline_depth = 2;
+        args.command_mix = ClientCommandMix::Alternate;
+        args.read_buffer_bytes = 64;
+        args.segments = Some(path.clone());
+        let config = TypedClientConfig::from_args(args).unwrap();
+        fs::remove_file(path).unwrap();
+        let session = TypedClientSession::new(&config, 0, 1, 2);
+        let stats = Arc::new(Stats::new());
+        let stop = Arc::new(AtomicBool::new(false));
+
+        session.run(stats.clone(), stop.clone()).await.unwrap();
+        server.await.unwrap();
+
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.commands, 2);
+        assert_eq!(snapshot.article_requests, 1);
+        assert_eq!(snapshot.body_requests, 1);
+        assert_eq!(snapshot.pipeline_batches, 1);
+    }
+
+    #[tokio::test]
+    async fn typed_client_session_zero_start_id_falls_back_per_request() {
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"201 loopback ready\r\n").await.unwrap();
+
+            let mut scratch = [0_u8; 128];
+            let mut pending = Vec::new();
+            while pending.iter().filter(|byte| **byte == b'\n').count() < 2 {
+                let read = stream.read(&mut scratch).await.unwrap();
+                assert_ne!(read, 0);
+                pending.extend_from_slice(&scratch[..read]);
+            }
+
+            assert_eq!(
+                &pending[..],
+                b"BODY <bench.0@nntpbench.local>\r\nARTICLE 1\r\n"
+            );
+
+            stream
+                .write_all(b"222 0 <bench.0@nntpbench.local> body follows\r\nzero\r\n.\r\n")
+                .await
+                .unwrap();
+            stream
+                .write_all(
+                    b"220 1 <bench.1@nntpbench.local> article follows\r\nSubject: Bench\r\n\r\none\r\n.\r\n",
+                )
+                .await
+                .unwrap();
+        });
+
+        let mut args = test_typed_client_args();
+        args.connect = addr;
+        args.requests = 2;
+        args.pipeline_depth = 2;
+        args.command_mix = ClientCommandMix::Alternate;
+        args.start_id = 0;
+        args.read_buffer_bytes = 64;
+        let config = TypedClientConfig::from_args(args).unwrap();
+        let session = TypedClientSession::new(&config, 0, 0, 2);
+        let stats = Arc::new(Stats::new());
+        let stop = Arc::new(AtomicBool::new(false));
+
+        session.run(stats.clone(), stop.clone()).await.unwrap();
+        server.await.unwrap();
+
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.commands, 2);
+        assert_eq!(snapshot.article_requests, 1);
+        assert_eq!(snapshot.body_requests, 1);
+        assert_eq!(snapshot.pipeline_batches, 1);
     }
 
     #[tokio::test]
