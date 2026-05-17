@@ -3,7 +3,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -2307,18 +2307,45 @@ async fn run_writer_task(
 }
 
 async fn run_reader_task(
-    mut reader: OwnedReadHalf,
+    reader: OwnedReadHalf,
     read_chunk_bytes: usize,
     response_mode: TypedClientResponseMode,
+    inflight_rx: mpsc::Receiver<InFlightRequest>,
+    poisoned: Arc<Mutex<Option<SharedEngineError>>>,
+    writer_abort: tokio::task::AbortHandle,
+) {
+    match response_mode {
+        TypedClientResponseMode::Owned => {
+            run_reader_task_owned(
+                reader,
+                read_chunk_bytes,
+                inflight_rx,
+                poisoned,
+                writer_abort,
+            )
+            .await;
+        }
+        TypedClientResponseMode::Drained => {
+            run_reader_task_drained(
+                reader,
+                read_chunk_bytes,
+                inflight_rx,
+                poisoned,
+                writer_abort,
+            )
+            .await;
+        }
+    }
+}
+
+async fn run_reader_task_owned(
+    mut reader: OwnedReadHalf,
+    read_chunk_bytes: usize,
     mut inflight_rx: mpsc::Receiver<InFlightRequest>,
     poisoned: Arc<Mutex<Option<SharedEngineError>>>,
     writer_abort: tokio::task::AbortHandle,
 ) {
-    let initial_capacity = match response_mode {
-        TypedClientResponseMode::Owned => read_chunk_bytes.saturating_mul(2),
-        TypedClientResponseMode::Drained => read_chunk_bytes.saturating_mul(4),
-    };
-    let mut pending_read = BytesMut::with_capacity(initial_capacity);
+    let mut pending_read = BytesMut::with_capacity(read_chunk_bytes.saturating_mul(2));
 
     while let Some(inflight_request) = inflight_rx.recv().await {
         let InFlightRequest {
@@ -2333,21 +2360,11 @@ async fn run_reader_task(
                 match decoder.push(&pending_read) {
                     Ok(DecodeProgress::NeedMore) => {}
                     Ok(DecodeProgress::Complete { status, consumed }) => {
-                        let response = match response_mode {
-                            TypedClientResponseMode::Owned => {
-                                CompletedResponse::Owned(OwnedResponse {
-                                    kind,
-                                    status,
-                                    bytes: pending_read.split_to(consumed).freeze(),
-                                })
-                            }
-                            TypedClientResponseMode::Drained => {
-                                pending_read.advance(consumed);
-                                CompletedResponse::Drained(DrainedResponse {
-                                    bytes_len: consumed,
-                                })
-                            }
-                        };
+                        let response = CompletedResponse::Owned(OwnedResponse {
+                            kind,
+                            status,
+                            bytes: pending_read.split_to(consumed).freeze(),
+                        });
                         let _ = response_tx.send(Ok(CompletedRequest { request, response }));
                         break;
                     }
@@ -2392,6 +2409,117 @@ async fn run_reader_task(
             }
         }
     }
+}
+
+async fn run_reader_task_drained(
+    mut reader: OwnedReadHalf,
+    read_chunk_bytes: usize,
+    mut inflight_rx: mpsc::Receiver<InFlightRequest>,
+    poisoned: Arc<Mutex<Option<SharedEngineError>>>,
+    writer_abort: tokio::task::AbortHandle,
+) {
+    let mut pending_read = BytesMut::with_capacity(read_chunk_bytes.saturating_mul(4));
+    let mut pending_start = 0usize;
+
+    while let Some(inflight_request) = inflight_rx.recv().await {
+        compact_drained_pending_read(&mut pending_read, &mut pending_start, read_chunk_bytes);
+
+        let InFlightRequest {
+            request,
+            kind,
+            response_tx,
+        } = inflight_request;
+        let mut decoder = ResponseDecoder::new(kind);
+
+        loop {
+            if pending_start < pending_read.len() {
+                match decoder.push(&pending_read[pending_start..]) {
+                    Ok(DecodeProgress::NeedMore) => {}
+                    Ok(DecodeProgress::Complete {
+                        status: _status,
+                        consumed,
+                    }) => {
+                        pending_start += consumed;
+                        if pending_start == pending_read.len() {
+                            pending_read.clear();
+                            pending_start = 0;
+                        }
+
+                        let response = CompletedResponse::Drained(DrainedResponse {
+                            bytes_len: consumed,
+                        });
+                        let _ = response_tx.send(Ok(CompletedRequest { request, response }));
+                        break;
+                    }
+                    Err(TypedClientError::InvalidStatusLine) => {
+                        let error = SharedEngineError::InvalidStatusLine;
+                        let _ = response_tx.send(Err(error.clone()));
+                        writer_abort.abort();
+                        poison_reader_engine(&poisoned, &mut inflight_rx, error).await;
+                        return;
+                    }
+                    Err(err) => {
+                        let error = shared_engine_error_from_typed(err);
+                        let _ = response_tx.send(Err(error.clone()));
+                        writer_abort.abort();
+                        poison_reader_engine(&poisoned, &mut inflight_rx, error).await;
+                        return;
+                    }
+                }
+            }
+
+            pending_read.reserve(read_chunk_bytes);
+            let read = match reader.read_buf(&mut pending_read).await {
+                Ok(read) => read,
+                Err(err) => {
+                    let error = SharedEngineError::Io {
+                        kind: err.kind(),
+                        message: err.to_string(),
+                    };
+                    let _ = response_tx.send(Err(error.clone()));
+                    writer_abort.abort();
+                    poison_reader_engine(&poisoned, &mut inflight_rx, error).await;
+                    return;
+                }
+            };
+
+            if read == 0 {
+                let error = SharedEngineError::UnexpectedEof;
+                let _ = response_tx.send(Err(error.clone()));
+                writer_abort.abort();
+                poison_reader_engine(&poisoned, &mut inflight_rx, error).await;
+                return;
+            }
+        }
+    }
+}
+
+fn compact_drained_pending_read(
+    pending_read: &mut BytesMut,
+    pending_start: &mut usize,
+    min_spare: usize,
+) {
+    if *pending_start == 0 {
+        return;
+    }
+
+    if *pending_start == pending_read.len() {
+        pending_read.clear();
+        *pending_start = 0;
+        return;
+    }
+
+    if pending_read.capacity().saturating_sub(pending_read.len()) >= min_spare {
+        return;
+    }
+
+    let pending_len = pending_read.len();
+    let tail_len = pending_len - *pending_start;
+    pending_read
+        .as_mut()
+        .copy_within(*pending_start..pending_len, 0);
+    pending_read.truncate(tail_len);
+    *pending_start = 0;
 }
 
 async fn poison_writer_engine(
@@ -2571,6 +2699,29 @@ mod tests {
         );
         assert_eq!(second_consumed, chunk.len() - consumed);
         assert_eq!(second_response.status().as_u16(), 220);
+    }
+
+    #[test]
+    fn compact_drained_pending_read_clears_fully_consumed_buffer() {
+        let mut pending_read = BytesMut::from(&b"abc"[..]);
+        let mut pending_start = pending_read.len();
+
+        compact_drained_pending_read(&mut pending_read, &mut pending_start, 8);
+
+        assert!(pending_read.is_empty());
+        assert_eq!(pending_start, 0);
+    }
+
+    #[test]
+    fn compact_drained_pending_read_moves_leftover_prefix_between_responses() {
+        let mut pending_read = BytesMut::with_capacity(8);
+        pending_read.extend_from_slice(b"abcd1234");
+        let mut pending_start = 4;
+
+        compact_drained_pending_read(&mut pending_read, &mut pending_start, 4);
+
+        assert_eq!(&pending_read[..], b"1234");
+        assert_eq!(pending_start, 0);
     }
 
     #[tokio::test]
