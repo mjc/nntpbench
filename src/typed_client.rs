@@ -1,10 +1,13 @@
 use std::fmt;
+use std::future::poll_fn;
 use std::io;
+use std::io::IoSlice;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -2287,9 +2290,8 @@ async fn run_writer_task(
 
     while let Some(queued) = request_rx.recv().await {
         let kind = queued.request.kind();
-        write_buffer.clear();
-        queued.request.write_wire_to(&mut write_buffer);
-        if let Err(err) = writer.write_all(&write_buffer).await {
+        if let Err(err) = write_request_wire(&mut writer, &queued.request, &mut write_buffer).await
+        {
             let error = SharedEngineError::Io {
                 kind: err.kind(),
                 message: err.to_string(),
@@ -2311,6 +2313,87 @@ async fn run_writer_task(
             break;
         }
     }
+}
+
+async fn write_request_wire<W>(
+    writer: &mut W,
+    request: &Request<'static>,
+    write_buffer: &mut Vec<u8>,
+) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    match request {
+        Request::TakeThis {
+            message_id,
+            article,
+        } => write_takethis_request_wire(writer, write_buffer, message_id, article).await,
+        _ => {
+            write_buffer.clear();
+            request.write_wire_to(write_buffer);
+            writer.write_all(write_buffer).await
+        }
+    }
+}
+
+async fn write_takethis_request_wire<W>(
+    writer: &mut W,
+    write_buffer: &mut Vec<u8>,
+    message_id: &MessageId<'_>,
+    article: &ArticleTransfer<'_>,
+) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    write_buffer.clear();
+    write_buffer.extend_from_slice(b"TAKETHIS ");
+    write_buffer.extend_from_slice(message_id.as_str().as_bytes());
+    write_buffer.extend_from_slice(b"\r\n");
+    writer.write_all(write_buffer).await?;
+
+    let payload = article.as_bytes();
+    if payload.is_empty() {
+        writer.write_all(b".\r\n").await?;
+        return Ok(());
+    }
+
+    for raw_line in payload.split_inclusive(|byte| *byte == b'\n') {
+        let line = raw_line.strip_suffix(b"\n").unwrap_or(raw_line);
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.starts_with(b".") {
+            let mut slices = [
+                IoSlice::new(b"."),
+                IoSlice::new(line),
+                IoSlice::new(b"\r\n"),
+            ];
+            write_all_vectored(writer, &mut slices).await?;
+        } else {
+            let mut slices = [IoSlice::new(line), IoSlice::new(b"\r\n")];
+            write_all_vectored(writer, &mut slices).await?;
+        }
+    }
+
+    writer.write_all(b".\r\n").await
+}
+
+async fn write_all_vectored<W>(writer: &mut W, slices: &mut [IoSlice<'_>]) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut remaining = slices;
+    while !remaining.is_empty() {
+        let written =
+            poll_fn(|cx| Pin::new(&mut *writer).poll_write_vectored(cx, remaining)).await?;
+        if written == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "failed to write buffers",
+            ));
+        }
+        IoSlice::advance_slices(&mut remaining, written);
+    }
+
+    Ok(())
 }
 
 async fn run_reader_task(
@@ -2676,6 +2759,26 @@ mod tests {
     }
 
     #[test]
+    fn decoder_completes_empty_multiline_response_across_pushes() {
+        let mut decoder = ResponseDecoder::new(RequestKind::Capabilities);
+        let mut buffer = b"101 Capability list:\r\n".to_vec();
+        assert!(matches!(
+            decoder.push(&buffer).unwrap(),
+            DecodeProgress::NeedMore
+        ));
+
+        buffer.extend_from_slice(b".\r\n");
+        let DecodeProgress::Complete { status, consumed } = decoder.push(&buffer).unwrap() else {
+            panic!("decoder should complete");
+        };
+        let response = response_from_bytes(RequestKind::Capabilities, status, &buffer[..consumed]);
+
+        assert_eq!(consumed, buffer.len());
+        assert_eq!(response.status().as_u16(), 101);
+        assert_eq!(response.as_bytes(), buffer);
+    }
+
+    #[test]
     fn decoder_does_not_treat_start_of_next_chunk_as_terminator() {
         let mut decoder = ResponseDecoder::new(RequestKind::Body);
         let mut buffer = b"222 1 <a@b> body follows\r\nbody".to_vec();
@@ -2698,6 +2801,36 @@ mod tests {
         assert_eq!(
             response.as_bytes(),
             b"222 1 <a@b> body follows\r\nbody.\r\nstill body\r\n.\r\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_request_wire_streams_takethis_without_full_buffer_copy() {
+        let (client, server) = tokio::io::duplex(4096);
+        let (_client_reader, mut client_writer) = tokio::io::split(client);
+        let (mut server_reader, _server_writer) = tokio::io::split(server);
+        let request = Request::TakeThis {
+            message_id: MessageId::from_borrowed("<stream@test>").unwrap(),
+            article: ArticleTransfer::from_borrowed(b".first\nsecond\r\nthird"),
+        };
+        let mut write_buffer = Vec::with_capacity(32);
+
+        write_request_wire(
+            // DuplexStream split writer matches AsyncWrite contract used by OwnedWriteHalf.
+            &mut client_writer,
+            &request,
+            &mut write_buffer,
+        )
+        .await
+        .unwrap();
+
+        let expected = b"TAKETHIS <stream@test>\r\n..first\r\nsecond\r\nthird\r\n.\r\n";
+        let mut actual = vec![0_u8; expected.len()];
+        server_reader.read_exact(&mut actual).await.unwrap();
+        assert_eq!(actual, expected);
+        assert!(
+            write_buffer.len() < actual.len(),
+            "scratch buffer should not hold full TAKETHIS payload"
         );
     }
 
