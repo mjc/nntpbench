@@ -26,9 +26,9 @@ pub mod tail_buffer;
 pub mod typed_client;
 
 pub use protocol::{
-    Article, ArticleNumber, ArticleParseError, ArticleSelector, ArticleTransfer, AuthInfoKind,
-    AuthInfoValue, GroupName, HeaderIter, HeaderName, Headers, ListKind, MessageId, NntpDate,
-    NntpTime, Request, RequestKind, RequestLine, StatusCode, Wildmat,
+    Article, ArticleNumber, ArticleParseError, ArticleRef, ArticleSelector, ArticleTransfer,
+    AuthInfoKind, AuthInfoValue, GroupName, HeaderIter, HeaderName, Headers, ListKind, MessageId,
+    NntpDate, NntpTime, Request, RequestKind, RequestLine, StatusCode, Wildmat,
 };
 pub use typed_client::{
     Client, OwnedArticle, OwnedArticleExchange, OwnedExchange, OwnedResponse,
@@ -617,18 +617,30 @@ pub async fn fetch_typed_response(
 
 fn typed_fetch_request(args: &TypedFetchArgs) -> Result<Request<'static>, TypedClientError> {
     match args.request {
-        TypedRequestKind::Article => {
-            typed_fetch_message_id_request(args, |message_id| Request::article(message_id))
-        }
-        TypedRequestKind::Body => {
-            typed_fetch_message_id_request(args, |message_id| Request::body(message_id))
-        }
-        TypedRequestKind::Head => {
-            typed_fetch_message_id_request(args, |message_id| Request::head(message_id))
-        }
-        TypedRequestKind::Stat => {
-            typed_fetch_message_id_request(args, |message_id| Request::stat(message_id))
-        }
+        TypedRequestKind::Article => typed_fetch_article_request(
+            args,
+            |message_id| Request::article(message_id),
+            |selector| Request::article_selector(selector),
+            Request::article_current,
+        ),
+        TypedRequestKind::Body => typed_fetch_article_request(
+            args,
+            |message_id| Request::body(message_id),
+            |selector| Request::body_selector(selector),
+            Request::body_current,
+        ),
+        TypedRequestKind::Head => typed_fetch_article_request(
+            args,
+            |message_id| Request::head(message_id),
+            |selector| Request::head_selector(selector),
+            Request::head_current,
+        ),
+        TypedRequestKind::Stat => typed_fetch_article_request(
+            args,
+            |message_id| Request::stat(message_id),
+            |selector| Request::stat_selector(selector),
+            Request::stat_current,
+        ),
         TypedRequestKind::ListActive => match args.wildmat.as_deref() {
             Some(wildmat) => {
                 Request::list_active_wildmat(wildmat).map_err(|_| TypedClientError::InvalidWildmat)
@@ -704,6 +716,28 @@ where
         .as_deref()
         .ok_or(TypedClientError::MissingMessageId)?;
     build(message_id).map_err(|_| TypedClientError::InvalidMessageId)
+}
+
+fn typed_fetch_article_request<F, G, H>(
+    args: &TypedFetchArgs,
+    build_message_id: F,
+    build_selector: G,
+    build_current: H,
+) -> Result<Request<'static>, TypedClientError>
+where
+    F: FnOnce(&str) -> Result<Request<'static>, protocol::InvalidMessageId>,
+    G: FnOnce(&str) -> Result<Request<'static>, protocol::InvalidArticleRef>,
+    H: FnOnce() -> Request<'static>,
+{
+    if let Some(message_id) = args.message_id.as_deref() {
+        return build_message_id(message_id).map_err(|_| TypedClientError::InvalidMessageId);
+    }
+
+    if let Some(selector) = args.selector.as_deref() {
+        return build_selector(selector).map_err(|_| TypedClientError::InvalidArticleSelector);
+    }
+
+    Ok(build_current())
 }
 
 fn typed_fetch_header_request<F>(
@@ -4210,12 +4244,74 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_typed_response_rejects_missing_message_id_for_article_style_requests() {
+    async fn fetch_typed_response_rejects_missing_message_id_for_message_id_only_requests() {
+        let mut args = test_typed_fetch_args();
+        args.request = TypedRequestKind::Ihave;
+        args.message_id = None;
+        assert!(matches!(
+            fetch_typed_response(&args).await.unwrap_err(),
+            TypedClientError::MissingMessageId
+        ));
+    }
+
+    #[tokio::test]
+    async fn fetch_typed_response_rejects_range_selector_for_article_style_requests() {
         let mut args = test_typed_fetch_args();
         args.message_id = None;
+        args.selector = Some("1-10".to_string());
 
-        let err = fetch_typed_response(&args).await.unwrap_err();
-        assert!(matches!(err, TypedClientError::MissingMessageId));
+        assert!(matches!(
+            fetch_typed_response(&args).await.unwrap_err(),
+            TypedClientError::InvalidArticleSelector
+        ));
+    }
+
+    #[tokio::test]
+    async fn fetch_typed_response_supports_article_request_current_and_numeric_selector() {
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            first.write_all(b"201 fetch ready\r\n").await.unwrap();
+
+            let mut request = [0_u8; 128];
+            let read = first.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"ARTICLE\r\n");
+            first
+                .write_all(
+                    b"220 1 <article.1@nntpbench.local> article follows\r\nSubject: Current\r\n\r\nbody\r\n.\r\n",
+                )
+                .await
+                .unwrap();
+
+            let (mut second, _) = listener.accept().await.unwrap();
+            second.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = second.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"BODY 42\r\n");
+            second
+                .write_all(b"222 42 <article.42@nntpbench.local> body follows\r\nbody\r\n.\r\n")
+                .await
+                .unwrap();
+        });
+
+        let mut current_args = test_typed_fetch_args();
+        current_args.connect = addr;
+        current_args.message_id = None;
+        current_args.selector = None;
+        let current = fetch_typed_response(&current_args).await.unwrap();
+        assert_eq!(current.kind(), RequestKind::Article);
+        assert_eq!(current.status().as_u16(), 220);
+
+        let mut numeric_args = test_typed_fetch_args();
+        numeric_args.connect = addr;
+        numeric_args.request = TypedRequestKind::Body;
+        numeric_args.message_id = None;
+        numeric_args.selector = Some("42".to_string());
+        let numeric = fetch_typed_response(&numeric_args).await.unwrap();
+        assert_eq!(numeric.kind(), RequestKind::Body);
+        assert_eq!(numeric.status().as_u16(), 222);
+
+        server.await.unwrap();
     }
 
     #[tokio::test]

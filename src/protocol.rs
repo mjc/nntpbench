@@ -113,6 +113,56 @@ fn validate_message_id(value: &str) -> Result<(), InvalidMessageId> {
     Ok(())
 }
 
+/// Validated ARTICLE/BODY/HEAD/STAT target.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ArticleRef<'a> {
+    Current,
+    Number(u64),
+    MessageId(MessageId<'a>),
+}
+
+impl<'a> ArticleRef<'a> {
+    /// Construct a numeric article reference after validation.
+    pub const fn from_number(value: u64) -> Result<Self, InvalidArticleRef> {
+        if value == 0 {
+            return Err(InvalidArticleRef);
+        }
+        Ok(Self::Number(value))
+    }
+
+    /// Return the carried message-id when this reference is message-id based.
+    #[must_use]
+    pub const fn message_id(&self) -> Option<&MessageId<'a>> {
+        match self {
+            Self::MessageId(message_id) => Some(message_id),
+            Self::Current | Self::Number(_) => None,
+        }
+    }
+}
+
+impl ArticleRef<'static> {
+    /// Construct an owned article reference from a selector string.
+    pub fn from_selector(value: impl AsRef<str>) -> Result<Self, InvalidArticleRef> {
+        let value = value.as_ref();
+        if value.is_empty() || value.bytes().any(|byte| byte.is_ascii_whitespace()) {
+            return Err(InvalidArticleRef);
+        }
+
+        if value.bytes().all(|byte| byte.is_ascii_digit()) {
+            let number = value.parse::<u64>().map_err(|_| InvalidArticleRef)?;
+            return ArticleRef::from_number(number);
+        }
+
+        let message_id = MessageId::from_borrowed(value).map_err(|_| InvalidArticleRef)?;
+        Ok(ArticleRef::MessageId(MessageId(Cow::Owned(
+            message_id.as_str().to_owned(),
+        ))))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidArticleRef;
+
 /// Validated NNTP header field name.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct HeaderName<'a>(Cow<'a, str>);
@@ -578,16 +628,16 @@ impl RequestKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request<'a> {
     Article {
-        message_id: MessageId<'a>,
+        article_ref: ArticleRef<'a>,
     },
     Body {
-        message_id: MessageId<'a>,
+        article_ref: ArticleRef<'a>,
     },
     Head {
-        message_id: MessageId<'a>,
+        article_ref: ArticleRef<'a>,
     },
     Stat {
-        message_id: MessageId<'a>,
+        article_ref: ArticleRef<'a>,
     },
     ListVariant {
         kind: ListKind,
@@ -698,10 +748,18 @@ impl<'a> Request<'a> {
     /// Serialize the request onto the NNTP wire.
     pub fn write_wire_to(&self, output: &mut Vec<u8>) {
         match self {
-            Self::Article { message_id } => write_request_wire(output, b"ARTICLE ", message_id),
-            Self::Body { message_id } => write_request_wire(output, b"BODY ", message_id),
-            Self::Head { message_id } => write_request_wire(output, b"HEAD ", message_id),
-            Self::Stat { message_id } => write_request_wire(output, b"STAT ", message_id),
+            Self::Article { article_ref } => {
+                write_article_ref_request_wire(output, b"ARTICLE", article_ref)
+            }
+            Self::Body { article_ref } => {
+                write_article_ref_request_wire(output, b"BODY", article_ref)
+            }
+            Self::Head { article_ref } => {
+                write_article_ref_request_wire(output, b"HEAD", article_ref)
+            }
+            Self::Stat { article_ref } => {
+                write_article_ref_request_wire(output, b"STAT", article_ref)
+            }
             Self::ListVariant { kind, wildmat } => {
                 write_list_request_wire(output, *kind, wildmat.as_ref())
             }
@@ -766,11 +824,11 @@ impl<'a> Request<'a> {
     #[must_use]
     pub const fn message_id(&self) -> Option<&MessageId<'a>> {
         match self {
-            Self::Article { message_id }
-            | Self::Body { message_id }
-            | Self::Head { message_id }
-            | Self::Stat { message_id }
-            | Self::Ihave { message_id }
+            Self::Article { article_ref }
+            | Self::Body { article_ref }
+            | Self::Head { article_ref }
+            | Self::Stat { article_ref } => article_ref.message_id(),
+            Self::Ihave { message_id }
             | Self::Check { message_id }
             | Self::TakeThis { message_id, .. } => Some(message_id),
             Self::ListVariant { .. }
@@ -788,6 +846,40 @@ impl<'a> Request<'a> {
             | Self::AuthInfo { .. }
             | Self::StartTls => None,
             Self::List
+            | Self::Help
+            | Self::Capabilities
+            | Self::Date
+            | Self::ModeReader
+            | Self::Quit => None,
+        }
+    }
+
+    /// Borrow the ARTICLE/BODY/HEAD/STAT reference carried by this request, if any.
+    #[must_use]
+    pub const fn article_ref(&self) -> Option<&ArticleRef<'a>> {
+        match self {
+            Self::Article { article_ref }
+            | Self::Body { article_ref }
+            | Self::Head { article_ref }
+            | Self::Stat { article_ref } => Some(article_ref),
+            Self::ListVariant { .. }
+            | Self::Group { .. }
+            | Self::ListGroup { .. }
+            | Self::Last
+            | Self::Next
+            | Self::Over { .. }
+            | Self::Xover { .. }
+            | Self::Hdr { .. }
+            | Self::Xhdr { .. }
+            | Self::NewGroups { .. }
+            | Self::NewNews { .. }
+            | Self::Post
+            | Self::Ihave { .. }
+            | Self::Check { .. }
+            | Self::TakeThis { .. }
+            | Self::AuthInfo { .. }
+            | Self::StartTls
+            | Self::List
             | Self::Help
             | Self::Capabilities
             | Self::Date
@@ -1078,28 +1170,116 @@ impl Request<'static> {
     /// Build an ARTICLE request from a borrowed or bare message-id string.
     pub fn article(message_id: impl AsRef<str>) -> Result<Self, InvalidMessageId> {
         Ok(Self::Article {
-            message_id: MessageId::from_str_or_wrap(message_id)?,
+            article_ref: ArticleRef::MessageId(MessageId::from_str_or_wrap(message_id)?),
+        })
+    }
+
+    /// Build an ARTICLE request targeting the current article.
+    #[must_use]
+    pub const fn article_current() -> Self {
+        Self::Article {
+            article_ref: ArticleRef::Current,
+        }
+    }
+
+    /// Build an ARTICLE request targeting a numeric article number.
+    pub fn article_number(number: u64) -> Result<Self, InvalidArticleRef> {
+        Ok(Self::Article {
+            article_ref: ArticleRef::from_number(number)?,
+        })
+    }
+
+    /// Build an ARTICLE request from an RFC article reference selector.
+    pub fn article_selector(selector: impl AsRef<str>) -> Result<Self, InvalidArticleRef> {
+        Ok(Self::Article {
+            article_ref: ArticleRef::from_selector(selector)?,
         })
     }
 
     /// Build a BODY request from a borrowed or bare message-id string.
     pub fn body(message_id: impl AsRef<str>) -> Result<Self, InvalidMessageId> {
         Ok(Self::Body {
-            message_id: MessageId::from_str_or_wrap(message_id)?,
+            article_ref: ArticleRef::MessageId(MessageId::from_str_or_wrap(message_id)?),
+        })
+    }
+
+    /// Build a BODY request targeting the current article.
+    #[must_use]
+    pub const fn body_current() -> Self {
+        Self::Body {
+            article_ref: ArticleRef::Current,
+        }
+    }
+
+    /// Build a BODY request targeting a numeric article number.
+    pub fn body_number(number: u64) -> Result<Self, InvalidArticleRef> {
+        Ok(Self::Body {
+            article_ref: ArticleRef::from_number(number)?,
+        })
+    }
+
+    /// Build a BODY request from an RFC article reference selector.
+    pub fn body_selector(selector: impl AsRef<str>) -> Result<Self, InvalidArticleRef> {
+        Ok(Self::Body {
+            article_ref: ArticleRef::from_selector(selector)?,
         })
     }
 
     /// Build a HEAD request from a borrowed or bare message-id string.
     pub fn head(message_id: impl AsRef<str>) -> Result<Self, InvalidMessageId> {
         Ok(Self::Head {
-            message_id: MessageId::from_str_or_wrap(message_id)?,
+            article_ref: ArticleRef::MessageId(MessageId::from_str_or_wrap(message_id)?),
+        })
+    }
+
+    /// Build a HEAD request targeting the current article.
+    #[must_use]
+    pub const fn head_current() -> Self {
+        Self::Head {
+            article_ref: ArticleRef::Current,
+        }
+    }
+
+    /// Build a HEAD request targeting a numeric article number.
+    pub fn head_number(number: u64) -> Result<Self, InvalidArticleRef> {
+        Ok(Self::Head {
+            article_ref: ArticleRef::from_number(number)?,
+        })
+    }
+
+    /// Build a HEAD request from an RFC article reference selector.
+    pub fn head_selector(selector: impl AsRef<str>) -> Result<Self, InvalidArticleRef> {
+        Ok(Self::Head {
+            article_ref: ArticleRef::from_selector(selector)?,
         })
     }
 
     /// Build a STAT request from a borrowed or bare message-id string.
     pub fn stat(message_id: impl AsRef<str>) -> Result<Self, InvalidMessageId> {
         Ok(Self::Stat {
-            message_id: MessageId::from_str_or_wrap(message_id)?,
+            article_ref: ArticleRef::MessageId(MessageId::from_str_or_wrap(message_id)?),
+        })
+    }
+
+    /// Build a STAT request targeting the current article.
+    #[must_use]
+    pub const fn stat_current() -> Self {
+        Self::Stat {
+            article_ref: ArticleRef::Current,
+        }
+    }
+
+    /// Build a STAT request targeting a numeric article number.
+    pub fn stat_number(number: u64) -> Result<Self, InvalidArticleRef> {
+        Ok(Self::Stat {
+            article_ref: ArticleRef::from_number(number)?,
+        })
+    }
+
+    /// Build a STAT request from an RFC article reference selector.
+    pub fn stat_selector(selector: impl AsRef<str>) -> Result<Self, InvalidArticleRef> {
+        Ok(Self::Stat {
+            article_ref: ArticleRef::from_selector(selector)?,
         })
     }
 
@@ -1562,6 +1742,22 @@ fn write_request_wire(output: &mut Vec<u8>, verb: &[u8], message_id: &MessageId<
     output.extend_from_slice(b"\r\n");
 }
 
+fn write_article_ref_request_wire(output: &mut Vec<u8>, verb: &[u8], article_ref: &ArticleRef<'_>) {
+    output.extend_from_slice(verb);
+    match article_ref {
+        ArticleRef::Current => {}
+        ArticleRef::Number(number) => {
+            output.push(b' ');
+            output.extend_from_slice(number.to_string().as_bytes());
+        }
+        ArticleRef::MessageId(message_id) => {
+            output.push(b' ');
+            output.extend_from_slice(message_id.as_str().as_bytes());
+        }
+    }
+    output.extend_from_slice(b"\r\n");
+}
+
 fn write_one_arg_request_wire(output: &mut Vec<u8>, verb: &[u8], arg: &str) {
     output.extend_from_slice(verb);
     output.extend_from_slice(arg.as_bytes());
@@ -1999,16 +2195,16 @@ mod tests {
     #[test]
     fn request_serializes_article_body_head_stat_and_simple_wire() {
         let article = Request::Article {
-            message_id: MessageId::from_borrowed("<a@b>").unwrap(),
+            article_ref: ArticleRef::MessageId(MessageId::from_borrowed("<a@b>").unwrap()),
         };
         let body = Request::Body {
-            message_id: MessageId::from_borrowed("<c@d>").unwrap(),
+            article_ref: ArticleRef::MessageId(MessageId::from_borrowed("<c@d>").unwrap()),
         };
         let head = Request::Head {
-            message_id: MessageId::from_borrowed("<e@f>").unwrap(),
+            article_ref: ArticleRef::MessageId(MessageId::from_borrowed("<e@f>").unwrap()),
         };
         let stat = Request::Stat {
-            message_id: MessageId::from_borrowed("<g@h>").unwrap(),
+            article_ref: ArticleRef::MessageId(MessageId::from_borrowed("<g@h>").unwrap()),
         };
         let group = Request::Group {
             group: GroupName::from_borrowed("alt.test").unwrap(),
@@ -2268,9 +2464,17 @@ mod tests {
     #[test]
     fn request_constructors_wrap_and_expose_message_ids() {
         let article = Request::article("a@b").unwrap();
+        let article_current = Request::article_current();
+        let article_number = Request::article_number(42).unwrap();
         let body = Request::body("<c@d>").unwrap();
+        let body_current = Request::body_current();
+        let body_number = Request::body_number(7).unwrap();
         let head = Request::head("e@f").unwrap();
+        let head_current = Request::head_current();
+        let head_number = Request::head_number(9).unwrap();
         let stat = Request::stat("<g@h>").unwrap();
+        let stat_current = Request::stat_current();
+        let stat_number = Request::stat_number(11).unwrap();
         let group = Request::group("alt.test").unwrap();
         let listgroup = Request::listgroup("alt.test").unwrap();
         let last = Request::last();
@@ -2301,15 +2505,25 @@ mod tests {
         let date = Request::date();
         let mode_reader = Request::mode_reader();
         let quit = Request::quit();
+        let article_message_ref = ArticleRef::MessageId(MessageId::from_borrowed("<a@b>").unwrap());
 
         assert_eq!(article.kind(), RequestKind::Article);
         assert_eq!(article.message_id().unwrap().as_str(), "<a@b>");
+        assert_eq!(article.article_ref(), Some(&article_message_ref));
+        assert_eq!(article_current.article_ref(), Some(&ArticleRef::Current));
+        assert_eq!(article_number.article_ref(), Some(&ArticleRef::Number(42)));
         assert_eq!(body.kind(), RequestKind::Body);
         assert_eq!(body.message_id().unwrap().as_str(), "<c@d>");
+        assert_eq!(body_current.article_ref(), Some(&ArticleRef::Current));
+        assert_eq!(body_number.article_ref(), Some(&ArticleRef::Number(7)));
         assert_eq!(head.kind(), RequestKind::Head);
         assert_eq!(head.message_id().unwrap().as_str(), "<e@f>");
+        assert_eq!(head_current.article_ref(), Some(&ArticleRef::Current));
+        assert_eq!(head_number.article_ref(), Some(&ArticleRef::Number(9)));
         assert_eq!(stat.kind(), RequestKind::Stat);
         assert_eq!(stat.message_id().unwrap().as_str(), "<g@h>");
+        assert_eq!(stat_current.article_ref(), Some(&ArticleRef::Current));
+        assert_eq!(stat_number.article_ref(), Some(&ArticleRef::Number(11)));
         assert_eq!(group.kind(), RequestKind::Group);
         assert_eq!(group.group_name().map(GroupName::as_str), Some("alt.test"));
         assert_eq!(listgroup.kind(), RequestKind::ListGroup);
@@ -2446,6 +2660,8 @@ mod tests {
         assert_eq!(quit.kind(), RequestKind::Quit);
         assert!(quit.message_id().is_none());
         assert!(Request::article("<bad id>").is_err());
+        assert!(Request::article_number(0).is_err());
+        assert!(Request::body_selector("1-10").is_err());
         assert!(Request::group("").is_err());
         assert!(Request::listgroup("<a@b>").is_err());
         assert!(Request::over("1 2").is_err());
@@ -2463,9 +2679,17 @@ mod tests {
     fn request_wire_uses_one_crlf_terminator() {
         let requests = [
             Request::article("a@b").unwrap(),
+            Request::article_current(),
+            Request::article_number(42).unwrap(),
             Request::body("c@d").unwrap(),
+            Request::body_current(),
+            Request::body_number(7).unwrap(),
             Request::head("e@f").unwrap(),
+            Request::head_current(),
+            Request::head_number(9).unwrap(),
             Request::stat("g@h").unwrap(),
+            Request::stat_current(),
+            Request::stat_number(11).unwrap(),
             Request::group("alt.test").unwrap(),
             Request::listgroup("alt.test").unwrap(),
             Request::last(),
@@ -2517,5 +2741,13 @@ mod tests {
             wire.windows(8).any(|window| window == b"..line\r\n"),
             "{wire:?}"
         );
+
+        let mut wire = Vec::new();
+        Request::article_current().write_wire_to(&mut wire);
+        assert_eq!(wire, b"ARTICLE\r\n");
+
+        wire.clear();
+        Request::stat_number(42).unwrap().write_wire_to(&mut wire);
+        assert_eq!(wire, b"STAT 42\r\n");
     }
 }

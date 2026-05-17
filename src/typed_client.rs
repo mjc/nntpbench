@@ -9,7 +9,7 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-use crate::protocol::Request;
+use crate::protocol::{ArticleRef, Request};
 use crate::tail_buffer::{TailBuffer, TerminatorStatus};
 use crate::{
     Article, ArticleParseError, ArticleSelector, ArticleTransfer, AuthInfoValue, GroupName,
@@ -112,6 +112,21 @@ impl Client {
         self.execute(request).await
     }
 
+    /// Send an ARTICLE request for the current article and return a typed owned article response.
+    pub async fn article_current(&self) -> Result<OwnedArticle, TypedClientError> {
+        self.execute(Request::article_current()).await
+    }
+
+    /// Send an ARTICLE request using a numeric/message-id selector and return a typed owned article response.
+    pub async fn article_selector(
+        &self,
+        selector: impl AsRef<str>,
+    ) -> Result<OwnedArticle, TypedClientError> {
+        let request = Request::article_selector(selector)
+            .map_err(|_| TypedClientError::InvalidArticleSelector)?;
+        self.execute(request).await
+    }
+
     /// Send an ARTICLE request and return the completed request/response pair.
     pub async fn article_exchange(
         &self,
@@ -119,6 +134,21 @@ impl Client {
     ) -> Result<OwnedArticleExchange, TypedClientError> {
         let request =
             Request::article(message_id).map_err(|_| TypedClientError::InvalidMessageId)?;
+        self.execute_exchange(request).await
+    }
+
+    /// Send an ARTICLE request for the current article and return the completed request/response pair.
+    pub async fn article_current_exchange(&self) -> Result<OwnedArticleExchange, TypedClientError> {
+        self.execute_exchange(Request::article_current()).await
+    }
+
+    /// Send an ARTICLE request using a numeric/message-id selector and return the completed request/response pair.
+    pub async fn article_selector_exchange(
+        &self,
+        selector: impl AsRef<str>,
+    ) -> Result<OwnedArticleExchange, TypedClientError> {
+        let request = Request::article_selector(selector)
+            .map_err(|_| TypedClientError::InvalidArticleSelector)?;
         self.execute_exchange(request).await
     }
 
@@ -131,12 +161,42 @@ impl Client {
         self.execute(request).await
     }
 
+    /// Send a BODY request for the current article and return a typed owned article-style response.
+    pub async fn body_current(&self) -> Result<OwnedArticle, TypedClientError> {
+        self.execute(Request::body_current()).await
+    }
+
+    /// Send a BODY request using a numeric/message-id selector and return a typed owned article-style response.
+    pub async fn body_selector(
+        &self,
+        selector: impl AsRef<str>,
+    ) -> Result<OwnedArticle, TypedClientError> {
+        let request = Request::body_selector(selector)
+            .map_err(|_| TypedClientError::InvalidArticleSelector)?;
+        self.execute(request).await
+    }
+
     /// Send a BODY request and return the completed request/response pair.
     pub async fn body_exchange(
         &self,
         message_id: impl AsRef<str>,
     ) -> Result<OwnedArticleExchange, TypedClientError> {
         let request = Request::body(message_id).map_err(|_| TypedClientError::InvalidMessageId)?;
+        self.execute_exchange(request).await
+    }
+
+    /// Send a BODY request for the current article and return the completed request/response pair.
+    pub async fn body_current_exchange(&self) -> Result<OwnedArticleExchange, TypedClientError> {
+        self.execute_exchange(Request::body_current()).await
+    }
+
+    /// Send a BODY request using a numeric/message-id selector and return the completed request/response pair.
+    pub async fn body_selector_exchange(
+        &self,
+        selector: impl AsRef<str>,
+    ) -> Result<OwnedArticleExchange, TypedClientError> {
+        let request = Request::body_selector(selector)
+            .map_err(|_| TypedClientError::InvalidArticleSelector)?;
         self.execute_exchange(request).await
     }
 
@@ -149,12 +209,42 @@ impl Client {
         self.execute(request).await
     }
 
+    /// Send a HEAD request for the current article and return a typed owned article-style response.
+    pub async fn head_current(&self) -> Result<OwnedArticle, TypedClientError> {
+        self.execute(Request::head_current()).await
+    }
+
+    /// Send a HEAD request using a numeric/message-id selector and return a typed owned article-style response.
+    pub async fn head_selector(
+        &self,
+        selector: impl AsRef<str>,
+    ) -> Result<OwnedArticle, TypedClientError> {
+        let request = Request::head_selector(selector)
+            .map_err(|_| TypedClientError::InvalidArticleSelector)?;
+        self.execute(request).await
+    }
+
     /// Send a HEAD request and return the completed request/response pair.
     pub async fn head_exchange(
         &self,
         message_id: impl AsRef<str>,
     ) -> Result<OwnedArticleExchange, TypedClientError> {
         let request = Request::head(message_id).map_err(|_| TypedClientError::InvalidMessageId)?;
+        self.execute_exchange(request).await
+    }
+
+    /// Send a HEAD request for the current article and return the completed request/response pair.
+    pub async fn head_current_exchange(&self) -> Result<OwnedArticleExchange, TypedClientError> {
+        self.execute_exchange(Request::head_current()).await
+    }
+
+    /// Send a HEAD request using a numeric/message-id selector and return the completed request/response pair.
+    pub async fn head_selector_exchange(
+        &self,
+        selector: impl AsRef<str>,
+    ) -> Result<OwnedArticleExchange, TypedClientError> {
+        let request = Request::head_selector(selector)
+            .map_err(|_| TypedClientError::InvalidArticleSelector)?;
         self.execute_exchange(request).await
     }
 
@@ -167,12 +257,42 @@ impl Client {
         self.execute(request).await
     }
 
+    /// Send a STAT request for the current article and return a typed owned article-style response.
+    pub async fn stat_current(&self) -> Result<OwnedArticle, TypedClientError> {
+        self.execute(Request::stat_current()).await
+    }
+
+    /// Send a STAT request using a numeric/message-id selector and return a typed owned article-style response.
+    pub async fn stat_selector(
+        &self,
+        selector: impl AsRef<str>,
+    ) -> Result<OwnedArticle, TypedClientError> {
+        let request = Request::stat_selector(selector)
+            .map_err(|_| TypedClientError::InvalidArticleSelector)?;
+        self.execute(request).await
+    }
+
     /// Send a STAT request and return the completed request/response pair.
     pub async fn stat_exchange(
         &self,
         message_id: impl AsRef<str>,
     ) -> Result<OwnedArticleExchange, TypedClientError> {
         let request = Request::stat(message_id).map_err(|_| TypedClientError::InvalidMessageId)?;
+        self.execute_exchange(request).await
+    }
+
+    /// Send a STAT request for the current article and return the completed request/response pair.
+    pub async fn stat_current_exchange(&self) -> Result<OwnedArticleExchange, TypedClientError> {
+        self.execute_exchange(Request::stat_current()).await
+    }
+
+    /// Send a STAT request using a numeric/message-id selector and return the completed request/response pair.
+    pub async fn stat_selector_exchange(
+        &self,
+        selector: impl AsRef<str>,
+    ) -> Result<OwnedArticleExchange, TypedClientError> {
+        let request = Request::stat_selector(selector)
+            .map_err(|_| TypedClientError::InvalidArticleSelector)?;
         self.execute_exchange(request).await
     }
 
@@ -731,7 +851,10 @@ impl TypedClientConnection {
         &self,
         message_id: MessageId<'static>,
     ) -> Result<OwnedResponse, TypedClientError> {
-        self.execute(Request::Article { message_id }).await
+        self.execute(Request::Article {
+            article_ref: ArticleRef::MessageId(message_id),
+        })
+        .await
     }
 
     /// Send an ARTICLE request and return the completed request/response pair.
@@ -739,7 +862,40 @@ impl TypedClientConnection {
         &self,
         message_id: MessageId<'static>,
     ) -> Result<OwnedExchange, TypedClientError> {
-        self.execute_exchange(Request::Article { message_id }).await
+        self.execute_exchange(Request::Article {
+            article_ref: ArticleRef::MessageId(message_id),
+        })
+        .await
+    }
+
+    /// Send an ARTICLE request for the current article and return the owned response frame.
+    pub async fn article_current(&self) -> Result<OwnedResponse, TypedClientError> {
+        self.execute(Request::article_current()).await
+    }
+
+    /// Send an ARTICLE request using a numeric or explicit message-id selector and return the owned response frame.
+    pub async fn article_selector(
+        &self,
+        selector: impl AsRef<str>,
+    ) -> Result<OwnedResponse, TypedClientError> {
+        let request = Request::article_selector(selector)
+            .map_err(|_| TypedClientError::InvalidArticleSelector)?;
+        self.execute(request).await
+    }
+
+    /// Send an ARTICLE request for the current article and return the completed request/response pair.
+    pub async fn article_current_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+        self.execute_exchange(Request::article_current()).await
+    }
+
+    /// Send an ARTICLE request using a numeric or explicit message-id selector and return the completed request/response pair.
+    pub async fn article_selector_exchange(
+        &self,
+        selector: impl AsRef<str>,
+    ) -> Result<OwnedExchange, TypedClientError> {
+        let request = Request::article_selector(selector)
+            .map_err(|_| TypedClientError::InvalidArticleSelector)?;
+        self.execute_exchange(request).await
     }
 
     /// Send a BODY request and return the owned response frame.
@@ -747,7 +903,10 @@ impl TypedClientConnection {
         &self,
         message_id: MessageId<'static>,
     ) -> Result<OwnedResponse, TypedClientError> {
-        self.execute(Request::Body { message_id }).await
+        self.execute(Request::Body {
+            article_ref: ArticleRef::MessageId(message_id),
+        })
+        .await
     }
 
     /// Send a BODY request and return the completed request/response pair.
@@ -755,7 +914,40 @@ impl TypedClientConnection {
         &self,
         message_id: MessageId<'static>,
     ) -> Result<OwnedExchange, TypedClientError> {
-        self.execute_exchange(Request::Body { message_id }).await
+        self.execute_exchange(Request::Body {
+            article_ref: ArticleRef::MessageId(message_id),
+        })
+        .await
+    }
+
+    /// Send a BODY request for the current article and return the owned response frame.
+    pub async fn body_current(&self) -> Result<OwnedResponse, TypedClientError> {
+        self.execute(Request::body_current()).await
+    }
+
+    /// Send a BODY request using a numeric or explicit message-id selector and return the owned response frame.
+    pub async fn body_selector(
+        &self,
+        selector: impl AsRef<str>,
+    ) -> Result<OwnedResponse, TypedClientError> {
+        let request = Request::body_selector(selector)
+            .map_err(|_| TypedClientError::InvalidArticleSelector)?;
+        self.execute(request).await
+    }
+
+    /// Send a BODY request for the current article and return the completed request/response pair.
+    pub async fn body_current_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+        self.execute_exchange(Request::body_current()).await
+    }
+
+    /// Send a BODY request using a numeric or explicit message-id selector and return the completed request/response pair.
+    pub async fn body_selector_exchange(
+        &self,
+        selector: impl AsRef<str>,
+    ) -> Result<OwnedExchange, TypedClientError> {
+        let request = Request::body_selector(selector)
+            .map_err(|_| TypedClientError::InvalidArticleSelector)?;
+        self.execute_exchange(request).await
     }
 
     /// Send a HEAD request and return the owned response frame.
@@ -763,7 +955,10 @@ impl TypedClientConnection {
         &self,
         message_id: MessageId<'static>,
     ) -> Result<OwnedResponse, TypedClientError> {
-        self.execute(Request::Head { message_id }).await
+        self.execute(Request::Head {
+            article_ref: ArticleRef::MessageId(message_id),
+        })
+        .await
     }
 
     /// Send a HEAD request and return the completed request/response pair.
@@ -771,7 +966,40 @@ impl TypedClientConnection {
         &self,
         message_id: MessageId<'static>,
     ) -> Result<OwnedExchange, TypedClientError> {
-        self.execute_exchange(Request::Head { message_id }).await
+        self.execute_exchange(Request::Head {
+            article_ref: ArticleRef::MessageId(message_id),
+        })
+        .await
+    }
+
+    /// Send a HEAD request for the current article and return the owned response frame.
+    pub async fn head_current(&self) -> Result<OwnedResponse, TypedClientError> {
+        self.execute(Request::head_current()).await
+    }
+
+    /// Send a HEAD request using a numeric or explicit message-id selector and return the owned response frame.
+    pub async fn head_selector(
+        &self,
+        selector: impl AsRef<str>,
+    ) -> Result<OwnedResponse, TypedClientError> {
+        let request = Request::head_selector(selector)
+            .map_err(|_| TypedClientError::InvalidArticleSelector)?;
+        self.execute(request).await
+    }
+
+    /// Send a HEAD request for the current article and return the completed request/response pair.
+    pub async fn head_current_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+        self.execute_exchange(Request::head_current()).await
+    }
+
+    /// Send a HEAD request using a numeric or explicit message-id selector and return the completed request/response pair.
+    pub async fn head_selector_exchange(
+        &self,
+        selector: impl AsRef<str>,
+    ) -> Result<OwnedExchange, TypedClientError> {
+        let request = Request::head_selector(selector)
+            .map_err(|_| TypedClientError::InvalidArticleSelector)?;
+        self.execute_exchange(request).await
     }
 
     /// Send a STAT request and return the owned response frame.
@@ -779,7 +1007,10 @@ impl TypedClientConnection {
         &self,
         message_id: MessageId<'static>,
     ) -> Result<OwnedResponse, TypedClientError> {
-        self.execute(Request::Stat { message_id }).await
+        self.execute(Request::Stat {
+            article_ref: ArticleRef::MessageId(message_id),
+        })
+        .await
     }
 
     /// Send a STAT request and return the completed request/response pair.
@@ -787,7 +1018,40 @@ impl TypedClientConnection {
         &self,
         message_id: MessageId<'static>,
     ) -> Result<OwnedExchange, TypedClientError> {
-        self.execute_exchange(Request::Stat { message_id }).await
+        self.execute_exchange(Request::Stat {
+            article_ref: ArticleRef::MessageId(message_id),
+        })
+        .await
+    }
+
+    /// Send a STAT request for the current article and return the owned response frame.
+    pub async fn stat_current(&self) -> Result<OwnedResponse, TypedClientError> {
+        self.execute(Request::stat_current()).await
+    }
+
+    /// Send a STAT request using a numeric or explicit message-id selector and return the owned response frame.
+    pub async fn stat_selector(
+        &self,
+        selector: impl AsRef<str>,
+    ) -> Result<OwnedResponse, TypedClientError> {
+        let request = Request::stat_selector(selector)
+            .map_err(|_| TypedClientError::InvalidArticleSelector)?;
+        self.execute(request).await
+    }
+
+    /// Send a STAT request for the current article and return the completed request/response pair.
+    pub async fn stat_current_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+        self.execute_exchange(Request::stat_current()).await
+    }
+
+    /// Send a STAT request using a numeric or explicit message-id selector and return the completed request/response pair.
+    pub async fn stat_selector_exchange(
+        &self,
+        selector: impl AsRef<str>,
+    ) -> Result<OwnedExchange, TypedClientError> {
+        let request = Request::stat_selector(selector)
+            .map_err(|_| TypedClientError::InvalidArticleSelector)?;
+        self.execute_exchange(request).await
     }
 
     /// Send a GROUP request and return the owned response frame.
@@ -2202,6 +2466,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn typed_connection_supports_current_and_numeric_article_selectors() {
+        let listener = crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"201 typed ready\r\n").await.unwrap();
+            assert_read_request(&mut stream, b"ARTICLE\r\n").await;
+            stream
+                .write_all(
+                    b"220 1 <current@test> article follows\r\nSubject: Current\r\n\r\npayload\r\n.\r\n",
+                )
+                .await
+                .unwrap();
+            assert_read_request(&mut stream, b"BODY 42\r\n").await;
+            stream
+                .write_all(b"222 42 <forty-two@test> body follows\r\nbody\r\n.\r\n")
+                .await
+                .unwrap();
+        });
+
+        let connection = TypedClientConnection::connect(addr).await.unwrap();
+        let current = connection.article_current().await.unwrap();
+        let body = connection.body_selector("42").await.unwrap();
+
+        assert_eq!(current.kind(), RequestKind::Article);
+        assert_eq!(current.status().as_u16(), 220);
+        assert_eq!(
+            current.parse_article().unwrap().message_id.as_str(),
+            "<current@test>"
+        );
+        assert_eq!(body.kind(), RequestKind::Body);
+        assert_eq!(body.status().as_u16(), 222);
+        assert_eq!(
+            body.parse_article().unwrap().message_id.as_str(),
+            "<forty-two@test>"
+        );
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn typed_connection_fetches_head_and_stat_frames() {
         let listener = crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2306,7 +2611,9 @@ mod tests {
         assert_eq!(
             exchange.request(),
             &Request::Body {
-                message_id: MessageId::from_str_or_wrap("pair@test").unwrap()
+                article_ref: ArticleRef::MessageId(
+                    MessageId::from_str_or_wrap("pair@test").unwrap()
+                )
             }
         );
         assert_eq!(exchange.response().status().as_u16(), 222);
@@ -2339,7 +2646,9 @@ mod tests {
         assert_eq!(
             request,
             Request::Stat {
-                message_id: MessageId::from_str_or_wrap("parts@test").unwrap()
+                article_ref: ArticleRef::MessageId(
+                    MessageId::from_str_or_wrap("parts@test").unwrap()
+                )
             }
         );
         assert_eq!(response.kind(), RequestKind::Stat);
@@ -2771,7 +3080,9 @@ mod tests {
         assert_eq!(
             exchange.request(),
             &Request::Article {
-                message_id: MessageId::from_str_or_wrap("exchange@test").unwrap()
+                article_ref: ArticleRef::MessageId(
+                    MessageId::from_str_or_wrap("exchange@test").unwrap()
+                )
             }
         );
         assert_eq!(exchange.article().status().as_u16(), 220);
@@ -2805,7 +3116,9 @@ mod tests {
         assert_eq!(
             request,
             Request::Article {
-                message_id: MessageId::from_str_or_wrap("pair-surface@test").unwrap()
+                article_ref: ArticleRef::MessageId(
+                    MessageId::from_str_or_wrap("pair-surface@test").unwrap()
+                )
             }
         );
         assert_eq!(article.status().as_u16(), 220);
@@ -2813,6 +3126,47 @@ mod tests {
         assert_eq!(
             article.article().unwrap().message_id.as_str(),
             "<pair-surface@test>"
+        );
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn client_article_methods_support_current_and_numeric_selectors() {
+        let listener = crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"201 typed ready\r\n").await.unwrap();
+            assert_read_request(&mut stream, b"ARTICLE\r\n").await;
+            stream
+                .write_all(
+                    b"220 1 <surface-current@test> article follows\r\nSubject: Current\r\n\r\npayload\r\n.\r\n",
+                )
+                .await
+                .unwrap();
+            assert_read_request(&mut stream, b"STAT 42\r\n").await;
+            stream
+                .write_all(b"223 42 <surface-42@test> article retrieved\r\n")
+                .await
+                .unwrap();
+        });
+
+        let client = Client::connect(addr).await.unwrap();
+        let current = client.article_current().await.unwrap();
+        let stat = client.stat_selector("42").await.unwrap();
+
+        assert_eq!(current.kind(), RequestKind::Article);
+        assert_eq!(current.status().as_u16(), 220);
+        assert_eq!(
+            current.article().unwrap().message_id.as_str(),
+            "<surface-current@test>"
+        );
+        assert_eq!(stat.kind(), RequestKind::Stat);
+        assert_eq!(stat.status().as_u16(), 223);
+        assert_eq!(
+            stat.article().unwrap().message_id.as_str(),
+            "<surface-42@test>"
         );
 
         server.await.unwrap();
@@ -3164,7 +3518,7 @@ mod tests {
 
         let client = Client::connect(addr).await.unwrap();
         let request = Request::Body {
-            message_id: MessageId::from_str_or_wrap("direct@test").unwrap(),
+            article_ref: ArticleRef::MessageId(MessageId::from_str_or_wrap("direct@test").unwrap()),
         };
         let exchange = client.execute_exchange(request.clone()).await.unwrap();
 
