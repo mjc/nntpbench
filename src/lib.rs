@@ -27,8 +27,8 @@ pub mod typed_client;
 
 pub use protocol::{
     Article, ArticleNumber, ArticleParseError, ArticleSelector, ArticleTransfer, AuthInfoKind,
-    AuthInfoValue, GroupName, HeaderIter, HeaderName, Headers, MessageId, NntpDate, NntpTime,
-    Request, RequestKind, RequestLine, StatusCode, Wildmat,
+    AuthInfoValue, GroupName, HeaderIter, HeaderName, Headers, ListKind, MessageId, NntpDate,
+    NntpTime, Request, RequestKind, RequestLine, StatusCode, Wildmat,
 };
 pub use typed_client::{
     Client, OwnedArticle, OwnedArticleExchange, OwnedExchange, OwnedResponse,
@@ -42,6 +42,16 @@ pub const MODE_READER_RESPONSE: &[u8] = b"201 posting not permitted\r\n";
 pub const DATE_RESPONSE: &[u8] = b"111 20260515120000\r\n";
 pub const LIST_RESPONSE: &[u8] =
     b"215 list of newsgroups follows\r\ncomp.lang.rust 0000000001 0000000001 y\r\n.\r\n";
+pub const LIST_ACTIVE_TIMES_RESPONSE: &[u8] =
+    b"215 information follows\r\ncomp.lang.rust 1715904000 admin@nntpbench.local\r\nalt.test 1715907600 admin@nntpbench.local\r\n.\r\n";
+pub const LIST_NEWSGROUPS_RESPONSE: &[u8] =
+    b"215 information follows\r\ncomp.lang.rust The Rust programming language\r\nalt.test Synthetic benchmark group\r\n.\r\n";
+pub const LIST_OVERVIEW_FMT_RESPONSE: &[u8] =
+    b"215 Order of fields in overview database\r\nSubject:\r\nFrom:\r\nDate:\r\nMessage-ID:\r\nReferences:\r\n:bytes\r\n:lines\r\n.\r\n";
+pub const LIST_HEADERS_RESPONSE: &[u8] =
+    b"215 headers supported\r\n:bytes\r\n:lines\r\nSubject\r\nFrom\r\nDate\r\nMessage-ID\r\nReferences\r\n.\r\n";
+pub const LIST_DISTRIB_PATS_RESPONSE: &[u8] =
+    b"215 distribution patterns\r\nworld:* world\r\nlocal:*.local local\r\n.\r\n";
 pub const GROUP_RESPONSE: &[u8] = b"211 3 1 3 alt.test\r\n";
 pub const LISTGROUP_RESPONSE: &[u8] = b"211 3 1 3 alt.test\r\n1\r\n2\r\n3\r\n.\r\n";
 pub const LAST_RESPONSE: &[u8] =
@@ -386,7 +396,7 @@ pub struct TypedFetchArgs {
     #[arg(long)]
     pub group: Option<String>,
 
-    /// Wildmat pattern for NEWNEWS requests.
+    /// Wildmat pattern for NEWNEWS and LIST ACTIVE/ACTIVE.TIMES/NEWSGROUPS requests.
     #[arg(long)]
     pub wildmat: Option<String>,
 
@@ -437,6 +447,12 @@ pub enum TypedRequestKind {
     Body,
     Head,
     Stat,
+    ListActive,
+    ListActiveTimes,
+    ListNewsgroups,
+    ListOverviewFmt,
+    ListHeaders,
+    ListDistribPats,
     Group,
     Listgroup,
     Last,
@@ -613,6 +629,25 @@ fn typed_fetch_request(args: &TypedFetchArgs) -> Result<Request<'static>, TypedC
         TypedRequestKind::Stat => {
             typed_fetch_message_id_request(args, |message_id| Request::stat(message_id))
         }
+        TypedRequestKind::ListActive => match args.wildmat.as_deref() {
+            Some(wildmat) => {
+                Request::list_active_wildmat(wildmat).map_err(|_| TypedClientError::InvalidWildmat)
+            }
+            None => Ok(Request::list_active()),
+        },
+        TypedRequestKind::ListActiveTimes => match args.wildmat.as_deref() {
+            Some(wildmat) => Request::list_active_times_wildmat(wildmat)
+                .map_err(|_| TypedClientError::InvalidWildmat),
+            None => Ok(Request::list_active_times()),
+        },
+        TypedRequestKind::ListNewsgroups => match args.wildmat.as_deref() {
+            Some(wildmat) => Request::list_newsgroups_wildmat(wildmat)
+                .map_err(|_| TypedClientError::InvalidWildmat),
+            None => Ok(Request::list_newsgroups()),
+        },
+        TypedRequestKind::ListOverviewFmt => Ok(Request::list_overview_fmt()),
+        TypedRequestKind::ListHeaders => Ok(Request::list_headers()),
+        TypedRequestKind::ListDistribPats => Ok(Request::list_distrib_pats()),
         TypedRequestKind::Group => typed_fetch_group_request(args, |group| Request::group(group)),
         TypedRequestKind::Listgroup => {
             typed_fetch_group_request(args, |group| Request::listgroup(group))
@@ -1482,6 +1517,58 @@ where
             write_response(writer, pending_write, config.body_response(), session_stats).await?;
             Ok(false)
         }
+        RequestKind::List => {
+            write_response(writer, pending_write, LIST_RESPONSE, session_stats).await?;
+            Ok(false)
+        }
+        RequestKind::ListActive => {
+            write_response(writer, pending_write, LIST_RESPONSE, session_stats).await?;
+            Ok(false)
+        }
+        RequestKind::ListActiveTimes => {
+            write_response(
+                writer,
+                pending_write,
+                LIST_ACTIVE_TIMES_RESPONSE,
+                session_stats,
+            )
+            .await?;
+            Ok(false)
+        }
+        RequestKind::ListNewsgroups => {
+            write_response(
+                writer,
+                pending_write,
+                LIST_NEWSGROUPS_RESPONSE,
+                session_stats,
+            )
+            .await?;
+            Ok(false)
+        }
+        RequestKind::ListOverviewFmt => {
+            write_response(
+                writer,
+                pending_write,
+                LIST_OVERVIEW_FMT_RESPONSE,
+                session_stats,
+            )
+            .await?;
+            Ok(false)
+        }
+        RequestKind::ListHeaders => {
+            write_response(writer, pending_write, LIST_HEADERS_RESPONSE, session_stats).await?;
+            Ok(false)
+        }
+        RequestKind::ListDistribPats => {
+            write_response(
+                writer,
+                pending_write,
+                LIST_DISTRIB_PATS_RESPONSE,
+                session_stats,
+            )
+            .await?;
+            Ok(false)
+        }
         RequestKind::Group => {
             write_response(writer, pending_write, GROUP_RESPONSE, session_stats).await?;
             Ok(false)
@@ -1562,10 +1649,6 @@ where
                 session_stats,
             )
             .await?;
-            Ok(false)
-        }
-        RequestKind::List => {
-            write_response(writer, pending_write, LIST_RESPONSE, session_stats).await?;
             Ok(false)
         }
         RequestKind::Help => {
@@ -1704,6 +1787,12 @@ pub fn process_request_to_buffer(
             stats.body_requests.fetch_add(1, Ordering::Relaxed);
             config.body_response()
         }
+        RequestKind::List | RequestKind::ListActive => LIST_RESPONSE,
+        RequestKind::ListActiveTimes => LIST_ACTIVE_TIMES_RESPONSE,
+        RequestKind::ListNewsgroups => LIST_NEWSGROUPS_RESPONSE,
+        RequestKind::ListOverviewFmt => LIST_OVERVIEW_FMT_RESPONSE,
+        RequestKind::ListHeaders => LIST_HEADERS_RESPONSE,
+        RequestKind::ListDistribPats => LIST_DISTRIB_PATS_RESPONSE,
         RequestKind::Group => GROUP_RESPONSE,
         RequestKind::ListGroup => LISTGROUP_RESPONSE,
         RequestKind::Last => LAST_RESPONSE,
@@ -1722,7 +1811,6 @@ pub fn process_request_to_buffer(
         RequestKind::Xover => XOVER_RESPONSE,
         RequestKind::Hdr => HDR_RESPONSE,
         RequestKind::Xhdr => XHDR_RESPONSE,
-        RequestKind::List => LIST_RESPONSE,
         RequestKind::Capabilities => b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n",
         RequestKind::Help => HELP_RESPONSE,
         RequestKind::Date => DATE_RESPONSE,
@@ -3551,6 +3639,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn serve_session_supports_list_subcommand_requests() {
+        let config = test_config();
+        let (output, stats) = run_session_with_input(
+            config,
+            b"LIST ACTIVE\r\nLIST ACTIVE.TIMES comp.lang.*\r\nLIST NEWSGROUPS comp.lang.*\r\nLIST OVERVIEW.FMT\r\nLIST HEADERS\r\nLIST DISTRIB.PATS\r\n",
+        )
+        .await;
+
+        assert_eq!(
+            output,
+            [
+                GREETING,
+                LIST_RESPONSE,
+                LIST_ACTIVE_TIMES_RESPONSE,
+                LIST_NEWSGROUPS_RESPONSE,
+                LIST_OVERVIEW_FMT_RESPONSE,
+                LIST_HEADERS_RESPONSE,
+                LIST_DISTRIB_PATS_RESPONSE,
+            ]
+            .concat()
+        );
+
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.commands, 6);
+        assert_eq!(snapshot.article_requests, 0);
+        assert_eq!(snapshot.body_requests, 0);
+    }
+
+    #[tokio::test]
     async fn fetch_typed_response_rejects_invalid_message_id() {
         let mut args = test_typed_fetch_args();
         args.message_id = Some("<bad id>".to_string());
@@ -3687,6 +3804,103 @@ mod tests {
         let quit = fetch_typed_response(&quit_args).await.unwrap();
         assert_eq!(quit.kind(), RequestKind::Quit);
         assert_eq!(quit.status().as_u16(), 205);
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fetch_typed_response_supports_list_subcommand_request_kinds() {
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            first.write_all(b"201 fetch ready\r\n").await.unwrap();
+
+            let mut request = [0_u8; 128];
+            let read = first.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"LIST ACTIVE\r\n");
+            first.write_all(LIST_RESPONSE).await.unwrap();
+
+            let (mut second, _) = listener.accept().await.unwrap();
+            second.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = second.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"LIST ACTIVE.TIMES comp.lang.*\r\n");
+            second.write_all(LIST_ACTIVE_TIMES_RESPONSE).await.unwrap();
+
+            let (mut third, _) = listener.accept().await.unwrap();
+            third.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = third.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"LIST NEWSGROUPS comp.lang.*\r\n");
+            third.write_all(LIST_NEWSGROUPS_RESPONSE).await.unwrap();
+
+            let (mut fourth, _) = listener.accept().await.unwrap();
+            fourth.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = fourth.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"LIST OVERVIEW.FMT\r\n");
+            fourth.write_all(LIST_OVERVIEW_FMT_RESPONSE).await.unwrap();
+
+            let (mut fifth, _) = listener.accept().await.unwrap();
+            fifth.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = fifth.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"LIST HEADERS\r\n");
+            fifth.write_all(LIST_HEADERS_RESPONSE).await.unwrap();
+
+            let (mut sixth, _) = listener.accept().await.unwrap();
+            sixth.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = sixth.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"LIST DISTRIB.PATS\r\n");
+            sixth.write_all(LIST_DISTRIB_PATS_RESPONSE).await.unwrap();
+        });
+
+        let mut list_active_args = test_typed_fetch_args();
+        list_active_args.connect = addr;
+        list_active_args.request = TypedRequestKind::ListActive;
+        list_active_args.message_id = None;
+        let list_active = fetch_typed_response(&list_active_args).await.unwrap();
+        assert_eq!(list_active.kind(), RequestKind::ListActive);
+        assert_eq!(list_active.status().as_u16(), 215);
+
+        let mut list_active_times_args = test_typed_fetch_args();
+        list_active_times_args.connect = addr;
+        list_active_times_args.request = TypedRequestKind::ListActiveTimes;
+        list_active_times_args.message_id = None;
+        list_active_times_args.wildmat = Some("comp.lang.*".to_string());
+        let list_active_times = fetch_typed_response(&list_active_times_args).await.unwrap();
+        assert_eq!(list_active_times.kind(), RequestKind::ListActiveTimes);
+        assert_eq!(list_active_times.status().as_u16(), 215);
+
+        let mut list_newsgroups_args = test_typed_fetch_args();
+        list_newsgroups_args.connect = addr;
+        list_newsgroups_args.request = TypedRequestKind::ListNewsgroups;
+        list_newsgroups_args.message_id = None;
+        list_newsgroups_args.wildmat = Some("comp.lang.*".to_string());
+        let list_newsgroups = fetch_typed_response(&list_newsgroups_args).await.unwrap();
+        assert_eq!(list_newsgroups.kind(), RequestKind::ListNewsgroups);
+        assert_eq!(list_newsgroups.status().as_u16(), 215);
+
+        let mut list_overview_fmt_args = test_typed_fetch_args();
+        list_overview_fmt_args.connect = addr;
+        list_overview_fmt_args.request = TypedRequestKind::ListOverviewFmt;
+        list_overview_fmt_args.message_id = None;
+        let list_overview_fmt = fetch_typed_response(&list_overview_fmt_args).await.unwrap();
+        assert_eq!(list_overview_fmt.kind(), RequestKind::ListOverviewFmt);
+        assert_eq!(list_overview_fmt.status().as_u16(), 215);
+
+        let mut list_headers_args = test_typed_fetch_args();
+        list_headers_args.connect = addr;
+        list_headers_args.request = TypedRequestKind::ListHeaders;
+        list_headers_args.message_id = None;
+        let list_headers = fetch_typed_response(&list_headers_args).await.unwrap();
+        assert_eq!(list_headers.kind(), RequestKind::ListHeaders);
+        assert_eq!(list_headers.status().as_u16(), 215);
+
+        let mut list_distrib_pats_args = test_typed_fetch_args();
+        list_distrib_pats_args.connect = addr;
+        list_distrib_pats_args.request = TypedRequestKind::ListDistribPats;
+        list_distrib_pats_args.message_id = None;
+        let list_distrib_pats = fetch_typed_response(&list_distrib_pats_args).await.unwrap();
+        assert_eq!(list_distrib_pats.kind(), RequestKind::ListDistribPats);
+        assert_eq!(list_distrib_pats.status().as_u16(), 215);
 
         server.await.unwrap();
     }
@@ -4666,6 +4880,36 @@ mod tests {
             &mut output,
         ));
         assert!(!process_request_to_buffer(
+            RequestLine::parse(b"LIST ACTIVE.TIMES comp.lang.*"),
+            &config,
+            &stats,
+            &mut output,
+        ));
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"LIST NEWSGROUPS comp.lang.*"),
+            &config,
+            &stats,
+            &mut output,
+        ));
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"LIST OVERVIEW.FMT"),
+            &config,
+            &stats,
+            &mut output,
+        ));
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"LIST HEADERS"),
+            &config,
+            &stats,
+            &mut output,
+        ));
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"LIST DISTRIB.PATS"),
+            &config,
+            &stats,
+            &mut output,
+        ));
+        assert!(!process_request_to_buffer(
             RequestLine::parse(b"HELP"),
             &config,
             &stats,
@@ -4688,13 +4932,18 @@ mod tests {
             output,
             [
                 LIST_RESPONSE,
+                LIST_ACTIVE_TIMES_RESPONSE,
+                LIST_NEWSGROUPS_RESPONSE,
+                LIST_OVERVIEW_FMT_RESPONSE,
+                LIST_HEADERS_RESPONSE,
+                LIST_DISTRIB_PATS_RESPONSE,
                 HELP_RESPONSE,
                 MODE_READER_RESPONSE,
                 DATE_RESPONSE
             ]
             .concat()
         );
-        assert_eq!(stats.snapshot().commands, 4);
+        assert_eq!(stats.snapshot().commands, 9);
     }
 
     #[test]

@@ -299,6 +299,32 @@ impl AuthInfoKind {
     }
 }
 
+/// LIST subcommands currently supported by the typed surface.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ListKind {
+    Active,
+    ActiveTimes,
+    Newsgroups,
+    OverviewFmt,
+    Headers,
+    DistribPats,
+}
+
+impl ListKind {
+    #[must_use]
+    pub const fn as_wire(self) -> &'static [u8] {
+        match self {
+            Self::Active => b"ACTIVE",
+            Self::ActiveTimes => b"ACTIVE.TIMES",
+            Self::Newsgroups => b"NEWSGROUPS",
+            Self::OverviewFmt => b"OVERVIEW.FMT",
+            Self::Headers => b"HEADERS",
+            Self::DistribPats => b"DISTRIB.PATS",
+        }
+    }
+}
+
 /// Raw TAKETHIS article payload bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArticleTransfer<'a>(Cow<'a, [u8]>);
@@ -481,6 +507,12 @@ pub enum RequestKind {
     Body,
     Head,
     Stat,
+    ListActive,
+    ListActiveTimes,
+    ListNewsgroups,
+    ListOverviewFmt,
+    ListHeaders,
+    ListDistribPats,
     Group,
     ListGroup,
     Last,
@@ -524,7 +556,16 @@ impl RequestKind {
                 | (Self::ListGroup, 211)
                 | (Self::Help, 100)
                 | (Self::Capabilities, 101)
-                | (Self::List, 215)
+                | (
+                    Self::List
+                        | Self::ListActive
+                        | Self::ListActiveTimes
+                        | Self::ListNewsgroups
+                        | Self::ListOverviewFmt
+                        | Self::ListHeaders
+                        | Self::ListDistribPats,
+                    215,
+                )
                 | (Self::Over | Self::Xover, 224)
                 | (Self::Hdr | Self::Xhdr, 225)
                 | (Self::NewNews, 230)
@@ -547,6 +588,10 @@ pub enum Request<'a> {
     },
     Stat {
         message_id: MessageId<'a>,
+    },
+    ListVariant {
+        kind: ListKind,
+        wildmat: Option<Wildmat<'a>>,
     },
     Group {
         group: GroupName<'a>,
@@ -614,6 +659,14 @@ impl<'a> Request<'a> {
             Self::Body { .. } => RequestKind::Body,
             Self::Head { .. } => RequestKind::Head,
             Self::Stat { .. } => RequestKind::Stat,
+            Self::ListVariant { kind, .. } => match kind {
+                ListKind::Active => RequestKind::ListActive,
+                ListKind::ActiveTimes => RequestKind::ListActiveTimes,
+                ListKind::Newsgroups => RequestKind::ListNewsgroups,
+                ListKind::OverviewFmt => RequestKind::ListOverviewFmt,
+                ListKind::Headers => RequestKind::ListHeaders,
+                ListKind::DistribPats => RequestKind::ListDistribPats,
+            },
             Self::Group { .. } => RequestKind::Group,
             Self::ListGroup { .. } => RequestKind::ListGroup,
             Self::Last => RequestKind::Last,
@@ -649,6 +702,9 @@ impl<'a> Request<'a> {
             Self::Body { message_id } => write_request_wire(output, b"BODY ", message_id),
             Self::Head { message_id } => write_request_wire(output, b"HEAD ", message_id),
             Self::Stat { message_id } => write_request_wire(output, b"STAT ", message_id),
+            Self::ListVariant { kind, wildmat } => {
+                write_list_request_wire(output, *kind, wildmat.as_ref())
+            }
             Self::Group { group } => write_one_arg_request_wire(output, b"GROUP ", group.as_str()),
             Self::ListGroup { group } => {
                 write_one_arg_request_wire(output, b"LISTGROUP ", group.as_str())
@@ -717,7 +773,8 @@ impl<'a> Request<'a> {
             | Self::Ihave { message_id }
             | Self::Check { message_id }
             | Self::TakeThis { message_id, .. } => Some(message_id),
-            Self::Group { .. }
+            Self::ListVariant { .. }
+            | Self::Group { .. }
             | Self::ListGroup { .. }
             | Self::Last
             | Self::Next
@@ -750,6 +807,7 @@ impl<'a> Request<'a> {
             | Self::Body { .. }
             | Self::Head { .. }
             | Self::Stat { .. }
+            | Self::ListVariant { .. }
             | Self::Group { .. }
             | Self::ListGroup { .. }
             | Self::Last
@@ -782,6 +840,7 @@ impl<'a> Request<'a> {
             | Self::Body { .. }
             | Self::Head { .. }
             | Self::Stat { .. }
+            | Self::ListVariant { .. }
             | Self::Group { .. }
             | Self::ListGroup { .. }
             | Self::Last
@@ -814,6 +873,7 @@ impl<'a> Request<'a> {
             | Self::Body { .. }
             | Self::Head { .. }
             | Self::Stat { .. }
+            | Self::ListVariant { .. }
             | Self::Last
             | Self::Next
             | Self::Over { .. }
@@ -849,6 +909,7 @@ impl<'a> Request<'a> {
             | Self::Body { .. }
             | Self::Head { .. }
             | Self::Stat { .. }
+            | Self::ListVariant { .. }
             | Self::Group { .. }
             | Self::ListGroup { .. }
             | Self::Last
@@ -872,15 +933,20 @@ impl<'a> Request<'a> {
         }
     }
 
-    /// Borrow the validated NEWNEWS wildmat carried by this request, if any.
+    /// Borrow the validated NEWNEWS/LIST wildmat carried by this request, if any.
     #[must_use]
     pub const fn wildmat(&self) -> Option<&Wildmat<'a>> {
         match self {
             Self::NewNews { wildmat, .. } => Some(wildmat),
+            Self::ListVariant {
+                wildmat: Some(wildmat),
+                ..
+            } => Some(wildmat),
             Self::Article { .. }
             | Self::Body { .. }
             | Self::Head { .. }
             | Self::Stat { .. }
+            | Self::ListVariant { wildmat: None, .. }
             | Self::Group { .. }
             | Self::ListGroup { .. }
             | Self::Last
@@ -914,6 +980,7 @@ impl<'a> Request<'a> {
             | Self::Body { .. }
             | Self::Head { .. }
             | Self::Stat { .. }
+            | Self::ListVariant { .. }
             | Self::Group { .. }
             | Self::ListGroup { .. }
             | Self::Last
@@ -947,6 +1014,7 @@ impl<'a> Request<'a> {
             | Self::Body { .. }
             | Self::Head { .. }
             | Self::Stat { .. }
+            | Self::ListVariant { .. }
             | Self::Group { .. }
             | Self::ListGroup { .. }
             | Self::Last
@@ -960,6 +1028,40 @@ impl<'a> Request<'a> {
             | Self::Post
             | Self::Ihave { .. }
             | Self::Check { .. }
+            | Self::AuthInfo { .. }
+            | Self::StartTls
+            | Self::List
+            | Self::Help
+            | Self::Capabilities
+            | Self::Date
+            | Self::ModeReader
+            | Self::Quit => None,
+        }
+    }
+
+    /// Borrow LIST family metadata carried by this request, if any.
+    #[must_use]
+    pub const fn list_variant(&self) -> Option<(ListKind, Option<&Wildmat<'a>>)> {
+        match self {
+            Self::ListVariant { kind, wildmat } => Some((*kind, wildmat.as_ref())),
+            Self::Article { .. }
+            | Self::Body { .. }
+            | Self::Head { .. }
+            | Self::Stat { .. }
+            | Self::Group { .. }
+            | Self::ListGroup { .. }
+            | Self::Last
+            | Self::Next
+            | Self::Over { .. }
+            | Self::Xover { .. }
+            | Self::Hdr { .. }
+            | Self::Xhdr { .. }
+            | Self::NewGroups { .. }
+            | Self::NewNews { .. }
+            | Self::Post
+            | Self::Ihave { .. }
+            | Self::Check { .. }
+            | Self::TakeThis { .. }
             | Self::AuthInfo { .. }
             | Self::StartTls
             | Self::List
@@ -1152,6 +1254,84 @@ impl Request<'static> {
         Self::List
     }
 
+    /// Build a LIST ACTIVE request.
+    #[must_use]
+    pub const fn list_active() -> Self {
+        Self::ListVariant {
+            kind: ListKind::Active,
+            wildmat: None,
+        }
+    }
+
+    /// Build a LIST ACTIVE request with a wildmat filter.
+    pub fn list_active_wildmat(wildmat: impl AsRef<str>) -> Result<Self, InvalidWildmat> {
+        Ok(Self::ListVariant {
+            kind: ListKind::Active,
+            wildmat: Some(Wildmat::from_owned(wildmat)?),
+        })
+    }
+
+    /// Build a LIST ACTIVE.TIMES request.
+    #[must_use]
+    pub const fn list_active_times() -> Self {
+        Self::ListVariant {
+            kind: ListKind::ActiveTimes,
+            wildmat: None,
+        }
+    }
+
+    /// Build a LIST ACTIVE.TIMES request with a wildmat filter.
+    pub fn list_active_times_wildmat(wildmat: impl AsRef<str>) -> Result<Self, InvalidWildmat> {
+        Ok(Self::ListVariant {
+            kind: ListKind::ActiveTimes,
+            wildmat: Some(Wildmat::from_owned(wildmat)?),
+        })
+    }
+
+    /// Build a LIST NEWSGROUPS request.
+    #[must_use]
+    pub const fn list_newsgroups() -> Self {
+        Self::ListVariant {
+            kind: ListKind::Newsgroups,
+            wildmat: None,
+        }
+    }
+
+    /// Build a LIST NEWSGROUPS request with a wildmat filter.
+    pub fn list_newsgroups_wildmat(wildmat: impl AsRef<str>) -> Result<Self, InvalidWildmat> {
+        Ok(Self::ListVariant {
+            kind: ListKind::Newsgroups,
+            wildmat: Some(Wildmat::from_owned(wildmat)?),
+        })
+    }
+
+    /// Build a LIST OVERVIEW.FMT request.
+    #[must_use]
+    pub const fn list_overview_fmt() -> Self {
+        Self::ListVariant {
+            kind: ListKind::OverviewFmt,
+            wildmat: None,
+        }
+    }
+
+    /// Build a LIST HEADERS request.
+    #[must_use]
+    pub const fn list_headers() -> Self {
+        Self::ListVariant {
+            kind: ListKind::Headers,
+            wildmat: None,
+        }
+    }
+
+    /// Build a LIST DISTRIB.PATS request.
+    #[must_use]
+    pub const fn list_distrib_pats() -> Self {
+        Self::ListVariant {
+            kind: ListKind::DistribPats,
+            wildmat: None,
+        }
+    }
+
     /// Build a HELP request.
     #[must_use]
     pub const fn help() -> Self {
@@ -1259,7 +1439,7 @@ fn classify_verb(verb: &[u8], arg: &[u8]) -> RequestKind {
         4 if eq_ignore_ascii_case_const(verb, b"HEAD") => RequestKind::Head,
         4 if eq_ignore_ascii_case_const(verb, b"HELP") => RequestKind::Help,
         4 if eq_ignore_ascii_case_const(verb, b"LAST") => RequestKind::Last,
-        4 if eq_ignore_ascii_case_const(verb, b"LIST") => RequestKind::List,
+        4 if eq_ignore_ascii_case_const(verb, b"LIST") => classify_list_kind(arg),
         4 if eq_ignore_ascii_case_const(verb, b"MODE") && eq_ignore_ascii_case(arg, b"READER") => {
             RequestKind::ModeReader
         }
@@ -1282,6 +1462,31 @@ fn classify_verb(verb: &[u8], arg: &[u8]) -> RequestKind {
         9 if eq_ignore_ascii_case_const(verb, b"NEWGROUPS") => RequestKind::NewGroups,
         12 if eq_ignore_ascii_case_const(verb, b"CAPABILITIES") => RequestKind::Capabilities,
         _ => RequestKind::Unknown,
+    }
+}
+
+fn classify_list_kind(arg: &[u8]) -> RequestKind {
+    let subcommand = arg
+        .split(|byte| byte.is_ascii_whitespace())
+        .find(|segment| !segment.is_empty());
+    match subcommand {
+        Some(segment) if eq_ignore_ascii_case_const(segment, b"ACTIVE") => RequestKind::ListActive,
+        Some(segment) if eq_ignore_ascii_case_const(segment, b"ACTIVE.TIMES") => {
+            RequestKind::ListActiveTimes
+        }
+        Some(segment) if eq_ignore_ascii_case_const(segment, b"NEWSGROUPS") => {
+            RequestKind::ListNewsgroups
+        }
+        Some(segment) if eq_ignore_ascii_case_const(segment, b"OVERVIEW.FMT") => {
+            RequestKind::ListOverviewFmt
+        }
+        Some(segment) if eq_ignore_ascii_case_const(segment, b"HEADERS") => {
+            RequestKind::ListHeaders
+        }
+        Some(segment) if eq_ignore_ascii_case_const(segment, b"DISTRIB.PATS") => {
+            RequestKind::ListDistribPats
+        }
+        _ => RequestKind::List,
     }
 }
 
@@ -1403,6 +1608,16 @@ fn write_newnews_request_wire(
     output.extend_from_slice(time.as_bytes());
     if gmt {
         output.extend_from_slice(b" GMT");
+    }
+    output.extend_from_slice(b"\r\n");
+}
+
+fn write_list_request_wire(output: &mut Vec<u8>, kind: ListKind, wildmat: Option<&Wildmat<'_>>) {
+    output.extend_from_slice(b"LIST ");
+    output.extend_from_slice(kind.as_wire());
+    if let Some(wildmat) = wildmat {
+        output.push(b' ');
+        output.extend_from_slice(wildmat.as_str().as_bytes());
     }
     output.extend_from_slice(b"\r\n");
 }
@@ -1604,7 +1819,30 @@ mod tests {
         assert_eq!(RequestLine::parse(b"HEAD <a@b>").kind(), RequestKind::Head);
         assert_eq!(RequestLine::parse(b"HELP").kind(), RequestKind::Help);
         assert_eq!(RequestLine::parse(b"STAT <a@b>").kind(), RequestKind::Stat);
-        assert_eq!(RequestLine::parse(b"LIST ACTIVE").kind(), RequestKind::List);
+        assert_eq!(
+            RequestLine::parse(b"LIST ACTIVE").kind(),
+            RequestKind::ListActive
+        );
+        assert_eq!(
+            RequestLine::parse(b"LIST ACTIVE.TIMES comp.lang.*").kind(),
+            RequestKind::ListActiveTimes
+        );
+        assert_eq!(
+            RequestLine::parse(b"LIST NEWSGROUPS comp.lang.*").kind(),
+            RequestKind::ListNewsgroups
+        );
+        assert_eq!(
+            RequestLine::parse(b"LIST OVERVIEW.FMT").kind(),
+            RequestKind::ListOverviewFmt
+        );
+        assert_eq!(
+            RequestLine::parse(b"LIST HEADERS").kind(),
+            RequestKind::ListHeaders
+        );
+        assert_eq!(
+            RequestLine::parse(b"LIST DISTRIB.PATS").kind(),
+            RequestKind::ListDistribPats
+        );
         assert_eq!(RequestLine::parse(b"OVER 1-10").kind(), RequestKind::Over);
         assert_eq!(RequestLine::parse(b"XOVER 1-10").kind(), RequestKind::Xover);
         assert_eq!(
@@ -1645,6 +1883,24 @@ mod tests {
             (b"LAST".as_slice(), RequestKind::Last),
             (b"NEXT".as_slice(), RequestKind::Next),
             (b"LIST".as_slice(), RequestKind::List),
+            (b"LIST ACTIVE".as_slice(), RequestKind::ListActive),
+            (
+                b"LIST ACTIVE.TIMES comp.lang.*".as_slice(),
+                RequestKind::ListActiveTimes,
+            ),
+            (
+                b"LIST NEWSGROUPS comp.lang.*".as_slice(),
+                RequestKind::ListNewsgroups,
+            ),
+            (
+                b"LIST OVERVIEW.FMT".as_slice(),
+                RequestKind::ListOverviewFmt,
+            ),
+            (b"LIST HEADERS".as_slice(), RequestKind::ListHeaders),
+            (
+                b"LIST DISTRIB.PATS".as_slice(),
+                RequestKind::ListDistribPats,
+            ),
             (b"DATE".as_slice(), RequestKind::Date),
             (b"HELP".as_slice(), RequestKind::Help),
             (b"CAPABILITIES".as_slice(), RequestKind::Capabilities),
@@ -1715,6 +1971,12 @@ mod tests {
         assert!(!RequestKind::Last.expects_multiline_response(StatusCode(223)));
         assert!(!RequestKind::Next.expects_multiline_response(StatusCode(223)));
         assert!(RequestKind::List.expects_multiline_response(StatusCode(215)));
+        assert!(RequestKind::ListActive.expects_multiline_response(StatusCode(215)));
+        assert!(RequestKind::ListActiveTimes.expects_multiline_response(StatusCode(215)));
+        assert!(RequestKind::ListNewsgroups.expects_multiline_response(StatusCode(215)));
+        assert!(RequestKind::ListOverviewFmt.expects_multiline_response(StatusCode(215)));
+        assert!(RequestKind::ListHeaders.expects_multiline_response(StatusCode(215)));
+        assert!(RequestKind::ListDistribPats.expects_multiline_response(StatusCode(215)));
         assert!(RequestKind::Over.expects_multiline_response(StatusCode(224)));
         assert!(RequestKind::Xhdr.expects_multiline_response(StatusCode(225)));
         assert!(RequestKind::NewGroups.expects_multiline_response(StatusCode(231)));
@@ -1804,6 +2066,30 @@ mod tests {
         };
         let starttls = Request::StartTls;
         let list = Request::List;
+        let list_active = Request::ListVariant {
+            kind: ListKind::Active,
+            wildmat: None,
+        };
+        let list_active_times = Request::ListVariant {
+            kind: ListKind::ActiveTimes,
+            wildmat: Some(Wildmat::from_borrowed("comp.lang.*").unwrap()),
+        };
+        let list_newsgroups = Request::ListVariant {
+            kind: ListKind::Newsgroups,
+            wildmat: Some(Wildmat::from_borrowed("comp.lang.*").unwrap()),
+        };
+        let list_overview_fmt = Request::ListVariant {
+            kind: ListKind::OverviewFmt,
+            wildmat: None,
+        };
+        let list_headers = Request::ListVariant {
+            kind: ListKind::Headers,
+            wildmat: None,
+        };
+        let list_distrib_pats = Request::ListVariant {
+            kind: ListKind::DistribPats,
+            wildmat: None,
+        };
         let help = Request::Help;
         let capabilities = Request::Capabilities;
         let date = Request::Date;
@@ -1924,6 +2210,36 @@ mod tests {
         assert_eq!(wire, b"LIST\r\n");
 
         wire.clear();
+        list_active.write_wire_to(&mut wire);
+        assert_eq!(list_active.kind(), RequestKind::ListActive);
+        assert_eq!(wire, b"LIST ACTIVE\r\n");
+
+        wire.clear();
+        list_active_times.write_wire_to(&mut wire);
+        assert_eq!(list_active_times.kind(), RequestKind::ListActiveTimes);
+        assert_eq!(wire, b"LIST ACTIVE.TIMES comp.lang.*\r\n");
+
+        wire.clear();
+        list_newsgroups.write_wire_to(&mut wire);
+        assert_eq!(list_newsgroups.kind(), RequestKind::ListNewsgroups);
+        assert_eq!(wire, b"LIST NEWSGROUPS comp.lang.*\r\n");
+
+        wire.clear();
+        list_overview_fmt.write_wire_to(&mut wire);
+        assert_eq!(list_overview_fmt.kind(), RequestKind::ListOverviewFmt);
+        assert_eq!(wire, b"LIST OVERVIEW.FMT\r\n");
+
+        wire.clear();
+        list_headers.write_wire_to(&mut wire);
+        assert_eq!(list_headers.kind(), RequestKind::ListHeaders);
+        assert_eq!(wire, b"LIST HEADERS\r\n");
+
+        wire.clear();
+        list_distrib_pats.write_wire_to(&mut wire);
+        assert_eq!(list_distrib_pats.kind(), RequestKind::ListDistribPats);
+        assert_eq!(wire, b"LIST DISTRIB.PATS\r\n");
+
+        wire.clear();
         help.write_wire_to(&mut wire);
         assert_eq!(help.kind(), RequestKind::Help);
         assert_eq!(wire, b"HELP\r\n");
@@ -1974,6 +2290,12 @@ mod tests {
         let authinfo_pass = Request::authinfo_pass("pass\tword").unwrap();
         let starttls = Request::starttls();
         let list = Request::list();
+        let list_active = Request::list_active();
+        let list_active_times = Request::list_active_times_wildmat("comp.lang.*").unwrap();
+        let list_newsgroups = Request::list_newsgroups_wildmat("comp.lang.*").unwrap();
+        let list_overview_fmt = Request::list_overview_fmt();
+        let list_headers = Request::list_headers();
+        let list_distrib_pats = Request::list_distrib_pats();
         let help = Request::help();
         let capabilities = Request::capabilities();
         let date = Request::date();
@@ -2083,6 +2405,36 @@ mod tests {
         assert!(starttls.message_id().is_none());
         assert_eq!(list.kind(), RequestKind::List);
         assert!(list.message_id().is_none());
+        assert_eq!(
+            list_active
+                .list_variant()
+                .map(|(kind, wildmat)| (kind, wildmat.is_some())),
+            Some((ListKind::Active, false))
+        );
+        assert_eq!(
+            list_active_times
+                .list_variant()
+                .map(|(kind, wildmat)| (kind, wildmat.map(Wildmat::as_str))),
+            Some((ListKind::ActiveTimes, Some("comp.lang.*")))
+        );
+        assert_eq!(
+            list_newsgroups
+                .list_variant()
+                .map(|(kind, wildmat)| (kind, wildmat.map(Wildmat::as_str))),
+            Some((ListKind::Newsgroups, Some("comp.lang.*")))
+        );
+        assert_eq!(
+            list_overview_fmt.list_variant().map(|(kind, _)| kind),
+            Some(ListKind::OverviewFmt)
+        );
+        assert_eq!(
+            list_headers.list_variant().map(|(kind, _)| kind),
+            Some(ListKind::Headers)
+        );
+        assert_eq!(
+            list_distrib_pats.list_variant().map(|(kind, _)| kind),
+            Some(ListKind::DistribPats)
+        );
         assert_eq!(help.kind(), RequestKind::Help);
         assert!(help.message_id().is_none());
         assert_eq!(capabilities.kind(), RequestKind::Capabilities);
@@ -2102,6 +2454,7 @@ mod tests {
         assert!(Request::xhdr("Subject", "1 2").is_err());
         assert!(Request::newgroups("20261301", "000000", true).is_err());
         assert!(Request::newnews("", "20260101", "000000", false).is_err());
+        assert!(Request::list_active_wildmat("").is_err());
         assert!(Request::authinfo_user("").is_err());
         assert!(Request::authinfo_pass("bad\nvalue").is_err());
     }
@@ -2130,6 +2483,12 @@ mod tests {
             Request::authinfo_pass("pass").unwrap(),
             Request::starttls(),
             Request::list(),
+            Request::list_active(),
+            Request::list_active_times_wildmat("comp.lang.*").unwrap(),
+            Request::list_newsgroups_wildmat("comp.lang.*").unwrap(),
+            Request::list_overview_fmt(),
+            Request::list_headers(),
+            Request::list_distrib_pats(),
             Request::help(),
             Request::capabilities(),
             Request::date(),

@@ -480,6 +480,129 @@ impl Client {
         self.execute_raw_exchange(Request::list()).await
     }
 
+    /// Send a LIST ACTIVE request and return the owned raw response frame.
+    pub async fn list_active(&self) -> Result<OwnedResponse, TypedClientError> {
+        self.execute_raw(Request::list_active()).await
+    }
+
+    /// Send a LIST ACTIVE request and return the completed raw request/response pair.
+    pub async fn list_active_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+        self.execute_raw_exchange(Request::list_active()).await
+    }
+
+    /// Send a LIST ACTIVE [wildmat] request and return the owned raw response frame.
+    pub async fn list_active_wildmat(
+        &self,
+        wildmat: impl AsRef<str>,
+    ) -> Result<OwnedResponse, TypedClientError> {
+        let request =
+            Request::list_active_wildmat(wildmat).map_err(|_| TypedClientError::InvalidWildmat)?;
+        self.execute_raw(request).await
+    }
+
+    /// Send a LIST ACTIVE [wildmat] request and return the completed raw request/response pair.
+    pub async fn list_active_wildmat_exchange(
+        &self,
+        wildmat: impl AsRef<str>,
+    ) -> Result<OwnedExchange, TypedClientError> {
+        let request =
+            Request::list_active_wildmat(wildmat).map_err(|_| TypedClientError::InvalidWildmat)?;
+        self.execute_raw_exchange(request).await
+    }
+
+    /// Send a LIST ACTIVE.TIMES request and return the owned raw response frame.
+    pub async fn list_active_times(&self) -> Result<OwnedResponse, TypedClientError> {
+        self.execute_raw(Request::list_active_times()).await
+    }
+
+    /// Send a LIST ACTIVE.TIMES request and return the completed raw request/response pair.
+    pub async fn list_active_times_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+        self.execute_raw_exchange(Request::list_active_times())
+            .await
+    }
+
+    /// Send a LIST ACTIVE.TIMES [wildmat] request and return the owned raw response frame.
+    pub async fn list_active_times_wildmat(
+        &self,
+        wildmat: impl AsRef<str>,
+    ) -> Result<OwnedResponse, TypedClientError> {
+        let request = Request::list_active_times_wildmat(wildmat)
+            .map_err(|_| TypedClientError::InvalidWildmat)?;
+        self.execute_raw(request).await
+    }
+
+    /// Send a LIST ACTIVE.TIMES [wildmat] request and return the completed raw request/response pair.
+    pub async fn list_active_times_wildmat_exchange(
+        &self,
+        wildmat: impl AsRef<str>,
+    ) -> Result<OwnedExchange, TypedClientError> {
+        let request = Request::list_active_times_wildmat(wildmat)
+            .map_err(|_| TypedClientError::InvalidWildmat)?;
+        self.execute_raw_exchange(request).await
+    }
+
+    /// Send a LIST NEWSGROUPS request and return the owned raw response frame.
+    pub async fn list_newsgroups(&self) -> Result<OwnedResponse, TypedClientError> {
+        self.execute_raw(Request::list_newsgroups()).await
+    }
+
+    /// Send a LIST NEWSGROUPS request and return the completed raw request/response pair.
+    pub async fn list_newsgroups_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+        self.execute_raw_exchange(Request::list_newsgroups()).await
+    }
+
+    /// Send a LIST NEWSGROUPS [wildmat] request and return the owned raw response frame.
+    pub async fn list_newsgroups_wildmat(
+        &self,
+        wildmat: impl AsRef<str>,
+    ) -> Result<OwnedResponse, TypedClientError> {
+        let request = Request::list_newsgroups_wildmat(wildmat)
+            .map_err(|_| TypedClientError::InvalidWildmat)?;
+        self.execute_raw(request).await
+    }
+
+    /// Send a LIST NEWSGROUPS [wildmat] request and return the completed raw request/response pair.
+    pub async fn list_newsgroups_wildmat_exchange(
+        &self,
+        wildmat: impl AsRef<str>,
+    ) -> Result<OwnedExchange, TypedClientError> {
+        let request = Request::list_newsgroups_wildmat(wildmat)
+            .map_err(|_| TypedClientError::InvalidWildmat)?;
+        self.execute_raw_exchange(request).await
+    }
+
+    /// Send a LIST OVERVIEW.FMT request and return the owned raw response frame.
+    pub async fn list_overview_fmt(&self) -> Result<OwnedResponse, TypedClientError> {
+        self.execute_raw(Request::list_overview_fmt()).await
+    }
+
+    /// Send a LIST OVERVIEW.FMT request and return the completed raw request/response pair.
+    pub async fn list_overview_fmt_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+        self.execute_raw_exchange(Request::list_overview_fmt())
+            .await
+    }
+
+    /// Send a LIST HEADERS request and return the owned raw response frame.
+    pub async fn list_headers(&self) -> Result<OwnedResponse, TypedClientError> {
+        self.execute_raw(Request::list_headers()).await
+    }
+
+    /// Send a LIST HEADERS request and return the completed raw request/response pair.
+    pub async fn list_headers_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+        self.execute_raw_exchange(Request::list_headers()).await
+    }
+
+    /// Send a LIST DISTRIB.PATS request and return the owned raw response frame.
+    pub async fn list_distrib_pats(&self) -> Result<OwnedResponse, TypedClientError> {
+        self.execute_raw(Request::list_distrib_pats()).await
+    }
+
+    /// Send a LIST DISTRIB.PATS request and return the completed raw request/response pair.
+    pub async fn list_distrib_pats_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+        self.execute_raw_exchange(Request::list_distrib_pats())
+            .await
+    }
+
     /// Send a HELP request and return the owned raw response frame.
     pub async fn help(&self) -> Result<OwnedResponse, TypedClientError> {
         self.execute_raw(Request::help()).await
@@ -978,6 +1101,138 @@ impl TypedClientConnection {
     /// Send a LIST request and return the completed request/response pair.
     pub async fn list_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
         self.execute_exchange(Request::List).await
+    }
+
+    /// Send a LIST ACTIVE request and return the owned response frame.
+    pub async fn list_active(&self) -> Result<OwnedResponse, TypedClientError> {
+        self.execute(Request::list_active()).await
+    }
+
+    /// Send a LIST ACTIVE request and return the completed request/response pair.
+    pub async fn list_active_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+        self.execute_exchange(Request::list_active()).await
+    }
+
+    /// Send a LIST ACTIVE [wildmat] request and return the owned response frame.
+    pub async fn list_active_wildmat(
+        &self,
+        wildmat: Wildmat<'static>,
+    ) -> Result<OwnedResponse, TypedClientError> {
+        self.execute(Request::ListVariant {
+            kind: crate::protocol::ListKind::Active,
+            wildmat: Some(wildmat),
+        })
+        .await
+    }
+
+    /// Send a LIST ACTIVE [wildmat] request and return the completed request/response pair.
+    pub async fn list_active_wildmat_exchange(
+        &self,
+        wildmat: Wildmat<'static>,
+    ) -> Result<OwnedExchange, TypedClientError> {
+        self.execute_exchange(Request::ListVariant {
+            kind: crate::protocol::ListKind::Active,
+            wildmat: Some(wildmat),
+        })
+        .await
+    }
+
+    /// Send a LIST ACTIVE.TIMES request and return the owned response frame.
+    pub async fn list_active_times(&self) -> Result<OwnedResponse, TypedClientError> {
+        self.execute(Request::list_active_times()).await
+    }
+
+    /// Send a LIST ACTIVE.TIMES request and return the completed request/response pair.
+    pub async fn list_active_times_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+        self.execute_exchange(Request::list_active_times()).await
+    }
+
+    /// Send a LIST ACTIVE.TIMES [wildmat] request and return the owned response frame.
+    pub async fn list_active_times_wildmat(
+        &self,
+        wildmat: Wildmat<'static>,
+    ) -> Result<OwnedResponse, TypedClientError> {
+        self.execute(Request::ListVariant {
+            kind: crate::protocol::ListKind::ActiveTimes,
+            wildmat: Some(wildmat),
+        })
+        .await
+    }
+
+    /// Send a LIST ACTIVE.TIMES [wildmat] request and return the completed request/response pair.
+    pub async fn list_active_times_wildmat_exchange(
+        &self,
+        wildmat: Wildmat<'static>,
+    ) -> Result<OwnedExchange, TypedClientError> {
+        self.execute_exchange(Request::ListVariant {
+            kind: crate::protocol::ListKind::ActiveTimes,
+            wildmat: Some(wildmat),
+        })
+        .await
+    }
+
+    /// Send a LIST NEWSGROUPS request and return the owned response frame.
+    pub async fn list_newsgroups(&self) -> Result<OwnedResponse, TypedClientError> {
+        self.execute(Request::list_newsgroups()).await
+    }
+
+    /// Send a LIST NEWSGROUPS request and return the completed request/response pair.
+    pub async fn list_newsgroups_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+        self.execute_exchange(Request::list_newsgroups()).await
+    }
+
+    /// Send a LIST NEWSGROUPS [wildmat] request and return the owned response frame.
+    pub async fn list_newsgroups_wildmat(
+        &self,
+        wildmat: Wildmat<'static>,
+    ) -> Result<OwnedResponse, TypedClientError> {
+        self.execute(Request::ListVariant {
+            kind: crate::protocol::ListKind::Newsgroups,
+            wildmat: Some(wildmat),
+        })
+        .await
+    }
+
+    /// Send a LIST NEWSGROUPS [wildmat] request and return the completed request/response pair.
+    pub async fn list_newsgroups_wildmat_exchange(
+        &self,
+        wildmat: Wildmat<'static>,
+    ) -> Result<OwnedExchange, TypedClientError> {
+        self.execute_exchange(Request::ListVariant {
+            kind: crate::protocol::ListKind::Newsgroups,
+            wildmat: Some(wildmat),
+        })
+        .await
+    }
+
+    /// Send a LIST OVERVIEW.FMT request and return the owned response frame.
+    pub async fn list_overview_fmt(&self) -> Result<OwnedResponse, TypedClientError> {
+        self.execute(Request::list_overview_fmt()).await
+    }
+
+    /// Send a LIST OVERVIEW.FMT request and return the completed request/response pair.
+    pub async fn list_overview_fmt_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+        self.execute_exchange(Request::list_overview_fmt()).await
+    }
+
+    /// Send a LIST HEADERS request and return the owned response frame.
+    pub async fn list_headers(&self) -> Result<OwnedResponse, TypedClientError> {
+        self.execute(Request::list_headers()).await
+    }
+
+    /// Send a LIST HEADERS request and return the completed request/response pair.
+    pub async fn list_headers_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+        self.execute_exchange(Request::list_headers()).await
+    }
+
+    /// Send a LIST DISTRIB.PATS request and return the owned response frame.
+    pub async fn list_distrib_pats(&self) -> Result<OwnedResponse, TypedClientError> {
+        self.execute(Request::list_distrib_pats()).await
+    }
+
+    /// Send a LIST DISTRIB.PATS request and return the completed request/response pair.
+    pub async fn list_distrib_pats_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+        self.execute_exchange(Request::list_distrib_pats()).await
     }
 
     /// Send a HELP request and return the owned response frame.
@@ -2094,7 +2349,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn typed_connection_fetches_list_help_capabilities_date_mode_reader_and_quit_frames() {
+    async fn typed_connection_fetches_list_family_and_general_raw_frames() {
         let listener = crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -2102,6 +2357,33 @@ mod tests {
             stream.write_all(b"201 typed ready\r\n").await.unwrap();
             assert_read_request(&mut stream, b"LIST\r\n").await;
             stream.write_all(crate::LIST_RESPONSE).await.unwrap();
+            assert_read_request(&mut stream, b"LIST ACTIVE\r\n").await;
+            stream.write_all(crate::LIST_RESPONSE).await.unwrap();
+            assert_read_request(&mut stream, b"LIST ACTIVE.TIMES comp.lang.*\r\n").await;
+            stream
+                .write_all(crate::LIST_ACTIVE_TIMES_RESPONSE)
+                .await
+                .unwrap();
+            assert_read_request(&mut stream, b"LIST NEWSGROUPS comp.lang.*\r\n").await;
+            stream
+                .write_all(crate::LIST_NEWSGROUPS_RESPONSE)
+                .await
+                .unwrap();
+            assert_read_request(&mut stream, b"LIST OVERVIEW.FMT\r\n").await;
+            stream
+                .write_all(crate::LIST_OVERVIEW_FMT_RESPONSE)
+                .await
+                .unwrap();
+            assert_read_request(&mut stream, b"LIST HEADERS\r\n").await;
+            stream
+                .write_all(crate::LIST_HEADERS_RESPONSE)
+                .await
+                .unwrap();
+            assert_read_request(&mut stream, b"LIST DISTRIB.PATS\r\n").await;
+            stream
+                .write_all(crate::LIST_DISTRIB_PATS_RESPONSE)
+                .await
+                .unwrap();
             assert_read_request(&mut stream, b"HELP\r\n").await;
             stream.write_all(crate::HELP_RESPONSE).await.unwrap();
             assert_read_request(&mut stream, b"CAPABILITIES\r\n").await;
@@ -2122,6 +2404,18 @@ mod tests {
 
         let connection = TypedClientConnection::connect(addr).await.unwrap();
         let list = connection.list().await.unwrap();
+        let list_active = connection.list_active().await.unwrap();
+        let list_active_times = connection
+            .list_active_times_wildmat(Wildmat::from_borrowed("comp.lang.*").unwrap())
+            .await
+            .unwrap();
+        let list_newsgroups = connection
+            .list_newsgroups_wildmat(Wildmat::from_borrowed("comp.lang.*").unwrap())
+            .await
+            .unwrap();
+        let list_overview_fmt = connection.list_overview_fmt().await.unwrap();
+        let list_headers = connection.list_headers().await.unwrap();
+        let list_distrib_pats = connection.list_distrib_pats().await.unwrap();
         let help = connection.help().await.unwrap();
         let capabilities = connection.capabilities().await.unwrap();
         let date = connection.date().await.unwrap();
@@ -2131,6 +2425,33 @@ mod tests {
         assert_eq!(list.kind(), RequestKind::List);
         assert_eq!(list.status().as_u16(), 215);
         assert_eq!(list.as_bytes(), crate::LIST_RESPONSE);
+        assert_eq!(list_active.kind(), RequestKind::ListActive);
+        assert_eq!(list_active.status().as_u16(), 215);
+        assert_eq!(list_active.as_bytes(), crate::LIST_RESPONSE);
+        assert_eq!(list_active_times.kind(), RequestKind::ListActiveTimes);
+        assert_eq!(list_active_times.status().as_u16(), 215);
+        assert_eq!(
+            list_active_times.as_bytes(),
+            crate::LIST_ACTIVE_TIMES_RESPONSE
+        );
+        assert_eq!(list_newsgroups.kind(), RequestKind::ListNewsgroups);
+        assert_eq!(list_newsgroups.status().as_u16(), 215);
+        assert_eq!(list_newsgroups.as_bytes(), crate::LIST_NEWSGROUPS_RESPONSE);
+        assert_eq!(list_overview_fmt.kind(), RequestKind::ListOverviewFmt);
+        assert_eq!(list_overview_fmt.status().as_u16(), 215);
+        assert_eq!(
+            list_overview_fmt.as_bytes(),
+            crate::LIST_OVERVIEW_FMT_RESPONSE
+        );
+        assert_eq!(list_headers.kind(), RequestKind::ListHeaders);
+        assert_eq!(list_headers.status().as_u16(), 215);
+        assert_eq!(list_headers.as_bytes(), crate::LIST_HEADERS_RESPONSE);
+        assert_eq!(list_distrib_pats.kind(), RequestKind::ListDistribPats);
+        assert_eq!(list_distrib_pats.status().as_u16(), 215);
+        assert_eq!(
+            list_distrib_pats.as_bytes(),
+            crate::LIST_DISTRIB_PATS_RESPONSE
+        );
 
         assert_eq!(help.kind(), RequestKind::Help);
         assert_eq!(help.status().as_u16(), 100);
@@ -2498,7 +2819,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn client_raw_methods_expose_general_request_surface() {
+    async fn client_raw_methods_expose_list_family_and_general_request_surface() {
         let listener = crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -2506,6 +2827,33 @@ mod tests {
             stream.write_all(b"201 typed ready\r\n").await.unwrap();
             assert_read_request(&mut stream, b"LIST\r\n").await;
             stream.write_all(crate::LIST_RESPONSE).await.unwrap();
+            assert_read_request(&mut stream, b"LIST ACTIVE\r\n").await;
+            stream.write_all(crate::LIST_RESPONSE).await.unwrap();
+            assert_read_request(&mut stream, b"LIST ACTIVE.TIMES comp.lang.*\r\n").await;
+            stream
+                .write_all(crate::LIST_ACTIVE_TIMES_RESPONSE)
+                .await
+                .unwrap();
+            assert_read_request(&mut stream, b"LIST NEWSGROUPS comp.lang.*\r\n").await;
+            stream
+                .write_all(crate::LIST_NEWSGROUPS_RESPONSE)
+                .await
+                .unwrap();
+            assert_read_request(&mut stream, b"LIST OVERVIEW.FMT\r\n").await;
+            stream
+                .write_all(crate::LIST_OVERVIEW_FMT_RESPONSE)
+                .await
+                .unwrap();
+            assert_read_request(&mut stream, b"LIST HEADERS\r\n").await;
+            stream
+                .write_all(crate::LIST_HEADERS_RESPONSE)
+                .await
+                .unwrap();
+            assert_read_request(&mut stream, b"LIST DISTRIB.PATS\r\n").await;
+            stream
+                .write_all(crate::LIST_DISTRIB_PATS_RESPONSE)
+                .await
+                .unwrap();
             assert_read_request(&mut stream, b"CAPABILITIES\r\n").await;
             stream
                 .write_all(b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n")
@@ -2517,11 +2865,32 @@ mod tests {
 
         let client = Client::connect(addr).await.unwrap();
         let list = client.list().await.unwrap();
+        let list_active = client.list_active().await.unwrap();
+        let list_active_times = client
+            .list_active_times_wildmat("comp.lang.*")
+            .await
+            .unwrap();
+        let list_newsgroups = client.list_newsgroups_wildmat("comp.lang.*").await.unwrap();
+        let list_overview_fmt = client.list_overview_fmt().await.unwrap();
+        let list_headers = client.list_headers().await.unwrap();
+        let list_distrib_pats = client.list_distrib_pats().await.unwrap();
         let capabilities = client.capabilities().await.unwrap();
         let exchange = client.date_exchange().await.unwrap();
 
         assert_eq!(list.kind(), RequestKind::List);
         assert_eq!(list.status().as_u16(), 215);
+        assert_eq!(list_active.kind(), RequestKind::ListActive);
+        assert_eq!(list_active.status().as_u16(), 215);
+        assert_eq!(list_active_times.kind(), RequestKind::ListActiveTimes);
+        assert_eq!(list_active_times.status().as_u16(), 215);
+        assert_eq!(list_newsgroups.kind(), RequestKind::ListNewsgroups);
+        assert_eq!(list_newsgroups.status().as_u16(), 215);
+        assert_eq!(list_overview_fmt.kind(), RequestKind::ListOverviewFmt);
+        assert_eq!(list_overview_fmt.status().as_u16(), 215);
+        assert_eq!(list_headers.kind(), RequestKind::ListHeaders);
+        assert_eq!(list_headers.status().as_u16(), 215);
+        assert_eq!(list_distrib_pats.kind(), RequestKind::ListDistribPats);
+        assert_eq!(list_distrib_pats.status().as_u16(), 215);
         assert_eq!(capabilities.kind(), RequestKind::Capabilities);
         assert_eq!(capabilities.status().as_u16(), 101);
         assert_eq!(exchange.request(), &Request::Date);
