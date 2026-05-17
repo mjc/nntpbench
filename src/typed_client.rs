@@ -2107,6 +2107,13 @@ impl ResponseDecoder {
         }
 
         let content_chunk = &buffer[content_chunk_start..];
+        if content_chunk_start == status_end && content_chunk.starts_with(b".\r\n") {
+            return Ok(DecodeProgress::Complete {
+                status,
+                consumed: content_chunk_start + 3,
+            });
+        }
+
         match self.tail.detect_terminator(content_chunk) {
             TerminatorStatus::FoundAt(end) => Ok(DecodeProgress::Complete {
                 status,
@@ -2666,6 +2673,32 @@ mod tests {
         assert_eq!(consumed, buffer.len());
         assert_eq!(response.status().as_u16(), 101);
         assert_eq!(response.as_bytes(), buffer);
+    }
+
+    #[test]
+    fn decoder_does_not_treat_start_of_next_chunk_as_terminator() {
+        let mut decoder = ResponseDecoder::new(RequestKind::Body);
+        let mut buffer = b"222 1 <a@b> body follows\r\nbody".to_vec();
+        assert!(matches!(
+            decoder.push(&buffer).unwrap(),
+            DecodeProgress::NeedMore
+        ));
+
+        buffer.extend_from_slice(b".\r\nstill body\r\n.\r\n");
+        let DecodeProgress::Complete { status, consumed } = decoder.push(&buffer).unwrap() else {
+            panic!("decoder should complete");
+        };
+        let response = response_from_bytes(RequestKind::Body, status, &buffer[..consumed]);
+
+        assert_eq!(
+            consumed,
+            b"222 1 <a@b> body follows\r\nbody.\r\nstill body\r\n.\r\n".len()
+        );
+        assert_eq!(response.status().as_u16(), 222);
+        assert_eq!(
+            response.as_bytes(),
+            b"222 1 <a@b> body follows\r\nbody.\r\nstill body\r\n.\r\n"
+        );
     }
 
     #[test]

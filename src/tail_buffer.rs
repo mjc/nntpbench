@@ -114,10 +114,6 @@ impl TailBuffer {
 /// Returns the position after the terminator, or None if not found.
 #[inline]
 fn find_terminator_end(data: &[u8]) -> Option<usize> {
-    if data.starts_with(b".\r\n") {
-        return Some(3);
-    }
-
     memchr::memmem::find(data, crate::TERMINATOR).map(|start| start + crate::TERMINATOR.len())
 }
 
@@ -227,6 +223,7 @@ mod tests {
 
         let tail = TailBuffer::default();
         assert_eq!(tail.detect_terminator(b"abc\r\n.\r\n").write_len(99), 8);
+        assert!(!tail.detect_terminator(b".\r\n").is_found());
         assert!(!tail.detect_terminator(b"abc").is_found());
     }
 
