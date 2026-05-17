@@ -92,7 +92,7 @@ supported! {
     #[bench::capabilities(args = (b"CAPABILITIES"))]
     #[bench::date(args = (b"DATE"))]
     #[bench::mode_reader(args = (b"MODE READER"))]
-    #[bench::unknown(args = (b"HEAD 1"))]
+    #[bench::unknown(args = (b"XYZZY 1"))]
     #[bench::quit(args = (b"QUIT"))]
     fn parse_command(command: &[u8]) -> RequestKind {
         black_box(RequestLine::parse(black_box(command)).kind())
@@ -140,7 +140,7 @@ supported! {
     #[bench::unknown(setup = setup_64k)]
     fn process_unknown(mut harness: ProcessHarness) -> usize {
         process_request_to_buffer(
-            RequestLine::parse(b"HEAD 1"),
+            RequestLine::parse(b"XYZZY 1"),
             &harness.config,
             &harness.stats,
             &mut harness.output,

@@ -1088,13 +1088,37 @@ impl TypedClientConnection {
         })
     }
 
+    pub(crate) async fn queue_request_exchange(
+        &self,
+        request: Request<'static>,
+    ) -> Result<PendingExchange, TypedClientError> {
+        if self.inner.response_mode != TypedClientResponseMode::Owned {
+            return Err(TypedClientError::Io(io::Error::other(
+                "owned response requested from drained typed connection",
+            )));
+        }
+        let (response_tx, response_rx) = oneshot::channel();
+        self.inner
+            .request_tx
+            .send(QueuedRequest {
+                request,
+                response_tx,
+            })
+            .await
+            .map_err(|_| TypedClientError::ConnectionClosed)?;
+
+        Ok(PendingExchange {
+            inner: self.inner.clone(),
+            response_rx,
+        })
+    }
+
     /// Execute a typed request and return the completed request/response pair.
     pub async fn execute_exchange(
         &self,
         request: Request<'static>,
     ) -> Result<OwnedExchange, TypedClientError> {
-        let response = self.execute(request.clone()).await?;
-        Ok(OwnedExchange { request, response })
+        self.queue_request_exchange(request).await?.receive().await
     }
 }
 
@@ -1446,13 +1470,13 @@ enum DecodeProgress {
 #[derive(Debug)]
 struct QueuedRequest {
     request: Request<'static>,
-    response_tx: oneshot::Sender<Result<CompletedResponse, SharedEngineError>>,
+    response_tx: oneshot::Sender<Result<CompletedRequest, SharedEngineError>>,
 }
 
 #[derive(Debug)]
 pub(crate) struct PendingResponse {
     inner: Arc<ConnectionHandle>,
-    response_rx: oneshot::Receiver<Result<CompletedResponse, SharedEngineError>>,
+    response_rx: oneshot::Receiver<Result<CompletedRequest, SharedEngineError>>,
 }
 
 impl PendingResponse {
@@ -1471,7 +1495,7 @@ impl PendingResponse {
             }
         };
 
-        match response.map_err(TypedClientError::from)? {
+        match response.map_err(TypedClientError::from)?.response {
             CompletedResponse::Owned(response) => Ok(response),
             CompletedResponse::Drained(_) => Err(TypedClientError::Io(io::Error::other(
                 "drained response returned to owned caller",
@@ -1483,7 +1507,7 @@ impl PendingResponse {
 #[derive(Debug)]
 pub(crate) struct PendingDrainedResponse {
     inner: Arc<ConnectionHandle>,
-    response_rx: oneshot::Receiver<Result<CompletedResponse, SharedEngineError>>,
+    response_rx: oneshot::Receiver<Result<CompletedRequest, SharedEngineError>>,
 }
 
 impl PendingDrainedResponse {
@@ -1502,10 +1526,45 @@ impl PendingDrainedResponse {
             }
         };
 
-        match response.map_err(TypedClientError::from)? {
+        match response.map_err(TypedClientError::from)?.response {
             CompletedResponse::Drained(response) => Ok(response),
             CompletedResponse::Owned(_) => Err(TypedClientError::Io(io::Error::other(
                 "owned response returned to drained caller",
+            ))),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct PendingExchange {
+    inner: Arc<ConnectionHandle>,
+    response_rx: oneshot::Receiver<Result<CompletedRequest, SharedEngineError>>,
+}
+
+impl PendingExchange {
+    pub(crate) async fn receive(self) -> Result<OwnedExchange, TypedClientError> {
+        let response = match self.response_rx.await {
+            Ok(response) => response,
+            Err(_) => {
+                return Err(self
+                    .inner
+                    .poisoned
+                    .lock()
+                    .await
+                    .clone()
+                    .map(TypedClientError::from)
+                    .unwrap_or(TypedClientError::ConnectionClosed));
+            }
+        };
+
+        let completed = response.map_err(TypedClientError::from)?;
+        match completed.response {
+            CompletedResponse::Owned(response) => Ok(OwnedExchange {
+                request: completed.request,
+                response,
+            }),
+            CompletedResponse::Drained(_) => Err(TypedClientError::Io(io::Error::other(
+                "drained response returned to exchange caller",
             ))),
         }
     }
@@ -1529,9 +1588,16 @@ enum CompletedResponse {
 }
 
 #[derive(Debug)]
+struct CompletedRequest {
+    request: Request<'static>,
+    response: CompletedResponse,
+}
+
+#[derive(Debug)]
 struct InFlightRequest {
+    request: Request<'static>,
     kind: RequestKind,
-    response_tx: oneshot::Sender<Result<CompletedResponse, SharedEngineError>>,
+    response_tx: oneshot::Sender<Result<CompletedRequest, SharedEngineError>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1568,6 +1634,7 @@ async fn run_writer_task(
         }
 
         let inflight = InFlightRequest {
+            request: queued.request,
             kind,
             response_tx: queued.response_tx,
         };
@@ -1595,8 +1662,12 @@ async fn run_reader_task(
     let mut pending_read = BytesMut::with_capacity(initial_capacity);
 
     while let Some(inflight_request) = inflight_rx.recv().await {
-        let mut decoder = ResponseDecoder::new(inflight_request.kind);
-        let response_tx = inflight_request.response_tx;
+        let InFlightRequest {
+            request,
+            kind,
+            response_tx,
+        } = inflight_request;
+        let mut decoder = ResponseDecoder::new(kind);
 
         loop {
             if !pending_read.is_empty() {
@@ -1606,7 +1677,7 @@ async fn run_reader_task(
                         let response = match response_mode {
                             TypedClientResponseMode::Owned => {
                                 CompletedResponse::Owned(OwnedResponse {
-                                    kind: inflight_request.kind,
+                                    kind,
                                     status,
                                     bytes: pending_read.split_to(consumed).freeze(),
                                 })
@@ -1618,7 +1689,7 @@ async fn run_reader_task(
                                 })
                             }
                         };
-                        let _ = response_tx.send(Ok(response));
+                        let _ = response_tx.send(Ok(CompletedRequest { request, response }));
                         break;
                     }
                     Err(TypedClientError::InvalidStatusLine) => {
@@ -1734,6 +1805,12 @@ fn status_line_end(buffer: &[u8]) -> Option<usize> {
 mod tests {
     use super::*;
 
+    async fn assert_read_request(stream: &mut tokio::net::TcpStream, expected: &[u8]) {
+        let mut request = vec![0_u8; expected.len()];
+        stream.read_exact(&mut request).await.unwrap();
+        assert_eq!(request, expected);
+    }
+
     fn response_from_bytes(kind: RequestKind, status: StatusCode, bytes: &[u8]) -> OwnedResponse {
         OwnedResponse {
             kind,
@@ -1843,10 +1920,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             stream.write_all(b"201 typed ready\r\n").await.unwrap();
-
-            let mut request = [0_u8; 128];
-            let read = stream.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"ARTICLE <typed@test>\r\n");
+            assert_read_request(&mut stream, b"ARTICLE <typed@test>\r\n").await;
 
             stream
                 .write_all(
@@ -1879,17 +1953,12 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             stream.write_all(b"201 typed ready\r\n").await.unwrap();
-
-            let mut request = [0_u8; 128];
-            let read = stream.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"HEAD <head@test>\r\n");
+            assert_read_request(&mut stream, b"HEAD <head@test>\r\n").await;
             stream
                 .write_all(b"221 1 <head@test> article retrieved\r\nSubject: Head\r\n.\r\n")
                 .await
                 .unwrap();
-
-            let read = stream.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"STAT <stat@test>\r\n");
+            assert_read_request(&mut stream, b"STAT <stat@test>\r\n").await;
             stream
                 .write_all(b"223 1 <stat@test> article retrieved\r\n")
                 .await
@@ -1934,10 +2003,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             stream.write_all(b"201 typed ready\r\n").await.unwrap();
-
-            let mut request = [0_u8; 128];
-            let read = stream.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"ARTICLE <missing@test>\r\n");
+            assert_read_request(&mut stream, b"ARTICLE <missing@test>\r\n").await;
 
             stream
                 .write_all(b"430 no article with that message-id\r\n")
@@ -1968,10 +2034,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             stream.write_all(b"201 typed ready\r\n").await.unwrap();
-
-            let mut request = [0_u8; 128];
-            let read = stream.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"BODY <pair@test>\r\n");
+            assert_read_request(&mut stream, b"BODY <pair@test>\r\n").await;
 
             stream
                 .write_all(b"222 1 <pair@test> body follows\r\npair body\r\n.\r\n")
@@ -2003,10 +2066,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             stream.write_all(b"201 typed ready\r\n").await.unwrap();
-
-            let mut request = [0_u8; 128];
-            let read = stream.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"STAT <parts@test>\r\n");
+            assert_read_request(&mut stream, b"STAT <parts@test>\r\n").await;
 
             stream
                 .write_all(b"223 1 <parts@test> article retrieved\r\n")
@@ -2040,36 +2100,23 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             stream.write_all(b"201 typed ready\r\n").await.unwrap();
-
-            let mut request = [0_u8; 128];
-            let read = stream.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"LIST\r\n");
+            assert_read_request(&mut stream, b"LIST\r\n").await;
             stream.write_all(crate::LIST_RESPONSE).await.unwrap();
-
-            let read = stream.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"HELP\r\n");
+            assert_read_request(&mut stream, b"HELP\r\n").await;
             stream.write_all(crate::HELP_RESPONSE).await.unwrap();
-
-            let read = stream.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"CAPABILITIES\r\n");
+            assert_read_request(&mut stream, b"CAPABILITIES\r\n").await;
             stream
                 .write_all(b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n")
                 .await
                 .unwrap();
-
-            let read = stream.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"DATE\r\n");
+            assert_read_request(&mut stream, b"DATE\r\n").await;
             stream.write_all(b"111 20260515120000\r\n").await.unwrap();
-
-            let read = stream.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"MODE READER\r\n");
+            assert_read_request(&mut stream, b"MODE READER\r\n").await;
             stream
                 .write_all(b"201 posting not permitted\r\n")
                 .await
                 .unwrap();
-
-            let read = stream.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"QUIT\r\n");
+            assert_read_request(&mut stream, b"QUIT\r\n").await;
             stream.write_all(crate::QUIT_RESPONSE).await.unwrap();
         });
 
@@ -2118,22 +2165,13 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             stream.write_all(b"201 typed ready\r\n").await.unwrap();
-
-            let mut request = [0_u8; 128];
-            let read = stream.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"GROUP alt.test\r\n");
+            assert_read_request(&mut stream, b"GROUP alt.test\r\n").await;
             stream.write_all(crate::GROUP_RESPONSE).await.unwrap();
-
-            let read = stream.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"LISTGROUP alt.test\r\n");
+            assert_read_request(&mut stream, b"LISTGROUP alt.test\r\n").await;
             stream.write_all(crate::LISTGROUP_RESPONSE).await.unwrap();
-
-            let read = stream.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"LAST\r\n");
+            assert_read_request(&mut stream, b"LAST\r\n").await;
             stream.write_all(crate::LAST_RESPONSE).await.unwrap();
-
-            let read = stream.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"NEXT\r\n");
+            assert_read_request(&mut stream, b"NEXT\r\n").await;
             stream.write_all(crate::NEXT_RESPONSE).await.unwrap();
         });
 
@@ -2172,17 +2210,13 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             stream.write_all(b"201 typed ready\r\n").await.unwrap();
-
-            let mut request = [0_u8; 128];
-            let read = stream.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"NEWGROUPS 20260101 000000 GMT\r\n");
+            assert_read_request(&mut stream, b"NEWGROUPS 20260101 000000 GMT\r\n").await;
             stream.write_all(crate::NEWGROUPS_RESPONSE).await.unwrap();
-
-            let read = stream.read(&mut request).await.unwrap();
-            assert_eq!(
-                &request[..read],
-                b"NEWNEWS comp.lang.*,alt.test 20260101 000000\r\n"
-            );
+            assert_read_request(
+                &mut stream,
+                b"NEWNEWS comp.lang.*,alt.test 20260101 000000\r\n",
+            )
+            .await;
             stream.write_all(crate::NEWNEWS_RESPONSE).await.unwrap();
         });
 
@@ -2222,37 +2256,23 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             stream.write_all(b"201 typed ready\r\n").await.unwrap();
-
-            let mut request = [0_u8; 256];
-            let read = stream.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"POST\r\n");
+            assert_read_request(&mut stream, b"POST\r\n").await;
             stream.write_all(crate::POST_RESPONSE).await.unwrap();
-
-            let read = stream.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"IHAVE <ihave@test>\r\n");
+            assert_read_request(&mut stream, b"IHAVE <ihave@test>\r\n").await;
             stream.write_all(crate::IHAVE_RESPONSE).await.unwrap();
-
-            let read = stream.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"CHECK <check@test>\r\n");
+            assert_read_request(&mut stream, b"CHECK <check@test>\r\n").await;
             stream.write_all(crate::CHECK_RESPONSE).await.unwrap();
-
-            let read = stream.read(&mut request).await.unwrap();
-            assert_eq!(
-                &request[..read],
-                b"TAKETHIS <take@test>\r\nSubject: Take\r\n\r\n..line\r\nbody\r\n.\r\n"
-            );
+            assert_read_request(
+                &mut stream,
+                b"TAKETHIS <take@test>\r\nSubject: Take\r\n\r\n..line\r\nbody\r\n.\r\n",
+            )
+            .await;
             stream.write_all(crate::TAKETHIS_RESPONSE).await.unwrap();
-
-            let read = stream.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"AUTHINFO USER bench user\r\n");
+            assert_read_request(&mut stream, b"AUTHINFO USER bench user\r\n").await;
             stream.write_all(crate::AUTHINFO_RESPONSE).await.unwrap();
-
-            let read = stream.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"AUTHINFO PASS bench pass\r\n");
+            assert_read_request(&mut stream, b"AUTHINFO PASS bench pass\r\n").await;
             stream.write_all(crate::AUTHINFO_RESPONSE).await.unwrap();
-
-            let read = stream.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"STARTTLS\r\n");
+            assert_read_request(&mut stream, b"STARTTLS\r\n").await;
             stream.write_all(crate::STARTTLS_RESPONSE).await.unwrap();
         });
 
@@ -2308,14 +2328,9 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             stream.write_all(b"201 typed ready\r\n").await.unwrap();
-
-            let mut request = [0_u8; 128];
-            let read = stream.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"HDR Subject 1-10\r\n");
+            assert_read_request(&mut stream, b"HDR Subject 1-10\r\n").await;
             stream.write_all(crate::HDR_RESPONSE).await.unwrap();
-
-            let read = stream.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"XHDR Message-ID <headers@test>\r\n");
+            assert_read_request(&mut stream, b"XHDR Message-ID <headers@test>\r\n").await;
             stream.write_all(crate::XHDR_RESPONSE).await.unwrap();
         });
 
@@ -2352,14 +2367,9 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             stream.write_all(b"201 typed ready\r\n").await.unwrap();
-
-            let mut request = [0_u8; 128];
-            let read = stream.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"OVER 1-10\r\n");
+            assert_read_request(&mut stream, b"OVER 1-10\r\n").await;
             stream.write_all(crate::OVER_RESPONSE).await.unwrap();
-
-            let read = stream.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"XOVER <overview@test>\r\n");
+            assert_read_request(&mut stream, b"XOVER <overview@test>\r\n").await;
             stream.write_all(crate::XOVER_RESPONSE).await.unwrap();
         });
 
@@ -2390,10 +2400,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             stream.write_all(b"201 typed ready\r\n").await.unwrap();
-
-            let mut request = [0_u8; 128];
-            let read = stream.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"ARTICLE <surface@test>\r\n");
+            assert_read_request(&mut stream, b"ARTICLE <surface@test>\r\n").await;
 
             stream
                 .write_all(
@@ -2426,10 +2433,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             stream.write_all(b"201 typed ready\r\n").await.unwrap();
-
-            let mut request = [0_u8; 128];
-            let read = stream.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"ARTICLE <exchange@test>\r\n");
+            assert_read_request(&mut stream, b"ARTICLE <exchange@test>\r\n").await;
 
             stream
                 .write_all(
@@ -2462,10 +2466,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             stream.write_all(b"201 typed ready\r\n").await.unwrap();
-
-            let mut request = [0_u8; 128];
-            let read = stream.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"ARTICLE <pair-surface@test>\r\n");
+            assert_read_request(&mut stream, b"ARTICLE <pair-surface@test>\r\n").await;
 
             stream
                 .write_all(
@@ -2503,21 +2504,14 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             stream.write_all(b"201 typed ready\r\n").await.unwrap();
-
-            let mut request = [0_u8; 128];
-            let read = stream.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"LIST\r\n");
+            assert_read_request(&mut stream, b"LIST\r\n").await;
             stream.write_all(crate::LIST_RESPONSE).await.unwrap();
-
-            let read = stream.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"CAPABILITIES\r\n");
+            assert_read_request(&mut stream, b"CAPABILITIES\r\n").await;
             stream
                 .write_all(b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n")
                 .await
                 .unwrap();
-
-            let read = stream.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"DATE\r\n");
+            assert_read_request(&mut stream, b"DATE\r\n").await;
             stream.write_all(b"111 20260515120000\r\n").await.unwrap();
         });
 
@@ -2543,22 +2537,13 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             stream.write_all(b"201 typed ready\r\n").await.unwrap();
-
-            let mut request = [0_u8; 128];
-            let read = stream.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"GROUP alt.test\r\n");
+            assert_read_request(&mut stream, b"GROUP alt.test\r\n").await;
             stream.write_all(crate::GROUP_RESPONSE).await.unwrap();
-
-            let read = stream.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"LISTGROUP alt.test\r\n");
+            assert_read_request(&mut stream, b"LISTGROUP alt.test\r\n").await;
             stream.write_all(crate::LISTGROUP_RESPONSE).await.unwrap();
-
-            let read = stream.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"LAST\r\n");
+            assert_read_request(&mut stream, b"LAST\r\n").await;
             stream.write_all(crate::LAST_RESPONSE).await.unwrap();
-
-            let read = stream.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"NEXT\r\n");
+            assert_read_request(&mut stream, b"NEXT\r\n").await;
             stream.write_all(crate::NEXT_RESPONSE).await.unwrap();
         });
 
@@ -2588,17 +2573,13 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             stream.write_all(b"201 typed ready\r\n").await.unwrap();
-
-            let mut request = [0_u8; 128];
-            let read = stream.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"NEWGROUPS 20260101 000000 GMT\r\n");
+            assert_read_request(&mut stream, b"NEWGROUPS 20260101 000000 GMT\r\n").await;
             stream.write_all(crate::NEWGROUPS_RESPONSE).await.unwrap();
-
-            let read = stream.read(&mut request).await.unwrap();
-            assert_eq!(
-                &request[..read],
-                b"NEWNEWS comp.lang.*,alt.test 20260101 000000\r\n"
-            );
+            assert_read_request(
+                &mut stream,
+                b"NEWNEWS comp.lang.*,alt.test 20260101 000000\r\n",
+            )
+            .await;
             stream.write_all(crate::NEWNEWS_RESPONSE).await.unwrap();
         });
 
@@ -2635,37 +2616,23 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             stream.write_all(b"201 typed ready\r\n").await.unwrap();
-
-            let mut request = [0_u8; 256];
-            let read = stream.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"POST\r\n");
+            assert_read_request(&mut stream, b"POST\r\n").await;
             stream.write_all(crate::POST_RESPONSE).await.unwrap();
-
-            let read = stream.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"IHAVE <ihave-surface@test>\r\n");
+            assert_read_request(&mut stream, b"IHAVE <ihave-surface@test>\r\n").await;
             stream.write_all(crate::IHAVE_RESPONSE).await.unwrap();
-
-            let read = stream.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"CHECK <check-surface@test>\r\n");
+            assert_read_request(&mut stream, b"CHECK <check-surface@test>\r\n").await;
             stream.write_all(crate::CHECK_RESPONSE).await.unwrap();
-
-            let read = stream.read(&mut request).await.unwrap();
-            assert_eq!(
-                &request[..read],
-                b"TAKETHIS <take-surface@test>\r\nSubject: Surface\r\n\r\n..line\r\nbody\r\n.\r\n"
-            );
+            assert_read_request(
+                &mut stream,
+                b"TAKETHIS <take-surface@test>\r\nSubject: Surface\r\n\r\n..line\r\nbody\r\n.\r\n",
+            )
+            .await;
             stream.write_all(crate::TAKETHIS_RESPONSE).await.unwrap();
-
-            let read = stream.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"AUTHINFO USER bench user\r\n");
+            assert_read_request(&mut stream, b"AUTHINFO USER bench user\r\n").await;
             stream.write_all(crate::AUTHINFO_RESPONSE).await.unwrap();
-
-            let read = stream.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"AUTHINFO PASS bench pass\r\n");
+            assert_read_request(&mut stream, b"AUTHINFO PASS bench pass\r\n").await;
             stream.write_all(crate::AUTHINFO_RESPONSE).await.unwrap();
-
-            let read = stream.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"STARTTLS\r\n");
+            assert_read_request(&mut stream, b"STARTTLS\r\n").await;
             stream.write_all(crate::STARTTLS_RESPONSE).await.unwrap();
         });
 
@@ -2710,14 +2677,9 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             stream.write_all(b"201 typed ready\r\n").await.unwrap();
-
-            let mut request = [0_u8; 128];
-            let read = stream.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"HDR Subject 1-10\r\n");
+            assert_read_request(&mut stream, b"HDR Subject 1-10\r\n").await;
             stream.write_all(crate::HDR_RESPONSE).await.unwrap();
-
-            let read = stream.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"XHDR Message-ID <headers@test>\r\n");
+            assert_read_request(&mut stream, b"XHDR Message-ID <headers@test>\r\n").await;
             stream.write_all(crate::XHDR_RESPONSE).await.unwrap();
         });
 
@@ -2749,14 +2711,9 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             stream.write_all(b"201 typed ready\r\n").await.unwrap();
-
-            let mut request = [0_u8; 128];
-            let read = stream.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"OVER 1-10\r\n");
+            assert_read_request(&mut stream, b"OVER 1-10\r\n").await;
             stream.write_all(crate::OVER_RESPONSE).await.unwrap();
-
-            let read = stream.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"XOVER <overview@test>\r\n");
+            assert_read_request(&mut stream, b"XOVER <overview@test>\r\n").await;
             stream.write_all(crate::XOVER_RESPONSE).await.unwrap();
         });
 
@@ -2786,19 +2743,14 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             stream.write_all(b"201 typed ready\r\n").await.unwrap();
-
-            let mut request = [0_u8; 128];
-            let read = stream.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"HEAD <head-surface@test>\r\n");
+            assert_read_request(&mut stream, b"HEAD <head-surface@test>\r\n").await;
             stream
                 .write_all(
                     b"221 1 <head-surface@test> article retrieved\r\nSubject: Surface Head\r\n.\r\n",
                 )
                 .await
                 .unwrap();
-
-            let read = stream.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"STAT <stat-surface@test>\r\n");
+            assert_read_request(&mut stream, b"STAT <stat-surface@test>\r\n").await;
             stream
                 .write_all(b"223 1 <stat-surface@test> article retrieved\r\n")
                 .await
@@ -2833,10 +2785,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             stream.write_all(b"201 typed ready\r\n").await.unwrap();
-
-            let mut request = [0_u8; 128];
-            let read = stream.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"BODY <direct@test>\r\n");
+            assert_read_request(&mut stream, b"BODY <direct@test>\r\n").await;
 
             stream
                 .write_all(b"222 1 <direct@test> body follows\r\ndirect body\r\n.\r\n")
@@ -2867,10 +2816,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             stream.write_all(b"201 typed ready\r\n").await.unwrap();
-
-            let mut request = [0_u8; 128];
-            let read = stream.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"ARTICLE <missing-surface@test>\r\n");
+            assert_read_request(&mut stream, b"ARTICLE <missing-surface@test>\r\n").await;
 
             stream
                 .write_all(b"430 no article with that message-id\r\n")
