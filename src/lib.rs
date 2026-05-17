@@ -661,9 +661,12 @@ fn typed_fetch_request(args: &TypedFetchArgs) -> Result<Request<'static>, TypedC
         TypedRequestKind::ListHeaders => Ok(Request::list_headers()),
         TypedRequestKind::ListDistribPats => Ok(Request::list_distrib_pats()),
         TypedRequestKind::Group => typed_fetch_group_request(args, |group| Request::group(group)),
-        TypedRequestKind::Listgroup => {
-            typed_fetch_group_request(args, |group| Request::listgroup(group))
-        }
+        TypedRequestKind::Listgroup => match args.group.as_deref() {
+            Some(group) => {
+                Request::listgroup(group).map_err(|_| TypedClientError::InvalidGroupName)
+            }
+            None => Ok(Request::listgroup_current()),
+        },
         TypedRequestKind::Last => Ok(Request::last()),
         TypedRequestKind::Next => Ok(Request::next()),
         TypedRequestKind::Newgroups => typed_fetch_newgroups_request(args),
@@ -4039,35 +4042,41 @@ mod tests {
             let (mut second, _) = listener.accept().await.unwrap();
             second.write_all(b"201 fetch ready\r\n").await.unwrap();
             let read = second.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"LISTGROUP alt.test\r\n");
+            assert_eq!(&request[..read], b"LISTGROUP\r\n");
             second.write_all(LISTGROUP_RESPONSE).await.unwrap();
 
             let (mut third, _) = listener.accept().await.unwrap();
             third.write_all(b"201 fetch ready\r\n").await.unwrap();
             let read = third.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"LAST\r\n");
-            third.write_all(LAST_RESPONSE).await.unwrap();
+            assert_eq!(&request[..read], b"LISTGROUP alt.test\r\n");
+            third.write_all(LISTGROUP_RESPONSE).await.unwrap();
 
             let (mut fourth, _) = listener.accept().await.unwrap();
             fourth.write_all(b"201 fetch ready\r\n").await.unwrap();
             let read = fourth.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"NEXT\r\n");
-            fourth.write_all(NEXT_RESPONSE).await.unwrap();
+            assert_eq!(&request[..read], b"LAST\r\n");
+            fourth.write_all(LAST_RESPONSE).await.unwrap();
 
             let (mut fifth, _) = listener.accept().await.unwrap();
             fifth.write_all(b"201 fetch ready\r\n").await.unwrap();
             let read = fifth.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"NEWGROUPS 20260101 000000 GMT\r\n");
-            fifth.write_all(NEWGROUPS_RESPONSE).await.unwrap();
+            assert_eq!(&request[..read], b"NEXT\r\n");
+            fifth.write_all(NEXT_RESPONSE).await.unwrap();
 
             let (mut sixth, _) = listener.accept().await.unwrap();
             sixth.write_all(b"201 fetch ready\r\n").await.unwrap();
             let read = sixth.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"NEWGROUPS 20260101 000000 GMT\r\n");
+            sixth.write_all(NEWGROUPS_RESPONSE).await.unwrap();
+
+            let (mut seventh, _) = listener.accept().await.unwrap();
+            seventh.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = seventh.read(&mut request).await.unwrap();
             assert_eq!(
                 &request[..read],
                 b"NEWNEWS comp.lang.*,alt.test 20260101 000000\r\n"
             );
-            sixth.write_all(NEWNEWS_RESPONSE).await.unwrap();
+            seventh.write_all(NEWNEWS_RESPONSE).await.unwrap();
         });
 
         let mut group_args = test_typed_fetch_args();
@@ -4083,10 +4092,19 @@ mod tests {
         listgroup_args.connect = addr;
         listgroup_args.request = TypedRequestKind::Listgroup;
         listgroup_args.message_id = None;
-        listgroup_args.group = Some("alt.test".to_string());
+        listgroup_args.group = None;
         let listgroup = fetch_typed_response(&listgroup_args).await.unwrap();
         assert_eq!(listgroup.kind(), RequestKind::ListGroup);
         assert_eq!(listgroup.status().as_u16(), 211);
+
+        let mut listgroup_group_args = test_typed_fetch_args();
+        listgroup_group_args.connect = addr;
+        listgroup_group_args.request = TypedRequestKind::Listgroup;
+        listgroup_group_args.message_id = None;
+        listgroup_group_args.group = Some("alt.test".to_string());
+        let listgroup_group = fetch_typed_response(&listgroup_group_args).await.unwrap();
+        assert_eq!(listgroup_group.kind(), RequestKind::ListGroup);
+        assert_eq!(listgroup_group.status().as_u16(), 211);
 
         let mut last_args = test_typed_fetch_args();
         last_args.connect = addr;
@@ -5150,6 +5168,12 @@ mod tests {
             &mut output,
         ));
         assert!(!process_request_to_buffer(
+            RequestLine::parse(b"LISTGROUP"),
+            &config,
+            &stats,
+            &mut output,
+        ));
+        assert!(!process_request_to_buffer(
             RequestLine::parse(b"LISTGROUP alt.binaries.test"),
             &config,
             &stats,
@@ -5173,12 +5197,13 @@ mod tests {
             [
                 GROUP_RESPONSE,
                 LISTGROUP_RESPONSE,
+                LISTGROUP_RESPONSE,
                 LAST_RESPONSE,
                 NEXT_RESPONSE
             ]
             .concat()
         );
-        assert_eq!(stats.snapshot().commands, 4);
+        assert_eq!(stats.snapshot().commands, 5);
     }
 
     #[test]

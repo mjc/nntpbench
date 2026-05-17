@@ -647,7 +647,7 @@ pub enum Request<'a> {
         group: GroupName<'a>,
     },
     ListGroup {
-        group: GroupName<'a>,
+        group: Option<GroupName<'a>>,
     },
     Last,
     Next,
@@ -764,9 +764,10 @@ impl<'a> Request<'a> {
                 write_list_request_wire(output, *kind, wildmat.as_ref())
             }
             Self::Group { group } => write_one_arg_request_wire(output, b"GROUP ", group.as_str()),
-            Self::ListGroup { group } => {
+            Self::ListGroup { group: Some(group) } => {
                 write_one_arg_request_wire(output, b"LISTGROUP ", group.as_str())
             }
+            Self::ListGroup { group: None } => write_simple_request_wire(output, b"LISTGROUP"),
             Self::Last => write_simple_request_wire(output, b"LAST"),
             Self::Next => write_simple_request_wire(output, b"NEXT"),
             Self::Over { selector } => {
@@ -960,7 +961,8 @@ impl<'a> Request<'a> {
     #[must_use]
     pub const fn group_name(&self) -> Option<&GroupName<'a>> {
         match self {
-            Self::Group { group } | Self::ListGroup { group } => Some(group),
+            Self::Group { group } => Some(group),
+            Self::ListGroup { group } => group.as_ref(),
             Self::Article { .. }
             | Self::Body { .. }
             | Self::Head { .. }
@@ -1293,8 +1295,14 @@ impl Request<'static> {
     /// Build a LISTGROUP request.
     pub fn listgroup(group: impl AsRef<str>) -> Result<Self, InvalidGroupName> {
         Ok(Self::ListGroup {
-            group: GroupName::from_owned(group)?,
+            group: Some(GroupName::from_owned(group)?),
         })
+    }
+
+    /// Build a LISTGROUP request targeting the current selected group.
+    #[must_use]
+    pub const fn listgroup_current() -> Self {
+        Self::ListGroup { group: None }
     }
 
     /// Build a LAST request.
@@ -2075,6 +2083,7 @@ mod tests {
             (b"STAT <a@b>".as_slice(), RequestKind::Stat),
             (b"ARTICLE 12345".as_slice(), RequestKind::Article),
             (b"GROUP alt.test".as_slice(), RequestKind::Group),
+            (b"LISTGROUP".as_slice(), RequestKind::ListGroup),
             (b"LISTGROUP alt.test".as_slice(), RequestKind::ListGroup),
             (b"LAST".as_slice(), RequestKind::Last),
             (b"NEXT".as_slice(), RequestKind::Next),
@@ -2210,8 +2219,9 @@ mod tests {
             group: GroupName::from_borrowed("alt.test").unwrap(),
         };
         let listgroup = Request::ListGroup {
-            group: GroupName::from_borrowed("alt.test").unwrap(),
+            group: Some(GroupName::from_borrowed("alt.test").unwrap()),
         };
+        let listgroup_current = Request::ListGroup { group: None };
         let last = Request::Last;
         let next = Request::Next;
         let over = Request::Over {
@@ -2321,6 +2331,11 @@ mod tests {
         listgroup.write_wire_to(&mut wire);
         assert_eq!(listgroup.kind(), RequestKind::ListGroup);
         assert_eq!(wire, b"LISTGROUP alt.test\r\n");
+
+        wire.clear();
+        listgroup_current.write_wire_to(&mut wire);
+        assert_eq!(listgroup_current.kind(), RequestKind::ListGroup);
+        assert_eq!(wire, b"LISTGROUP\r\n");
 
         wire.clear();
         last.write_wire_to(&mut wire);
@@ -2477,6 +2492,7 @@ mod tests {
         let stat_number = Request::stat_number(11).unwrap();
         let group = Request::group("alt.test").unwrap();
         let listgroup = Request::listgroup("alt.test").unwrap();
+        let listgroup_current = Request::listgroup_current();
         let last = Request::last();
         let next = Request::next();
         let over = Request::over("1-10").unwrap();
@@ -2531,6 +2547,8 @@ mod tests {
             listgroup.group_name().map(GroupName::as_str),
             Some("alt.test")
         );
+        assert_eq!(listgroup_current.kind(), RequestKind::ListGroup);
+        assert!(listgroup_current.group_name().is_none());
         assert_eq!(last.kind(), RequestKind::Last);
         assert!(last.group_name().is_none());
         assert_eq!(next.kind(), RequestKind::Next);
@@ -2692,6 +2710,7 @@ mod tests {
             Request::stat_number(11).unwrap(),
             Request::group("alt.test").unwrap(),
             Request::listgroup("alt.test").unwrap(),
+            Request::listgroup_current(),
             Request::last(),
             Request::next(),
             Request::over("1-10").unwrap(),

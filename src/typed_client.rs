@@ -320,6 +320,11 @@ impl Client {
         self.execute_raw(request).await
     }
 
+    /// Send a LISTGROUP request for the current selected group and return the owned raw response frame.
+    pub async fn listgroup_current(&self) -> Result<OwnedResponse, TypedClientError> {
+        self.execute_raw(Request::listgroup_current()).await
+    }
+
     /// Send a LISTGROUP request and return the completed raw request/response pair.
     pub async fn listgroup_exchange(
         &self,
@@ -327,6 +332,12 @@ impl Client {
     ) -> Result<OwnedExchange, TypedClientError> {
         let request = Request::listgroup(group).map_err(|_| TypedClientError::InvalidGroupName)?;
         self.execute_raw_exchange(request).await
+    }
+
+    /// Send a LISTGROUP request for the current selected group and return the completed raw request/response pair.
+    pub async fn listgroup_current_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+        self.execute_raw_exchange(Request::listgroup_current())
+            .await
     }
 
     /// Send a LAST request and return the owned raw response frame.
@@ -1075,7 +1086,13 @@ impl TypedClientConnection {
         &self,
         group: GroupName<'static>,
     ) -> Result<OwnedResponse, TypedClientError> {
-        self.execute(Request::ListGroup { group }).await
+        self.execute(Request::ListGroup { group: Some(group) })
+            .await
+    }
+
+    /// Send a LISTGROUP request for the current selected group and return the owned response frame.
+    pub async fn listgroup_current(&self) -> Result<OwnedResponse, TypedClientError> {
+        self.execute(Request::listgroup_current()).await
     }
 
     /// Send a LISTGROUP request and return the completed request/response pair.
@@ -1083,7 +1100,13 @@ impl TypedClientConnection {
         &self,
         group: GroupName<'static>,
     ) -> Result<OwnedExchange, TypedClientError> {
-        self.execute_exchange(Request::ListGroup { group }).await
+        self.execute_exchange(Request::ListGroup { group: Some(group) })
+            .await
+    }
+
+    /// Send a LISTGROUP request for the current selected group and return the completed request/response pair.
+    pub async fn listgroup_current_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+        self.execute_exchange(Request::listgroup_current()).await
     }
 
     /// Send a LAST request and return the owned response frame.
@@ -2797,6 +2820,8 @@ mod tests {
             stream.write_all(b"201 typed ready\r\n").await.unwrap();
             assert_read_request(&mut stream, b"GROUP alt.test\r\n").await;
             stream.write_all(crate::GROUP_RESPONSE).await.unwrap();
+            assert_read_request(&mut stream, b"LISTGROUP\r\n").await;
+            stream.write_all(crate::LISTGROUP_RESPONSE).await.unwrap();
             assert_read_request(&mut stream, b"LISTGROUP alt.test\r\n").await;
             stream.write_all(crate::LISTGROUP_RESPONSE).await.unwrap();
             assert_read_request(&mut stream, b"LAST\r\n").await;
@@ -2810,6 +2835,7 @@ mod tests {
             .group(GroupName::from_owned("alt.test").unwrap())
             .await
             .unwrap();
+        let listgroup_current = connection.listgroup_current().await.unwrap();
         let listgroup = connection
             .listgroup(GroupName::from_owned("alt.test").unwrap())
             .await
@@ -2820,6 +2846,9 @@ mod tests {
         assert_eq!(group.kind(), RequestKind::Group);
         assert_eq!(group.status().as_u16(), 211);
         assert_eq!(group.as_bytes(), crate::GROUP_RESPONSE);
+        assert_eq!(listgroup_current.kind(), RequestKind::ListGroup);
+        assert_eq!(listgroup_current.status().as_u16(), 211);
+        assert_eq!(listgroup_current.as_bytes(), crate::LISTGROUP_RESPONSE);
         assert_eq!(listgroup.kind(), RequestKind::ListGroup);
         assert_eq!(listgroup.status().as_u16(), 211);
         assert_eq!(listgroup.as_bytes(), crate::LISTGROUP_RESPONSE);
@@ -3262,6 +3291,8 @@ mod tests {
             stream.write_all(b"201 typed ready\r\n").await.unwrap();
             assert_read_request(&mut stream, b"GROUP alt.test\r\n").await;
             stream.write_all(crate::GROUP_RESPONSE).await.unwrap();
+            assert_read_request(&mut stream, b"LISTGROUP\r\n").await;
+            stream.write_all(crate::LISTGROUP_RESPONSE).await.unwrap();
             assert_read_request(&mut stream, b"LISTGROUP alt.test\r\n").await;
             stream.write_all(crate::LISTGROUP_RESPONSE).await.unwrap();
             assert_read_request(&mut stream, b"LAST\r\n").await;
@@ -3272,12 +3303,15 @@ mod tests {
 
         let client = Client::connect(addr).await.unwrap();
         let group = client.group("alt.test").await.unwrap();
+        let listgroup_current = client.listgroup_current().await.unwrap();
         let listgroup = client.listgroup("alt.test").await.unwrap();
         let last = client.last().await.unwrap();
         let next = client.next_exchange().await.unwrap();
 
         assert_eq!(group.kind(), RequestKind::Group);
         assert_eq!(group.status().as_u16(), 211);
+        assert_eq!(listgroup_current.kind(), RequestKind::ListGroup);
+        assert_eq!(listgroup_current.status().as_u16(), 211);
         assert_eq!(listgroup.kind(), RequestKind::ListGroup);
         assert_eq!(listgroup.status().as_u16(), 211);
         assert_eq!(last.kind(), RequestKind::Last);
