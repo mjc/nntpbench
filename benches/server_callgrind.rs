@@ -192,7 +192,7 @@ ARTICLE <article@nntpbench.local>\r\n\
 CAPABILITIES\r\n\
 DATE\r\n\
 MODE READER\r\n\
-HEAD 1\r\n\
+XYZZY 1\r\n\
 QUIT\r\n",
         );
         let consumed = for_each_request_line_in_batch(request, 64, |request| {

@@ -9,6 +9,7 @@ use crate::tail_buffer::find_terminator_content_end;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ArticleParseError {
     InvalidStatusCode(u16),
+    InvalidStatusPrefix,
     MissingSeparator,
     MissingTerminator,
     InvalidHeader(String),
@@ -21,6 +22,7 @@ impl fmt::Display for ArticleParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidStatusCode(code) => write!(f, "invalid status code: {code}"),
+            Self::InvalidStatusPrefix => write!(f, "invalid status code prefix"),
             Self::MissingSeparator => {
                 write!(f, "missing blank line separator between headers and body")
             }
@@ -75,7 +77,7 @@ impl<'a> Headers<'a> {
     /// Return a header value by case-insensitive name.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&'a [u8]> {
-        let name_lower = name.to_ascii_lowercase();
+        let lookup = name.as_bytes();
         let mut pos = 0;
 
         while pos < self.data.len() {
@@ -92,7 +94,7 @@ impl<'a> Headers<'a> {
 
             let colon_pos = memchr::memchr(b':', line)?;
             let header_name = &line[..colon_pos];
-            if header_name.eq_ignore_ascii_case(name_lower.as_bytes()) {
+            if header_name.eq_ignore_ascii_case(lookup) {
                 let mut value_start = colon_pos + 1;
                 while value_start < line.len()
                     && (line[value_start] == b' ' || line[value_start] == b'\t')
@@ -274,7 +276,7 @@ impl<'a> Article<'a> {
 fn parse_status_code(buf: &[u8]) -> Result<u16, ArticleParseError> {
     StatusCode::parse(buf)
         .map(StatusCode::as_u16)
-        .ok_or(ArticleParseError::InvalidStatusCode(0))
+        .ok_or(ArticleParseError::InvalidStatusPrefix)
 }
 
 fn parse_first_line(
@@ -565,6 +567,10 @@ Body\r\n\
             (
                 b"430 No such article\r\n".as_slice(),
                 ArticleParseError::InvalidStatusCode(430),
+            ),
+            (
+                b"bad status line\r\n".as_slice(),
+                ArticleParseError::InvalidStatusPrefix,
             ),
         ] {
             let err = Article::parse(input).unwrap_err();
