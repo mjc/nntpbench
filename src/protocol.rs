@@ -244,6 +244,78 @@ fn validate_article_selector(value: &str) -> Result<(), InvalidArticleSelector> 
     Ok(())
 }
 
+/// Validated LISTGROUP range argument.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ListGroupRange<'a>(Cow<'a, str>);
+
+impl<'a> ListGroupRange<'a> {
+    /// Construct a borrowed LISTGROUP range after validation.
+    pub fn from_borrowed(value: &'a str) -> Result<Self, InvalidListGroupRange> {
+        validate_listgroup_range(value)?;
+        Ok(Self(Cow::Borrowed(value)))
+    }
+
+    /// Construct an owned LISTGROUP range after validation.
+    pub fn from_owned(
+        value: impl AsRef<str>,
+    ) -> Result<ListGroupRange<'static>, InvalidListGroupRange> {
+        let value = value.as_ref();
+        validate_listgroup_range(value)?;
+        Ok(ListGroupRange(Cow::Owned(value.to_owned())))
+    }
+
+    /// Borrow the validated string.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidListGroupRange;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvalidListGroupRangeOrGroupName {
+    Range(InvalidListGroupRange),
+    GroupName(InvalidGroupName),
+}
+
+fn validate_listgroup_range(value: &str) -> Result<(), InvalidListGroupRange> {
+    if value.is_empty() || value.bytes().any(|byte| byte.is_ascii_whitespace()) {
+        return Err(InvalidListGroupRange);
+    }
+
+    if let Some((start, end)) = value.split_once('-') {
+        validate_article_number_token(start).map_err(|_| InvalidListGroupRange)?;
+        if !end.is_empty() {
+            validate_article_number_token(end).map_err(|_| InvalidListGroupRange)?;
+        }
+        return Ok(());
+    }
+
+    validate_article_number_token(value).map_err(|_| InvalidListGroupRange)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InvalidArticleNumberToken;
+
+fn validate_article_number_token(value: &str) -> Result<(), InvalidArticleNumberToken> {
+    const MAX_ARTICLE_NUMBER: u64 = 2_147_483_647;
+
+    if value.is_empty() || value.len() > 16 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(InvalidArticleNumberToken);
+    }
+
+    let number = value
+        .parse::<u64>()
+        .map_err(|_| InvalidArticleNumberToken)?;
+    if number == 0 || number > MAX_ARTICLE_NUMBER {
+        return Err(InvalidArticleNumberToken);
+    }
+
+    Ok(())
+}
+
 /// Validated group name for GROUP/LISTGROUP requests.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct GroupName<'a>(Cow<'a, str>);
@@ -648,6 +720,7 @@ pub enum Request<'a> {
     },
     ListGroup {
         group: Option<GroupName<'a>>,
+        range: Option<ListGroupRange<'a>>,
     },
     Last,
     Next,
@@ -764,10 +837,9 @@ impl<'a> Request<'a> {
                 write_list_request_wire(output, *kind, wildmat.as_ref())
             }
             Self::Group { group } => write_one_arg_request_wire(output, b"GROUP ", group.as_str()),
-            Self::ListGroup { group: Some(group) } => {
-                write_one_arg_request_wire(output, b"LISTGROUP ", group.as_str())
+            Self::ListGroup { group, range } => {
+                write_listgroup_request_wire(output, group.as_ref(), range.as_ref())
             }
-            Self::ListGroup { group: None } => write_simple_request_wire(output, b"LISTGROUP"),
             Self::Last => write_simple_request_wire(output, b"LAST"),
             Self::Next => write_simple_request_wire(output, b"NEXT"),
             Self::Over { selector } => {
@@ -962,12 +1034,46 @@ impl<'a> Request<'a> {
     pub const fn group_name(&self) -> Option<&GroupName<'a>> {
         match self {
             Self::Group { group } => Some(group),
-            Self::ListGroup { group } => group.as_ref(),
+            Self::ListGroup { group, .. } => group.as_ref(),
             Self::Article { .. }
             | Self::Body { .. }
             | Self::Head { .. }
             | Self::Stat { .. }
             | Self::ListVariant { .. }
+            | Self::Last
+            | Self::Next
+            | Self::Over { .. }
+            | Self::Xover { .. }
+            | Self::Hdr { .. }
+            | Self::Xhdr { .. }
+            | Self::NewGroups { .. }
+            | Self::NewNews { .. }
+            | Self::Post
+            | Self::Ihave { .. }
+            | Self::Check { .. }
+            | Self::TakeThis { .. }
+            | Self::AuthInfo { .. }
+            | Self::StartTls
+            | Self::List
+            | Self::Help
+            | Self::Capabilities
+            | Self::Date
+            | Self::ModeReader
+            | Self::Quit => None,
+        }
+    }
+
+    /// Borrow the validated LISTGROUP range carried by this request, if any.
+    #[must_use]
+    pub const fn listgroup_range_arg(&self) -> Option<&ListGroupRange<'a>> {
+        match self {
+            Self::ListGroup { range, .. } => range.as_ref(),
+            Self::Article { .. }
+            | Self::Body { .. }
+            | Self::Head { .. }
+            | Self::Stat { .. }
+            | Self::ListVariant { .. }
+            | Self::Group { .. }
             | Self::Last
             | Self::Next
             | Self::Over { .. }
@@ -1296,13 +1402,42 @@ impl Request<'static> {
     pub fn listgroup(group: impl AsRef<str>) -> Result<Self, InvalidGroupName> {
         Ok(Self::ListGroup {
             group: Some(GroupName::from_owned(group)?),
+            range: None,
         })
     }
 
     /// Build a LISTGROUP request targeting the current selected group.
     #[must_use]
     pub const fn listgroup_current() -> Self {
-        Self::ListGroup { group: None }
+        Self::ListGroup {
+            group: None,
+            range: None,
+        }
+    }
+
+    /// Build a LISTGROUP request targeting the current selected group with a range filter.
+    pub fn listgroup_range(range: impl AsRef<str>) -> Result<Self, InvalidListGroupRange> {
+        Ok(Self::ListGroup {
+            group: None,
+            range: Some(ListGroupRange::from_owned(range)?),
+        })
+    }
+
+    /// Build a LISTGROUP request with explicit group and range arguments.
+    pub fn listgroup_group_range(
+        group: impl AsRef<str>,
+        range: impl AsRef<str>,
+    ) -> Result<Self, InvalidListGroupRangeOrGroupName> {
+        Ok(Self::ListGroup {
+            group: Some(
+                GroupName::from_owned(group)
+                    .map_err(InvalidListGroupRangeOrGroupName::GroupName)?,
+            ),
+            range: Some(
+                ListGroupRange::from_owned(range)
+                    .map_err(InvalidListGroupRangeOrGroupName::Range)?,
+            ),
+        })
     }
 
     /// Build a LAST request.
@@ -1780,6 +1915,23 @@ fn write_two_arg_request_wire(output: &mut Vec<u8>, verb: &[u8], left: &str, rig
     output.extend_from_slice(b"\r\n");
 }
 
+fn write_listgroup_request_wire(
+    output: &mut Vec<u8>,
+    group: Option<&GroupName<'_>>,
+    range: Option<&ListGroupRange<'_>>,
+) {
+    output.extend_from_slice(b"LISTGROUP");
+    if let Some(group) = group {
+        output.push(b' ');
+        output.extend_from_slice(group.as_str().as_bytes());
+    }
+    if let Some(range) = range {
+        output.push(b' ');
+        output.extend_from_slice(range.as_str().as_bytes());
+    }
+    output.extend_from_slice(b"\r\n");
+}
+
 fn write_datetime_request_wire(
     output: &mut Vec<u8>,
     verb: &[u8],
@@ -2085,6 +2237,11 @@ mod tests {
             (b"GROUP alt.test".as_slice(), RequestKind::Group),
             (b"LISTGROUP".as_slice(), RequestKind::ListGroup),
             (b"LISTGROUP alt.test".as_slice(), RequestKind::ListGroup),
+            (b"LISTGROUP 1-".as_slice(), RequestKind::ListGroup),
+            (
+                b"LISTGROUP alt.test 1-10".as_slice(),
+                RequestKind::ListGroup,
+            ),
             (b"LAST".as_slice(), RequestKind::Last),
             (b"NEXT".as_slice(), RequestKind::Next),
             (b"LIST".as_slice(), RequestKind::List),
@@ -2220,8 +2377,20 @@ mod tests {
         };
         let listgroup = Request::ListGroup {
             group: Some(GroupName::from_borrowed("alt.test").unwrap()),
+            range: None,
         };
-        let listgroup_current = Request::ListGroup { group: None };
+        let listgroup_current = Request::ListGroup {
+            group: None,
+            range: None,
+        };
+        let listgroup_current_range = Request::ListGroup {
+            group: None,
+            range: Some(ListGroupRange::from_borrowed("1-").unwrap()),
+        };
+        let listgroup_group_range = Request::ListGroup {
+            group: Some(GroupName::from_borrowed("alt.test").unwrap()),
+            range: Some(ListGroupRange::from_borrowed("1-10").unwrap()),
+        };
         let last = Request::Last;
         let next = Request::Next;
         let over = Request::Over {
@@ -2336,6 +2505,16 @@ mod tests {
         listgroup_current.write_wire_to(&mut wire);
         assert_eq!(listgroup_current.kind(), RequestKind::ListGroup);
         assert_eq!(wire, b"LISTGROUP\r\n");
+
+        wire.clear();
+        listgroup_current_range.write_wire_to(&mut wire);
+        assert_eq!(listgroup_current_range.kind(), RequestKind::ListGroup);
+        assert_eq!(wire, b"LISTGROUP 1-\r\n");
+
+        wire.clear();
+        listgroup_group_range.write_wire_to(&mut wire);
+        assert_eq!(listgroup_group_range.kind(), RequestKind::ListGroup);
+        assert_eq!(wire, b"LISTGROUP alt.test 1-10\r\n");
 
         wire.clear();
         last.write_wire_to(&mut wire);
@@ -2493,6 +2672,8 @@ mod tests {
         let group = Request::group("alt.test").unwrap();
         let listgroup = Request::listgroup("alt.test").unwrap();
         let listgroup_current = Request::listgroup_current();
+        let listgroup_range = Request::listgroup_range("1-").unwrap();
+        let listgroup_group_range = Request::listgroup_group_range("alt.test", "1-10").unwrap();
         let last = Request::last();
         let next = Request::next();
         let over = Request::over("1-10").unwrap();
@@ -2549,6 +2730,22 @@ mod tests {
         );
         assert_eq!(listgroup_current.kind(), RequestKind::ListGroup);
         assert!(listgroup_current.group_name().is_none());
+        assert_eq!(
+            listgroup_range
+                .listgroup_range_arg()
+                .map(ListGroupRange::as_str),
+            Some("1-")
+        );
+        assert_eq!(
+            listgroup_group_range.group_name().map(GroupName::as_str),
+            Some("alt.test")
+        );
+        assert_eq!(
+            listgroup_group_range
+                .listgroup_range_arg()
+                .map(ListGroupRange::as_str),
+            Some("1-10")
+        );
         assert_eq!(last.kind(), RequestKind::Last);
         assert!(last.group_name().is_none());
         assert_eq!(next.kind(), RequestKind::Next);
@@ -2682,6 +2879,9 @@ mod tests {
         assert!(Request::body_selector("1-10").is_err());
         assert!(Request::group("").is_err());
         assert!(Request::listgroup("<a@b>").is_err());
+        assert!(Request::listgroup_range("0").is_err());
+        assert!(Request::listgroup_range("-10").is_err());
+        assert!(Request::listgroup_range("1-10-20").is_err());
         assert!(Request::over("1 2").is_err());
         assert!(Request::xover("").is_err());
         assert!(Request::hdr("Bad Header", "1").is_err());
@@ -2711,6 +2911,8 @@ mod tests {
             Request::group("alt.test").unwrap(),
             Request::listgroup("alt.test").unwrap(),
             Request::listgroup_current(),
+            Request::listgroup_range("1-").unwrap(),
+            Request::listgroup_group_range("alt.test", "1-10").unwrap(),
             Request::last(),
             Request::next(),
             Request::over("1-10").unwrap(),

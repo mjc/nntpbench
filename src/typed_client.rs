@@ -13,7 +13,7 @@ use crate::protocol::{ArticleRef, Request};
 use crate::tail_buffer::{TailBuffer, TerminatorStatus};
 use crate::{
     Article, ArticleParseError, ArticleSelector, ArticleTransfer, AuthInfoValue, GroupName,
-    HeaderName, MessageId, NntpDate, NntpTime, RequestKind, StatusCode, Wildmat,
+    HeaderName, ListGroupRange, MessageId, NntpDate, NntpTime, RequestKind, StatusCode, Wildmat,
 };
 
 /// Options for the typed one-connection client prototype.
@@ -325,6 +325,27 @@ impl Client {
         self.execute_raw(Request::listgroup_current()).await
     }
 
+    /// Send a LISTGROUP request for the current selected group with a range filter and return the owned raw response frame.
+    pub async fn listgroup_range(
+        &self,
+        range: impl AsRef<str>,
+    ) -> Result<OwnedResponse, TypedClientError> {
+        let request =
+            Request::listgroup_range(range).map_err(|_| TypedClientError::InvalidListGroupRange)?;
+        self.execute_raw(request).await
+    }
+
+    /// Send a LISTGROUP request with explicit group and range arguments and return the owned raw response frame.
+    pub async fn listgroup_group_range(
+        &self,
+        group: impl AsRef<str>,
+        range: impl AsRef<str>,
+    ) -> Result<OwnedResponse, TypedClientError> {
+        let request =
+            Request::listgroup_group_range(group, range).map_err(TypedClientError::from)?;
+        self.execute_raw(request).await
+    }
+
     /// Send a LISTGROUP request and return the completed raw request/response pair.
     pub async fn listgroup_exchange(
         &self,
@@ -338,6 +359,27 @@ impl Client {
     pub async fn listgroup_current_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
         self.execute_raw_exchange(Request::listgroup_current())
             .await
+    }
+
+    /// Send a LISTGROUP request for the current selected group with a range filter and return the completed raw request/response pair.
+    pub async fn listgroup_range_exchange(
+        &self,
+        range: impl AsRef<str>,
+    ) -> Result<OwnedExchange, TypedClientError> {
+        let request =
+            Request::listgroup_range(range).map_err(|_| TypedClientError::InvalidListGroupRange)?;
+        self.execute_raw_exchange(request).await
+    }
+
+    /// Send a LISTGROUP request with explicit group and range arguments and return the completed raw request/response pair.
+    pub async fn listgroup_group_range_exchange(
+        &self,
+        group: impl AsRef<str>,
+        range: impl AsRef<str>,
+    ) -> Result<OwnedExchange, TypedClientError> {
+        let request =
+            Request::listgroup_group_range(group, range).map_err(TypedClientError::from)?;
+        self.execute_raw_exchange(request).await
     }
 
     /// Send a LAST request and return the owned raw response frame.
@@ -1086,8 +1128,10 @@ impl TypedClientConnection {
         &self,
         group: GroupName<'static>,
     ) -> Result<OwnedResponse, TypedClientError> {
-        self.execute(Request::ListGroup { group: Some(group) })
-            .await
+        self.execute(
+            Request::listgroup(group.as_str()).map_err(|_| TypedClientError::InvalidGroupName)?,
+        )
+        .await
     }
 
     /// Send a LISTGROUP request for the current selected group and return the owned response frame.
@@ -1095,18 +1139,70 @@ impl TypedClientConnection {
         self.execute(Request::listgroup_current()).await
     }
 
+    /// Send a LISTGROUP request for the current selected group with a range filter and return the owned response frame.
+    pub async fn listgroup_range(
+        &self,
+        range: ListGroupRange<'static>,
+    ) -> Result<OwnedResponse, TypedClientError> {
+        self.execute(
+            Request::listgroup_range(range.as_str())
+                .map_err(|_| TypedClientError::InvalidListGroupRange)?,
+        )
+        .await
+    }
+
+    /// Send a LISTGROUP request with explicit group and range arguments and return the owned response frame.
+    pub async fn listgroup_group_range(
+        &self,
+        group: GroupName<'static>,
+        range: ListGroupRange<'static>,
+    ) -> Result<OwnedResponse, TypedClientError> {
+        self.execute(
+            Request::listgroup_group_range(group.as_str(), range.as_str())
+                .map_err(TypedClientError::from)?,
+        )
+        .await
+    }
+
     /// Send a LISTGROUP request and return the completed request/response pair.
     pub async fn listgroup_exchange(
         &self,
         group: GroupName<'static>,
     ) -> Result<OwnedExchange, TypedClientError> {
-        self.execute_exchange(Request::ListGroup { group: Some(group) })
-            .await
+        self.execute_exchange(
+            Request::listgroup(group.as_str()).map_err(|_| TypedClientError::InvalidGroupName)?,
+        )
+        .await
     }
 
     /// Send a LISTGROUP request for the current selected group and return the completed request/response pair.
     pub async fn listgroup_current_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
         self.execute_exchange(Request::listgroup_current()).await
+    }
+
+    /// Send a LISTGROUP request for the current selected group with a range filter and return the completed request/response pair.
+    pub async fn listgroup_range_exchange(
+        &self,
+        range: ListGroupRange<'static>,
+    ) -> Result<OwnedExchange, TypedClientError> {
+        self.execute_exchange(
+            Request::listgroup_range(range.as_str())
+                .map_err(|_| TypedClientError::InvalidListGroupRange)?,
+        )
+        .await
+    }
+
+    /// Send a LISTGROUP request with explicit group and range arguments and return the completed request/response pair.
+    pub async fn listgroup_group_range_exchange(
+        &self,
+        group: GroupName<'static>,
+        range: ListGroupRange<'static>,
+    ) -> Result<OwnedExchange, TypedClientError> {
+        self.execute_exchange(
+            Request::listgroup_group_range(group.as_str(), range.as_str())
+                .map_err(TypedClientError::from)?,
+        )
+        .await
     }
 
     /// Send a LAST request and return the owned response frame.
@@ -1857,6 +1953,7 @@ pub enum TypedClientError {
     MissingHeaderName,
     InvalidArticleSelector,
     MissingArticleSelector,
+    InvalidListGroupRange,
     ConnectionClosed,
     UnexpectedArticleResponse {
         response: OwnedResponse,
@@ -1889,6 +1986,7 @@ impl fmt::Display for TypedClientError {
             Self::MissingArticleSelector => {
                 write!(f, "article selector is required for this request")
             }
+            Self::InvalidListGroupRange => write!(f, "invalid LISTGROUP range"),
             Self::ConnectionClosed => write!(f, "connection engine closed"),
             Self::UnexpectedArticleResponse { response, source } => write!(
                 f,
@@ -1940,6 +2038,25 @@ impl From<crate::protocol::InvalidDiscoveryArguments> for TypedClientError {
 impl From<crate::protocol::InvalidAuthInfoValue> for TypedClientError {
     fn from(_: crate::protocol::InvalidAuthInfoValue) -> Self {
         Self::InvalidAuthInfoValue
+    }
+}
+
+impl From<crate::protocol::InvalidListGroupRange> for TypedClientError {
+    fn from(_: crate::protocol::InvalidListGroupRange) -> Self {
+        Self::InvalidListGroupRange
+    }
+}
+
+impl From<crate::protocol::InvalidListGroupRangeOrGroupName> for TypedClientError {
+    fn from(value: crate::protocol::InvalidListGroupRangeOrGroupName) -> Self {
+        match value {
+            crate::protocol::InvalidListGroupRangeOrGroupName::Range(_) => {
+                Self::InvalidListGroupRange
+            }
+            crate::protocol::InvalidListGroupRangeOrGroupName::GroupName(_) => {
+                Self::InvalidGroupName
+            }
+        }
     }
 }
 
@@ -2335,6 +2452,7 @@ fn shared_engine_error_from_typed(err: TypedClientError) -> SharedEngineError {
         | TypedClientError::MissingHeaderName
         | TypedClientError::InvalidArticleSelector
         | TypedClientError::MissingArticleSelector
+        | TypedClientError::InvalidListGroupRange
         | TypedClientError::UnexpectedArticleResponse { .. } => SharedEngineError::ConnectionClosed,
     }
 }
@@ -2822,7 +2940,9 @@ mod tests {
             stream.write_all(crate::GROUP_RESPONSE).await.unwrap();
             assert_read_request(&mut stream, b"LISTGROUP\r\n").await;
             stream.write_all(crate::LISTGROUP_RESPONSE).await.unwrap();
-            assert_read_request(&mut stream, b"LISTGROUP alt.test\r\n").await;
+            assert_read_request(&mut stream, b"LISTGROUP 1-\r\n").await;
+            stream.write_all(crate::LISTGROUP_RESPONSE).await.unwrap();
+            assert_read_request(&mut stream, b"LISTGROUP alt.test 1-10\r\n").await;
             stream.write_all(crate::LISTGROUP_RESPONSE).await.unwrap();
             assert_read_request(&mut stream, b"LAST\r\n").await;
             stream.write_all(crate::LAST_RESPONSE).await.unwrap();
@@ -2836,8 +2956,15 @@ mod tests {
             .await
             .unwrap();
         let listgroup_current = connection.listgroup_current().await.unwrap();
+        let listgroup_range = connection
+            .listgroup_range(ListGroupRange::from_owned("1-").unwrap())
+            .await
+            .unwrap();
         let listgroup = connection
-            .listgroup(GroupName::from_owned("alt.test").unwrap())
+            .listgroup_group_range(
+                GroupName::from_owned("alt.test").unwrap(),
+                ListGroupRange::from_owned("1-10").unwrap(),
+            )
             .await
             .unwrap();
         let last = connection.last().await.unwrap();
@@ -2849,6 +2976,9 @@ mod tests {
         assert_eq!(listgroup_current.kind(), RequestKind::ListGroup);
         assert_eq!(listgroup_current.status().as_u16(), 211);
         assert_eq!(listgroup_current.as_bytes(), crate::LISTGROUP_RESPONSE);
+        assert_eq!(listgroup_range.kind(), RequestKind::ListGroup);
+        assert_eq!(listgroup_range.status().as_u16(), 211);
+        assert_eq!(listgroup_range.as_bytes(), crate::LISTGROUP_RESPONSE);
         assert_eq!(listgroup.kind(), RequestKind::ListGroup);
         assert_eq!(listgroup.status().as_u16(), 211);
         assert_eq!(listgroup.as_bytes(), crate::LISTGROUP_RESPONSE);
@@ -3293,7 +3423,9 @@ mod tests {
             stream.write_all(crate::GROUP_RESPONSE).await.unwrap();
             assert_read_request(&mut stream, b"LISTGROUP\r\n").await;
             stream.write_all(crate::LISTGROUP_RESPONSE).await.unwrap();
-            assert_read_request(&mut stream, b"LISTGROUP alt.test\r\n").await;
+            assert_read_request(&mut stream, b"LISTGROUP 1-\r\n").await;
+            stream.write_all(crate::LISTGROUP_RESPONSE).await.unwrap();
+            assert_read_request(&mut stream, b"LISTGROUP alt.test 1-10\r\n").await;
             stream.write_all(crate::LISTGROUP_RESPONSE).await.unwrap();
             assert_read_request(&mut stream, b"LAST\r\n").await;
             stream.write_all(crate::LAST_RESPONSE).await.unwrap();
@@ -3304,7 +3436,11 @@ mod tests {
         let client = Client::connect(addr).await.unwrap();
         let group = client.group("alt.test").await.unwrap();
         let listgroup_current = client.listgroup_current().await.unwrap();
-        let listgroup = client.listgroup("alt.test").await.unwrap();
+        let listgroup_range = client.listgroup_range("1-").await.unwrap();
+        let listgroup = client
+            .listgroup_group_range("alt.test", "1-10")
+            .await
+            .unwrap();
         let last = client.last().await.unwrap();
         let next = client.next_exchange().await.unwrap();
 
@@ -3312,6 +3448,8 @@ mod tests {
         assert_eq!(group.status().as_u16(), 211);
         assert_eq!(listgroup_current.kind(), RequestKind::ListGroup);
         assert_eq!(listgroup_current.status().as_u16(), 211);
+        assert_eq!(listgroup_range.kind(), RequestKind::ListGroup);
+        assert_eq!(listgroup_range.status().as_u16(), 211);
         assert_eq!(listgroup.kind(), RequestKind::ListGroup);
         assert_eq!(listgroup.status().as_u16(), 211);
         assert_eq!(last.kind(), RequestKind::Last);
