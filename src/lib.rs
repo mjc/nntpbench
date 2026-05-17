@@ -3693,7 +3693,7 @@ mod tests {
         let config = test_config();
         let (output, stats) = run_session_with_input(
             config,
-            b"LIST ACTIVE\r\nLIST ACTIVE.TIMES comp.lang.*\r\nLIST NEWSGROUPS comp.lang.*\r\nLIST OVERVIEW.FMT\r\nLIST HEADERS\r\nLIST DISTRIB.PATS\r\n",
+            b"LIST ACTIVE\r\nLIST ACTIVE.TIMES\r\nLIST ACTIVE.TIMES comp.lang.*\r\nLIST NEWSGROUPS\r\nLIST NEWSGROUPS comp.lang.*\r\nLIST OVERVIEW.FMT\r\nLIST HEADERS\r\nLIST DISTRIB.PATS\r\n",
         )
         .await;
 
@@ -3703,6 +3703,8 @@ mod tests {
                 GREETING,
                 LIST_RESPONSE,
                 LIST_ACTIVE_TIMES_RESPONSE,
+                LIST_ACTIVE_TIMES_RESPONSE,
+                LIST_NEWSGROUPS_RESPONSE,
                 LIST_NEWSGROUPS_RESPONSE,
                 LIST_OVERVIEW_FMT_RESPONSE,
                 LIST_HEADERS_RESPONSE,
@@ -3712,7 +3714,7 @@ mod tests {
         );
 
         let snapshot = stats.snapshot();
-        assert_eq!(snapshot.commands, 6);
+        assert_eq!(snapshot.commands, 8);
         assert_eq!(snapshot.article_requests, 0);
         assert_eq!(snapshot.body_requests, 0);
     }
@@ -3874,32 +3876,44 @@ mod tests {
             let (mut second, _) = listener.accept().await.unwrap();
             second.write_all(b"201 fetch ready\r\n").await.unwrap();
             let read = second.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"LIST ACTIVE.TIMES comp.lang.*\r\n");
+            assert_eq!(&request[..read], b"LIST ACTIVE.TIMES\r\n");
             second.write_all(LIST_ACTIVE_TIMES_RESPONSE).await.unwrap();
 
             let (mut third, _) = listener.accept().await.unwrap();
             third.write_all(b"201 fetch ready\r\n").await.unwrap();
             let read = third.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"LIST NEWSGROUPS comp.lang.*\r\n");
-            third.write_all(LIST_NEWSGROUPS_RESPONSE).await.unwrap();
+            assert_eq!(&request[..read], b"LIST ACTIVE.TIMES comp.lang.*\r\n");
+            third.write_all(LIST_ACTIVE_TIMES_RESPONSE).await.unwrap();
 
             let (mut fourth, _) = listener.accept().await.unwrap();
             fourth.write_all(b"201 fetch ready\r\n").await.unwrap();
             let read = fourth.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"LIST OVERVIEW.FMT\r\n");
-            fourth.write_all(LIST_OVERVIEW_FMT_RESPONSE).await.unwrap();
+            assert_eq!(&request[..read], b"LIST NEWSGROUPS\r\n");
+            fourth.write_all(LIST_NEWSGROUPS_RESPONSE).await.unwrap();
 
             let (mut fifth, _) = listener.accept().await.unwrap();
             fifth.write_all(b"201 fetch ready\r\n").await.unwrap();
             let read = fifth.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"LIST HEADERS\r\n");
-            fifth.write_all(LIST_HEADERS_RESPONSE).await.unwrap();
+            assert_eq!(&request[..read], b"LIST NEWSGROUPS comp.lang.*\r\n");
+            fifth.write_all(LIST_NEWSGROUPS_RESPONSE).await.unwrap();
 
             let (mut sixth, _) = listener.accept().await.unwrap();
             sixth.write_all(b"201 fetch ready\r\n").await.unwrap();
             let read = sixth.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"LIST OVERVIEW.FMT\r\n");
+            sixth.write_all(LIST_OVERVIEW_FMT_RESPONSE).await.unwrap();
+
+            let (mut seventh, _) = listener.accept().await.unwrap();
+            seventh.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = seventh.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"LIST HEADERS\r\n");
+            seventh.write_all(LIST_HEADERS_RESPONSE).await.unwrap();
+
+            let (mut eighth, _) = listener.accept().await.unwrap();
+            eighth.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = eighth.read(&mut request).await.unwrap();
             assert_eq!(&request[..read], b"LIST DISTRIB.PATS\r\n");
-            sixth.write_all(LIST_DISTRIB_PATS_RESPONSE).await.unwrap();
+            eighth.write_all(LIST_DISTRIB_PATS_RESPONSE).await.unwrap();
         });
 
         let mut list_active_args = test_typed_fetch_args();
@@ -3914,19 +3928,42 @@ mod tests {
         list_active_times_args.connect = addr;
         list_active_times_args.request = TypedRequestKind::ListActiveTimes;
         list_active_times_args.message_id = None;
-        list_active_times_args.wildmat = Some("comp.lang.*".to_string());
         let list_active_times = fetch_typed_response(&list_active_times_args).await.unwrap();
         assert_eq!(list_active_times.kind(), RequestKind::ListActiveTimes);
         assert_eq!(list_active_times.status().as_u16(), 215);
+
+        let mut list_active_times_wildmat_args = test_typed_fetch_args();
+        list_active_times_wildmat_args.connect = addr;
+        list_active_times_wildmat_args.request = TypedRequestKind::ListActiveTimes;
+        list_active_times_wildmat_args.message_id = None;
+        list_active_times_wildmat_args.wildmat = Some("comp.lang.*".to_string());
+        let list_active_times_wildmat = fetch_typed_response(&list_active_times_wildmat_args)
+            .await
+            .unwrap();
+        assert_eq!(
+            list_active_times_wildmat.kind(),
+            RequestKind::ListActiveTimes
+        );
+        assert_eq!(list_active_times_wildmat.status().as_u16(), 215);
 
         let mut list_newsgroups_args = test_typed_fetch_args();
         list_newsgroups_args.connect = addr;
         list_newsgroups_args.request = TypedRequestKind::ListNewsgroups;
         list_newsgroups_args.message_id = None;
-        list_newsgroups_args.wildmat = Some("comp.lang.*".to_string());
         let list_newsgroups = fetch_typed_response(&list_newsgroups_args).await.unwrap();
         assert_eq!(list_newsgroups.kind(), RequestKind::ListNewsgroups);
         assert_eq!(list_newsgroups.status().as_u16(), 215);
+
+        let mut list_newsgroups_wildmat_args = test_typed_fetch_args();
+        list_newsgroups_wildmat_args.connect = addr;
+        list_newsgroups_wildmat_args.request = TypedRequestKind::ListNewsgroups;
+        list_newsgroups_wildmat_args.message_id = None;
+        list_newsgroups_wildmat_args.wildmat = Some("comp.lang.*".to_string());
+        let list_newsgroups_wildmat = fetch_typed_response(&list_newsgroups_wildmat_args)
+            .await
+            .unwrap();
+        assert_eq!(list_newsgroups_wildmat.kind(), RequestKind::ListNewsgroups);
+        assert_eq!(list_newsgroups_wildmat.status().as_u16(), 215);
 
         let mut list_overview_fmt_args = test_typed_fetch_args();
         list_overview_fmt_args.connect = addr;
@@ -3971,29 +4008,61 @@ mod tests {
             let (mut second, _) = listener.accept().await.unwrap();
             second.write_all(b"201 fetch ready\r\n").await.unwrap();
             let read = second.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"HDR Message-ID <headers@test>\r\n");
+            second.write_all(HDR_RESPONSE).await.unwrap();
+
+            let (mut third, _) = listener.accept().await.unwrap();
+            third.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = third.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"XHDR Subject 1-10\r\n");
+            third.write_all(XHDR_RESPONSE).await.unwrap();
+
+            let (mut fourth, _) = listener.accept().await.unwrap();
+            fourth.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = fourth.read(&mut request).await.unwrap();
             assert_eq!(&request[..read], b"XHDR Message-ID <headers@test>\r\n");
-            second.write_all(XHDR_RESPONSE).await.unwrap();
+            fourth.write_all(XHDR_RESPONSE).await.unwrap();
         });
 
-        let mut hdr_args = test_typed_fetch_args();
-        hdr_args.connect = addr;
-        hdr_args.request = TypedRequestKind::Hdr;
-        hdr_args.message_id = None;
-        hdr_args.header = Some("Subject".to_string());
-        hdr_args.selector = Some("1-10".to_string());
-        let hdr = fetch_typed_response(&hdr_args).await.unwrap();
-        assert_eq!(hdr.kind(), RequestKind::Hdr);
-        assert_eq!(hdr.status().as_u16(), 225);
+        let mut hdr_range_args = test_typed_fetch_args();
+        hdr_range_args.connect = addr;
+        hdr_range_args.request = TypedRequestKind::Hdr;
+        hdr_range_args.message_id = None;
+        hdr_range_args.header = Some("Subject".to_string());
+        hdr_range_args.selector = Some("1-10".to_string());
+        let hdr_range = fetch_typed_response(&hdr_range_args).await.unwrap();
+        assert_eq!(hdr_range.kind(), RequestKind::Hdr);
+        assert_eq!(hdr_range.status().as_u16(), 225);
 
-        let mut xhdr_args = test_typed_fetch_args();
-        xhdr_args.connect = addr;
-        xhdr_args.request = TypedRequestKind::Xhdr;
-        xhdr_args.message_id = None;
-        xhdr_args.header = Some("Message-ID".to_string());
-        xhdr_args.selector = Some("<headers@test>".to_string());
-        let xhdr = fetch_typed_response(&xhdr_args).await.unwrap();
-        assert_eq!(xhdr.kind(), RequestKind::Xhdr);
-        assert_eq!(xhdr.status().as_u16(), 225);
+        let mut hdr_message_id_args = test_typed_fetch_args();
+        hdr_message_id_args.connect = addr;
+        hdr_message_id_args.request = TypedRequestKind::Hdr;
+        hdr_message_id_args.message_id = None;
+        hdr_message_id_args.header = Some("Message-ID".to_string());
+        hdr_message_id_args.selector = Some("<headers@test>".to_string());
+        let hdr_message_id = fetch_typed_response(&hdr_message_id_args).await.unwrap();
+        assert_eq!(hdr_message_id.kind(), RequestKind::Hdr);
+        assert_eq!(hdr_message_id.status().as_u16(), 225);
+
+        let mut xhdr_range_args = test_typed_fetch_args();
+        xhdr_range_args.connect = addr;
+        xhdr_range_args.request = TypedRequestKind::Xhdr;
+        xhdr_range_args.message_id = None;
+        xhdr_range_args.header = Some("Subject".to_string());
+        xhdr_range_args.selector = Some("1-10".to_string());
+        let xhdr_range = fetch_typed_response(&xhdr_range_args).await.unwrap();
+        assert_eq!(xhdr_range.kind(), RequestKind::Xhdr);
+        assert_eq!(xhdr_range.status().as_u16(), 225);
+
+        let mut xhdr_message_id_args = test_typed_fetch_args();
+        xhdr_message_id_args.connect = addr;
+        xhdr_message_id_args.request = TypedRequestKind::Xhdr;
+        xhdr_message_id_args.message_id = None;
+        xhdr_message_id_args.header = Some("Message-ID".to_string());
+        xhdr_message_id_args.selector = Some("<headers@test>".to_string());
+        let xhdr_message_id = fetch_typed_response(&xhdr_message_id_args).await.unwrap();
+        assert_eq!(xhdr_message_id.kind(), RequestKind::Xhdr);
+        assert_eq!(xhdr_message_id.status().as_u16(), 225);
 
         server.await.unwrap();
     }
@@ -4014,27 +4083,57 @@ mod tests {
             let (mut second, _) = listener.accept().await.unwrap();
             second.write_all(b"201 fetch ready\r\n").await.unwrap();
             let read = second.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"OVER <overview@test>\r\n");
+            second.write_all(OVER_RESPONSE).await.unwrap();
+
+            let (mut third, _) = listener.accept().await.unwrap();
+            third.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = third.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"XOVER 1-10\r\n");
+            third.write_all(XOVER_RESPONSE).await.unwrap();
+
+            let (mut fourth, _) = listener.accept().await.unwrap();
+            fourth.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = fourth.read(&mut request).await.unwrap();
             assert_eq!(&request[..read], b"XOVER <overview@test>\r\n");
-            second.write_all(XOVER_RESPONSE).await.unwrap();
+            fourth.write_all(XOVER_RESPONSE).await.unwrap();
         });
 
-        let mut over_args = test_typed_fetch_args();
-        over_args.connect = addr;
-        over_args.request = TypedRequestKind::Over;
-        over_args.message_id = None;
-        over_args.selector = Some("1-10".to_string());
-        let over = fetch_typed_response(&over_args).await.unwrap();
-        assert_eq!(over.kind(), RequestKind::Over);
-        assert_eq!(over.status().as_u16(), 224);
+        let mut over_range_args = test_typed_fetch_args();
+        over_range_args.connect = addr;
+        over_range_args.request = TypedRequestKind::Over;
+        over_range_args.message_id = None;
+        over_range_args.selector = Some("1-10".to_string());
+        let over_range = fetch_typed_response(&over_range_args).await.unwrap();
+        assert_eq!(over_range.kind(), RequestKind::Over);
+        assert_eq!(over_range.status().as_u16(), 224);
 
-        let mut xover_args = test_typed_fetch_args();
-        xover_args.connect = addr;
-        xover_args.request = TypedRequestKind::Xover;
-        xover_args.message_id = None;
-        xover_args.selector = Some("<overview@test>".to_string());
-        let xover = fetch_typed_response(&xover_args).await.unwrap();
-        assert_eq!(xover.kind(), RequestKind::Xover);
-        assert_eq!(xover.status().as_u16(), 224);
+        let mut over_message_id_args = test_typed_fetch_args();
+        over_message_id_args.connect = addr;
+        over_message_id_args.request = TypedRequestKind::Over;
+        over_message_id_args.message_id = None;
+        over_message_id_args.selector = Some("<overview@test>".to_string());
+        let over_message_id = fetch_typed_response(&over_message_id_args).await.unwrap();
+        assert_eq!(over_message_id.kind(), RequestKind::Over);
+        assert_eq!(over_message_id.status().as_u16(), 224);
+
+        let mut xover_range_args = test_typed_fetch_args();
+        xover_range_args.connect = addr;
+        xover_range_args.request = TypedRequestKind::Xover;
+        xover_range_args.message_id = None;
+        xover_range_args.selector = Some("1-10".to_string());
+        let xover_range = fetch_typed_response(&xover_range_args).await.unwrap();
+        assert_eq!(xover_range.kind(), RequestKind::Xover);
+        assert_eq!(xover_range.status().as_u16(), 224);
+
+        let mut xover_message_id_args = test_typed_fetch_args();
+        xover_message_id_args.connect = addr;
+        xover_message_id_args.request = TypedRequestKind::Xover;
+        xover_message_id_args.message_id = None;
+        xover_message_id_args.selector = Some("<overview@test>".to_string());
+        let xover_message_id = fetch_typed_response(&xover_message_id_args).await.unwrap();
+        assert_eq!(xover_message_id.kind(), RequestKind::Xover);
+        assert_eq!(xover_message_id.status().as_u16(), 224);
 
         server.await.unwrap();
     }
@@ -4746,18 +4845,31 @@ mod tests {
 
     #[tokio::test]
     async fn serve_session_supports_overview_commands() {
-        let (output, stats) =
-            run_session_with_input(test_config(), b"OVER 1-10\r\nXOVER <overview@test>\r\n").await;
+        let (output, stats) = run_session_with_input(
+            test_config(),
+            b"OVER 1-10\r\nOVER <overview@test>\r\nXOVER 1-10\r\nXOVER <overview@test>\r\n",
+        )
+        .await;
 
-        assert_eq!(output, [GREETING, OVER_RESPONSE, XOVER_RESPONSE].concat());
-        assert_eq!(stats.snapshot().commands, 2);
+        assert_eq!(
+            output,
+            [
+                GREETING,
+                OVER_RESPONSE,
+                OVER_RESPONSE,
+                XOVER_RESPONSE,
+                XOVER_RESPONSE
+            ]
+            .concat()
+        );
+        assert_eq!(stats.snapshot().commands, 4);
     }
 
     #[tokio::test]
     async fn serve_session_supports_group_navigation_commands() {
         let (output, stats) = run_session_with_input(
             test_config(),
-            b"GROUP alt.test\r\nLISTGROUP alt.test\r\nLAST\r\nNEXT\r\n",
+            b"GROUP alt.test\r\nLISTGROUP\r\nLISTGROUP alt.test\r\nLISTGROUP 1-\r\nLISTGROUP alt.test 1-10\r\nLAST\r\nNEXT\r\n",
         )
         .await;
 
@@ -4767,12 +4879,15 @@ mod tests {
                 GREETING,
                 GROUP_RESPONSE,
                 LISTGROUP_RESPONSE,
+                LISTGROUP_RESPONSE,
+                LISTGROUP_RESPONSE,
+                LISTGROUP_RESPONSE,
                 LAST_RESPONSE,
                 NEXT_RESPONSE,
             ]
             .concat()
         );
-        assert_eq!(stats.snapshot().commands, 4);
+        assert_eq!(stats.snapshot().commands, 7);
     }
 
     #[tokio::test]
@@ -5038,7 +5153,19 @@ mod tests {
             &mut output,
         ));
         assert!(!process_request_to_buffer(
+            RequestLine::parse(b"LIST ACTIVE.TIMES"),
+            &config,
+            &stats,
+            &mut output,
+        ));
+        assert!(!process_request_to_buffer(
             RequestLine::parse(b"LIST ACTIVE.TIMES comp.lang.*"),
+            &config,
+            &stats,
+            &mut output,
+        ));
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"LIST NEWSGROUPS"),
             &config,
             &stats,
             &mut output,
@@ -5091,6 +5218,8 @@ mod tests {
             [
                 LIST_RESPONSE,
                 LIST_ACTIVE_TIMES_RESPONSE,
+                LIST_ACTIVE_TIMES_RESPONSE,
+                LIST_NEWSGROUPS_RESPONSE,
                 LIST_NEWSGROUPS_RESPONSE,
                 LIST_OVERVIEW_FMT_RESPONSE,
                 LIST_HEADERS_RESPONSE,
@@ -5101,7 +5230,7 @@ mod tests {
             ]
             .concat()
         );
-        assert_eq!(stats.snapshot().commands, 9);
+        assert_eq!(stats.snapshot().commands, 11);
     }
 
     #[test]
@@ -5189,14 +5318,29 @@ mod tests {
             &mut output,
         ));
         assert!(!process_request_to_buffer(
+            RequestLine::parse(b"OVER <overview@test>"),
+            &config,
+            &stats,
+            &mut output,
+        ));
+        assert!(!process_request_to_buffer(
             RequestLine::parse(b"XOVER 1-10"),
             &config,
             &stats,
             &mut output,
         ));
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"XOVER <overview@test>"),
+            &config,
+            &stats,
+            &mut output,
+        ));
 
-        assert_eq!(output, [OVER_RESPONSE, XOVER_RESPONSE].concat());
-        assert_eq!(stats.snapshot().commands, 2);
+        assert_eq!(
+            output,
+            [OVER_RESPONSE, OVER_RESPONSE, XOVER_RESPONSE, XOVER_RESPONSE].concat()
+        );
+        assert_eq!(stats.snapshot().commands, 4);
     }
 
     #[test]
@@ -5224,6 +5368,18 @@ mod tests {
             &mut output,
         ));
         assert!(!process_request_to_buffer(
+            RequestLine::parse(b"LISTGROUP 1-"),
+            &config,
+            &stats,
+            &mut output,
+        ));
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"LISTGROUP alt.binaries.test 1-10"),
+            &config,
+            &stats,
+            &mut output,
+        ));
+        assert!(!process_request_to_buffer(
             RequestLine::parse(b"LAST"),
             &config,
             &stats,
@@ -5242,12 +5398,14 @@ mod tests {
                 GROUP_RESPONSE,
                 LISTGROUP_RESPONSE,
                 LISTGROUP_RESPONSE,
+                LISTGROUP_RESPONSE,
+                LISTGROUP_RESPONSE,
                 LAST_RESPONSE,
                 NEXT_RESPONSE
             ]
             .concat()
         );
-        assert_eq!(stats.snapshot().commands, 5);
+        assert_eq!(stats.snapshot().commands, 7);
     }
 
     #[test]

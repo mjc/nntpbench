@@ -2809,9 +2809,19 @@ mod tests {
             stream.write_all(crate::LIST_RESPONSE).await.unwrap();
             assert_read_request(&mut stream, b"LIST ACTIVE\r\n").await;
             stream.write_all(crate::LIST_RESPONSE).await.unwrap();
+            assert_read_request(&mut stream, b"LIST ACTIVE.TIMES\r\n").await;
+            stream
+                .write_all(crate::LIST_ACTIVE_TIMES_RESPONSE)
+                .await
+                .unwrap();
             assert_read_request(&mut stream, b"LIST ACTIVE.TIMES comp.lang.*\r\n").await;
             stream
                 .write_all(crate::LIST_ACTIVE_TIMES_RESPONSE)
+                .await
+                .unwrap();
+            assert_read_request(&mut stream, b"LIST NEWSGROUPS\r\n").await;
+            stream
+                .write_all(crate::LIST_NEWSGROUPS_RESPONSE)
                 .await
                 .unwrap();
             assert_read_request(&mut stream, b"LIST NEWSGROUPS comp.lang.*\r\n").await;
@@ -2855,11 +2865,13 @@ mod tests {
         let connection = TypedClientConnection::connect(addr).await.unwrap();
         let list = connection.list().await.unwrap();
         let list_active = connection.list_active().await.unwrap();
-        let list_active_times = connection
+        let list_active_times = connection.list_active_times().await.unwrap();
+        let list_active_times_wildmat = connection
             .list_active_times_wildmat(Wildmat::from_borrowed("comp.lang.*").unwrap())
             .await
             .unwrap();
-        let list_newsgroups = connection
+        let list_newsgroups = connection.list_newsgroups().await.unwrap();
+        let list_newsgroups_wildmat = connection
             .list_newsgroups_wildmat(Wildmat::from_borrowed("comp.lang.*").unwrap())
             .await
             .unwrap();
@@ -2884,9 +2896,24 @@ mod tests {
             list_active_times.as_bytes(),
             crate::LIST_ACTIVE_TIMES_RESPONSE
         );
+        assert_eq!(
+            list_active_times_wildmat.kind(),
+            RequestKind::ListActiveTimes
+        );
+        assert_eq!(list_active_times_wildmat.status().as_u16(), 215);
+        assert_eq!(
+            list_active_times_wildmat.as_bytes(),
+            crate::LIST_ACTIVE_TIMES_RESPONSE
+        );
         assert_eq!(list_newsgroups.kind(), RequestKind::ListNewsgroups);
         assert_eq!(list_newsgroups.status().as_u16(), 215);
         assert_eq!(list_newsgroups.as_bytes(), crate::LIST_NEWSGROUPS_RESPONSE);
+        assert_eq!(list_newsgroups_wildmat.kind(), RequestKind::ListNewsgroups);
+        assert_eq!(list_newsgroups_wildmat.status().as_u16(), 215);
+        assert_eq!(
+            list_newsgroups_wildmat.as_bytes(),
+            crate::LIST_NEWSGROUPS_RESPONSE
+        );
         assert_eq!(list_overview_fmt.kind(), RequestKind::ListOverviewFmt);
         assert_eq!(list_overview_fmt.status().as_u16(), 215);
         assert_eq!(
@@ -3119,19 +3146,37 @@ mod tests {
             stream.write_all(b"201 typed ready\r\n").await.unwrap();
             assert_read_request(&mut stream, b"HDR Subject 1-10\r\n").await;
             stream.write_all(crate::HDR_RESPONSE).await.unwrap();
+            assert_read_request(&mut stream, b"HDR Message-ID <headers@test>\r\n").await;
+            stream.write_all(crate::HDR_RESPONSE).await.unwrap();
+            assert_read_request(&mut stream, b"XHDR Subject 1-10\r\n").await;
+            stream.write_all(crate::XHDR_RESPONSE).await.unwrap();
             assert_read_request(&mut stream, b"XHDR Message-ID <headers@test>\r\n").await;
             stream.write_all(crate::XHDR_RESPONSE).await.unwrap();
         });
 
         let connection = TypedClientConnection::connect(addr).await.unwrap();
-        let hdr = connection
+        let hdr_range = connection
             .hdr(
                 HeaderName::from_owned("Subject").unwrap(),
                 ArticleSelector::from_owned("1-10").unwrap(),
             )
             .await
             .unwrap();
-        let xhdr = connection
+        let hdr_message_id = connection
+            .hdr(
+                HeaderName::from_owned("Message-ID").unwrap(),
+                ArticleSelector::from_owned("<headers@test>").unwrap(),
+            )
+            .await
+            .unwrap();
+        let xhdr_range = connection
+            .xhdr(
+                HeaderName::from_owned("Subject").unwrap(),
+                ArticleSelector::from_owned("1-10").unwrap(),
+            )
+            .await
+            .unwrap();
+        let xhdr_message_id = connection
             .xhdr(
                 HeaderName::from_owned("Message-ID").unwrap(),
                 ArticleSelector::from_owned("<headers@test>").unwrap(),
@@ -3139,12 +3184,18 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(hdr.kind(), RequestKind::Hdr);
-        assert_eq!(hdr.status().as_u16(), 225);
-        assert_eq!(hdr.as_bytes(), crate::HDR_RESPONSE);
-        assert_eq!(xhdr.kind(), RequestKind::Xhdr);
-        assert_eq!(xhdr.status().as_u16(), 225);
-        assert_eq!(xhdr.as_bytes(), crate::XHDR_RESPONSE);
+        assert_eq!(hdr_range.kind(), RequestKind::Hdr);
+        assert_eq!(hdr_range.status().as_u16(), 225);
+        assert_eq!(hdr_range.as_bytes(), crate::HDR_RESPONSE);
+        assert_eq!(hdr_message_id.kind(), RequestKind::Hdr);
+        assert_eq!(hdr_message_id.status().as_u16(), 225);
+        assert_eq!(hdr_message_id.as_bytes(), crate::HDR_RESPONSE);
+        assert_eq!(xhdr_range.kind(), RequestKind::Xhdr);
+        assert_eq!(xhdr_range.status().as_u16(), 225);
+        assert_eq!(xhdr_range.as_bytes(), crate::XHDR_RESPONSE);
+        assert_eq!(xhdr_message_id.kind(), RequestKind::Xhdr);
+        assert_eq!(xhdr_message_id.status().as_u16(), 225);
+        assert_eq!(xhdr_message_id.as_bytes(), crate::XHDR_RESPONSE);
 
         server.await.unwrap();
     }
@@ -3158,26 +3209,44 @@ mod tests {
             stream.write_all(b"201 typed ready\r\n").await.unwrap();
             assert_read_request(&mut stream, b"OVER 1-10\r\n").await;
             stream.write_all(crate::OVER_RESPONSE).await.unwrap();
+            assert_read_request(&mut stream, b"OVER <overview@test>\r\n").await;
+            stream.write_all(crate::OVER_RESPONSE).await.unwrap();
+            assert_read_request(&mut stream, b"XOVER 1-10\r\n").await;
+            stream.write_all(crate::XOVER_RESPONSE).await.unwrap();
             assert_read_request(&mut stream, b"XOVER <overview@test>\r\n").await;
             stream.write_all(crate::XOVER_RESPONSE).await.unwrap();
         });
 
         let connection = TypedClientConnection::connect(addr).await.unwrap();
-        let over = connection
+        let over_range = connection
             .over(ArticleSelector::from_owned("1-10").unwrap())
             .await
             .unwrap();
-        let xover = connection
+        let over_message_id = connection
+            .over(ArticleSelector::from_owned("<overview@test>").unwrap())
+            .await
+            .unwrap();
+        let xover_range = connection
+            .xover(ArticleSelector::from_owned("1-10").unwrap())
+            .await
+            .unwrap();
+        let xover_message_id = connection
             .xover(ArticleSelector::from_owned("<overview@test>").unwrap())
             .await
             .unwrap();
 
-        assert_eq!(over.kind(), RequestKind::Over);
-        assert_eq!(over.status().as_u16(), 224);
-        assert_eq!(over.as_bytes(), crate::OVER_RESPONSE);
-        assert_eq!(xover.kind(), RequestKind::Xover);
-        assert_eq!(xover.status().as_u16(), 224);
-        assert_eq!(xover.as_bytes(), crate::XOVER_RESPONSE);
+        assert_eq!(over_range.kind(), RequestKind::Over);
+        assert_eq!(over_range.status().as_u16(), 224);
+        assert_eq!(over_range.as_bytes(), crate::OVER_RESPONSE);
+        assert_eq!(over_message_id.kind(), RequestKind::Over);
+        assert_eq!(over_message_id.status().as_u16(), 224);
+        assert_eq!(over_message_id.as_bytes(), crate::OVER_RESPONSE);
+        assert_eq!(xover_range.kind(), RequestKind::Xover);
+        assert_eq!(xover_range.status().as_u16(), 224);
+        assert_eq!(xover_range.as_bytes(), crate::XOVER_RESPONSE);
+        assert_eq!(xover_message_id.kind(), RequestKind::Xover);
+        assert_eq!(xover_message_id.status().as_u16(), 224);
+        assert_eq!(xover_message_id.as_bytes(), crate::XOVER_RESPONSE);
 
         server.await.unwrap();
     }
@@ -3342,9 +3411,19 @@ mod tests {
             stream.write_all(crate::LIST_RESPONSE).await.unwrap();
             assert_read_request(&mut stream, b"LIST ACTIVE\r\n").await;
             stream.write_all(crate::LIST_RESPONSE).await.unwrap();
+            assert_read_request(&mut stream, b"LIST ACTIVE.TIMES\r\n").await;
+            stream
+                .write_all(crate::LIST_ACTIVE_TIMES_RESPONSE)
+                .await
+                .unwrap();
             assert_read_request(&mut stream, b"LIST ACTIVE.TIMES comp.lang.*\r\n").await;
             stream
                 .write_all(crate::LIST_ACTIVE_TIMES_RESPONSE)
+                .await
+                .unwrap();
+            assert_read_request(&mut stream, b"LIST NEWSGROUPS\r\n").await;
+            stream
+                .write_all(crate::LIST_NEWSGROUPS_RESPONSE)
                 .await
                 .unwrap();
             assert_read_request(&mut stream, b"LIST NEWSGROUPS comp.lang.*\r\n").await;
@@ -3379,11 +3458,13 @@ mod tests {
         let client = Client::connect(addr).await.unwrap();
         let list = client.list().await.unwrap();
         let list_active = client.list_active().await.unwrap();
-        let list_active_times = client
+        let list_active_times = client.list_active_times().await.unwrap();
+        let list_active_times_wildmat = client
             .list_active_times_wildmat("comp.lang.*")
             .await
             .unwrap();
-        let list_newsgroups = client.list_newsgroups_wildmat("comp.lang.*").await.unwrap();
+        let list_newsgroups = client.list_newsgroups().await.unwrap();
+        let list_newsgroups_wildmat = client.list_newsgroups_wildmat("comp.lang.*").await.unwrap();
         let list_overview_fmt = client.list_overview_fmt().await.unwrap();
         let list_headers = client.list_headers().await.unwrap();
         let list_distrib_pats = client.list_distrib_pats().await.unwrap();
@@ -3396,8 +3477,15 @@ mod tests {
         assert_eq!(list_active.status().as_u16(), 215);
         assert_eq!(list_active_times.kind(), RequestKind::ListActiveTimes);
         assert_eq!(list_active_times.status().as_u16(), 215);
+        assert_eq!(
+            list_active_times_wildmat.kind(),
+            RequestKind::ListActiveTimes
+        );
+        assert_eq!(list_active_times_wildmat.status().as_u16(), 215);
         assert_eq!(list_newsgroups.kind(), RequestKind::ListNewsgroups);
         assert_eq!(list_newsgroups.status().as_u16(), 215);
+        assert_eq!(list_newsgroups_wildmat.kind(), RequestKind::ListNewsgroups);
+        assert_eq!(list_newsgroups_wildmat.status().as_u16(), 215);
         assert_eq!(list_overview_fmt.kind(), RequestKind::ListOverviewFmt);
         assert_eq!(list_overview_fmt.status().as_u16(), 215);
         assert_eq!(list_headers.kind(), RequestKind::ListHeaders);
@@ -3574,27 +3662,38 @@ mod tests {
             stream.write_all(b"201 typed ready\r\n").await.unwrap();
             assert_read_request(&mut stream, b"HDR Subject 1-10\r\n").await;
             stream.write_all(crate::HDR_RESPONSE).await.unwrap();
+            assert_read_request(&mut stream, b"HDR Message-ID <headers@test>\r\n").await;
+            stream.write_all(crate::HDR_RESPONSE).await.unwrap();
+            assert_read_request(&mut stream, b"XHDR Subject 1-10\r\n").await;
+            stream.write_all(crate::XHDR_RESPONSE).await.unwrap();
             assert_read_request(&mut stream, b"XHDR Message-ID <headers@test>\r\n").await;
             stream.write_all(crate::XHDR_RESPONSE).await.unwrap();
         });
 
         let client = Client::connect(addr).await.unwrap();
-        let hdr = client.hdr("Subject", "1-10").await.unwrap();
-        let xhdr = client
+        let hdr_range = client.hdr("Subject", "1-10").await.unwrap();
+        let hdr_message_id = client.hdr("Message-ID", "<headers@test>").await.unwrap();
+        let xhdr_range = client.xhdr("Subject", "1-10").await.unwrap();
+        let xhdr_message_id = client
             .xhdr_exchange("Message-ID", "<headers@test>")
             .await
             .unwrap();
 
-        assert_eq!(hdr.kind(), RequestKind::Hdr);
-        assert_eq!(hdr.status().as_u16(), 225);
+        assert_eq!(hdr_range.kind(), RequestKind::Hdr);
+        assert_eq!(hdr_range.status().as_u16(), 225);
+        assert_eq!(hdr_message_id.kind(), RequestKind::Hdr);
+        assert_eq!(hdr_message_id.status().as_u16(), 225);
+        assert_eq!(xhdr_range.kind(), RequestKind::Xhdr);
+        assert_eq!(xhdr_range.status().as_u16(), 225);
         assert_eq!(
-            xhdr.request()
+            xhdr_message_id
+                .request()
                 .header_query()
                 .map(|(header, selector)| (header.as_str(), selector.as_str())),
             Some(("Message-ID", "<headers@test>"))
         );
-        assert_eq!(xhdr.response().kind(), RequestKind::Xhdr);
-        assert_eq!(xhdr.response().status().as_u16(), 225);
+        assert_eq!(xhdr_message_id.response().kind(), RequestKind::Xhdr);
+        assert_eq!(xhdr_message_id.response().status().as_u16(), 225);
 
         server.await.unwrap();
     }
@@ -3608,25 +3707,35 @@ mod tests {
             stream.write_all(b"201 typed ready\r\n").await.unwrap();
             assert_read_request(&mut stream, b"OVER 1-10\r\n").await;
             stream.write_all(crate::OVER_RESPONSE).await.unwrap();
+            assert_read_request(&mut stream, b"OVER <overview@test>\r\n").await;
+            stream.write_all(crate::OVER_RESPONSE).await.unwrap();
+            assert_read_request(&mut stream, b"XOVER 1-10\r\n").await;
+            stream.write_all(crate::XOVER_RESPONSE).await.unwrap();
             assert_read_request(&mut stream, b"XOVER <overview@test>\r\n").await;
             stream.write_all(crate::XOVER_RESPONSE).await.unwrap();
         });
 
         let client = Client::connect(addr).await.unwrap();
-        let over = client.over("1-10").await.unwrap();
-        let xover = client.xover_exchange("<overview@test>").await.unwrap();
+        let over_range = client.over("1-10").await.unwrap();
+        let over_message_id = client.over("<overview@test>").await.unwrap();
+        let xover_range = client.xover("1-10").await.unwrap();
+        let xover_message_id = client.xover_exchange("<overview@test>").await.unwrap();
 
-        assert_eq!(over.kind(), RequestKind::Over);
-        assert_eq!(over.status().as_u16(), 224);
+        assert_eq!(over_range.kind(), RequestKind::Over);
+        assert_eq!(over_range.status().as_u16(), 224);
+        assert_eq!(over_message_id.kind(), RequestKind::Over);
+        assert_eq!(over_message_id.status().as_u16(), 224);
+        assert_eq!(xover_range.kind(), RequestKind::Xover);
+        assert_eq!(xover_range.status().as_u16(), 224);
         assert_eq!(
-            xover
+            xover_message_id
                 .request()
                 .overview_selector()
                 .map(ArticleSelector::as_str),
             Some("<overview@test>")
         );
-        assert_eq!(xover.response().kind(), RequestKind::Xover);
-        assert_eq!(xover.response().status().as_u16(), 224);
+        assert_eq!(xover_message_id.response().kind(), RequestKind::Xover);
+        assert_eq!(xover_message_id.response().status().as_u16(), 224);
 
         server.await.unwrap();
     }
