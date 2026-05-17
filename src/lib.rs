@@ -1155,6 +1155,18 @@ fn typed_request_for_command(
     total_clients: usize,
 ) -> io::Result<Request<'static>> {
     let kind = client_command_kind(command_id, mix);
+    if segments.is_none() && command_id != 0 {
+        return match kind {
+            ClientCommandMix::Article | ClientCommandMix::Alternate => {
+                Request::article_number(command_id).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid article number")
+                })
+            }
+            ClientCommandMix::Body => Request::body_number(command_id)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid body number")),
+        };
+    }
+
     let message_id = request_message_id_for_command(
         kind,
         command_id,
@@ -3149,6 +3161,41 @@ mod tests {
     }
 
     #[test]
+    fn typed_request_for_command_prefers_numeric_refs_without_segments() {
+        let article =
+            typed_request_for_command(42, 0, ClientCommandMix::Article, None, 0, 1).unwrap();
+        let body = typed_request_for_command(7, 0, ClientCommandMix::Body, None, 0, 1).unwrap();
+
+        assert_eq!(article.kind(), RequestKind::Article);
+        assert_eq!(article.article_ref(), Some(&ArticleRef::Number(42)));
+        assert!(article.message_id().is_none());
+        assert_eq!(body.kind(), RequestKind::Body);
+        assert_eq!(body.article_ref(), Some(&ArticleRef::Number(7)));
+        assert!(body.message_id().is_none());
+    }
+
+    #[test]
+    fn typed_request_for_command_keeps_message_ids_for_segments_and_zero_id() {
+        let path = write_temp_segments("typed-request", "1\tsegment@test\n");
+        let segments = read_segments(&path).unwrap();
+        fs::remove_file(path).unwrap();
+
+        let segmented =
+            typed_request_for_command(11, 0, ClientCommandMix::Article, Some(&segments), 0, 1)
+                .unwrap();
+        let zero = typed_request_for_command(0, 0, ClientCommandMix::Article, None, 0, 1).unwrap();
+
+        assert_eq!(
+            segmented.message_id().map(MessageId::as_str),
+            Some("<segment@test>")
+        );
+        assert_eq!(
+            zero.message_id().map(MessageId::as_str),
+            Some("<bench.0@nntpbench.local>")
+        );
+    }
+
+    #[test]
     fn process_metrics_helpers_return_sensible_values() {
         assert_eq!(cpu_seconds_since(None), 0.0);
         let start = process_cpu_ticks();
@@ -3309,10 +3356,7 @@ mod tests {
                 pending.extend_from_slice(&scratch[..read]);
             }
 
-            assert_eq!(
-                &pending[..],
-                b"ARTICLE <bench.1@nntpbench.local>\r\nBODY <bench.2@nntpbench.local>\r\n"
-            );
+            assert_eq!(&pending[..], b"ARTICLE 1\r\nBODY 2\r\n");
 
             stream
                 .write_all(
