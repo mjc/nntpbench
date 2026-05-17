@@ -65,6 +65,8 @@ pub const HDR_RESPONSE: &[u8] =
     b"225 headers follow\r\n1 Subject: example one\r\n2 Subject: example two\r\n.\r\n";
 pub const XHDR_RESPONSE: &[u8] =
     b"225 headers follow\r\n1 <one@example>\r\n2 <two@example>\r\n.\r\n";
+pub const HEAD_RESPONSE: &[u8] = b"221 1 <article.1@nntpbench.local> article retrieved\r\nPath: nntpbench.local!mock\r\nFrom: Bench User <bench@nntpbench.local>\r\nNewsgroups: alt.binaries.bench\r\nSubject: nntpbench synthetic article\r\nMessage-ID: <article.1@nntpbench.local>\r\nDate: Fri, 15 May 2026 00:00:00 +0000\r\n.\r\n";
+pub const STAT_RESPONSE: &[u8] = b"223 1 <article.1@nntpbench.local> article retrieved\r\n";
 pub const HELP_RESPONSE: &[u8] =
     b"100 help text follows\r\nLIST\r\nCAPABILITIES\r\nDATE\r\nMODE-READER\r\nQUIT\r\n.\r\n";
 pub const QUIT_RESPONSE: &[u8] = b"205 closing connection\r\n";
@@ -1465,6 +1467,16 @@ where
             .await?;
             Ok(false)
         }
+        RequestKind::Head => {
+            session_stats.article_requests += 1;
+            write_response(writer, pending_write, config.head_response(), session_stats).await?;
+            Ok(false)
+        }
+        RequestKind::Stat => {
+            session_stats.article_requests += 1;
+            write_response(writer, pending_write, config.stat_response(), session_stats).await?;
+            Ok(false)
+        }
         RequestKind::Body => {
             session_stats.body_requests += 1;
             write_response(writer, pending_write, config.body_response(), session_stats).await?;
@@ -1680,6 +1692,14 @@ pub fn process_request_to_buffer(
             stats.article_requests.fetch_add(1, Ordering::Relaxed);
             config.article_response()
         }
+        RequestKind::Head => {
+            stats.article_requests.fetch_add(1, Ordering::Relaxed);
+            config.head_response()
+        }
+        RequestKind::Stat => {
+            stats.article_requests.fetch_add(1, Ordering::Relaxed);
+            config.stat_response()
+        }
         RequestKind::Body => {
             stats.body_requests.fetch_add(1, Ordering::Relaxed);
             config.body_response()
@@ -1861,6 +1881,14 @@ impl ServerConfig {
 
     pub fn body_response(&self) -> &[u8] {
         &self.body
+    }
+
+    pub fn head_response(&self) -> &[u8] {
+        HEAD_RESPONSE
+    }
+
+    pub fn stat_response(&self) -> &[u8] {
+        STAT_RESPONSE
     }
 }
 
@@ -3506,6 +3534,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn serve_session_supports_head_and_stat_requests() {
+        let config = test_config();
+        let (output, stats) = run_session_with_input(
+            config,
+            b"HEAD <typed-head@test>\r\nSTAT <typed-stat@test>\r\n",
+        )
+        .await;
+
+        assert_eq!(output, [GREETING, HEAD_RESPONSE, STAT_RESPONSE].concat());
+
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.commands, 2);
+        assert_eq!(snapshot.article_requests, 2);
+        assert_eq!(snapshot.body_requests, 0);
+    }
+
+    #[tokio::test]
     async fn fetch_typed_response_rejects_invalid_message_id() {
         let mut args = test_typed_fetch_args();
         args.message_id = Some("<bad id>".to_string());
@@ -4280,19 +4325,19 @@ mod tests {
         let caps = text.find("101 Capability").unwrap();
         let date = text.find("111 20260515120000").unwrap();
         let mode = text.find("201 posting not permitted").unwrap();
-        let unknown = text.find("500 unknown").unwrap();
+        let head = text.find("221 1 <article.1@nntpbench.local>").unwrap();
         let quit = text.find("205 closing").unwrap();
         assert!(body < article);
         assert!(article < caps);
         assert!(caps < date);
         assert!(date < mode);
-        assert!(mode < unknown);
-        assert!(unknown < quit);
+        assert!(mode < head);
+        assert!(head < quit);
 
         let snapshot = stats.snapshot();
         assert_eq!(snapshot.commands, 7);
         assert_eq!(snapshot.body_requests, 1);
-        assert_eq!(snapshot.article_requests, 1);
+        assert_eq!(snapshot.article_requests, 2);
         assert_eq!(snapshot.pipeline_batches, 1);
         assert_eq!(snapshot.bytes_sent, output.len() as u64);
     }
@@ -4815,7 +4860,7 @@ mod tests {
     }
 
     #[test]
-    fn process_request_to_buffer_supports_body_capabilities_and_unknown() {
+    fn process_request_to_buffer_supports_body_head_stat_capabilities_and_unknown() {
         let config = test_config();
         let stats = Stats::new();
         let mut output = Vec::new();
@@ -4838,11 +4883,34 @@ mod tests {
             &stats,
             &mut output,
         ));
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"STAT 1"),
+            &config,
+            &stats,
+            &mut output,
+        ));
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"XYZZY 1"),
+            &config,
+            &stats,
+            &mut output,
+        ));
 
         let snapshot = stats.snapshot();
-        assert_eq!(snapshot.commands, 3);
+        assert_eq!(snapshot.commands, 5);
+        assert_eq!(snapshot.article_requests, 2);
         assert_eq!(snapshot.body_requests, 1);
         assert!(output.starts_with(b"222 "));
+        assert!(
+            output
+                .windows(HEAD_RESPONSE.len())
+                .any(|window| window == HEAD_RESPONSE)
+        );
+        assert!(
+            output
+                .windows(STAT_RESPONSE.len())
+                .any(|window| window == STAT_RESPONSE)
+        );
         assert!(output.ends_with(b"500 unknown command\r\n"));
     }
 }
