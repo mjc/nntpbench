@@ -174,21 +174,22 @@ fn bench_connecting_command(
 fn bench_pipeline_mixed(bencher: Bencher) {
     let rt = Builder::new_current_thread().enable_all().build().unwrap();
     let addr = rt.block_on(spawn_server(BODY_64K, ARTICLE_64K));
-    let request = b"BODY <body@nntpbench.local>\r\n\
-ARTICLE <article@nntpbench.local>\r\n\
+    let request = b"BODY 42\r\n\
+ARTICLE\r\n\
 CAPABILITIES\r\n\
 DATE\r\n\
 MODE READER\r\n\
-HEAD 1\r\n\
+HEAD <head@nntpbench.local>\r\n\
+LISTGROUP 1-\r\n\
 QUIT\r\n";
 
     bencher
-        .counter(divan::counter::ItemsCount::new(7usize))
+        .counter(divan::counter::ItemsCount::new(8usize))
         .bench_local(|| {
             black_box(rt.block_on(async {
-                let mut client = BenchClient::connect(addr, BODY_64K + ARTICLE_64K + 2048).await;
+                let mut client = BenchClient::connect(addr, BODY_64K + ARTICLE_64K + 4096).await;
                 client.stream.write_all(request).await.unwrap();
-                let mut response = Vec::with_capacity(BODY_64K + ARTICLE_64K + 2048);
+                let mut response = Vec::with_capacity(BODY_64K + ARTICLE_64K + 4096);
                 client.stream.read_to_end(&mut response).await.unwrap();
                 response.len()
             }))

@@ -160,6 +160,30 @@ fn bench_pipelined_mixed_requests(bencher: Bencher) {
         });
 }
 
+fn bench_pipelined_rfc_grammar_requests(bencher: Bencher) {
+    let harness = TypedHarness::start(BODY_64K, ARTICLE_64K, 4);
+    bencher
+        .counter(divan::counter::ItemsCount::new(4usize))
+        .bench_local(|| {
+            black_box(harness.rt.block_on(async {
+                let (body, article, over, listgroup) = tokio::try_join!(
+                    harness.client.body_selector("42"),
+                    harness.client.article_current(),
+                    harness.client.over("<overview@nntpbench.local>"),
+                    harness
+                        .client
+                        .listgroup_group_range("alt.binaries.bench", "1-10"),
+                )
+                .unwrap();
+
+                body.as_bytes().len()
+                    + article.as_bytes().len()
+                    + over.as_bytes().len()
+                    + listgroup.as_bytes().len()
+            }))
+        });
+}
+
 mod sequential_roundtrip {
     use super::{Bencher, bench_public_article_roundtrip, bench_raw_capabilities_roundtrip};
 
@@ -175,7 +199,10 @@ mod sequential_roundtrip {
 }
 
 mod pipelined_roundtrip {
-    use super::{Bencher, bench_pipelined_body_burst, bench_pipelined_mixed_requests};
+    use super::{
+        Bencher, bench_pipelined_body_burst, bench_pipelined_mixed_requests,
+        bench_pipelined_rfc_grammar_requests,
+    };
 
     #[divan::bench(sample_count = 100, sample_size = 20)]
     fn body_burst_4(bencher: Bencher) {
@@ -185,5 +212,10 @@ mod pipelined_roundtrip {
     #[divan::bench(sample_count = 100, sample_size = 20)]
     fn mixed_4(bencher: Bencher) {
         bench_pipelined_mixed_requests(bencher);
+    }
+
+    #[divan::bench(sample_count = 100, sample_size = 20)]
+    fn rfc_grammar_4(bencher: Bencher) {
+        bench_pipelined_rfc_grammar_requests(bencher);
     }
 }
