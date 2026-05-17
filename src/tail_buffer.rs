@@ -262,4 +262,17 @@ mod tests {
         );
         assert_eq!(find_terminator_content_end(b"body", 0), None);
     }
+
+    #[test]
+    fn terminator_detection_requires_crlf_sequences() {
+        let tail = TailBuffer::default();
+        for data in [
+            b"line1\nline2\n.\n".as_slice(),
+            b"line1\rline2\r.\r".as_slice(),
+            b"line1\r\nline2\n.\r\n".as_slice(),
+        ] {
+            assert!(!tail.detect_terminator(data).is_found(), "{data:?}");
+            assert_eq!(find_terminator_content_end(data, 0), None, "{data:?}");
+        }
+    }
 }

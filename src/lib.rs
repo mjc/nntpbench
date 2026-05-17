@@ -194,13 +194,16 @@ mod proptests {
             let expected_kind = client_command_kind(command_id, mix);
 
             match expected_kind {
-                ClientCommandMix::Article | ClientCommandMix::Alternate => {
+                ClientCommandMix::Article => {
                     prop_assert_eq!(request.kind(), RequestKind::Article);
                     prop_assert_eq!(request.article_ref(), Some(&ArticleRef::Number(command_id)));
                 }
                 ClientCommandMix::Body => {
                     prop_assert_eq!(request.kind(), RequestKind::Body);
                     prop_assert_eq!(request.article_ref(), Some(&ArticleRef::Number(command_id)));
+                }
+                ClientCommandMix::Alternate => {
+                    unreachable!("client_command_kind should normalize Alternate")
                 }
             }
             prop_assert!(request.message_id().is_none());
@@ -1158,11 +1161,14 @@ impl TypedClientSession {
                 .fetch_add(response.bytes_len() as u64, Ordering::Relaxed);
             stats.commands.fetch_add(1, Ordering::Relaxed);
             match client_command_kind(command_id, self.command_mix) {
-                ClientCommandMix::Article | ClientCommandMix::Alternate => {
+                ClientCommandMix::Article => {
                     stats.article_requests.fetch_add(1, Ordering::Relaxed);
                 }
                 ClientCommandMix::Body => {
                     stats.body_requests.fetch_add(1, Ordering::Relaxed);
+                }
+                ClientCommandMix::Alternate => {
+                    unreachable!("client_command_kind should normalize Alternate")
                 }
             }
 
@@ -1236,13 +1242,13 @@ fn typed_request_for_command(
     let kind = client_command_kind(command_id, mix);
     if segments.is_none() && command_id != 0 {
         return match kind {
-            ClientCommandMix::Article | ClientCommandMix::Alternate => {
-                Request::article_number(command_id).map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidData, "invalid article number")
-                })
-            }
+            ClientCommandMix::Article => Request::article_number(command_id)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid article number")),
             ClientCommandMix::Body => Request::body_number(command_id)
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid body number")),
+            ClientCommandMix::Alternate => {
+                unreachable!("client_command_kind should normalize Alternate")
+            }
         };
     }
 
@@ -1255,10 +1261,13 @@ fn typed_request_for_command(
         total_clients,
     )?;
     match kind {
-        ClientCommandMix::Article | ClientCommandMix::Alternate => Request::article(message_id)
+        ClientCommandMix::Article => Request::article(message_id)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid article message-id")),
         ClientCommandMix::Body => Request::body(message_id)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid body message-id")),
+        ClientCommandMix::Alternate => {
+            unreachable!("client_command_kind should normalize Alternate")
+        }
     }
 }
 
@@ -1287,8 +1296,10 @@ fn request_message_id_for_command(
     }
 
     let prefix = match kind {
-        ClientCommandMix::Article | ClientCommandMix::Alternate => "bench.",
-        ClientCommandMix::Body => "bench.",
+        ClientCommandMix::Article | ClientCommandMix::Body => "bench.",
+        ClientCommandMix::Alternate => {
+            unreachable!("client_command_kind should normalize Alternate")
+        }
     };
     Ok(format!("<{prefix}{command_id}@nntpbench.local>"))
 }

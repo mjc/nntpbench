@@ -1177,12 +1177,28 @@ This is the article body.\r\n\
 Multiple lines of text.\r\n\
 .\r\n";
 
+    const VALID_ARTICLE_YENC: &[u8] = b"220 54321 <binary@example.com>\r\n\
+Subject: test.txt (1/1)\r\n\
+From: poster@example.com\r\n\
+Message-ID: <binary@example.com>\r\n\
+\r\n\
+=ybegin line=128 size=12 name=test.txt\r\n\
+r\x8f\x96\x96\x99VJ\xa3o\x98\x8dK\r\n\
+=yend size=12 crc32=0337ab3d\r\n\
+.\r\n";
+
     const VALID_STAT: &[u8] = b"223 12345 <test@example.com>\r\n";
 
     const ARTICLE_BY_MSGID: &[u8] = b"220 0 <msgid@example.com>\r\n\
 Subject: Retrieved by message-ID\r\n\
 \r\n\
 Body\r\n\
+.\r\n";
+
+    const BODY_WITH_HEADERS: &[u8] = b"222 12345 <test@example.com>\r\n\
+Subject: Should be ignored\r\n\
+\r\n\
+Actual body content\r\n\
 .\r\n";
 
     const FOLDED_HEADER: &[u8] = concat!(
@@ -1317,6 +1333,27 @@ Body\r\n\
                 .body
                 .unwrap()
                 .starts_with(b"This is the article body.")
+        );
+    }
+
+    #[test]
+    fn borrowed_nntp_proxy_article_fixtures_preserve_binary_and_body_only_shapes() {
+        let yenc = Article::parse(VALID_ARTICLE_YENC).unwrap();
+        assert_eq!(yenc.article_number, Some(ArticleNumber(54321)));
+        assert_eq!(yenc.message_id.as_str(), "<binary@example.com>");
+        assert_eq!(
+            yenc.headers.unwrap().get("Subject"),
+            Some(&b"test.txt (1/1)"[..])
+        );
+        let yenc_body = yenc.body.unwrap();
+        assert!(yenc_body.starts_with(b"=ybegin"));
+        assert!(yenc_body.windows(5).any(|window| window == b"=yend"));
+
+        let body_only = Article::parse(BODY_WITH_HEADERS).unwrap();
+        assert!(body_only.headers.is_none());
+        assert_eq!(
+            body_only.body,
+            Some(&b"Subject: Should be ignored\r\n\r\nActual body content\r\n"[..])
         );
     }
 

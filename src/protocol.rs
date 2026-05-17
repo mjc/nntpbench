@@ -3060,20 +3060,32 @@ mod tests {
             assert!(!status.is_error(), "{code}");
         }
 
-        for code in [200, 205, 220, 281, 381, 399] {
+        for code in [200, 205, 220, 281, 299, 335, 381, 399] {
             let status = StatusCode(code);
+            assert!(!status.is_informational(), "{code}");
             assert!(status.is_success(), "{code}");
             assert!(!status.is_error(), "{code}");
         }
 
-        for code in [400, 430, 500, 599] {
+        for code in [400, 430, 499, 500, 599] {
             let status = StatusCode(code);
+            assert!(!status.is_informational(), "{code}");
             assert!(status.is_error(), "{code}");
             assert!(!status.is_success(), "{code}");
         }
 
         for (input, expected) in [
             (b"200 Service ready\r\n".as_slice(), Some(StatusCode(200))),
+            (b"200".as_slice(), Some(StatusCode(200))),
+            (b"200 ".as_slice(), Some(StatusCode(200))),
+            (
+                b"200 Welcome! <server@example>\r\n".as_slice(),
+                Some(StatusCode(200)),
+            ),
+            (
+                b"200  multiple  spaces  \r\n".as_slice(),
+                Some(StatusCode(200)),
+            ),
             (b"000".as_slice(), Some(StatusCode(0))),
             (b"999 message\r\n".as_slice(), Some(StatusCode(999))),
             (b"211 42 1 100 alt.test".as_slice(), Some(StatusCode(211))),
@@ -3086,6 +3098,12 @@ mod tests {
         ] {
             assert_eq!(StatusCode::parse(input), expected, "{input:?}");
         }
+
+        let long_msg = format!("200 {}\r\n", "x".repeat(1000));
+        assert_eq!(
+            StatusCode::parse(long_msg.as_bytes()),
+            Some(StatusCode(200))
+        );
     }
 
     #[test]
