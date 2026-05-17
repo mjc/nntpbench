@@ -991,7 +991,7 @@ impl<'a> Article<'a> {
         let separator_pos = find_blank_line(buf, content_start)?;
         let headers = Some(Headers::parse(&buf[content_start..separator_pos + 2])?);
         let body_start = separator_pos + 4;
-        let body_end = find_terminator_content_end(buf, body_start)
+        let body_end = find_article_content_end(buf, body_start)
             .ok_or(ArticleParseError::MissingTerminator)?;
 
         Ok(Self {
@@ -1009,7 +1009,7 @@ impl<'a> Article<'a> {
         if find_blank_line(buf, content_start).is_ok() {
             return Err(ArticleParseError::UnexpectedBody);
         }
-        let headers_end = find_terminator_content_end(buf, content_start)
+        let headers_end = find_article_content_end(buf, content_start)
             .ok_or(ArticleParseError::MissingTerminator)?;
 
         Ok(Self {
@@ -1024,7 +1024,7 @@ impl<'a> Article<'a> {
         let first_line_end = find_line_end(buf, 0)?;
         let (message_id, article_number) = parse_first_line(&buf[..first_line_end])?;
         let body_start = first_line_end + 2;
-        let body_end = find_terminator_content_end(buf, body_start)
+        let body_end = find_article_content_end(buf, body_start)
             .ok_or(ArticleParseError::MissingTerminator)?;
 
         Ok(Self {
@@ -1050,6 +1050,15 @@ impl<'a> Article<'a> {
             body: None,
         })
     }
+}
+
+fn find_article_content_end(buf: &[u8], start: usize) -> Option<usize> {
+    let slice = buf.get(start..)?;
+    if slice.starts_with(b".\r\n") {
+        return Some(start);
+    }
+
+    find_terminator_content_end(buf, start)
 }
 
 fn parse_status_code(buf: &[u8]) -> Result<u16, ArticleParseError> {

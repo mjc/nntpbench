@@ -125,10 +125,6 @@ fn find_terminator_end(data: &[u8]) -> Option<usize> {
 #[inline]
 pub(crate) fn find_terminator_content_end(data: &[u8], start: usize) -> Option<usize> {
     let slice = data.get(start..)?;
-    if slice.starts_with(b".\r\n") {
-        return Some(start);
-    }
-
     find_terminator_end(slice).map(|end| start + end - 3)
 }
 
@@ -251,7 +247,7 @@ mod tests {
 
     #[test]
     fn terminator_content_end_handles_empty_and_non_empty_content() {
-        assert_eq!(find_terminator_content_end(b".\r\n", 0), Some(0));
+        assert_eq!(find_terminator_content_end(b".\r\n", 0), None);
         assert_eq!(
             find_terminator_content_end(b"body\r\n.\r\nnext", 0),
             Some(b"body\r\n".len())
