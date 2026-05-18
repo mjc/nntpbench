@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc ecf67a1b98f3689137d20b19269d7622d27dafdcbbbe44e4e0fd78bae3235986 # shrinks to mut body = [46, 13, 10], trailer = []
+cc d4c0d8a16e5ded5025718b321857c3c8908b31acbe515d730fa1acb1ae830278 # shrinks to mut prefix = [], mut suffix = [13, 10, 46], near_miss = [10, 46, 13, 10], trailer = []
+cc f08fa318ee214f435ebffd8f7d97f85e08841db7a65bb277e8192db1726383ba # shrinks to mut body = [], trailer = [46, 13, 10]
