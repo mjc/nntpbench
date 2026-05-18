@@ -5,8 +5,9 @@
 //! performance-sensitive helper changes stay measurable.
 
 use divan::{Bencher, black_box};
+use nntpbench::protocol::ResponseFrame;
 use nntpbench::terminator::{MultilineTerminatorDetector, TerminatorStatus};
-use nntpbench::{Article, Headers, StatusCode};
+use nntpbench::{Article, Headers, RequestKind, StatusCode};
 
 fn main() {
     divan::main();
@@ -152,6 +153,58 @@ It has multiple lines.\r\n\
     #[divan::bench(sample_count = 1000, sample_size = 100)]
     fn body_empty_content(bencher: Bencher) {
         bencher.bench(|| black_box(Article::parse(black_box(EMPTY_BODY_RESPONSE))));
+    }
+}
+
+mod response_frame_parsing {
+    use super::{Bencher, RequestKind, ResponseFrame, black_box};
+
+    const SINGLE_LINE_RESPONSE: &[u8] = b"223 42 <bench@example.com> article retrieved\r\n";
+    const ERROR_RESPONSE: &[u8] = b"430 no article with that message-id\r\n";
+    const BODY_RESPONSE: &[u8] = b"222 42 <bench@example.com> body follows\r\n\
+This is the benchmark body.\r\n\
+It has multiple lines.\r\n\
+.\r\n";
+    const EMPTY_CAPABILITIES_RESPONSE: &[u8] = b"101 capability list follows\r\n.\r\n";
+
+    #[divan::bench(sample_count = 1000, sample_size = 100)]
+    fn single_line_stat(bencher: Bencher) {
+        bencher.bench(|| {
+            black_box(ResponseFrame::parse(
+                black_box(RequestKind::Stat),
+                black_box(SINGLE_LINE_RESPONSE),
+            ))
+        });
+    }
+
+    #[divan::bench(sample_count = 1000, sample_size = 100)]
+    fn single_line_error(bencher: Bencher) {
+        bencher.bench(|| {
+            black_box(ResponseFrame::parse(
+                black_box(RequestKind::Article),
+                black_box(ERROR_RESPONSE),
+            ))
+        });
+    }
+
+    #[divan::bench(sample_count = 1000, sample_size = 100)]
+    fn multiline_body(bencher: Bencher) {
+        bencher.bench(|| {
+            black_box(ResponseFrame::parse(
+                black_box(RequestKind::Body),
+                black_box(BODY_RESPONSE),
+            ))
+        });
+    }
+
+    #[divan::bench(sample_count = 1000, sample_size = 100)]
+    fn empty_multiline_capabilities(bencher: Bencher) {
+        bencher.bench(|| {
+            black_box(ResponseFrame::parse(
+                black_box(RequestKind::Capabilities),
+                black_box(EMPTY_CAPABILITIES_RESPONSE),
+            ))
+        });
     }
 }
 
