@@ -21,8 +21,14 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio::time;
 
+use crate::terminator::{
+    ResponseLineStatus, append_dot_terminator, detect_response_line_end, find_crlf_line_end,
+    find_dot_terminated_block_end, is_dot_terminator_line, strip_crlf, strip_dot_terminator_suffix,
+    target_before_dot_terminator,
+};
+
 pub mod protocol;
-pub mod tail_buffer;
+pub mod terminator;
 pub mod typed_client;
 
 pub use protocol::{
@@ -683,9 +689,7 @@ pub async fn fetch_typed_response(
     let connection = TypedClientConnection::connect_with_options(
         args.connect,
         TypedClientOptions {
-            read_buffer_bytes: args
-                .read_buffer_bytes
-                .max(tail_buffer::TERMINATOR_TAIL_SIZE),
+            read_buffer_bytes: args.read_buffer_bytes.max(terminator::TERMINATOR_TAIL_SIZE),
             nodelay: args.nodelay,
             socket_recv_buffer: args.socket_recv_buffer,
             socket_send_buffer: args.socket_send_buffer,
@@ -1062,7 +1066,7 @@ impl TypedClientConfig {
             pipeline_depth: pipeline_depth.clamp(1, 4096),
             command_mix,
             start_id,
-            read_buffer_bytes: read_buffer_bytes.max(tail_buffer::TERMINATOR_TAIL_SIZE),
+            read_buffer_bytes: read_buffer_bytes.max(terminator::TERMINATOR_TAIL_SIZE),
             nodelay,
             socket_recv_buffer,
             socket_send_buffer,
@@ -1477,11 +1481,17 @@ async fn read_greeting(stream: &mut TcpStream, buffer: &mut [u8]) -> io::Result<
             ));
         }
 
-        let end = total + read;
-        if memchr::memchr(b'\n', &buffer[total..end]).is_some() {
-            return Ok(());
+        total += read;
+        match detect_response_line_end(&buffer[..total]) {
+            ResponseLineStatus::CompleteAt(_) => return Ok(()),
+            ResponseLineStatus::NeedMore => {}
+            ResponseLineStatus::Invalid => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "server greeting missing CRLF terminator",
+                ));
+            }
         }
-        total = end;
     }
 }
 
@@ -1990,11 +2000,10 @@ where
     let mut count = 0;
 
     while count < max_pipeline_depth {
-        let Some(relative_lf) = memchr::memchr(b'\n', &input[start..]) else {
+        let Some(end) = find_crlf_line_end(input, start) else {
             break;
         };
-        let end = start + relative_lf + 1;
-        let line = trim_line_slice(&input[start..end]);
+        let line = strip_crlf(&input[start..end]).unwrap_or(&input[start..end]);
         let request = RequestLine::parse(line);
         if matches!(request.kind(), RequestKind::TakeThis) {
             let Some(body_end) = find_dot_terminated_block_end(input, end) else {
@@ -2011,15 +2020,6 @@ where
     }
 
     start
-}
-
-fn find_dot_terminated_block_end(input: &[u8], start: usize) -> Option<usize> {
-    let slice = input.get(start..)?;
-    if slice.starts_with(b".\r\n") {
-        return Some(start + b".\r\n".len());
-    }
-
-    memchr::memmem::find(slice, TERMINATOR).map(|end| start + end + TERMINATOR.len())
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -2336,7 +2336,7 @@ where
     .await?;
 
     while command_batch.len() < max_pipeline_depth {
-        if memchr::memchr(b'\n', reader.buffer()).is_none() {
+        if find_crlf_line_end(reader.buffer(), 0).is_none() {
             break;
         }
 
@@ -2365,6 +2365,12 @@ async fn push_command<R>(
 where
     R: tokio::io::AsyncRead + Unpin,
 {
+    if !command_arena[line_start..].ends_with(CRLF) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "command line missing CRLF terminator",
+        ));
+    }
     let command = parse_command_line(command_arena, line_start);
     let kind = command.kind;
     if matches!(kind, RequestKind::TakeThis) {
@@ -2375,32 +2381,12 @@ where
 }
 
 fn parse_command_line(command_arena: &[u8], line_start: usize) -> ParsedCommand {
-    let line_end = line_start + trim_command_len(&command_arena[line_start..]);
+    let line = &command_arena[line_start..];
+    let line_end = line_start + strip_crlf(line).map_or(line.len(), <[u8]>::len);
     ParsedCommand {
         kind: RequestLine::parse(&command_arena[line_start..line_end]).kind(),
         line_range: line_start..line_end,
     }
-}
-
-fn trim_command_len(line: &[u8]) -> usize {
-    let mut end = line.len();
-    while end > 0 && matches!(line[end - 1], b'\r' | b'\n') {
-        end -= 1;
-    }
-    end
-}
-
-#[cfg(test)]
-fn trim_command_line(line: &mut Vec<u8>) {
-    while matches!(line.last(), Some(b'\r' | b'\n')) {
-        line.pop();
-    }
-}
-
-fn trim_line_slice(line: &[u8]) -> &[u8] {
-    line.strip_suffix(b"\r\n")
-        .or_else(|| line.strip_suffix(b"\n"))
-        .unwrap_or(line)
 }
 
 async fn read_dot_terminated_body<R>(
@@ -2420,12 +2406,10 @@ where
                 "truncated TAKETHIS body",
             ));
         }
-        if previous_line_ended_with_crlf
-            && command_scratch.strip_suffix(b"\r\n") == Some(b".".as_slice())
-        {
+        if is_dot_terminator_line(previous_line_ended_with_crlf, command_scratch) {
             return Ok(());
         }
-        previous_line_ended_with_crlf = command_scratch.ends_with(b"\r\n");
+        previous_line_ended_with_crlf = strip_crlf(command_scratch).is_some();
     }
 }
 
@@ -2438,7 +2422,7 @@ pub fn generate_article(target_bytes: usize, body: &[u8]) -> Box<[u8]> {
     response.extend_from_slice(b"Subject: nntpbench synthetic article\r\n");
     response.extend_from_slice(b"Message-ID: <article.1@nntpbench.local>\r\n");
     response.extend_from_slice(b"Date: Fri, 15 May 2026 00:00:00 +0000\r\n");
-    response.extend_from_slice(b"\r\n");
+    crate::terminator::append_crlf(&mut response);
     append_repeated_payload(&mut response, body_payload(body), target_bytes);
     ensure_terminated(&mut response);
     response.into_boxed_slice()
@@ -2453,17 +2437,16 @@ pub fn generate_body(target_bytes: usize) -> Box<[u8]> {
 }
 
 fn body_payload(body: &[u8]) -> &[u8] {
-    let header_end = memchr::memmem::find(body, CRLF).map_or(0, |idx| idx + CRLF.len());
-    body[header_end..]
-        .strip_suffix(b".\r\n")
-        .unwrap_or(&body[header_end..])
+    let header_end = find_crlf_line_end(body, 0).unwrap_or(0);
+    let payload = &body[header_end..];
+    strip_dot_terminator_suffix(payload).unwrap_or(payload)
 }
 
 const BODY_LINE: &[u8] =
     b"This is synthetic NNTP article payload for throughput and latency benchmarking\r\n";
 
 fn append_repeated_payload(response: &mut Vec<u8>, line: &[u8], target_bytes: usize) {
-    let target_before_dot_line = target_bytes.saturating_sub(b".\r\n".len());
+    let target_before_dot_line = target_before_dot_terminator(target_bytes);
     while response.len() + line.len() <= target_before_dot_line {
         response.extend_from_slice(line);
     }
@@ -2475,10 +2458,7 @@ fn append_repeated_payload(response: &mut Vec<u8>, line: &[u8], target_bytes: us
 }
 
 fn ensure_terminated(response: &mut Vec<u8>) {
-    if !response.ends_with(CRLF) {
-        response.extend_from_slice(CRLF);
-    }
-    response.extend_from_slice(b".\r\n");
+    append_dot_terminator(response);
 }
 
 #[cfg(test)]
@@ -2509,14 +2489,6 @@ mod tests {
         {
             buffer[start + 2] = b'x';
         }
-    }
-
-    fn exact_dot_terminated_block_end(input: &[u8], start: usize) -> Option<usize> {
-        let slice = input.get(start..)?;
-        if slice.starts_with(b".\r\n") {
-            return Some(start + b".\r\n".len());
-        }
-        memchr::memmem::find(slice, TERMINATOR).map(|end| start + end + TERMINATOR.len())
     }
 
     fn test_args() -> ServerArgs {
@@ -2975,18 +2947,14 @@ mod tests {
     }
 
     #[test]
-    fn trims_crlf_command_lines() {
-        let mut line = b"ARTICLE 1\r\n".to_vec();
-        trim_command_line(&mut line);
-        assert_eq!(line, b"ARTICLE 1");
-
-        let mut bare_lf = b"BODY 1\n".to_vec();
-        trim_command_line(&mut bare_lf);
-        assert_eq!(bare_lf, b"BODY 1");
-
-        let mut unchanged = b"QUIT".to_vec();
-        trim_command_line(&mut unchanged);
-        assert_eq!(unchanged, b"QUIT");
+    fn centralized_command_line_stripping_requires_rfc_crlf() {
+        // RFC 3977 section 3.1 defines command/response lines as CRLF-terminated:
+        // https://www.rfc-editor.org/rfc/rfc3977#section-3.1
+        // Command parsing must use the centralized strict CRLF helper, so bare LF
+        // is not silently normalized as a valid NNTP line ending.
+        assert_eq!(strip_crlf(b"ARTICLE 1\r\n"), Some(b"ARTICLE 1".as_slice()));
+        assert_eq!(strip_crlf(b"BODY 1\n"), None);
+        assert_eq!(strip_crlf(b"QUIT"), None);
     }
 
     #[test]
@@ -3013,7 +2981,7 @@ mod tests {
 
         let article = generate_article(8192, &body);
         let header_end = memchr::memmem::find(&article, b"\r\n\r\n").unwrap() + b"\r\n\r\n".len();
-        let article_content = article[header_end..].strip_suffix(b".\r\n").unwrap();
+        let article_content = strip_dot_terminator_suffix(&article[header_end..]).unwrap();
         assert!(!article_content.contains(&b'.'));
     }
 
@@ -3140,7 +3108,7 @@ mod tests {
         assert_eq!(config.pipeline_depth, 1);
         assert_eq!(config.command_mix, ClientCommandMix::Body);
         assert_eq!(config.start_id, 99);
-        assert_eq!(config.read_buffer_bytes, tail_buffer::TERMINATOR_TAIL_SIZE);
+        assert_eq!(config.read_buffer_bytes, terminator::TERMINATOR_TAIL_SIZE);
         assert!(!config.nodelay);
         assert_eq!(config.socket_recv_buffer, 4096);
         assert_eq!(config.socket_send_buffer, 8192);
@@ -3241,7 +3209,7 @@ mod tests {
         assert_eq!(config.pipeline_depth, 1);
         assert_eq!(config.command_mix, ClientCommandMix::Body);
         assert_eq!(config.start_id, 99);
-        assert_eq!(config.read_buffer_bytes, tail_buffer::TERMINATOR_TAIL_SIZE);
+        assert_eq!(config.read_buffer_bytes, terminator::TERMINATOR_TAIL_SIZE);
         assert!(!config.nodelay);
         assert_eq!(config.socket_recv_buffer, 4096);
         assert_eq!(config.socket_send_buffer, 8192);
@@ -3450,8 +3418,7 @@ mod tests {
                 assert_ne!(read, 0);
                 pending.extend_from_slice(&scratch[..read]);
 
-                while let Some(line_end) = memchr::memchr(b'\n', &pending) {
-                    let line_len = line_end + 1;
+                while let Some(line_len) = find_crlf_line_end(&pending, 0) {
                     let response: &[u8] = if pending[..line_len].starts_with(b"ARTICLE ") {
                         b"220 1 article follows\r\nbody\r\n.\r\n"
                     } else {
@@ -5459,11 +5426,14 @@ mod tests {
         assert_eq!(batch, vec![RequestKind::Article, RequestKind::Body]);
 
         batch.clear();
+        // RFC 3977 section 3.1 makes CRLF the only line terminator:
+        // https://www.rfc-editor.org/rfc/rfc3977#section-3.1
+        // The batch scanner must not keep the old LF-only command behavior.
         let consumed = for_each_request_line_in_batch(b"DATE\nMODE READER\n", 8, |request| {
             batch.push(request.kind());
         });
-        assert_eq!(consumed, b"DATE\nMODE READER\n".len());
-        assert_eq!(batch, vec![RequestKind::Date, RequestKind::ModeReader]);
+        assert_eq!(consumed, 0);
+        assert!(batch.is_empty());
 
         batch.clear();
         let consumed = for_each_request_line_in_batch(
@@ -5539,7 +5509,7 @@ mod tests {
             input.extend_from_slice(&prefix);
             input.extend_from_slice(&near_miss);
             input.extend_from_slice(&suffix);
-            prop_assume!(exact_dot_terminated_block_end(&input, b"TAKETHIS <take@test>\r\n".len()).is_none());
+            prop_assume!(find_dot_terminated_block_end(&input, b"TAKETHIS <take@test>\r\n".len()).is_none());
             input.extend_from_slice(b"QUIT\r\n");
 
             let mut batch = Vec::with_capacity(4);

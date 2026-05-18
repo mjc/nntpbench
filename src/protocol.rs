@@ -1,9 +1,8 @@
-//! Typed NNTP protocol helpers for the redesign path.
-//!
-//! These helpers are intentionally pure and additive so the current server/client
-//! loops can adopt them incrementally without changing hot-path behavior first.
+//! Typed NNTP protocol helpers.
 
 use std::borrow::Cow;
+
+use crate::terminator::{DOT_TERMINATOR, append_crlf, crlf_normalized_payload_lines, strip_crlf};
 
 pub mod article;
 
@@ -66,6 +65,7 @@ impl StatusCode {
 #[cfg(test)]
 mod proptests {
     use super::*;
+    use crate::terminator::find_crlf_line_end;
     use proptest::collection::vec;
     use proptest::prelude::*;
     use proptest::string::string_regex;
@@ -588,9 +588,9 @@ mod proptests {
     fn expected_transfer_wire(first_line: &str, payload: &[u8]) -> Vec<u8> {
         let mut expected = Vec::new();
         expected.extend_from_slice(first_line.as_bytes());
-        expected.extend_from_slice(b"\r\n");
+        append_crlf(&mut expected);
         if payload.is_empty() {
-            expected.extend_from_slice(b".\r\n");
+            expected.extend_from_slice(DOT_TERMINATOR);
             return expected;
         }
 
@@ -599,9 +599,9 @@ mod proptests {
                 expected.push(b'.');
             }
             expected.extend_from_slice(line);
-            expected.extend_from_slice(b"\r\n");
+            append_crlf(&mut expected);
         }
-        expected.extend_from_slice(b".\r\n");
+        expected.extend_from_slice(DOT_TERMINATOR);
         expected
     }
 
@@ -1041,7 +1041,7 @@ mod proptests {
             let mut wire = Vec::new();
             request.write_wire_to(&mut wire);
 
-            let command_end = memchr::memmem::find(&wire, b"\r\n").expect("command CRLF") + 2;
+            let command_end = find_crlf_line_end(&wire, 0).expect("command CRLF");
             let expected_command = format!("TAKETHIS {message_id}\r\n");
             prop_assert_eq!(&wire[..command_end], expected_command.as_bytes());
             prop_assert!(wire.ends_with(b".\r\n"));
@@ -1049,9 +1049,8 @@ mod proptests {
             let mut line_start = command_end;
             let mut terminator_count = 0;
             while line_start < wire.len() {
-                let relative = memchr::memmem::find(&wire[line_start..], b"\r\n")
-                    .expect("data line CRLF");
-                let line_end = line_start + relative;
+                let crlf_end = find_crlf_line_end(&wire, line_start).expect("data line CRLF");
+                let line_end = crlf_end - crate::CRLF.len();
                 let line = &wire[line_start..line_end];
                 prop_assert!(!line.contains(&b'\r'), "{wire:?}");
                 prop_assert!(!line.contains(&b'\n'), "{wire:?}");
@@ -1059,7 +1058,7 @@ mod proptests {
                     terminator_count += 1;
                     prop_assert_eq!(line_end + 2, wire.len(), "{:?}", wire);
                 }
-                line_start = line_end + 2;
+                line_start = crlf_end;
             }
 
             prop_assert_eq!(terminator_count, 1, "{:?}", wire);
@@ -2781,7 +2780,7 @@ impl<'a> RequestLine<'a> {
     /// Parse a raw command line into borrowed protocol pieces.
     #[must_use]
     pub fn parse(line: &'a [u8]) -> Self {
-        let line = trim_line_end(line);
+        let line = strip_crlf(line).unwrap_or(line);
         let split = memchr::memchr(b' ', line).unwrap_or(line.len());
         let verb = &line[..split];
         let args = if split < line.len() {
@@ -2822,13 +2821,6 @@ impl<'a> RequestLine<'a> {
         let value = std::str::from_utf8(&self.args[start..end]).ok()?;
         MessageId::from_borrowed(value).ok()
     }
-}
-
-fn trim_line_end(mut line: &[u8]) -> &[u8] {
-    while matches!(line.last(), Some(b'\r' | b'\n')) {
-        line = &line[..line.len() - 1];
-    }
-    line
 }
 
 fn classify_verb(verb: &[u8], arg: &[u8]) -> RequestKind {
@@ -2959,7 +2951,7 @@ const fn status_implies_multiline(code: u16) -> bool {
 fn write_request_wire(output: &mut Vec<u8>, verb: &[u8], message_id: &MessageId<'_>) {
     output.extend_from_slice(verb);
     output.extend_from_slice(message_id.as_str().as_bytes());
-    output.extend_from_slice(b"\r\n");
+    append_crlf(output);
 }
 
 fn write_article_ref_request_wire(output: &mut Vec<u8>, verb: &[u8], article_ref: &ArticleRef<'_>) {
@@ -2975,13 +2967,13 @@ fn write_article_ref_request_wire(output: &mut Vec<u8>, verb: &[u8], article_ref
             output.extend_from_slice(message_id.as_str().as_bytes());
         }
     }
-    output.extend_from_slice(b"\r\n");
+    append_crlf(output);
 }
 
 fn write_one_arg_request_wire(output: &mut Vec<u8>, verb: &[u8], arg: &str) {
     output.extend_from_slice(verb);
     output.extend_from_slice(arg.as_bytes());
-    output.extend_from_slice(b"\r\n");
+    append_crlf(output);
 }
 
 fn write_two_arg_request_wire(output: &mut Vec<u8>, verb: &[u8], left: &str, right: &str) {
@@ -2989,7 +2981,7 @@ fn write_two_arg_request_wire(output: &mut Vec<u8>, verb: &[u8], left: &str, rig
     output.extend_from_slice(left.as_bytes());
     output.push(b' ');
     output.extend_from_slice(right.as_bytes());
-    output.extend_from_slice(b"\r\n");
+    append_crlf(output);
 }
 
 fn write_listgroup_request_wire(
@@ -3006,7 +2998,7 @@ fn write_listgroup_request_wire(
         output.push(b' ');
         output.extend_from_slice(range.as_str().as_bytes());
     }
-    output.extend_from_slice(b"\r\n");
+    append_crlf(output);
 }
 
 fn write_datetime_request_wire(
@@ -3023,7 +3015,7 @@ fn write_datetime_request_wire(
     if gmt {
         output.extend_from_slice(b" GMT");
     }
-    output.extend_from_slice(b"\r\n");
+    append_crlf(output);
 }
 
 fn write_newnews_request_wire(
@@ -3042,7 +3034,7 @@ fn write_newnews_request_wire(
     if gmt {
         output.extend_from_slice(b" GMT");
     }
-    output.extend_from_slice(b"\r\n");
+    append_crlf(output);
 }
 
 fn write_list_request_wire(output: &mut Vec<u8>, kind: ListKind, wildmat: Option<&Wildmat<'_>>) {
@@ -3052,7 +3044,7 @@ fn write_list_request_wire(output: &mut Vec<u8>, kind: ListKind, wildmat: Option
         output.push(b' ');
         output.extend_from_slice(wildmat.as_str().as_bytes());
     }
-    output.extend_from_slice(b"\r\n");
+    append_crlf(output);
 }
 
 fn write_authinfo_request_wire(output: &mut Vec<u8>, kind: AuthInfoKind, value: &str) {
@@ -3060,7 +3052,7 @@ fn write_authinfo_request_wire(output: &mut Vec<u8>, kind: AuthInfoKind, value: 
     output.extend_from_slice(kind.as_wire());
     output.push(b' ');
     output.extend_from_slice(value.as_bytes());
-    output.extend_from_slice(b"\r\n");
+    append_crlf(output);
 }
 
 fn write_transfer_request_wire(
@@ -3071,11 +3063,11 @@ fn write_transfer_request_wire(
 ) {
     output.extend_from_slice(verb);
     output.extend_from_slice(message_id.as_str().as_bytes());
-    output.extend_from_slice(b"\r\n");
+    append_crlf(output);
 
     let payload = article.as_bytes();
     if payload.is_empty() {
-        output.extend_from_slice(b".\r\n");
+        output.extend_from_slice(DOT_TERMINATOR);
         return;
     }
 
@@ -3084,59 +3076,15 @@ fn write_transfer_request_wire(
             output.push(b'.');
         }
         output.extend_from_slice(line);
-        output.extend_from_slice(b"\r\n");
+        append_crlf(output);
     }
 
-    output.extend_from_slice(b".\r\n");
-}
-
-pub(crate) fn crlf_normalized_payload_lines(payload: &[u8]) -> CrlfNormalizedPayloadLines<'_> {
-    CrlfNormalizedPayloadLines { payload, start: 0 }
-}
-
-pub(crate) struct CrlfNormalizedPayloadLines<'a> {
-    payload: &'a [u8],
-    start: usize,
-}
-
-impl<'a> Iterator for CrlfNormalizedPayloadLines<'a> {
-    type Item = &'a [u8];
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.start >= self.payload.len() {
-            return None;
-        }
-
-        let mut index = self.start;
-        while index < self.payload.len() {
-            match self.payload[index] {
-                b'\r' => {
-                    let line = &self.payload[self.start..index];
-                    index += 1;
-                    if index < self.payload.len() && self.payload[index] == b'\n' {
-                        index += 1;
-                    }
-                    self.start = index;
-                    return Some(line);
-                }
-                b'\n' => {
-                    let line = &self.payload[self.start..index];
-                    self.start = index + 1;
-                    return Some(line);
-                }
-                _ => index += 1,
-            }
-        }
-
-        let line = &self.payload[self.start..];
-        self.start = self.payload.len();
-        Some(line)
-    }
+    output.extend_from_slice(DOT_TERMINATOR);
 }
 
 fn write_simple_request_wire(output: &mut Vec<u8>, verb: &[u8]) {
     output.extend_from_slice(verb);
-    output.extend_from_slice(b"\r\n");
+    append_crlf(output);
 }
 
 #[cfg(test)]

@@ -1,6 +1,7 @@
-//! Response line and multiline terminator helpers for NNTP responses.
+//! CRLF line and multiline terminator helpers for NNTP protocol frames.
 
 pub const TERMINATOR_TAIL_SIZE: usize = 4;
+pub const DOT_TERMINATOR: &[u8] = b".\r\n";
 
 /// Status of strict NNTP response-line CRLF scanning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +55,24 @@ pub fn detect_response_line_end(buffer: &[u8]) -> ResponseLineStatus {
     }
 
     ResponseLineStatus::NeedMore
+}
+
+/// Return the line without a final CRLF terminator.
+#[must_use]
+pub fn strip_crlf(line: &[u8]) -> Option<&[u8]> {
+    line.strip_suffix(crate::CRLF)
+}
+
+/// Return the byte position after the next CRLF-terminated line.
+#[must_use]
+pub fn find_crlf_line_end(data: &[u8], start: usize) -> Option<usize> {
+    let slice = data.get(start..)?;
+    memchr::memmem::find(slice, crate::CRLF).map(|relative| start + relative + crate::CRLF.len())
+}
+
+/// Append a CRLF line terminator.
+pub fn append_crlf(output: &mut Vec<u8>) {
+    output.extend_from_slice(crate::CRLF);
 }
 
 /// Streaming detector for NNTP multiline response terminators.
@@ -147,8 +166,6 @@ impl EmptyMultilineTerminator {
     /// Detect `.\r\n` only when the caller knows scanning is at multiline content start.
     #[must_use]
     pub fn detect(&mut self, chunk: &[u8]) -> EmptyTerminatorStatus {
-        const EMPTY_TERMINATOR: &[u8; 3] = b".\r\n";
-
         let already_matched = self.prefix_len;
         if already_matched == 0 && chunk.first().is_some_and(|byte| *byte != b'.') {
             return EmptyTerminatorStatus::NotFound {
@@ -156,14 +173,14 @@ impl EmptyMultilineTerminator {
             };
         }
 
-        let remaining = &EMPTY_TERMINATOR[already_matched..];
+        let remaining = &DOT_TERMINATOR[already_matched..];
         let matched = chunk
             .iter()
             .zip(remaining.iter())
             .take_while(|(actual, expected)| actual == expected)
             .count();
 
-        if already_matched + matched == EMPTY_TERMINATOR.len() {
+        if already_matched + matched == DOT_TERMINATOR.len() {
             self.prefix_len = 0;
             return EmptyTerminatorStatus::FoundAt(matched);
         }
@@ -216,6 +233,93 @@ fn find_terminator_end(data: &[u8]) -> Option<usize> {
 pub(crate) fn find_terminator_content_end(data: &[u8], start: usize) -> Option<usize> {
     let slice = data.get(start..)?;
     find_terminator_end(slice).map(|end| start + end - 3)
+}
+
+/// Find the end of a dot-terminated multiline block starting at `start`.
+///
+/// Matches either an empty block beginning with "." CRLF or a non-empty block
+/// whose first terminator is CRLF "." CRLF.
+#[must_use]
+pub fn find_dot_terminated_block_end(data: &[u8], start: usize) -> Option<usize> {
+    let slice = data.get(start..)?;
+    if slice.starts_with(DOT_TERMINATOR) {
+        return Some(start + DOT_TERMINATOR.len());
+    }
+
+    memchr::memmem::find(slice, crate::TERMINATOR)
+        .map(|relative| start + relative + crate::TERMINATOR.len())
+}
+
+/// Remove a final dot terminator line from a complete multiline payload.
+#[must_use]
+pub fn strip_dot_terminator_suffix(data: &[u8]) -> Option<&[u8]> {
+    data.strip_suffix(DOT_TERMINATOR)
+}
+
+/// Append the RFC multiline terminator, adding a missing CRLF before the dot line.
+pub fn append_dot_terminator(output: &mut Vec<u8>) {
+    if !output.ends_with(crate::CRLF) {
+        append_crlf(output);
+    }
+    output.extend_from_slice(DOT_TERMINATOR);
+}
+
+/// Return the target length available before a final dot terminator line.
+#[must_use]
+pub fn target_before_dot_terminator(target_bytes: usize) -> usize {
+    target_bytes.saturating_sub(DOT_TERMINATOR.len())
+}
+
+/// Whether the current line is a valid dot terminator after a CRLF-ended prior line.
+#[must_use]
+pub fn is_dot_terminator_line(previous_line_ended_with_crlf: bool, line: &[u8]) -> bool {
+    previous_line_ended_with_crlf && strip_crlf(line) == Some(b".".as_slice())
+}
+
+/// Iterate payload lines normalized for NNTP multiline output.
+#[must_use]
+pub fn crlf_normalized_payload_lines(payload: &[u8]) -> CrlfNormalizedPayloadLines<'_> {
+    CrlfNormalizedPayloadLines { payload, start: 0 }
+}
+
+pub struct CrlfNormalizedPayloadLines<'a> {
+    payload: &'a [u8],
+    start: usize,
+}
+
+impl<'a> Iterator for CrlfNormalizedPayloadLines<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.start >= self.payload.len() {
+            return None;
+        }
+
+        let mut index = self.start;
+        while index < self.payload.len() {
+            match self.payload[index] {
+                b'\r' => {
+                    let line = &self.payload[self.start..index];
+                    index += 1;
+                    if index < self.payload.len() && self.payload[index] == b'\n' {
+                        index += 1;
+                    }
+                    self.start = index;
+                    return Some(line);
+                }
+                b'\n' => {
+                    let line = &self.payload[self.start..index];
+                    self.start = index + 1;
+                    return Some(line);
+                }
+                _ => index += 1,
+            }
+        }
+
+        let line = &self.payload[self.start..];
+        self.start = self.payload.len();
+        Some(line)
+    }
 }
 
 /// Find spanning terminator across boundary between tail and current chunk.
@@ -386,6 +490,40 @@ mod tests {
         ] {
             assert_eq!(detect_response_line_end(input), expected, "{input:?}");
         }
+    }
+
+    #[test]
+    fn centralized_helpers_own_line_and_dot_terminator_edges() {
+        // RFC 3977 section 3.1 makes CRLF the line terminator, and section 3.1.1
+        // reserves "." CRLF as the terminating line for multiline blocks:
+        // https://www.rfc-editor.org/rfc/rfc3977#section-3.1
+        // https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1
+        // These helpers are the single API for call sites that need to strip,
+        // find, append, or size around protocol terminators.
+        assert_eq!(
+            strip_crlf(b"211 1 1 group\r\n"),
+            Some(b"211 1 1 group".as_slice())
+        );
+        assert_eq!(strip_crlf(b"211 1 1 group\n"), None);
+        assert_eq!(
+            find_crlf_line_end(b"211 ok\r\nnext", 0),
+            Some(b"211 ok\r\n".len())
+        );
+        assert_eq!(find_crlf_line_end(b"211 ok\nnext", 0), None);
+        assert_eq!(
+            strip_dot_terminator_suffix(b"body\r\n.\r\n"),
+            Some(b"body\r\n".as_slice())
+        );
+        assert_eq!(
+            strip_dot_terminator_suffix(b"body\n.\r\n"),
+            Some(b"body\n".as_slice())
+        );
+
+        let mut output = b"body".to_vec();
+        append_dot_terminator(&mut output);
+        assert_eq!(output, b"body\r\n.\r\n");
+        assert_eq!(target_before_dot_terminator(2), 0);
+        assert_eq!(target_before_dot_terminator(10), 7);
     }
 
     #[test]

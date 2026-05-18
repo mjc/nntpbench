@@ -5,7 +5,7 @@
 //! performance-sensitive helper changes stay measurable.
 
 use divan::{Bencher, black_box};
-use nntpbench::tail_buffer::{MultilineTerminatorDetector, TerminatorStatus};
+use nntpbench::terminator::{MultilineTerminatorDetector, TerminatorStatus};
 use nntpbench::{Article, Headers, StatusCode};
 
 fn main() {

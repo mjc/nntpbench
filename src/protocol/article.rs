@@ -3,8 +3,8 @@
 use std::fmt;
 
 use super::{InvalidMessageId, MessageId, StatusCode};
-use crate::tail_buffer::{
-    ResponseLineStatus, detect_response_line_end, find_terminator_content_end,
+use crate::terminator::{
+    DOT_TERMINATOR, ResponseLineStatus, detect_response_line_end, find_terminator_content_end,
 };
 
 /// Article parsing error.
@@ -1152,7 +1152,7 @@ impl<'a> Article<'a> {
         let first_line_end = find_line_end(buf, 0)?;
         let (message_id, article_number) = parse_first_line(&buf[..first_line_end])?;
         let content_start = first_line_end + 2;
-        if content_start < buf.len() && !buf[content_start..].starts_with(b".\r\n") {
+        if content_start < buf.len() && !buf[content_start..].starts_with(DOT_TERMINATOR) {
             return Err(ArticleParseError::UnexpectedBody);
         }
 
@@ -1167,7 +1167,7 @@ impl<'a> Article<'a> {
 
 fn find_article_content_end(buf: &[u8], start: usize) -> Option<usize> {
     let slice = buf.get(start..)?;
-    if slice.starts_with(b".\r\n") {
+    if slice.starts_with(DOT_TERMINATOR) {
         return Some(start);
     }
 

@@ -12,10 +12,10 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-use crate::protocol::{ArticleRef, Request, crlf_normalized_payload_lines};
-use crate::tail_buffer::{
-    EmptyMultilineTerminator, EmptyTerminatorStatus, MultilineTerminatorDetector,
-    ResponseLineStatus, TerminatorStatus, detect_response_line_end,
+use crate::protocol::{ArticleRef, Request};
+use crate::terminator::{
+    DOT_TERMINATOR, EmptyMultilineTerminator, EmptyTerminatorStatus, MultilineTerminatorDetector,
+    ResponseLineStatus, TerminatorStatus, crlf_normalized_payload_lines, detect_response_line_end,
 };
 use crate::{
     Article, ArticleParseError, ArticleSelector, ArticleTransfer, AuthInfoValue, GroupName,
@@ -867,7 +867,7 @@ impl TypedClientConnection {
             0;
             options
                 .read_buffer_bytes
-                .max(crate::tail_buffer::TERMINATOR_TAIL_SIZE)
+                .max(crate::terminator::TERMINATOR_TAIL_SIZE)
         ]
         .into_boxed_slice();
         crate::read_greeting(&mut stream, &mut read_buffer).await?;
@@ -2130,7 +2130,7 @@ impl ResponseDecoder {
                     previous_prefix_len,
                 } => {
                     if previous_prefix_len != 0 {
-                        self.tail.update(&b".\r\n"[..previous_prefix_len]);
+                        self.tail.update(&DOT_TERMINATOR[..previous_prefix_len]);
                     }
                 }
             }
@@ -2367,12 +2367,12 @@ where
     write_buffer.clear();
     write_buffer.extend_from_slice(b"TAKETHIS ");
     write_buffer.extend_from_slice(message_id.as_str().as_bytes());
-    write_buffer.extend_from_slice(b"\r\n");
+    write_buffer.extend_from_slice(crate::CRLF);
     writer.write_all(write_buffer).await?;
 
     let payload = article.as_bytes();
     if payload.is_empty() {
-        writer.write_all(b".\r\n").await?;
+        writer.write_all(DOT_TERMINATOR).await?;
         return Ok(());
     }
 
@@ -2381,16 +2381,16 @@ where
             let mut slices = [
                 IoSlice::new(b"."),
                 IoSlice::new(line),
-                IoSlice::new(b"\r\n"),
+                IoSlice::new(crate::CRLF),
             ];
             write_all_vectored(writer, &mut slices).await?;
         } else {
-            let mut slices = [IoSlice::new(line), IoSlice::new(b"\r\n")];
+            let mut slices = [IoSlice::new(line), IoSlice::new(crate::CRLF)];
             write_all_vectored(writer, &mut slices).await?;
         }
     }
 
-    writer.write_all(b".\r\n").await
+    writer.write_all(DOT_TERMINATOR).await
 }
 
 async fn write_all_vectored<W>(writer: &mut W, slices: &mut [IoSlice<'_>]) -> io::Result<()>
