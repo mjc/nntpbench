@@ -30,23 +30,11 @@ Results:
 Command shape:
 
 ```bash
-./target/release/nntpbench server \
-  --listen 127.0.0.1:21211 \
-  --body-bytes 786432 \
-  --article-bytes 786432 \
-  --threads 4 \
-  --max-pipeline-depth 256
-
-./target/release/nntpbench client \
-  --connect 127.0.0.1:21211 \
-  --transfer-bytes 100000000000 \
-  --connections 16 \
-  --threads 8 \
-  --pipeline-depth 128 \
-  --command-mix body \
-  --stats-interval-secs 0 \
-  --csv
+COMMAND_MIX=body ./scripts/direct-e2e-bench.sh
 ```
+
+The script defaults both `BODY_BYTES` and `ARTICLE_BYTES` to `786432` bytes
+(`768 KiB`) and uses `PENDING_WRITE_BYTES=819200` (`800 KiB`).
 
 ## Profiling
 
