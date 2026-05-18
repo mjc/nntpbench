@@ -27,9 +27,9 @@ use tokio::task::JoinSet;
 use tokio::time;
 
 use crate::terminator::{
-    DOT_TERMINATOR, ResponseLineStatus, detect_response_line_end, detect_response_line_end_from,
-    find_crlf_line_end, find_dot_terminated_block_end, is_dot_terminator_line,
-    strip_complete_crlf_line, strip_crlf,
+    BoundedResponseLineStatus, DOT_TERMINATOR, ResponseLineStatus,
+    detect_bounded_response_line_end, detect_response_line_end_from, find_crlf_line_end,
+    find_dot_terminated_block_end, is_dot_terminator_line, strip_complete_crlf_line, strip_crlf,
 };
 #[cfg(test)]
 use crate::terminator::{
@@ -138,7 +138,7 @@ pub const HELP_RESPONSE: &[u8] =
 pub const QUIT_RESPONSE: &[u8] = b"205 closing connection\r\n";
 const BODY_RESPONSE_PREFIX: &[u8] = b"222 1 <article.1@nntpbench.local> body follows\r\n";
 const ARTICLE_RESPONSE_PREFIX: &[u8] = b"220 1 <article.1@nntpbench.local> article follows\r\nPath: nntpbench.local!mock\r\nFrom: Bench User <bench@nntpbench.local>\r\nNewsgroups: alt.binaries.bench\r\nSubject: nntpbench synthetic article\r\nMessage-ID: <article.1@nntpbench.local>\r\nDate: Fri, 15 May 2026 00:00:00 +0000\r\n\r\n";
-const MAX_COMMAND_LINE_BYTES: usize = 1024;
+const MAX_COMMAND_LINE_BYTES: usize = protocol::MAX_INITIAL_RESPONSE_LINE_BYTES;
 const MAX_SERVER_PIPELINE_DEPTH: usize = 1024;
 const SERVER_READER_CAPACITY: usize = 256 * 1024;
 const CLIENT_READER_CAPACITY: usize = 256 * 1024;
@@ -1532,13 +1532,22 @@ async fn read_greeting(stream: &mut TcpStream, buffer: &mut [u8]) -> io::Result<
         }
 
         total += read;
-        match detect_response_line_end(&buffer[..total]) {
-            ResponseLineStatus::CompleteAt(_) => return Ok(()),
-            ResponseLineStatus::NeedMore => {}
-            ResponseLineStatus::Invalid => {
+        match detect_bounded_response_line_end(
+            &buffer[..total],
+            protocol::MAX_INITIAL_RESPONSE_LINE_BYTES,
+        ) {
+            BoundedResponseLineStatus::CompleteAt(_) => return Ok(()),
+            BoundedResponseLineStatus::NeedMore => {}
+            BoundedResponseLineStatus::Invalid => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "server greeting missing CRLF terminator",
+                ));
+            }
+            BoundedResponseLineStatus::TooLong => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "server greeting exceeded RFC response-line limit",
                 ));
             }
         }
@@ -2667,6 +2676,93 @@ mod tests {
         guard.finish(label);
     }
 
+    fn client_command_mix_strategy() -> impl Strategy<Value = ClientCommandMix> {
+        prop_oneof![
+            Just(ClientCommandMix::Article),
+            Just(ClientCommandMix::Body),
+            Just(ClientCommandMix::Alternate),
+        ]
+    }
+
+    fn expected_client_command_counts(
+        start_id: u64,
+        requests: u64,
+        mix: ClientCommandMix,
+    ) -> (u64, u64) {
+        let mut articles = 0;
+        let mut bodies = 0;
+        for offset in 0..requests {
+            match client_command_kind(start_id.wrapping_add(offset), mix) {
+                ClientCommandMix::Article => articles += 1,
+                ClientCommandMix::Body => bodies += 1,
+                ClientCommandMix::Alternate => {
+                    unreachable!("client_command_kind should normalize Alternate")
+                }
+            }
+        }
+        (articles, bodies)
+    }
+
+    fn direct_e2e_proptest_config(cases: u32) -> ProptestConfig {
+        ProptestConfig {
+            cases,
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_direct_client_server_case(
+        body_bytes: usize,
+        article_bytes: usize,
+        max_pipeline_depth: usize,
+        requests: u64,
+        transfer_bytes: u64,
+        pipeline_depth: usize,
+        mix: ClientCommandMix,
+        start_id: u64,
+        read_buffer_bytes: usize,
+    ) -> io::Result<(Snapshot, Snapshot)> {
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let mut server_args = test_args();
+        server_args.body_bytes = body_bytes;
+        server_args.article_bytes = article_bytes;
+        server_args.max_pipeline_depth = max_pipeline_depth;
+        let server_config = Arc::new(ServerConfig::from_args(server_args));
+        let server_stats = Arc::new(Stats::new());
+
+        let server_task = tokio::spawn({
+            let server_config = server_config.clone();
+            let server_stats = server_stats.clone();
+            async move {
+                let (stream, peer_addr) = listener.accept().await.unwrap();
+                serve_session(stream, peer_addr, server_config, server_stats).await
+            }
+        });
+
+        let mut client_args = test_client_args();
+        client_args.connect = addr;
+        client_args.requests = requests;
+        client_args.transfer_bytes = transfer_bytes;
+        client_args.pipeline_depth = pipeline_depth;
+        client_args.command_mix = mix;
+        client_args.start_id = start_id;
+        client_args.read_buffer_bytes = read_buffer_bytes;
+        client_args.socket_recv_buffer = 0;
+        client_args.socket_send_buffer = 0;
+        let client_config = TypedClientConfig::from_client_args(client_args)?;
+        let client_session = TypedClientSession::new(&client_config, 0, start_id, requests);
+        let client_stats = Arc::new(Stats::new());
+        let stop = Arc::new(AtomicBool::new(false));
+
+        client_session.run(client_stats.clone(), stop).await?;
+        server_task.await.unwrap()?;
+
+        Ok((client_stats.snapshot(), server_stats.snapshot()))
+    }
+
     struct FixedWrite<const N: usize> {
         data: [u8; N],
         len: usize,
@@ -3538,6 +3634,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_greeting_accepts_exact_rfc_initial_line_limit() {
+        // RFC 3977 section 3.1 permits a response initial line of exactly
+        // 512 octets, including the terminating CRLF.
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut greeting = Vec::from(b"201 ".as_slice());
+            greeting.resize(protocol::MAX_INITIAL_RESPONSE_LINE_BYTES - 2, b'x');
+            greeting.extend_from_slice(b"\r\n");
+            stream.write_all(&greeting).await.unwrap();
+        });
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let mut buffer = [0_u8; protocol::MAX_INITIAL_RESPONSE_LINE_BYTES];
+        read_greeting(&mut client, &mut buffer).await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn read_greeting_rejects_malformed_crlf_recovery() {
         // RFC 3977 section 3.1 defines response lines as CRLF-terminated. A greeting
         // with bare LF, bare CR, or malformed CR before a later CRLF must fail at the
@@ -3614,6 +3729,133 @@ mod tests {
         assert_eq!(snapshot.pipeline_batches, 1);
         assert!(snapshot.bytes_sent > 0);
         assert!(!stop.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn direct_client_server_request_limited_roundtrips_match_generated_e2e_shapes() {
+        let mut runner = proptest::test_runner::TestRunner::new(direct_e2e_proptest_config(16));
+        let strategy = (
+            128_usize..=4096,
+            256_usize..=8192,
+            1_usize..=8,
+            1_u64..=16,
+            1_usize..=8,
+            client_command_mix_strategy(),
+            0_u64..=4,
+            64_usize..=256,
+        );
+
+        runner
+            .run(
+                &strategy,
+                |(
+                    body_bytes,
+                    article_bytes,
+                    max_pipeline_depth,
+                    requests,
+                    pipeline_depth,
+                    mix,
+                    start_id,
+                    read_buffer_bytes,
+                )| {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    let (client, server) = runtime
+                        .block_on(run_direct_client_server_case(
+                            body_bytes,
+                            article_bytes,
+                            max_pipeline_depth,
+                            requests,
+                            0,
+                            pipeline_depth,
+                            mix,
+                            start_id,
+                            read_buffer_bytes,
+                        ))
+                        .unwrap();
+
+                    let (expected_articles, expected_bodies) =
+                        expected_client_command_counts(start_id, requests, mix);
+                    prop_assert_eq!(client.accepted_connections, 1);
+                    prop_assert_eq!(client.active_connections, 0);
+                    prop_assert_eq!(client.commands, requests);
+                    prop_assert_eq!(client.article_requests, expected_articles);
+                    prop_assert_eq!(client.body_requests, expected_bodies);
+                    prop_assert_eq!(server.commands, requests);
+                    prop_assert_eq!(server.article_requests, expected_articles);
+                    prop_assert_eq!(server.body_requests, expected_bodies);
+                    prop_assert_eq!(server.errors, 0);
+                    prop_assert!(client.bytes_sent > 0);
+                    prop_assert!(server.bytes_sent >= client.bytes_sent);
+                    if requests > 1 && pipeline_depth > 1 {
+                        prop_assert!(client.pipeline_batches > 0);
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn direct_client_server_transfer_limited_roundtrips_cross_generated_byte_targets() {
+        let mut runner = proptest::test_runner::TestRunner::new(direct_e2e_proptest_config(12));
+        let strategy = (
+            128_usize..=4096,
+            256_usize..=8192,
+            1_usize..=8,
+            1_u64..=16_384,
+            1_usize..=6,
+            client_command_mix_strategy(),
+            0_u64..=4,
+            64_usize..=256,
+        );
+
+        runner
+            .run(
+                &strategy,
+                |(
+                    body_bytes,
+                    article_bytes,
+                    max_pipeline_depth,
+                    transfer_bytes,
+                    pipeline_depth,
+                    mix,
+                    start_id,
+                    read_buffer_bytes,
+                )| {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    let (client, server) = runtime
+                        .block_on(run_direct_client_server_case(
+                            body_bytes,
+                            article_bytes,
+                            max_pipeline_depth,
+                            0,
+                            transfer_bytes,
+                            pipeline_depth,
+                            mix,
+                            start_id,
+                            read_buffer_bytes,
+                        ))
+                        .unwrap();
+
+                    prop_assert_eq!(client.accepted_connections, 1);
+                    prop_assert_eq!(client.active_connections, 0);
+                    prop_assert!(client.commands >= 1);
+                    prop_assert!(client.bytes_sent >= transfer_bytes);
+                    prop_assert_eq!(server.commands, client.commands);
+                    prop_assert_eq!(server.article_requests, client.article_requests);
+                    prop_assert_eq!(server.body_requests, client.body_requests);
+                    prop_assert_eq!(server.errors, 0);
+                    prop_assert!(server.bytes_sent >= client.bytes_sent);
+                    Ok(())
+                },
+            )
+            .unwrap();
     }
 
     #[tokio::test]
