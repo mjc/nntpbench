@@ -14,6 +14,29 @@ pub enum ResponseLineStatus {
     Invalid,
 }
 
+/// Status of strict NNTP response-line CRLF scanning with an RFC line cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoundedResponseLineStatus {
+    /// Complete CRLF-terminated line found at this position, after the CRLF.
+    CompleteAt(usize),
+    /// More bytes are needed before the line can be classified.
+    NeedMore,
+    /// A bare LF or non-terminal CR was found before the line terminator.
+    Invalid,
+    /// No CRLF was found before the configured response-line limit.
+    TooLong,
+}
+
+impl From<ResponseLineStatus> for BoundedResponseLineStatus {
+    fn from(value: ResponseLineStatus) -> Self {
+        match value {
+            ResponseLineStatus::CompleteAt(end) => Self::CompleteAt(end),
+            ResponseLineStatus::NeedMore => Self::NeedMore,
+            ResponseLineStatus::Invalid => Self::Invalid,
+        }
+    }
+}
+
 /// Status of terminator detection in a chunk.
 #[derive(Debug, Clone, Copy)]
 pub enum TerminatorStatus {
@@ -55,6 +78,28 @@ pub fn detect_response_line_end(buffer: &[u8]) -> ResponseLineStatus {
     }
 
     ResponseLineStatus::NeedMore
+}
+
+/// Find a strict CRLF-terminated NNTP response line, enforcing `max_len`.
+///
+/// RFC 3977 section 3.1 limits command lines and response initial lines to
+/// 512 octets including the terminating CRLF. The caller supplies the bound so
+/// this helper stays protocol-agnostic.
+#[must_use]
+pub fn detect_bounded_response_line_end(
+    buffer: &[u8],
+    max_len: usize,
+) -> BoundedResponseLineStatus {
+    match detect_response_line_end(buffer) {
+        ResponseLineStatus::CompleteAt(end) if end <= max_len => {
+            BoundedResponseLineStatus::CompleteAt(end)
+        }
+        ResponseLineStatus::CompleteAt(_) => BoundedResponseLineStatus::TooLong,
+        ResponseLineStatus::NeedMore if buffer.len() >= max_len => {
+            BoundedResponseLineStatus::TooLong
+        }
+        status => status.into(),
+    }
 }
 
 /// Find a strict CRLF-terminated NNTP response line from `start`.
@@ -275,19 +320,118 @@ pub(crate) fn find_terminator_content_end(data: &[u8], start: usize) -> Option<u
     find_terminator_end(slice).map(|end| start + end - 3)
 }
 
+/// Borrowed bytes and offsets for a complete dot-terminated block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DotTerminatedBlock<'a> {
+    bytes: &'a [u8],
+    content: &'a [u8],
+    terminator: &'a [u8],
+    start: usize,
+    content_end: usize,
+    block_end: usize,
+}
+
+impl<'a> DotTerminatedBlock<'a> {
+    /// Full block bytes, including the dot terminator.
+    #[must_use]
+    pub const fn bytes(self) -> &'a [u8] {
+        self.bytes
+    }
+
+    /// Payload bytes before the dot terminator.
+    #[must_use]
+    pub const fn content(self) -> &'a [u8] {
+        self.content
+    }
+
+    /// Dot terminator bytes.
+    #[must_use]
+    pub const fn terminator(self) -> &'a [u8] {
+        self.terminator
+    }
+
+    /// Absolute block start.
+    #[must_use]
+    pub const fn start(self) -> usize {
+        self.start
+    }
+
+    /// Position after the payload bytes and before the dot terminator.
+    #[must_use]
+    pub const fn content_end(self) -> usize {
+        self.content_end
+    }
+
+    /// Position after the full dot-terminated block.
+    #[must_use]
+    pub const fn block_end(self) -> usize {
+        self.block_end
+    }
+}
+
+/// Iterator over complete dot-terminated blocks in a byte slice.
+#[derive(Debug, Clone)]
+pub struct DotTerminatedBlocks<'a> {
+    data: &'a [u8],
+    cursor: usize,
+}
+
+impl<'a> Iterator for DotTerminatedBlocks<'a> {
+    type Item = DotTerminatedBlock<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let start = self.cursor;
+        let slice = self.data.get(start..)?;
+        if slice.is_empty() {
+            return None;
+        }
+
+        let (content_end, block_end) = if slice.starts_with(DOT_TERMINATOR) {
+            (start, start + DOT_TERMINATOR.len())
+        } else {
+            let relative = memchr::memmem::find(slice, crate::TERMINATOR)?;
+            let block_end = start + relative + crate::TERMINATOR.len();
+            (block_end - DOT_TERMINATOR.len(), block_end)
+        };
+
+        self.cursor = block_end;
+        Some(DotTerminatedBlock {
+            bytes: &self.data[start..block_end],
+            content: &self.data[start..content_end],
+            terminator: &self.data[content_end..block_end],
+            start,
+            content_end,
+            block_end,
+        })
+    }
+}
+
+/// Iterate over complete dot-terminated multiline blocks starting at `start`.
+#[must_use]
+pub const fn dot_terminated_blocks(data: &[u8], start: usize) -> DotTerminatedBlocks<'_> {
+    DotTerminatedBlocks {
+        data,
+        cursor: start,
+    }
+}
+
+/// Find the payload and full-frame boundaries for a dot-terminated multiline block.
+///
+/// Matches either an empty block beginning with "." CRLF or a non-empty block
+/// whose first terminator is CRLF "." CRLF. The non-empty path performs one
+/// terminator search and derives both returned offsets from it.
+#[must_use]
+pub fn find_dot_terminated_block(data: &[u8], start: usize) -> Option<DotTerminatedBlock<'_>> {
+    dot_terminated_blocks(data, start).next()
+}
+
 /// Find the end of a dot-terminated multiline block starting at `start`.
 ///
 /// Matches either an empty block beginning with "." CRLF or a non-empty block
 /// whose first terminator is CRLF "." CRLF.
 #[must_use]
 pub fn find_dot_terminated_block_end(data: &[u8], start: usize) -> Option<usize> {
-    let slice = data.get(start..)?;
-    if slice.starts_with(DOT_TERMINATOR) {
-        return Some(start + DOT_TERMINATOR.len());
-    }
-
-    memchr::memmem::find(slice, crate::TERMINATOR)
-        .map(|relative| start + relative + crate::TERMINATOR.len())
+    find_dot_terminated_block(data, start).map(DotTerminatedBlock::block_end)
 }
 
 /// Remove a final dot terminator line from a complete multiline payload.
@@ -709,6 +853,30 @@ mod tests {
     }
 
     #[test]
+    fn bounded_response_line_end_reports_complete_invalid_need_more_and_too_long() {
+        assert_eq!(
+            detect_bounded_response_line_end(b"200 ok\r\n", 8),
+            BoundedResponseLineStatus::CompleteAt(8)
+        );
+        assert_eq!(
+            detect_bounded_response_line_end(b"200 ok", 8),
+            BoundedResponseLineStatus::NeedMore
+        );
+        assert_eq!(
+            detect_bounded_response_line_end(b"200 ok\n", 8),
+            BoundedResponseLineStatus::Invalid
+        );
+        assert_eq!(
+            detect_bounded_response_line_end(b"200 too long\r\n", 8),
+            BoundedResponseLineStatus::TooLong
+        );
+        assert_eq!(
+            detect_bounded_response_line_end(b"200 no crlf", 8),
+            BoundedResponseLineStatus::TooLong
+        );
+    }
+
+    #[test]
     fn centralized_helpers_own_line_and_dot_terminator_edges() {
         // RFC 3977 section 3.1 makes CRLF the line terminator, and section 3.1.1
         // reserves "." CRLF as the terminating line for multiline blocks:
@@ -1003,6 +1171,58 @@ mod tests {
             Some(2 + b"body\r\n".len())
         );
         assert_eq!(find_terminator_content_end(b"body", 0), None);
+    }
+
+    #[test]
+    fn dot_terminated_block_returns_content_and_block_boundaries() {
+        let empty = find_dot_terminated_block(b".\r\nnext", 0).unwrap();
+        assert_eq!(empty.bytes(), b".\r\n");
+        assert_eq!(empty.content(), b"");
+        assert_eq!(empty.terminator(), b".\r\n");
+        assert_eq!(empty.start(), 0);
+        assert_eq!(empty.content_end(), 0);
+        assert_eq!(empty.block_end(), 3);
+
+        let non_empty = find_dot_terminated_block(b"body\r\n.\r\nnext", 0).unwrap();
+        assert_eq!(non_empty.bytes(), b"body\r\n.\r\n");
+        assert_eq!(non_empty.content(), b"body\r\n");
+        assert_eq!(non_empty.terminator(), b".\r\n");
+        assert_eq!(non_empty.start(), 0);
+        assert_eq!(non_empty.content_end(), 6);
+        assert_eq!(non_empty.block_end(), 9);
+
+        let offset = find_dot_terminated_block(b"xxbody\r\n.\r\nnext", 2).unwrap();
+        assert_eq!(offset.bytes(), b"body\r\n.\r\n");
+        assert_eq!(offset.content(), b"body\r\n");
+        assert_eq!(offset.terminator(), b".\r\n");
+        assert_eq!(offset.start(), 2);
+        assert_eq!(offset.content_end(), 8);
+        assert_eq!(offset.block_end(), 11);
+    }
+
+    #[test]
+    fn dot_terminated_blocks_iterates_all_complete_borrowed_blocks() {
+        let data = b"one\r\n.\r\n.\r\ntwo\r\n.\r\ntail";
+        let blocks: Vec<_> = dot_terminated_blocks(data, 0).collect();
+
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0].bytes(), b"one\r\n.\r\n");
+        assert_eq!(blocks[0].content(), b"one\r\n");
+        assert_eq!(blocks[0].terminator(), b".\r\n");
+        assert_eq!(blocks[0].start(), 0);
+        assert_eq!(blocks[0].block_end(), 8);
+
+        assert_eq!(blocks[1].bytes(), b".\r\n");
+        assert_eq!(blocks[1].content(), b"");
+        assert_eq!(blocks[1].terminator(), b".\r\n");
+        assert_eq!(blocks[1].start(), 8);
+        assert_eq!(blocks[1].block_end(), 11);
+
+        assert_eq!(blocks[2].bytes(), b"two\r\n.\r\n");
+        assert_eq!(blocks[2].content(), b"two\r\n");
+        assert_eq!(blocks[2].terminator(), b".\r\n");
+        assert_eq!(blocks[2].start(), 11);
+        assert_eq!(blocks[2].block_end(), 19);
     }
 
     #[test]
