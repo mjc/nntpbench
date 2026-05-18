@@ -2889,10 +2889,15 @@ async fn run_reader_task_owned(
                 match decoder.push(&pending_read) {
                     Ok(DecodeProgress::NeedMore) => {}
                     Ok(DecodeProgress::Complete { status, consumed }) => {
+                        let bytes = Bytes::copy_from_slice(&pending_read[..consumed]);
+                        let pending_len = pending_read.len();
+                        let leftover_len = pending_len - consumed;
+                        pending_read.copy_within(consumed..pending_len, 0);
+                        pending_read.truncate(leftover_len);
                         let response = CompletedResponse::Owned(OwnedResponse {
                             kind,
                             status,
-                            bytes: pending_read.split_to(consumed).freeze(),
+                            bytes,
                         });
                         let _ = response_tx.send(Ok(CompletedRequest { request, response }));
                         break;
@@ -3661,6 +3666,93 @@ mod tests {
                 );
             }
         }
+
+        #[test]
+        fn streaming_decoder_consumes_large_multiline_response_at_rfc_terminator_across_chunk_schedules(
+            response_case in 0usize..4,
+            line_count in 0usize..4096,
+            chunk_sizes in vec(1usize..=65536, 0..48),
+            trailer in vec(dangerous_wire_bytes(), 0..64),
+        ) {
+            // RFC 3977 section 3.1.1: https://datatracker.ietf.org/doc/html/rfc3977#section-3.1.1
+            // Multiline responses end at the first dot line. The drained streaming
+            // decoder must find that exact terminator across arbitrary read chunks,
+            // return the bytes consumed through the terminator, and leave trailers for
+            // the next pipelined response without buffering the payload.
+            let (kind, status_line, line, expected_status) = match response_case {
+                0 => (
+                    RequestKind::Article,
+                    b"220 1 <article@test> article follows\r\n".as_slice(),
+                    b"Header: value\r\n\r\narticle body line\r\n".as_slice(),
+                    220,
+                ),
+                1 => (
+                    RequestKind::Body,
+                    b"222 1 <body@test> body follows\r\n".as_slice(),
+                    b"article body line for a large body response\r\n".as_slice(),
+                    222,
+                ),
+                2 => (
+                    RequestKind::Over,
+                    b"224 Overview information follows\r\n".as_slice(),
+                    b"1\tSubject\tposter@example.test\tFri, 15 May 2026 00:00:00 +0000\t<message@example.test>\t<ref@example.test>\t1048576\t12000\r\n".as_slice(),
+                    224,
+                ),
+                _ => (
+                    RequestKind::Xover,
+                    b"224 Overview information follows\r\n".as_slice(),
+                    b"2\tSubject\tposter@example.test\tFri, 15 May 2026 00:00:00 +0000\t<message@example.test>\t<ref@example.test>\t1048576\t12000\r\n".as_slice(),
+                    224,
+                ),
+            };
+
+            let mut frame = status_line.to_vec();
+            for _ in 0..line_count {
+                frame.extend_from_slice(line);
+            }
+            frame.extend_from_slice(b".\r\n");
+            let expected_consumed = frame.len();
+            frame.extend_from_slice(&trailer);
+
+            let mut decoder = StreamingResponseDecoder::new(kind);
+            let mut offset = 0;
+            let mut chunk_index = 0;
+            let mut completed = false;
+
+            while offset < frame.len() {
+                let requested = chunk_sizes
+                    .get(chunk_index)
+                    .copied()
+                    .unwrap_or(frame.len() - offset);
+                chunk_index += 1;
+                let end = (offset + requested).min(frame.len());
+                let chunk = &frame[offset..end];
+
+                match decoder.push(chunk)? {
+                    StreamingDecodeProgress::NeedMore { consumed } => {
+                        prop_assert_eq!(consumed, chunk.len());
+                        offset += consumed;
+                        prop_assert!(
+                            offset < expected_consumed,
+                            "decoder needed more after passing RFC terminator: offset {offset} expected {expected_consumed}",
+                        );
+                    }
+                    StreamingDecodeProgress::Complete { status, consumed } => {
+                        prop_assert_eq!(status.as_u16(), expected_status);
+                        prop_assert!(consumed <= chunk.len());
+                        prop_assert_eq!(
+                            offset + consumed,
+                            expected_consumed,
+                            "streaming decoder consumed trailer bytes or stopped before terminator",
+                        );
+                        completed = true;
+                        break;
+                    }
+                }
+            }
+
+            prop_assert!(completed, "streaming decoder did not complete");
+        }
     }
 
     #[tokio::test]
@@ -3784,6 +3876,39 @@ mod tests {
             crate::TEST_ALLOCATIONS.load(std::sync::atomic::Ordering::Relaxed),
             0
         );
+    }
+
+    #[test]
+    fn streaming_drained_decoder_handles_pipelined_body_frames_in_fixed_chunks() {
+        let mut response = Vec::new();
+        for id in 1..=4 {
+            response
+                .extend_from_slice(format!("222 {id} <body{id}@test> body follows\r\n").as_bytes());
+            while response.len() % (64 * 1024) < (64 * 1024 - 128) {
+                response.extend_from_slice(
+                    b"This is synthetic NNTP article payload for throughput and latency benchmarking\r\n",
+                );
+            }
+            response.extend_from_slice(b".\r\n");
+        }
+
+        let mut offset = 0;
+        for _ in 0..4 {
+            let mut decoder = StreamingResponseDecoder::new(RequestKind::Body);
+            loop {
+                let end = (offset + DRAINED_PENDING_READ_BYTES).min(response.len());
+                match decoder.push(&response[offset..end]).unwrap() {
+                    StreamingDecodeProgress::NeedMore { consumed } => {
+                        offset += consumed;
+                    }
+                    StreamingDecodeProgress::Complete { consumed, .. } => {
+                        offset += consumed;
+                        break;
+                    }
+                }
+            }
+        }
+        assert_eq!(offset, response.len());
     }
 
     #[test]
