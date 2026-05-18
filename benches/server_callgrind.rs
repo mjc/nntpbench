@@ -45,6 +45,7 @@ supported! {
             socket_send_buffer: 0,
             stats_interval_secs: 0,
             flush: false,
+            pending_write_bytes: 1024 * 1024,
         }
     }
 

@@ -142,7 +142,7 @@ const MAX_COMMAND_LINE_BYTES: usize = protocol::MAX_INITIAL_RESPONSE_LINE_BYTES;
 const MAX_SERVER_PIPELINE_DEPTH: usize = 1024;
 const SERVER_READER_CAPACITY: usize = 256 * 1024;
 const CLIENT_READER_CAPACITY: usize = 256 * 1024;
-const MAX_PENDING_WRITE_BYTES: usize = 1024 * 1024;
+const DEFAULT_PENDING_WRITE_BYTES: usize = 1024 * 1024;
 const HIGH_THROUGHPUT_SOCKET_BUFFER: usize = 16 * 1024 * 1024;
 const PROCESS_CLOCK_TICK: Duration = Duration::from_millis(10);
 const TCP_LINGER_TIMEOUT: Duration = Duration::from_secs(5);
@@ -204,6 +204,10 @@ pub struct ServerArgs {
     /// Flush after each response.
     #[arg(long, default_value_t = false)]
     pub flush: bool,
+
+    /// Per-session pending write buffer used to coalesce small generated response chunks.
+    #[arg(long, default_value_t = DEFAULT_PENDING_WRITE_BYTES)]
+    pub pending_write_bytes: usize,
 }
 
 #[cfg(test)]
@@ -1598,7 +1602,7 @@ async fn serve_session_inner(
     let mut command_line = [0; MAX_COMMAND_LINE_BYTES];
     let mut command_scratch = [0; MAX_COMMAND_LINE_BYTES];
     let mut command_batch = CommandBatch::new();
-    let mut pending_write = PendingWrite::new();
+    let mut pending_write = PendingWrite::new(config.pending_write_bytes);
 
     send_greeting(&mut writer, &config, session_stats).await?;
 
@@ -1896,7 +1900,7 @@ where
 }
 
 struct PendingWrite {
-    buf: Box<[u8; MAX_PENDING_WRITE_BYTES]>,
+    buf: Box<[u8]>,
     len: usize,
 }
 
@@ -1937,9 +1941,9 @@ impl<'a> GeneratedResponse<'a> {
 
 #[cfg_attr(coverage_nightly, coverage(off))]
 impl PendingWrite {
-    fn new() -> Self {
+    fn new(capacity: usize) -> Self {
         Self {
-            buf: Box::new([0; MAX_PENDING_WRITE_BYTES]),
+            buf: vec![0; capacity.max(1)].into_boxed_slice(),
             len: 0,
         }
     }
@@ -2232,6 +2236,7 @@ pub struct ServerConfig {
     pub max_pipeline_depth: usize,
     pub stats_interval: Duration,
     pub flush: bool,
+    pub pending_write_bytes: usize,
     pub nodelay: bool,
     pub socket_recv_buffer: usize,
     pub socket_send_buffer: usize,
@@ -2246,6 +2251,7 @@ impl ServerConfig {
             max_pipeline_depth: args.max_pipeline_depth.clamp(1, 1024),
             stats_interval: Duration::from_secs(args.stats_interval_secs),
             flush: args.flush,
+            pending_write_bytes: args.pending_write_bytes.max(1),
             nodelay: args.nodelay,
             socket_recv_buffer: args.socket_recv_buffer,
             socket_send_buffer: args.socket_send_buffer,
@@ -2668,6 +2674,7 @@ mod tests {
             socket_send_buffer: HIGH_THROUGHPUT_SOCKET_BUFFER,
             stats_interval_secs: 0,
             flush: false,
+            pending_write_bytes: DEFAULT_PENDING_WRITE_BYTES,
         }
     }
 
@@ -2951,15 +2958,15 @@ mod tests {
     #[tokio::test]
     async fn pending_write_flushes_when_full_and_writes_oversized_directly() {
         let mut sink = tokio::io::sink();
-        let mut pending = PendingWrite::new();
-        let first = vec![b'a'; MAX_PENDING_WRITE_BYTES - 16];
+        let mut pending = PendingWrite::new(DEFAULT_PENDING_WRITE_BYTES);
+        let first = vec![b'a'; DEFAULT_PENDING_WRITE_BYTES - 16];
         let second = vec![b'b'; 32];
         pending.push(&mut sink, &first).await.unwrap();
         assert_eq!(pending.len, first.len());
         pending.push(&mut sink, &second).await.unwrap();
         assert_eq!(pending.len, second.len());
 
-        let huge = vec![b'c'; MAX_PENDING_WRITE_BYTES + 1];
+        let huge = vec![b'c'; DEFAULT_PENDING_WRITE_BYTES + 1];
         pending.push(&mut sink, &huge).await.unwrap();
         assert_eq!(pending.len, 0);
     }
@@ -2967,7 +2974,7 @@ mod tests {
     #[tokio::test]
     async fn pending_write_handles_pending_writer() {
         let mut writer = PendingOnceWriter::default();
-        let mut pending = PendingWrite::new();
+        let mut pending = PendingWrite::new(DEFAULT_PENDING_WRITE_BYTES);
 
         pending
             .push(&mut writer, b"CAPABILITIES\r\n")
@@ -2984,7 +2991,7 @@ mod tests {
     #[tokio::test]
     async fn pending_write_vectors_pending_prefix_with_large_response() {
         let mut writer = VectoredWriter::default();
-        let mut pending = PendingWrite::new();
+        let mut pending = PendingWrite::new(DEFAULT_PENDING_WRITE_BYTES);
 
         pending.push(&mut writer, DATE_RESPONSE).await.unwrap();
         pending
@@ -3004,10 +3011,10 @@ mod tests {
     #[tokio::test]
     async fn handle_command_reports_large_response_write_error() {
         let mut args = test_args();
-        args.article_bytes = MAX_PENDING_WRITE_BYTES + BODY_LINE.len();
+        args.article_bytes = DEFAULT_PENDING_WRITE_BYTES + BODY_LINE.len();
         let config = ServerConfig::from_args(args);
         let mut stats = SessionStats::default();
-        let mut pending = PendingWrite::new();
+        let mut pending = PendingWrite::new(DEFAULT_PENDING_WRITE_BYTES);
         let mut writer = FailingWriter;
         let command = ParsedCommand {
             kind: RequestKind::Article,
