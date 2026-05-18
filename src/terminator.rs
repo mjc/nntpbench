@@ -101,6 +101,15 @@ pub fn find_crlf_line_end(data: &[u8], start: usize) -> Option<usize> {
     memchr::memmem::find(slice, crate::CRLF).map(|relative| start + relative + crate::CRLF.len())
 }
 
+/// Return the byte position before a complete strict CRLF line terminator.
+#[must_use]
+pub fn strict_crlf_line_content_end_from(data: &[u8], start: usize) -> Option<usize> {
+    match detect_response_line_end_from(data, start) {
+        ResponseLineStatus::CompleteAt(end) => Some(end - crate::CRLF.len()),
+        ResponseLineStatus::NeedMore | ResponseLineStatus::Invalid => None,
+    }
+}
+
 /// Append a CRLF line terminator.
 pub fn append_crlf(output: &mut Vec<u8>) {
     output.extend_from_slice(crate::CRLF);

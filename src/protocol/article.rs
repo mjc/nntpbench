@@ -4,7 +4,7 @@ use std::fmt;
 
 use super::{InvalidMessageId, MessageId, StatusCode};
 use crate::terminator::{
-    DOT_TERMINATOR, ResponseLineStatus, detect_response_line_end_from, find_terminator_content_end,
+    DOT_TERMINATOR, find_terminator_content_end, strict_crlf_line_content_end_from,
 };
 
 /// Article parsing error.
@@ -14,10 +14,18 @@ pub enum ArticleParseError {
     InvalidStatusPrefix,
     MissingSeparator,
     MissingTerminator,
-    InvalidHeader(String),
+    InvalidHeader(InvalidHeaderReason),
     UnexpectedBody,
     BufferTooShort,
     InvalidMessageId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvalidHeaderReason {
+    LeadingFold,
+    MissingColon,
+    EmptyName,
+    InvalidName,
 }
 
 #[cfg(test)]
@@ -929,6 +937,17 @@ impl fmt::Display for ArticleParseError {
 
 impl std::error::Error for ArticleParseError {}
 
+impl fmt::Display for InvalidHeaderReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LeadingFold => write!(f, "header cannot start with folding whitespace"),
+            Self::MissingColon => write!(f, "header missing colon"),
+            Self::EmptyName => write!(f, "empty header name"),
+            Self::InvalidName => write!(f, "invalid character in header name"),
+        }
+    }
+}
+
 impl From<InvalidMessageId> for ArticleParseError {
     fn from(_: InvalidMessageId) -> Self {
         Self::InvalidMessageId
@@ -973,7 +992,7 @@ impl<'a> Headers<'a> {
         let mut pos = 0;
 
         while pos < self.data.len() {
-            let line_end = find_line_end(self.data, pos).ok()?;
+            let line_end = strict_crlf_line_content_end_from(self.data, pos)?;
             let line = &self.data[pos..line_end];
             if line.is_empty() {
                 pos = line_end + 2;
@@ -1039,7 +1058,7 @@ impl<'a> Iterator for HeaderIter<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         while self.pos < self.data.len() {
-            let line_end = find_line_end(self.data, self.pos).ok()?;
+            let line_end = strict_crlf_line_content_end_from(self.data, self.pos)?;
             let line = &self.data[self.pos..line_end];
             if line.is_empty() {
                 self.pos = line_end + 2;
@@ -1098,7 +1117,8 @@ impl<'a> Article<'a> {
     }
 
     fn parse_article(buf: &'a [u8]) -> Result<Self, ArticleParseError> {
-        let first_line_end = find_line_end(buf, 0)?;
+        let first_line_end =
+            strict_crlf_line_content_end_from(buf, 0).ok_or(ArticleParseError::BufferTooShort)?;
         let (message_id, article_number) = parse_first_line(&buf[..first_line_end])?;
         let content_start = first_line_end + 2;
         let separator_pos = find_blank_line(buf, content_start)?;
@@ -1116,7 +1136,8 @@ impl<'a> Article<'a> {
     }
 
     fn parse_head(buf: &'a [u8]) -> Result<Self, ArticleParseError> {
-        let first_line_end = find_line_end(buf, 0)?;
+        let first_line_end =
+            strict_crlf_line_content_end_from(buf, 0).ok_or(ArticleParseError::BufferTooShort)?;
         let (message_id, article_number) = parse_first_line(&buf[..first_line_end])?;
         let content_start = first_line_end + 2;
         if find_blank_line(buf, content_start).is_ok() {
@@ -1134,7 +1155,8 @@ impl<'a> Article<'a> {
     }
 
     fn parse_body(buf: &'a [u8]) -> Result<Self, ArticleParseError> {
-        let first_line_end = find_line_end(buf, 0)?;
+        let first_line_end =
+            strict_crlf_line_content_end_from(buf, 0).ok_or(ArticleParseError::BufferTooShort)?;
         let (message_id, article_number) = parse_first_line(&buf[..first_line_end])?;
         let body_start = first_line_end + 2;
         let body_end = find_article_content_end(buf, body_start)
@@ -1149,7 +1171,8 @@ impl<'a> Article<'a> {
     }
 
     fn parse_stat(buf: &'a [u8]) -> Result<Self, ArticleParseError> {
-        let first_line_end = find_line_end(buf, 0)?;
+        let first_line_end =
+            strict_crlf_line_content_end_from(buf, 0).ok_or(ArticleParseError::BufferTooShort)?;
         let (message_id, article_number) = parse_first_line(&buf[..first_line_end])?;
         let content_start = first_line_end + 2;
         if content_start < buf.len() && !buf[content_start..].starts_with(DOT_TERMINATOR) {
@@ -1210,19 +1233,6 @@ fn parse_first_line(
     Ok((MessageId::from_borrowed(msgid)?, article_number))
 }
 
-fn find_line_end(buf: &[u8], start: usize) -> Result<usize, ArticleParseError> {
-    if start > buf.len() {
-        return Err(ArticleParseError::BufferTooShort);
-    }
-
-    match detect_response_line_end_from(buf, start) {
-        ResponseLineStatus::CompleteAt(end) => Ok(end - 2),
-        ResponseLineStatus::NeedMore | ResponseLineStatus::Invalid => {
-            Err(ArticleParseError::BufferTooShort)
-        }
-    }
-}
-
 fn find_blank_line(buf: &[u8], start: usize) -> Result<usize, ArticleParseError> {
     memchr::memmem::find(&buf[start..], b"\r\n\r\n")
         .map(|pos| start + pos)
@@ -1232,7 +1242,8 @@ fn find_blank_line(buf: &[u8], start: usize) -> Result<usize, ArticleParseError>
 fn validate_headers(data: &[u8]) -> Result<(), ArticleParseError> {
     let mut pos = 0;
     while pos < data.len() {
-        let line_end = find_line_end(data, pos)?;
+        let line_end = strict_crlf_line_content_end_from(data, pos)
+            .ok_or(ArticleParseError::BufferTooShort)?;
         let line = &data[pos..line_end];
 
         if line.is_empty() {
@@ -1243,31 +1254,27 @@ fn validate_headers(data: &[u8]) -> Result<(), ArticleParseError> {
         if line[0] == b' ' || line[0] == b'\t' {
             if pos == 0 {
                 return Err(ArticleParseError::InvalidHeader(
-                    "header cannot start with folding whitespace".to_string(),
+                    InvalidHeaderReason::LeadingFold,
                 ));
             }
             pos = line_end + 2;
             continue;
         }
 
-        let colon_pos = memchr::memchr(b':', line).ok_or_else(|| {
-            ArticleParseError::InvalidHeader(format!(
-                "header missing colon: {}",
-                String::from_utf8_lossy(line)
-            ))
-        })?;
+        let colon_pos = memchr::memchr(b':', line).ok_or(ArticleParseError::InvalidHeader(
+            InvalidHeaderReason::MissingColon,
+        ))?;
         let name = &line[..colon_pos];
         if name.is_empty() {
             return Err(ArticleParseError::InvalidHeader(
-                "empty header name".to_string(),
+                InvalidHeaderReason::EmptyName,
             ));
         }
         for &byte in name {
             if byte == b' ' || byte == b'\t' || !(33..=126).contains(&byte) {
-                return Err(ArticleParseError::InvalidHeader(format!(
-                    "invalid character in header name: {}",
-                    String::from_utf8_lossy(name)
-                )));
+                return Err(ArticleParseError::InvalidHeader(
+                    InvalidHeaderReason::InvalidName,
+                ));
             }
         }
 
@@ -1400,6 +1407,40 @@ Actual body content\r\n\
     }
 
     #[test]
+    fn article_header_parsing_does_not_allocate() {
+        let valid = b"Subject: Test\r\nFrom: user@example.com\r\n";
+        let missing_colon = b"Invalid Header\r\n";
+        let invalid_name = b"Invalid Header: value\r\n";
+        let leading_fold = b" folded\r\nSubject: Test\r\n";
+
+        crate::COUNT_TEST_ALLOCATIONS.with(|enabled| enabled.set(false));
+        crate::TEST_ALLOCATIONS.store(0, std::sync::atomic::Ordering::Relaxed);
+        crate::COUNT_TEST_ALLOCATIONS.with(|enabled| enabled.set(true));
+
+        let headers = Headers::parse(valid).unwrap();
+        assert_eq!(headers.get("subject"), Some(&b"Test"[..]));
+        assert_eq!(headers.iter().count(), 2);
+        assert_eq!(
+            Headers::parse(missing_colon).unwrap_err(),
+            ArticleParseError::InvalidHeader(InvalidHeaderReason::MissingColon)
+        );
+        assert_eq!(
+            Headers::parse(invalid_name).unwrap_err(),
+            ArticleParseError::InvalidHeader(InvalidHeaderReason::InvalidName)
+        );
+        assert_eq!(
+            Headers::parse(leading_fold).unwrap_err(),
+            ArticleParseError::InvalidHeader(InvalidHeaderReason::LeadingFold)
+        );
+
+        crate::COUNT_TEST_ALLOCATIONS.with(|enabled| enabled.set(false));
+        assert_eq!(
+            crate::TEST_ALLOCATIONS.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[test]
     fn parses_rfc_style_article_shapes() {
         for (input, article_number, message_id, has_headers, has_body) in [
             (
@@ -1499,7 +1540,7 @@ Actual body content\r\n\
             (
                 b"220 12345 <test@example.com>\r\nSubject: Valid\r\nInvalidHeaderNoColon\r\n\r\nBody\r\n.\r\n"
                     .as_slice(),
-                ArticleParseError::InvalidHeader("".to_string()),
+                ArticleParseError::InvalidHeader(InvalidHeaderReason::MissingColon),
             ),
             (
                 b"221 12345 <test@example.com>\r\nSubject: Test\r\n\r\nThis body should not be here\r\n.\r\n"
