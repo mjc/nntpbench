@@ -3,7 +3,9 @@
 use std::fmt;
 
 use super::{InvalidMessageId, MessageId, StatusCode};
-use crate::tail_buffer::find_terminator_content_end;
+use crate::tail_buffer::{
+    ResponseLineStatus, detect_response_line_end, find_terminator_content_end,
+};
 
 /// Article parsing error.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,6 +85,17 @@ mod proptests {
                 buf.len() < 3 || !buf[..3].iter().all(|byte| byte.is_ascii_digit())
             })
             .boxed()
+    }
+
+    fn dangerous_wire_bytes() -> impl Strategy<Value = u8> {
+        prop_oneof![
+            Just(b'\r'),
+            Just(b'\n'),
+            Just(b'.'),
+            Just(b' '),
+            b'0'..=b'9',
+            b'a'..=b'z',
+        ]
     }
 
     proptest! {
@@ -688,11 +701,111 @@ mod proptests {
             message_id in message_id_strategy(),
             article_number in 0_u32..=999_999,
         ) {
+            // RFC 3977 section 3.1 requires the response initial line to be terminated
+            // by a CRLF pair. Without that pair, the parser must keep treating the frame
+            // as incomplete rather than accepting a partial status line:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-3.1
             let frame = format!("{status} {article_number} {message_id}");
             prop_assert_eq!(
                 Article::parse(frame.as_bytes()).unwrap_err(),
                 ArticleParseError::BufferTooShort
             );
+        }
+
+        #[test]
+        fn article_family_responses_reject_bare_lf_or_cr_before_later_crlf(
+            status in prop_oneof![Just("220"), Just("221"), Just("222"), Just("223")],
+            message_id in message_id_strategy(),
+            article_number in 0_u32..=999_999,
+            before in string_regex("[A-Za-z0-9 ._-]{0,16}").unwrap(),
+            after in string_regex("[A-Za-z0-9 ._-]{0,16}").unwrap(),
+            bad_separator in prop::sample::select(vec![b"\n".to_vec(), b"\r ".to_vec(), b"\r\r".to_vec()]),
+        ) {
+            // RFC 3977 section 3.1 says the response initial line ends with CRLF, and
+            // section 3.1.1 says multiline block lines also use CRLF and otherwise MUST
+            // NOT include bare LF or CR. The article parser must fail at the first invalid
+            // line ending instead of resynchronizing on a later CRLF:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-3.1
+            // https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1
+            let mut frame = format!("{status} {article_number} {message_id}").into_bytes();
+            frame.extend_from_slice(before.as_bytes());
+            frame.extend_from_slice(&bad_separator);
+            frame.extend_from_slice(after.as_bytes());
+            frame.extend_from_slice(b"\r\nHeader: value\r\n\r\nbody\r\n.\r\n");
+
+            prop_assert_eq!(Article::parse(&frame).unwrap_err(), ArticleParseError::BufferTooShort);
+        }
+
+        #[test]
+        fn article_body_terminator_is_first_rfc_dot_line(
+            message_id in message_id_strategy(),
+            article_number in 0_u32..=999_999,
+            mut body in vec(dangerous_wire_bytes(), 0..48),
+            trailer in vec(dangerous_wire_bytes(), 0..16),
+        ) {
+            // RFC 3977 section 3.1.1 terminates a non-empty multiline block with the first
+            // exact CRLF "." CRLF sequence. Generated body bytes are scrubbed of that exact
+            // sequence before the real terminator is appended, so the parser must expose the
+            // whole generated body and ignore trailer bytes after the terminator:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1
+            while let Some(start) = body
+                .windows(crate::TERMINATOR.len())
+                .position(|window| window == crate::TERMINATOR)
+            {
+                body[start + 2] = b'x';
+            }
+            body.insert(0, b'x');
+            body.push(b'x');
+
+            let mut frame = format!("222 {article_number} {message_id}\r\n").into_bytes();
+            frame.extend_from_slice(&body);
+            frame.extend_from_slice(crate::TERMINATOR);
+            frame.extend_from_slice(&trailer);
+
+            let parsed = Article::parse(&frame).unwrap();
+            let mut expected_body = body;
+            expected_body.extend_from_slice(crate::CRLF);
+            prop_assert_eq!(parsed.message_id.as_str(), message_id.as_str());
+            prop_assert_eq!(parsed.article_number, Some(ArticleNumber::from(article_number as u64)));
+            prop_assert_eq!(parsed.body, Some(expected_body.as_slice()));
+        }
+
+        #[test]
+        fn article_body_rejects_missing_rfc_dot_line_despite_near_misses(
+            message_id in message_id_strategy(),
+            article_number in 0_u32..=999_999,
+            prefix in vec(dangerous_wire_bytes(), 0..16),
+            suffix in vec(dangerous_wire_bytes(), 0..16),
+            near_miss in prop::sample::select(vec![
+                b"\n.\r\n".to_vec(),
+                b"\r.\r\n".to_vec(),
+                b"\r\n.\n".to_vec(),
+                b"\r\n.\r".to_vec(),
+                b".foo\r\n".to_vec(),
+                b"..\r\n".to_vec(),
+                b"body.\r\n".to_vec(),
+            ]),
+        ) {
+            // RFC 3977 section 3.1.1 names only CRLF "." CRLF as the non-empty multiline
+            // terminator. Near-misses, dot-stuffed lines, and bare LF/CR variants are not a
+            // complete terminating line, so BODY parsing must report a missing terminator:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1
+            let mut body = prefix;
+            body.extend_from_slice(&near_miss);
+            body.extend_from_slice(&suffix);
+            while let Some(start) = body
+                .windows(crate::TERMINATOR.len())
+                .position(|window| window == crate::TERMINATOR)
+            {
+                body[start + 2] = b'x';
+            }
+            body.insert(0, b'x');
+            body.push(b'x');
+
+            let mut frame = format!("222 {article_number} {message_id}\r\n").into_bytes();
+            frame.extend_from_slice(&body);
+
+            prop_assert_eq!(Article::parse(&frame).unwrap_err(), ArticleParseError::MissingTerminator);
         }
 
         #[test]
@@ -1098,12 +1211,12 @@ fn parse_first_line(
 }
 
 fn find_line_end(buf: &[u8], start: usize) -> Result<usize, ArticleParseError> {
-    for index in start..buf.len() {
-        if buf[index] == b'\r' && index + 1 < buf.len() && buf[index + 1] == b'\n' {
-            return Ok(index);
+    match detect_response_line_end(buf.get(start..).ok_or(ArticleParseError::BufferTooShort)?) {
+        ResponseLineStatus::CompleteAt(end) => Ok(start + end - 2),
+        ResponseLineStatus::NeedMore | ResponseLineStatus::Invalid => {
+            Err(ArticleParseError::BufferTooShort)
         }
     }
-    Err(ArticleParseError::BufferTooShort)
 }
 
 fn find_blank_line(buf: &[u8], start: usize) -> Result<usize, ArticleParseError> {
