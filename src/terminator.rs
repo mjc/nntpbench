@@ -57,10 +57,41 @@ pub fn detect_response_line_end(buffer: &[u8]) -> ResponseLineStatus {
     ResponseLineStatus::NeedMore
 }
 
+/// Find a strict CRLF-terminated NNTP response line from `start`.
+///
+/// `CompleteAt` reports the absolute position after the CRLF.
+#[must_use]
+pub fn detect_response_line_end_from(buffer: &[u8], start: usize) -> ResponseLineStatus {
+    let Some(slice) = buffer.get(start..) else {
+        return ResponseLineStatus::NeedMore;
+    };
+
+    match detect_response_line_end(slice) {
+        ResponseLineStatus::CompleteAt(end) => ResponseLineStatus::CompleteAt(start + end),
+        status => status,
+    }
+}
+
 /// Return the line without a final CRLF terminator.
 #[must_use]
 pub fn strip_crlf(line: &[u8]) -> Option<&[u8]> {
     line.strip_suffix(crate::CRLF)
+}
+
+/// Return the content of a single strict CRLF line.
+///
+/// Unlike [`strip_crlf`], this rejects bare LF/CR and rejects bytes after the
+/// first complete CRLF line.
+#[must_use]
+pub fn strip_complete_crlf_line(line: &[u8]) -> Option<&[u8]> {
+    match detect_response_line_end(line) {
+        ResponseLineStatus::CompleteAt(end) if end == line.len() => {
+            Some(&line[..line.len() - crate::CRLF.len()])
+        }
+        ResponseLineStatus::CompleteAt(_)
+        | ResponseLineStatus::NeedMore
+        | ResponseLineStatus::Invalid => None,
+    }
 }
 
 /// Return the byte position after the next CRLF-terminated line.
@@ -404,6 +435,17 @@ mod tests {
         ResponseLineStatus::NeedMore
     }
 
+    fn strict_response_line_crlf_oracle_from(buffer: &[u8], start: usize) -> ResponseLineStatus {
+        let Some(slice) = buffer.get(start..) else {
+            return ResponseLineStatus::NeedMore;
+        };
+
+        match strict_response_line_crlf_oracle(slice) {
+            ResponseLineStatus::CompleteAt(end) => ResponseLineStatus::CompleteAt(start + end),
+            status => status,
+        }
+    }
+
     fn crlf_line_end_oracle(buffer: &[u8], start: usize) -> Option<usize> {
         if start > buffer.len() {
             return None;
@@ -460,6 +502,17 @@ mod tests {
             Some(&buffer[..buffer.len() - 2])
         } else {
             None
+        }
+    }
+
+    fn strip_complete_crlf_line_oracle(buffer: &[u8]) -> Option<&[u8]> {
+        match strict_response_line_crlf_oracle(buffer) {
+            ResponseLineStatus::CompleteAt(end) if end == buffer.len() => {
+                Some(&buffer[..buffer.len() - 2])
+            }
+            ResponseLineStatus::CompleteAt(_)
+            | ResponseLineStatus::NeedMore
+            | ResponseLineStatus::Invalid => None,
         }
     }
 
@@ -700,7 +753,17 @@ mod tests {
                 "{input:?}",
             );
             assert_eq!(strip_crlf(input), strip_crlf_oracle(input), "{input:?}");
+            assert_eq!(
+                strip_complete_crlf_line(input),
+                strip_complete_crlf_line_oracle(input),
+                "{input:?}",
+            );
             for start in 0..=input.len() + 1 {
+                assert_eq!(
+                    detect_response_line_end_from(input, start),
+                    strict_response_line_crlf_oracle_from(input, start),
+                    "start {start} input {input:?}",
+                );
                 assert_eq!(
                     find_crlf_line_end(input, start),
                     crlf_line_end_oracle(input, start),
@@ -1042,7 +1105,15 @@ mod tests {
                 detect_response_line_end(&input),
                 strict_response_line_crlf_oracle(&input),
             );
+            prop_assert_eq!(
+                detect_response_line_end_from(&input, start),
+                strict_response_line_crlf_oracle_from(&input, start),
+            );
             prop_assert_eq!(strip_crlf(&input), strip_crlf_oracle(&input));
+            prop_assert_eq!(
+                strip_complete_crlf_line(&input),
+                strip_complete_crlf_line_oracle(&input),
+            );
             prop_assert_eq!(
                 find_crlf_line_end(&input, start),
                 crlf_line_end_oracle(&input, start),

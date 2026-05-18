@@ -4,7 +4,7 @@ use std::fmt;
 
 use super::{InvalidMessageId, MessageId, StatusCode};
 use crate::terminator::{
-    DOT_TERMINATOR, ResponseLineStatus, detect_response_line_end, find_terminator_content_end,
+    DOT_TERMINATOR, ResponseLineStatus, detect_response_line_end_from, find_terminator_content_end,
 };
 
 /// Article parsing error.
@@ -1211,8 +1211,12 @@ fn parse_first_line(
 }
 
 fn find_line_end(buf: &[u8], start: usize) -> Result<usize, ArticleParseError> {
-    match detect_response_line_end(buf.get(start..).ok_or(ArticleParseError::BufferTooShort)?) {
-        ResponseLineStatus::CompleteAt(end) => Ok(start + end - 2),
+    if start > buf.len() {
+        return Err(ArticleParseError::BufferTooShort);
+    }
+
+    match detect_response_line_end_from(buf, start) {
+        ResponseLineStatus::CompleteAt(end) => Ok(end - 2),
         ResponseLineStatus::NeedMore | ResponseLineStatus::Invalid => {
             Err(ArticleParseError::BufferTooShort)
         }
