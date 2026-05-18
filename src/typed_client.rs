@@ -26,7 +26,7 @@ use crate::{
     StatusCode, Wildmat,
 };
 
-const DRAINED_PENDING_READ_BYTES: usize = 64 * 1024;
+const DRAINED_PENDING_READ_BYTES: usize = 1024 * 1024;
 const OWNED_RESPONSE_PREALLOC_BYTES: usize = 8 * 1024 * 1024;
 const STREAMING_STATUS_LINE_BYTES: usize = crate::protocol::MAX_INITIAL_RESPONSE_LINE_BYTES;
 
