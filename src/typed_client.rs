@@ -1,4 +1,5 @@
 use std::fmt;
+use std::fmt::Write as FmtWrite;
 use std::future::poll_fn;
 use std::io;
 use std::io::IoSlice;
@@ -18,8 +19,9 @@ use crate::terminator::{
     ResponseLineStatus, TerminatorStatus, crlf_normalized_payload_lines, detect_response_line_end,
 };
 use crate::{
-    Article, ArticleParseError, ArticleSelector, ArticleTransfer, AuthInfoValue, GroupName,
-    HeaderName, ListGroupRange, MessageId, NntpDate, NntpTime, RequestKind, StatusCode, Wildmat,
+    Article, ArticleParseError, ArticleSelector, ArticleTransfer, AuthInfoKind, AuthInfoValue,
+    GroupName, HeaderName, ListGroupRange, ListKind, MessageId, NntpDate, NntpTime, RequestKind,
+    StatusCode, Wildmat,
 };
 
 /// Options for the typed one-connection client prototype.
@@ -2305,12 +2307,9 @@ async fn run_writer_task(
     inflight_tx: mpsc::Sender<InFlightRequest>,
     poisoned: Arc<Mutex<Option<SharedEngineError>>>,
 ) {
-    let mut write_buffer = Vec::with_capacity(crate::MAX_CLIENT_COMMAND_BYTES);
-
     while let Some(queued) = request_rx.recv().await {
         let kind = queued.request.kind();
-        if let Err(err) = write_request_wire(&mut writer, &queued.request, &mut write_buffer).await
-        {
+        if let Err(err) = write_request_wire(&mut writer, &queued.request).await {
             let error = SharedEngineError::Io {
                 kind: err.kind(),
                 message: err.to_string(),
@@ -2334,41 +2333,335 @@ async fn run_writer_task(
     }
 }
 
-async fn write_request_wire<W>(
-    writer: &mut W,
-    request: &Request<'static>,
-    write_buffer: &mut Vec<u8>,
-) -> io::Result<()>
+async fn write_request_wire<W>(writer: &mut W, request: &Request<'static>) -> io::Result<()>
 where
     W: AsyncWrite + Unpin,
 {
     match request {
+        Request::Article { article_ref } => {
+            write_article_ref_request_wire(writer, b"ARTICLE", article_ref).await
+        }
+        Request::Body { article_ref } => {
+            write_article_ref_request_wire(writer, b"BODY", article_ref).await
+        }
+        Request::Head { article_ref } => {
+            write_article_ref_request_wire(writer, b"HEAD", article_ref).await
+        }
+        Request::Stat { article_ref } => {
+            write_article_ref_request_wire(writer, b"STAT", article_ref).await
+        }
+        Request::ListVariant { kind, wildmat } => {
+            write_list_request_wire(writer, *kind, wildmat.as_ref()).await
+        }
+        Request::Group { group } => {
+            write_one_arg_request_wire(writer, b"GROUP ", group.as_str()).await
+        }
+        Request::ListGroup { group, range } => {
+            write_listgroup_request_wire(writer, group.as_ref(), range.as_ref()).await
+        }
+        Request::Last => write_simple_request_wire(writer, b"LAST").await,
+        Request::Next => write_simple_request_wire(writer, b"NEXT").await,
+        Request::Over { selector } => {
+            write_one_arg_request_wire(writer, b"OVER ", selector.as_str()).await
+        }
+        Request::Xover { selector } => {
+            write_one_arg_request_wire(writer, b"XOVER ", selector.as_str()).await
+        }
+        Request::Hdr { header, selector } => {
+            write_two_arg_request_wire(writer, b"HDR ", header.as_str(), selector.as_str()).await
+        }
+        Request::Xhdr { header, selector } => {
+            write_two_arg_request_wire(writer, b"XHDR ", header.as_str(), selector.as_str()).await
+        }
+        Request::NewGroups { date, time, gmt } => {
+            write_datetime_request_wire(writer, b"NEWGROUPS ", date.as_str(), time.as_str(), *gmt)
+                .await
+        }
+        Request::NewNews {
+            wildmat,
+            date,
+            time,
+            gmt,
+        } => {
+            write_newnews_request_wire(writer, wildmat.as_str(), date.as_str(), time.as_str(), *gmt)
+                .await
+        }
+        Request::Post => write_simple_request_wire(writer, b"POST").await,
+        Request::Ihave { message_id } => {
+            write_message_id_request_wire(writer, b"IHAVE ", message_id).await
+        }
+        Request::Check { message_id } => {
+            write_message_id_request_wire(writer, b"CHECK ", message_id).await
+        }
         Request::TakeThis {
             message_id,
             article,
-        } => write_takethis_request_wire(writer, write_buffer, message_id, article).await,
-        _ => {
-            write_buffer.clear();
-            request.write_wire_to(write_buffer);
-            writer.write_all(write_buffer).await
+        } => write_takethis_request_wire(writer, message_id, article).await,
+        Request::AuthInfo { kind, value } => {
+            write_authinfo_request_wire(writer, *kind, value.as_str()).await
+        }
+        Request::StartTls => write_simple_request_wire(writer, b"STARTTLS").await,
+        Request::List => write_simple_request_wire(writer, b"LIST").await,
+        Request::Help => write_simple_request_wire(writer, b"HELP").await,
+        Request::Capabilities => write_simple_request_wire(writer, b"CAPABILITIES").await,
+        Request::Date => write_simple_request_wire(writer, b"DATE").await,
+        Request::ModeReader => write_simple_request_wire(writer, b"MODE READER").await,
+        Request::Quit => write_simple_request_wire(writer, b"QUIT").await,
+    }
+}
+
+async fn write_article_ref_request_wire<W>(
+    writer: &mut W,
+    verb: &[u8],
+    article_ref: &ArticleRef<'_>,
+) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    match article_ref {
+        ArticleRef::Current => {
+            write_slices(writer, &mut [IoSlice::new(verb), IoSlice::new(crate::CRLF)]).await
+        }
+        ArticleRef::Number(number) => {
+            let mut number_buf = arrayvec::ArrayString::<20>::new();
+            write!(&mut number_buf, "{number}").map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid article number")
+            })?;
+            write_slices(
+                writer,
+                &mut [
+                    IoSlice::new(verb),
+                    IoSlice::new(b" "),
+                    IoSlice::new(number_buf.as_bytes()),
+                    IoSlice::new(crate::CRLF),
+                ],
+            )
+            .await
+        }
+        ArticleRef::MessageId(message_id) => {
+            write_slices(
+                writer,
+                &mut [
+                    IoSlice::new(verb),
+                    IoSlice::new(b" "),
+                    IoSlice::new(message_id.as_str().as_bytes()),
+                    IoSlice::new(crate::CRLF),
+                ],
+            )
+            .await
         }
     }
 }
 
+async fn write_message_id_request_wire<W>(
+    writer: &mut W,
+    verb: &[u8],
+    message_id: &MessageId<'_>,
+) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    write_slices(
+        writer,
+        &mut [
+            IoSlice::new(verb),
+            IoSlice::new(message_id.as_str().as_bytes()),
+            IoSlice::new(crate::CRLF),
+        ],
+    )
+    .await
+}
+
+async fn write_one_arg_request_wire<W>(writer: &mut W, verb: &[u8], arg: &str) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    write_slices(
+        writer,
+        &mut [
+            IoSlice::new(verb),
+            IoSlice::new(arg.as_bytes()),
+            IoSlice::new(crate::CRLF),
+        ],
+    )
+    .await
+}
+
+async fn write_two_arg_request_wire<W>(
+    writer: &mut W,
+    verb: &[u8],
+    left: &str,
+    right: &str,
+) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    write_slices(
+        writer,
+        &mut [
+            IoSlice::new(verb),
+            IoSlice::new(left.as_bytes()),
+            IoSlice::new(b" "),
+            IoSlice::new(right.as_bytes()),
+            IoSlice::new(crate::CRLF),
+        ],
+    )
+    .await
+}
+
+async fn write_listgroup_request_wire<W>(
+    writer: &mut W,
+    group: Option<&GroupName<'_>>,
+    range: Option<&ListGroupRange<'_>>,
+) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    match (group, range) {
+        (None, None) => write_simple_request_wire(writer, b"LISTGROUP").await,
+        (Some(group), None) => {
+            write_one_arg_request_wire(writer, b"LISTGROUP ", group.as_str()).await
+        }
+        (None, Some(range)) => {
+            write_one_arg_request_wire(writer, b"LISTGROUP ", range.as_str()).await
+        }
+        (Some(group), Some(range)) => {
+            write_two_arg_request_wire(writer, b"LISTGROUP ", group.as_str(), range.as_str()).await
+        }
+    }
+}
+
+async fn write_datetime_request_wire<W>(
+    writer: &mut W,
+    verb: &[u8],
+    date: &str,
+    time: &str,
+    gmt: bool,
+) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let suffix = if gmt {
+        b" GMT\r\n".as_slice()
+    } else {
+        crate::CRLF
+    };
+    write_slices(
+        writer,
+        &mut [
+            IoSlice::new(verb),
+            IoSlice::new(date.as_bytes()),
+            IoSlice::new(b" "),
+            IoSlice::new(time.as_bytes()),
+            IoSlice::new(suffix),
+        ],
+    )
+    .await
+}
+
+async fn write_newnews_request_wire<W>(
+    writer: &mut W,
+    wildmat: &str,
+    date: &str,
+    time: &str,
+    gmt: bool,
+) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let suffix = if gmt {
+        b" GMT\r\n".as_slice()
+    } else {
+        crate::CRLF
+    };
+    write_slices(
+        writer,
+        &mut [
+            IoSlice::new(b"NEWNEWS "),
+            IoSlice::new(wildmat.as_bytes()),
+            IoSlice::new(b" "),
+            IoSlice::new(date.as_bytes()),
+            IoSlice::new(b" "),
+            IoSlice::new(time.as_bytes()),
+            IoSlice::new(suffix),
+        ],
+    )
+    .await
+}
+
+async fn write_list_request_wire<W>(
+    writer: &mut W,
+    kind: ListKind,
+    wildmat: Option<&Wildmat<'_>>,
+) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    match wildmat {
+        Some(wildmat) => {
+            write_slices(
+                writer,
+                &mut [
+                    IoSlice::new(b"LIST "),
+                    IoSlice::new(kind.as_wire()),
+                    IoSlice::new(b" "),
+                    IoSlice::new(wildmat.as_str().as_bytes()),
+                    IoSlice::new(crate::CRLF),
+                ],
+            )
+            .await
+        }
+        None => {
+            write_slices(
+                writer,
+                &mut [
+                    IoSlice::new(b"LIST "),
+                    IoSlice::new(kind.as_wire()),
+                    IoSlice::new(crate::CRLF),
+                ],
+            )
+            .await
+        }
+    }
+}
+
+async fn write_authinfo_request_wire<W>(
+    writer: &mut W,
+    kind: AuthInfoKind,
+    value: &str,
+) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    write_slices(
+        writer,
+        &mut [
+            IoSlice::new(b"AUTHINFO "),
+            IoSlice::new(kind.as_wire()),
+            IoSlice::new(b" "),
+            IoSlice::new(value.as_bytes()),
+            IoSlice::new(crate::CRLF),
+        ],
+    )
+    .await
+}
+
+async fn write_simple_request_wire<W>(writer: &mut W, verb: &[u8]) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    write_slices(writer, &mut [IoSlice::new(verb), IoSlice::new(crate::CRLF)]).await
+}
+
 async fn write_takethis_request_wire<W>(
     writer: &mut W,
-    write_buffer: &mut Vec<u8>,
     message_id: &MessageId<'_>,
     article: &ArticleTransfer<'_>,
 ) -> io::Result<()>
 where
     W: AsyncWrite + Unpin,
 {
-    write_buffer.clear();
-    write_buffer.extend_from_slice(b"TAKETHIS ");
-    write_buffer.extend_from_slice(message_id.as_str().as_bytes());
-    write_buffer.extend_from_slice(crate::CRLF);
-    writer.write_all(write_buffer).await?;
+    write_message_id_request_wire(writer, b"TAKETHIS ", message_id).await?;
 
     let payload = article.as_bytes();
     if payload.is_empty() {
@@ -2391,6 +2684,13 @@ where
     }
 
     writer.write_all(DOT_TERMINATOR).await
+}
+
+async fn write_slices<W>(writer: &mut W, slices: &mut [IoSlice<'_>]) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    write_all_vectored(writer, slices).await
 }
 
 async fn write_all_vectored<W>(writer: &mut W, slices: &mut [IoSlice<'_>]) -> io::Result<()>
@@ -3221,13 +3521,11 @@ mod tests {
             message_id: MessageId::from_borrowed("<stream@test>").unwrap(),
             article: ArticleTransfer::from_borrowed(b".first\nsecond\r\nthird"),
         };
-        let mut write_buffer = Vec::with_capacity(32);
 
         write_request_wire(
             // DuplexStream split writer matches AsyncWrite contract used by OwnedWriteHalf.
             &mut client_writer,
             &request,
-            &mut write_buffer,
         )
         .await
         .unwrap();
@@ -3236,10 +3534,6 @@ mod tests {
         let mut actual = vec![0_u8; expected.len()];
         server_reader.read_exact(&mut actual).await.unwrap();
         assert_eq!(actual, expected);
-        assert!(
-            write_buffer.len() < actual.len(),
-            "scratch buffer should not hold full TAKETHIS payload"
-        );
     }
 
     #[test]

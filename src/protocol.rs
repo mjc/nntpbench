@@ -1,11 +1,12 @@
 //! Typed NNTP protocol helpers.
 
 use std::borrow::Cow;
+use std::fmt::Write as FmtWrite;
+use std::io::Write;
 
-use crate::terminator::{
-    DOT_TERMINATOR, ResponseLineStatus, append_crlf, crlf_normalized_payload_lines,
-    detect_response_line_end,
-};
+#[cfg(test)]
+use crate::terminator::append_crlf;
+use crate::terminator::{DOT_TERMINATOR, crlf_normalized_payload_lines, strip_complete_crlf_line};
 
 pub mod article;
 
@@ -1928,7 +1929,10 @@ impl<'a> Request<'a> {
     }
 
     /// Serialize the request onto the NNTP wire.
-    pub fn write_wire_to(&self, output: &mut Vec<u8>) {
+    pub fn write_wire_to<W>(&self, output: &mut W)
+    where
+        W: Write,
+    {
         match self {
             Self::Article { article_ref } => {
                 write_article_ref_request_wire(output, b"ARTICLE", article_ref)
@@ -2813,21 +2817,13 @@ impl<'a> RequestLine<'a> {
     /// Parse a raw command line into borrowed protocol pieces.
     #[must_use]
     pub fn parse(line: &'a [u8]) -> Self {
-        let ResponseLineStatus::CompleteAt(end) = detect_response_line_end(line) else {
+        let Some(line) = strip_complete_crlf_line(line) else {
             return Self {
                 kind: RequestKind::Unknown,
                 verb: line,
                 args: &[],
             };
         };
-        if end != line.len() {
-            return Self {
-                kind: RequestKind::Unknown,
-                verb: line,
-                args: &[],
-            };
-        };
-        let line = &line[..line.len() - crate::CRLF.len()];
         let split = memchr::memchr(b' ', line).unwrap_or(line.len());
         let verb = &line[..split];
         let args = if split < line.len() {
@@ -2995,143 +2991,178 @@ const fn status_implies_multiline(code: u16) -> bool {
     )
 }
 
-fn write_request_wire(output: &mut Vec<u8>, verb: &[u8], message_id: &MessageId<'_>) {
-    output.extend_from_slice(verb);
-    output.extend_from_slice(message_id.as_str().as_bytes());
-    append_crlf(output);
+fn write_bytes<W>(output: &mut W, bytes: &[u8])
+where
+    W: Write,
+{
+    output.write_all(bytes).expect("request wire write failed");
 }
 
-fn write_article_ref_request_wire(output: &mut Vec<u8>, verb: &[u8], article_ref: &ArticleRef<'_>) {
-    output.extend_from_slice(verb);
+fn write_crlf<W>(output: &mut W)
+where
+    W: Write,
+{
+    write_bytes(output, b"\r\n");
+}
+
+fn write_request_wire<W>(output: &mut W, verb: &[u8], message_id: &MessageId<'_>)
+where
+    W: Write,
+{
+    write_bytes(output, verb);
+    write_bytes(output, message_id.as_str().as_bytes());
+    write_crlf(output);
+}
+
+fn write_article_ref_request_wire<W>(output: &mut W, verb: &[u8], article_ref: &ArticleRef<'_>)
+where
+    W: Write,
+{
+    write_bytes(output, verb);
     match article_ref {
         ArticleRef::Current => {}
         ArticleRef::Number(number) => {
-            output.push(b' ');
-            output.extend_from_slice(number.to_string().as_bytes());
+            let mut number_buf = arrayvec::ArrayString::<20>::new();
+            write!(&mut number_buf, "{number}").expect("article number fits fixed buffer");
+            write_bytes(output, b" ");
+            write_bytes(output, number_buf.as_bytes());
         }
         ArticleRef::MessageId(message_id) => {
-            output.push(b' ');
-            output.extend_from_slice(message_id.as_str().as_bytes());
+            write_bytes(output, b" ");
+            write_bytes(output, message_id.as_str().as_bytes());
         }
     }
-    append_crlf(output);
+    write_crlf(output);
 }
 
-fn write_one_arg_request_wire(output: &mut Vec<u8>, verb: &[u8], arg: &str) {
-    output.extend_from_slice(verb);
-    output.extend_from_slice(arg.as_bytes());
-    append_crlf(output);
+fn write_one_arg_request_wire<W>(output: &mut W, verb: &[u8], arg: &str)
+where
+    W: Write,
+{
+    write_bytes(output, verb);
+    write_bytes(output, arg.as_bytes());
+    write_crlf(output);
 }
 
-fn write_two_arg_request_wire(output: &mut Vec<u8>, verb: &[u8], left: &str, right: &str) {
-    output.extend_from_slice(verb);
-    output.extend_from_slice(left.as_bytes());
-    output.push(b' ');
-    output.extend_from_slice(right.as_bytes());
-    append_crlf(output);
+fn write_two_arg_request_wire<W>(output: &mut W, verb: &[u8], left: &str, right: &str)
+where
+    W: Write,
+{
+    write_bytes(output, verb);
+    write_bytes(output, left.as_bytes());
+    write_bytes(output, b" ");
+    write_bytes(output, right.as_bytes());
+    write_crlf(output);
 }
 
-fn write_listgroup_request_wire(
-    output: &mut Vec<u8>,
+fn write_listgroup_request_wire<W>(
+    output: &mut W,
     group: Option<&GroupName<'_>>,
     range: Option<&ListGroupRange<'_>>,
-) {
-    output.extend_from_slice(b"LISTGROUP");
+) where
+    W: Write,
+{
+    write_bytes(output, b"LISTGROUP");
     if let Some(group) = group {
-        output.push(b' ');
-        output.extend_from_slice(group.as_str().as_bytes());
+        write_bytes(output, b" ");
+        write_bytes(output, group.as_str().as_bytes());
     }
     if let Some(range) = range {
-        output.push(b' ');
-        output.extend_from_slice(range.as_str().as_bytes());
+        write_bytes(output, b" ");
+        write_bytes(output, range.as_str().as_bytes());
     }
-    append_crlf(output);
+    write_crlf(output);
 }
 
-fn write_datetime_request_wire(
-    output: &mut Vec<u8>,
-    verb: &[u8],
-    date: &str,
-    time: &str,
-    gmt: bool,
-) {
-    output.extend_from_slice(verb);
-    output.extend_from_slice(date.as_bytes());
-    output.push(b' ');
-    output.extend_from_slice(time.as_bytes());
+fn write_datetime_request_wire<W>(output: &mut W, verb: &[u8], date: &str, time: &str, gmt: bool)
+where
+    W: Write,
+{
+    write_bytes(output, verb);
+    write_bytes(output, date.as_bytes());
+    write_bytes(output, b" ");
+    write_bytes(output, time.as_bytes());
     if gmt {
-        output.extend_from_slice(b" GMT");
+        write_bytes(output, b" GMT");
     }
-    append_crlf(output);
+    write_crlf(output);
 }
 
-fn write_newnews_request_wire(
-    output: &mut Vec<u8>,
-    wildmat: &str,
-    date: &str,
-    time: &str,
-    gmt: bool,
-) {
-    output.extend_from_slice(b"NEWNEWS ");
-    output.extend_from_slice(wildmat.as_bytes());
-    output.push(b' ');
-    output.extend_from_slice(date.as_bytes());
-    output.push(b' ');
-    output.extend_from_slice(time.as_bytes());
+fn write_newnews_request_wire<W>(output: &mut W, wildmat: &str, date: &str, time: &str, gmt: bool)
+where
+    W: Write,
+{
+    write_bytes(output, b"NEWNEWS ");
+    write_bytes(output, wildmat.as_bytes());
+    write_bytes(output, b" ");
+    write_bytes(output, date.as_bytes());
+    write_bytes(output, b" ");
+    write_bytes(output, time.as_bytes());
     if gmt {
-        output.extend_from_slice(b" GMT");
+        write_bytes(output, b" GMT");
     }
-    append_crlf(output);
+    write_crlf(output);
 }
 
-fn write_list_request_wire(output: &mut Vec<u8>, kind: ListKind, wildmat: Option<&Wildmat<'_>>) {
-    output.extend_from_slice(b"LIST ");
-    output.extend_from_slice(kind.as_wire());
+fn write_list_request_wire<W>(output: &mut W, kind: ListKind, wildmat: Option<&Wildmat<'_>>)
+where
+    W: Write,
+{
+    write_bytes(output, b"LIST ");
+    write_bytes(output, kind.as_wire());
     if let Some(wildmat) = wildmat {
-        output.push(b' ');
-        output.extend_from_slice(wildmat.as_str().as_bytes());
+        write_bytes(output, b" ");
+        write_bytes(output, wildmat.as_str().as_bytes());
     }
-    append_crlf(output);
+    write_crlf(output);
 }
 
-fn write_authinfo_request_wire(output: &mut Vec<u8>, kind: AuthInfoKind, value: &str) {
-    output.extend_from_slice(b"AUTHINFO ");
-    output.extend_from_slice(kind.as_wire());
-    output.push(b' ');
-    output.extend_from_slice(value.as_bytes());
-    append_crlf(output);
+fn write_authinfo_request_wire<W>(output: &mut W, kind: AuthInfoKind, value: &str)
+where
+    W: Write,
+{
+    write_bytes(output, b"AUTHINFO ");
+    write_bytes(output, kind.as_wire());
+    write_bytes(output, b" ");
+    write_bytes(output, value.as_bytes());
+    write_crlf(output);
 }
 
-fn write_transfer_request_wire(
-    output: &mut Vec<u8>,
+fn write_transfer_request_wire<W>(
+    output: &mut W,
     verb: &[u8],
     message_id: &MessageId<'_>,
     article: &ArticleTransfer<'_>,
-) {
-    output.extend_from_slice(verb);
-    output.extend_from_slice(message_id.as_str().as_bytes());
-    append_crlf(output);
+) where
+    W: Write,
+{
+    write_bytes(output, verb);
+    write_bytes(output, message_id.as_str().as_bytes());
+    write_crlf(output);
 
     let payload = article.as_bytes();
     if payload.is_empty() {
-        output.extend_from_slice(DOT_TERMINATOR);
+        write_bytes(output, DOT_TERMINATOR);
         return;
     }
 
     for line in crlf_normalized_payload_lines(payload) {
         if line.starts_with(b".") {
-            output.push(b'.');
+            write_bytes(output, b".");
         }
-        output.extend_from_slice(line);
-        append_crlf(output);
+        write_bytes(output, line);
+        write_crlf(output);
     }
 
-    output.extend_from_slice(DOT_TERMINATOR);
+    write_bytes(output, DOT_TERMINATOR);
 }
 
-fn write_simple_request_wire(output: &mut Vec<u8>, verb: &[u8]) {
-    output.extend_from_slice(verb);
-    append_crlf(output);
+fn write_simple_request_wire<W>(output: &mut W, verb: &[u8])
+where
+    W: Write,
+{
+    write_bytes(output, verb);
+    write_crlf(output);
 }
 
 #[cfg(test)]

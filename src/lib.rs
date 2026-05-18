@@ -1,11 +1,14 @@
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
+#[cfg(test)]
+use std::alloc::{GlobalAlloc, Layout, System};
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::fs;
 use std::future::poll_fn;
 use std::io::{self, IoSlice, Write};
 use std::net::SocketAddr;
-use std::ops::Range;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -15,17 +18,63 @@ use std::time::{Duration, Instant};
 use arrayvec::ArrayVec;
 use clap::{ArgAction, Parser, ValueEnum};
 use socket2::{Domain, Protocol, SockRef, Socket, Type};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{
+    AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
+};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio::time;
 
 use crate::terminator::{
-    ResponseLineStatus, append_dot_terminator, detect_response_line_end, find_crlf_line_end,
-    find_dot_terminated_block_end, is_dot_terminator_line, strip_crlf, strip_dot_terminator_suffix,
-    target_before_dot_terminator,
+    DOT_TERMINATOR, ResponseLineStatus, detect_response_line_end, detect_response_line_end_from,
+    find_crlf_line_end, find_dot_terminated_block_end, is_dot_terminator_line,
+    strip_complete_crlf_line, strip_crlf,
 };
+#[cfg(test)]
+use crate::terminator::{
+    append_dot_terminator, strip_dot_terminator_suffix, target_before_dot_terminator,
+};
+
+#[cfg(test)]
+#[global_allocator]
+static TEST_ALLOCATOR: CountingAllocator = CountingAllocator;
+
+#[cfg(test)]
+struct CountingAllocator;
+
+#[cfg(test)]
+static TEST_ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+thread_local! {
+    static COUNT_TEST_ALLOCATIONS: Cell<bool> = const { Cell::new(false) };
+}
+
+#[cfg(test)]
+unsafe impl GlobalAlloc for CountingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        COUNT_TEST_ALLOCATIONS.with(|enabled| {
+            if enabled.get() {
+                TEST_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        unsafe { System.alloc(layout) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe { System.dealloc(ptr, layout) };
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        COUNT_TEST_ALLOCATIONS.with(|enabled| {
+            if enabled.get() {
+                TEST_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        unsafe { System.realloc(ptr, layout, new_size) }
+    }
+}
 
 pub mod protocol;
 pub mod terminator;
@@ -87,12 +136,13 @@ pub const STAT_RESPONSE: &[u8] = b"223 1 <article.1@nntpbench.local> article ret
 pub const HELP_RESPONSE: &[u8] =
     b"100 help text follows\r\nLIST\r\nCAPABILITIES\r\nDATE\r\nMODE-READER\r\nQUIT\r\n.\r\n";
 pub const QUIT_RESPONSE: &[u8] = b"205 closing connection\r\n";
+const BODY_RESPONSE_PREFIX: &[u8] = b"222 1 <article.1@nntpbench.local> body follows\r\n";
+const ARTICLE_RESPONSE_PREFIX: &[u8] = b"220 1 <article.1@nntpbench.local> article follows\r\nPath: nntpbench.local!mock\r\nFrom: Bench User <bench@nntpbench.local>\r\nNewsgroups: alt.binaries.bench\r\nSubject: nntpbench synthetic article\r\nMessage-ID: <article.1@nntpbench.local>\r\nDate: Fri, 15 May 2026 00:00:00 +0000\r\n\r\n";
 const MAX_COMMAND_LINE_BYTES: usize = 1024;
 const MAX_SERVER_PIPELINE_DEPTH: usize = 1024;
 const SERVER_READER_CAPACITY: usize = 256 * 1024;
 const CLIENT_READER_CAPACITY: usize = 256 * 1024;
 const MAX_PENDING_WRITE_BYTES: usize = 64 * 1024;
-const MAX_CLIENT_COMMAND_BYTES: usize = 64;
 const HIGH_THROUGHPUT_SOCKET_BUFFER: usize = 16 * 1024 * 1024;
 const PROCESS_CLOCK_TICK: Duration = Duration::from_millis(10);
 const TCP_LINGER_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1536,9 +1586,8 @@ async fn serve_session_inner(
     let (reader, mut writer) = stream.split();
     let mut reader = BufReader::with_capacity(SERVER_READER_CAPACITY, reader);
     let max_pipeline_depth = config.max_pipeline_depth.min(MAX_SERVER_PIPELINE_DEPTH);
-    let mut command_arena =
-        Vec::with_capacity(MAX_COMMAND_LINE_BYTES.saturating_mul(max_pipeline_depth));
-    let mut command_scratch = Vec::with_capacity(MAX_COMMAND_LINE_BYTES);
+    let mut command_line = [0; MAX_COMMAND_LINE_BYTES];
+    let mut command_scratch = [0; MAX_COMMAND_LINE_BYTES];
     let mut command_batch = CommandBatch::new();
     let mut pending_write = PendingWrite::new();
 
@@ -1547,7 +1596,7 @@ async fn serve_session_inner(
     loop {
         if !read_command_batch(
             &mut reader,
-            &mut command_arena,
+            &mut command_line,
             &mut command_scratch,
             &mut command_batch,
             max_pipeline_depth,
@@ -1559,7 +1608,6 @@ async fn serve_session_inner(
 
         if process_command_batch(
             &command_batch,
-            &command_arena,
             &config,
             session_stats,
             &mut writer,
@@ -1606,7 +1654,6 @@ where
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn process_command_batch<W>(
     command_batch: &CommandBatch,
-    command_arena: &[u8],
     config: &ServerConfig,
     session_stats: &mut SessionStats,
     writer: &mut W,
@@ -1618,16 +1665,7 @@ where
     session_stats.pipeline_batches += u64::from(command_batch.len() > 1);
 
     for command in command_batch {
-        if handle_command(
-            command,
-            command_arena,
-            config,
-            session_stats,
-            writer,
-            pending_write,
-        )
-        .await?
-        {
+        if handle_command(command, config, session_stats, writer, pending_write).await? {
             flush_session_writer(writer, pending_write, config).await?;
             return Ok(BatchOutcome::Close);
         }
@@ -1640,7 +1678,6 @@ where
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn handle_command<W>(
     command: &ParsedCommand,
-    command_arena: &[u8],
     config: &ServerConfig,
     session_stats: &mut SessionStats,
     writer: &mut W,
@@ -1650,15 +1687,15 @@ where
     W: AsyncWrite + Unpin,
 {
     session_stats.commands += 1;
-    let request = command.request_line(command_arena);
 
-    match request.kind() {
+    match command.kind {
         RequestKind::Article => {
             session_stats.article_requests += 1;
-            write_response(
+            write_generated_response(
                 writer,
                 pending_write,
-                config.article_response(),
+                ARTICLE_RESPONSE_PREFIX,
+                config.article_bytes,
                 session_stats,
             )
             .await?;
@@ -1676,7 +1713,14 @@ where
         }
         RequestKind::Body => {
             session_stats.body_requests += 1;
-            write_response(writer, pending_write, config.body_response(), session_stats).await?;
+            write_generated_response(
+                writer,
+                pending_write,
+                BODY_RESPONSE_PREFIX,
+                config.body_bytes,
+                session_stats,
+            )
+            .await?;
             Ok(false)
         }
         RequestKind::List => {
@@ -1843,7 +1887,7 @@ where
 }
 
 struct PendingWrite {
-    buf: Box<[u8; MAX_PENDING_WRITE_BYTES]>,
+    buf: [u8; MAX_PENDING_WRITE_BYTES],
     len: usize,
 }
 
@@ -1851,7 +1895,7 @@ struct PendingWrite {
 impl PendingWrite {
     fn new() -> Self {
         Self {
-            buf: Box::new([0; MAX_PENDING_WRITE_BYTES]),
+            buf: [0; MAX_PENDING_WRITE_BYTES],
             len: 0,
         }
     }
@@ -1924,18 +1968,28 @@ where
     Ok(())
 }
 
-pub fn process_request_to_buffer(
+pub fn process_request_to_buffer<W>(
     request: RequestLine<'_>,
     config: &ServerConfig,
     stats: &Stats,
-    output: &mut Vec<u8>,
-) -> bool {
+    output: &mut W,
+) -> bool
+where
+    W: Write,
+{
     stats.commands.fetch_add(1, Ordering::Relaxed);
 
     let response = match request.kind() {
         RequestKind::Article => {
             stats.article_requests.fetch_add(1, Ordering::Relaxed);
-            config.article_response()
+            write_generated_response_to(
+                output,
+                ARTICLE_RESPONSE_PREFIX,
+                config.article_bytes,
+                stats,
+            )
+            .expect("response write failed");
+            return false;
         }
         RequestKind::Head => {
             stats.article_requests.fetch_add(1, Ordering::Relaxed);
@@ -1947,7 +2001,9 @@ pub fn process_request_to_buffer(
         }
         RequestKind::Body => {
             stats.body_requests.fetch_add(1, Ordering::Relaxed);
-            config.body_response()
+            write_generated_response_to(output, BODY_RESPONSE_PREFIX, config.body_bytes, stats)
+                .expect("response write failed");
+            return false;
         }
         RequestKind::List | RequestKind::ListActive => LIST_RESPONSE,
         RequestKind::ListActiveTimes => LIST_ACTIVE_TIMES_RESPONSE,
@@ -1984,7 +2040,7 @@ pub fn process_request_to_buffer(
     stats
         .bytes_sent
         .fetch_add(response.len() as u64, Ordering::Relaxed);
-    output.extend_from_slice(response);
+    output.write_all(response).expect("response write failed");
     matches!(request.kind(), RequestKind::Quit)
 }
 
@@ -2000,8 +2056,8 @@ where
     let mut count = 0;
 
     while count < max_pipeline_depth {
-        let end = match detect_response_line_end(&input[start..]) {
-            ResponseLineStatus::CompleteAt(end) => start + end,
+        let end = match detect_response_line_end_from(input, start) {
+            ResponseLineStatus::CompleteAt(end) => end,
             ResponseLineStatus::NeedMore | ResponseLineStatus::Invalid => break,
         };
         let request = RequestLine::parse(&input[start..end]);
@@ -2040,6 +2096,60 @@ where
     }
 
     pending_write.write_with_response(writer, response).await
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn write_generated_response<W>(
+    writer: &mut W,
+    pending_write: &mut PendingWrite,
+    prefix: &[u8],
+    target_bytes: usize,
+    session_stats: &mut SessionStats,
+) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut written = 0;
+    write_response(writer, pending_write, prefix, session_stats).await?;
+    written += prefix.len();
+
+    while written < target_bytes {
+        write_response(writer, pending_write, BODY_LINE, session_stats).await?;
+        written += BODY_LINE.len();
+    }
+
+    write_response(writer, pending_write, DOT_TERMINATOR, session_stats).await
+}
+
+fn write_generated_response_to<W>(
+    output: &mut W,
+    prefix: &[u8],
+    target_bytes: usize,
+    stats: &Stats,
+) -> io::Result<()>
+where
+    W: Write,
+{
+    let mut written = 0;
+    output.write_all(prefix)?;
+    written += prefix.len();
+    stats
+        .bytes_sent
+        .fetch_add(prefix.len() as u64, Ordering::Relaxed);
+
+    while written < target_bytes {
+        output.write_all(BODY_LINE)?;
+        written += BODY_LINE.len();
+        stats
+            .bytes_sent
+            .fetch_add(BODY_LINE.len() as u64, Ordering::Relaxed);
+    }
+
+    output.write_all(DOT_TERMINATOR)?;
+    stats
+        .bytes_sent
+        .fetch_add(DOT_TERMINATOR.len() as u64, Ordering::Relaxed);
+    Ok(())
 }
 
 async fn flush_pending<W>(writer: &mut W, pending_write: &mut PendingWrite) -> io::Result<()>
@@ -2088,15 +2198,10 @@ pub struct ServerConfig {
     pub nodelay: bool,
     pub socket_recv_buffer: usize,
     pub socket_send_buffer: usize,
-    body: Box<[u8]>,
-    article: Box<[u8]>,
 }
 
 impl ServerConfig {
     pub fn from_args(args: ServerArgs) -> Self {
-        let body = generate_body(args.body_bytes);
-        let article = generate_article(args.article_bytes, &body);
-
         Self {
             body_bytes: args.body_bytes,
             article_bytes: args.article_bytes,
@@ -2107,17 +2212,7 @@ impl ServerConfig {
             nodelay: args.nodelay,
             socket_recv_buffer: args.socket_recv_buffer,
             socket_send_buffer: args.socket_send_buffer,
-            body,
-            article,
         }
-    }
-
-    pub fn article_response(&self) -> &[u8] {
-        &self.article
-    }
-
-    pub fn body_response(&self) -> &[u8] {
-        &self.body
     }
 
     pub fn head_response(&self) -> &[u8] {
@@ -2297,13 +2392,6 @@ pub fn rate(count: u64, seconds: f64) -> f64 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ParsedCommand {
     kind: RequestKind,
-    line_range: Range<usize>,
-}
-
-impl ParsedCommand {
-    fn request_line<'a>(&self, command_arena: &'a [u8]) -> RequestLine<'a> {
-        RequestLine::parse(&command_arena[self.line_range.clone()])
-    }
 }
 
 type CommandBatch = ArrayVec<ParsedCommand, MAX_SERVER_PIPELINE_DEPTH>;
@@ -2311,8 +2399,8 @@ type CommandBatch = ArrayVec<ParsedCommand, MAX_SERVER_PIPELINE_DEPTH>;
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn read_command_batch<R>(
     reader: &mut BufReader<R>,
-    command_arena: &mut Vec<u8>,
-    command_scratch: &mut Vec<u8>,
+    command_line: &mut [u8; MAX_COMMAND_LINE_BYTES],
+    command_scratch: &mut [u8; MAX_COMMAND_LINE_BYTES],
     command_batch: &mut CommandBatch,
     max_pipeline_depth: usize,
 ) -> io::Result<bool>
@@ -2320,16 +2408,12 @@ where
     R: tokio::io::AsyncRead + Unpin,
 {
     command_batch.clear();
-    command_arena.clear();
-    let line_start = command_arena.len();
-    let read = reader.read_until(b'\n', command_arena).await?;
-    if read == 0 {
+    let Some(line_len) = read_crlf_line_into(reader, command_line).await? else {
         return Ok(false);
-    }
+    };
     push_command(
         reader,
-        command_arena,
-        line_start,
+        &command_line[..line_len],
         command_scratch,
         command_batch,
     )
@@ -2340,12 +2424,12 @@ where
             break;
         }
 
-        let line_start = command_arena.len();
-        reader.read_until(b'\n', command_arena).await?;
+        let Some(line_len) = read_crlf_line_into(reader, command_line).await? else {
+            break;
+        };
         push_command(
             reader,
-            command_arena,
-            line_start,
+            &command_line[..line_len],
             command_scratch,
             command_batch,
         )
@@ -2355,23 +2439,57 @@ where
     Ok(true)
 }
 
+async fn read_crlf_line_into<R>(reader: &mut R, line: &mut [u8]) -> io::Result<Option<usize>>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let mut len = 0;
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            if len == 0 {
+                return Ok(None);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "truncated line",
+            ));
+        }
+
+        let take = memchr::memchr(b'\n', available).map_or(available.len(), |index| index + 1);
+        if len + take > line.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "line exceeds fixed read buffer",
+            ));
+        }
+
+        line[len..len + take].copy_from_slice(&available[..take]);
+        reader.consume(take);
+        len += take;
+
+        if line[..len].ends_with(b"\n") {
+            return Ok(Some(len));
+        }
+    }
+}
+
 async fn push_command<R>(
     reader: &mut BufReader<R>,
-    command_arena: &[u8],
-    line_start: usize,
-    command_scratch: &mut Vec<u8>,
+    line: &[u8],
+    command_scratch: &mut [u8; MAX_COMMAND_LINE_BYTES],
     command_batch: &mut CommandBatch,
 ) -> io::Result<()>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
-    if !command_arena[line_start..].ends_with(CRLF) {
+    if strip_complete_crlf_line(line).is_none() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "command line missing CRLF terminator",
         ));
     }
-    let command = parse_command_line(command_arena, line_start);
+    let command = parse_command_line(line);
     let kind = command.kind;
     if matches!(kind, RequestKind::TakeThis) {
         read_dot_terminated_body(reader, command_scratch).await?;
@@ -2380,50 +2498,42 @@ where
     Ok(())
 }
 
-fn parse_command_line(command_arena: &[u8], line_start: usize) -> ParsedCommand {
-    let line = &command_arena[line_start..];
-    let line_end = line_start + line.len();
+fn parse_command_line(line: &[u8]) -> ParsedCommand {
     ParsedCommand {
-        kind: RequestLine::parse(&command_arena[line_start..line_end]).kind(),
-        line_range: line_start..line_end,
+        kind: RequestLine::parse(line).kind(),
     }
 }
 
 async fn read_dot_terminated_body<R>(
     reader: &mut BufReader<R>,
-    command_scratch: &mut Vec<u8>,
+    command_scratch: &mut [u8; MAX_COMMAND_LINE_BYTES],
 ) -> io::Result<()>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
     let mut previous_line_ended_with_crlf = true;
     loop {
-        command_scratch.clear();
-        let read = reader.read_until(b'\n', command_scratch).await?;
-        if read == 0 {
+        let Some(read) = read_crlf_line_into(reader, command_scratch).await? else {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "truncated TAKETHIS body",
             ));
+        };
+        let line = &command_scratch[..read];
+        if strip_complete_crlf_line(line).is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "TAKETHIS body line missing CRLF terminator",
+            ));
         }
-        match detect_response_line_end(command_scratch) {
-            ResponseLineStatus::CompleteAt(end) if end == command_scratch.len() => {}
-            ResponseLineStatus::CompleteAt(_)
-            | ResponseLineStatus::NeedMore
-            | ResponseLineStatus::Invalid => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "TAKETHIS body line missing CRLF terminator",
-                ));
-            }
-        }
-        if is_dot_terminator_line(previous_line_ended_with_crlf, command_scratch) {
+        if is_dot_terminator_line(previous_line_ended_with_crlf, line) {
             return Ok(());
         }
-        previous_line_ended_with_crlf = strip_crlf(command_scratch).is_some();
+        previous_line_ended_with_crlf = strip_crlf(line).is_some();
     }
 }
 
+#[cfg(test)]
 pub fn generate_article(target_bytes: usize, body: &[u8]) -> Box<[u8]> {
     let mut response = Vec::with_capacity(target_bytes.max(256) + TERMINATOR.len());
     response.extend_from_slice(b"220 1 <article.1@nntpbench.local> article follows\r\n");
@@ -2439,6 +2549,7 @@ pub fn generate_article(target_bytes: usize, body: &[u8]) -> Box<[u8]> {
     response.into_boxed_slice()
 }
 
+#[cfg(test)]
 pub fn generate_body(target_bytes: usize) -> Box<[u8]> {
     let mut response = Vec::with_capacity(target_bytes.max(128) + TERMINATOR.len());
     response.extend_from_slice(b"222 1 <article.1@nntpbench.local> body follows\r\n");
@@ -2447,6 +2558,7 @@ pub fn generate_body(target_bytes: usize) -> Box<[u8]> {
     response.into_boxed_slice()
 }
 
+#[cfg(test)]
 fn body_payload(body: &[u8]) -> &[u8] {
     let header_end = find_crlf_line_end(body, 0).unwrap_or(0);
     let payload = &body[header_end..];
@@ -2456,6 +2568,7 @@ fn body_payload(body: &[u8]) -> &[u8] {
 const BODY_LINE: &[u8] =
     b"This is synthetic NNTP article payload for throughput and latency benchmarking\r\n";
 
+#[cfg(test)]
 fn append_repeated_payload(response: &mut Vec<u8>, line: &[u8], target_bytes: usize) {
     let target_before_dot_line = target_before_dot_terminator(target_bytes);
     while response.len() + line.len() <= target_before_dot_line {
@@ -2468,6 +2581,7 @@ fn append_repeated_payload(response: &mut Vec<u8>, line: &[u8], target_bytes: us
     }
 }
 
+#[cfg(test)]
 fn ensure_terminated(response: &mut Vec<u8>) {
     append_dot_terminator(response);
 }
@@ -2522,6 +2636,76 @@ mod tests {
 
     fn test_config() -> Arc<ServerConfig> {
         Arc::new(ServerConfig::from_args(test_args()))
+    }
+
+    struct AllocationCountGuard;
+
+    impl AllocationCountGuard {
+        fn start() -> Self {
+            COUNT_TEST_ALLOCATIONS.with(|enabled| enabled.set(false));
+            TEST_ALLOCATIONS.store(0, Ordering::Relaxed);
+            COUNT_TEST_ALLOCATIONS.with(|enabled| enabled.set(true));
+            Self
+        }
+
+        fn finish(self, label: &str) {
+            COUNT_TEST_ALLOCATIONS.with(|enabled| enabled.set(false));
+            let allocations = TEST_ALLOCATIONS.load(Ordering::Relaxed);
+            assert_eq!(allocations, 0, "{label} allocated {allocations} times");
+        }
+    }
+
+    impl Drop for AllocationCountGuard {
+        fn drop(&mut self) {
+            COUNT_TEST_ALLOCATIONS.with(|enabled| enabled.set(false));
+        }
+    }
+
+    fn assert_no_allocations(label: &str, run: impl FnOnce()) {
+        let guard = AllocationCountGuard::start();
+        run();
+        guard.finish(label);
+    }
+
+    struct FixedWrite<const N: usize> {
+        data: [u8; N],
+        len: usize,
+    }
+
+    impl<const N: usize> FixedWrite<N> {
+        const fn new() -> Self {
+            Self {
+                data: [0; N],
+                len: 0,
+            }
+        }
+
+        fn clear(&mut self) {
+            self.len = 0;
+        }
+
+        fn as_slice(&self) -> &[u8] {
+            &self.data[..self.len]
+        }
+    }
+
+    impl<const N: usize> Write for FixedWrite<N> {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.len + buf.len() > self.data.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "fixed test sink overflow",
+                ));
+            }
+            let end = self.len + buf.len();
+            self.data[self.len..end].copy_from_slice(buf);
+            self.len = end;
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
 
     fn test_client_args() -> ClientArgs {
@@ -2696,27 +2880,18 @@ mod tests {
     #[tokio::test]
     async fn handle_command_reports_large_response_write_error() {
         let mut args = test_args();
-        args.article_bytes = 8192;
+        args.article_bytes = MAX_PENDING_WRITE_BYTES + BODY_LINE.len();
         let config = ServerConfig::from_args(args);
         let mut stats = SessionStats::default();
         let mut pending = PendingWrite::new();
         let mut writer = FailingWriter;
-        let command_arena = b"ARTICLE 1\r\n".to_vec();
         let command = ParsedCommand {
             kind: RequestKind::Article,
-            line_range: 0..command_arena.len(),
         };
 
-        let err = handle_command(
-            &command,
-            &command_arena,
-            &config,
-            &mut stats,
-            &mut writer,
-            &mut pending,
-        )
-        .await
-        .unwrap_err();
+        let err = handle_command(&command, &config, &mut stats, &mut writer, &mut pending)
+            .await
+            .unwrap_err();
 
         assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
     }
@@ -2725,8 +2900,8 @@ mod tests {
     async fn fixed_command_reader_handles_split_line_and_closed_sender() {
         let server = ChunkedRead::new(&[b"ART".as_slice(), b"ICLE 1\r\nBODY 2\r\n".as_slice()]);
         let mut reader = BufReader::with_capacity(32, server);
-        let mut command_buf = Vec::with_capacity(MAX_COMMAND_LINE_BYTES);
-        let mut command_scratch = Vec::with_capacity(MAX_COMMAND_LINE_BYTES);
+        let mut command_buf = [0; MAX_COMMAND_LINE_BYTES];
+        let mut command_scratch = [0; MAX_COMMAND_LINE_BYTES];
         let mut command_batch = CommandBatch::new();
         assert!(
             read_command_batch(
@@ -2762,8 +2937,8 @@ mod tests {
     #[tokio::test]
     async fn read_command_batch_reports_reader_error() {
         let mut reader = BufReader::with_capacity(32, FailingRead);
-        let mut command_buf = Vec::new();
-        let mut command_scratch = Vec::new();
+        let mut command_buf = [0; MAX_COMMAND_LINE_BYTES];
+        let mut command_scratch = [0; MAX_COMMAND_LINE_BYTES];
         let mut command_batch = CommandBatch::new();
 
         let err = read_command_batch(
@@ -2991,8 +3166,8 @@ mod tests {
         low.max_pipeline_depth = 0;
         let config = ServerConfig::from_args(low);
         assert_eq!(config.max_pipeline_depth, 1);
-        assert!(config.body_response().starts_with(b"222 "));
-        assert!(config.article_response().starts_with(b"220 "));
+        assert_eq!(config.body_bytes, 1024);
+        assert_eq!(config.article_bytes, 2048);
 
         let mut high = test_args();
         high.max_pipeline_depth = 4096;
@@ -4874,8 +5049,8 @@ mod tests {
             .unwrap();
 
         let mut reader = BufReader::with_capacity(1024, server);
-        let mut command_buf = Vec::with_capacity(1024);
-        let mut command_scratch = Vec::with_capacity(1024);
+        let mut command_buf = [0; MAX_COMMAND_LINE_BYTES];
+        let mut command_scratch = [0; MAX_COMMAND_LINE_BYTES];
         let mut command_batch = CommandBatch::new();
 
         assert!(
@@ -4909,8 +5084,8 @@ mod tests {
         let (client, server) = tokio::io::duplex(1024);
         drop(client);
         let mut reader = BufReader::with_capacity(1024, server);
-        let mut command_buf = Vec::with_capacity(1024);
-        let mut command_scratch = Vec::with_capacity(1024);
+        let mut command_buf = [0; MAX_COMMAND_LINE_BYTES];
+        let mut command_scratch = [0; MAX_COMMAND_LINE_BYTES];
         let mut command_batch = CommandBatch::new();
 
         assert!(
@@ -4933,8 +5108,8 @@ mod tests {
         client.write_all(b"ARTICLE 1\r\nBODY 2").await.unwrap();
 
         let mut reader = BufReader::with_capacity(1024, server);
-        let mut command_buf = Vec::with_capacity(1024);
-        let mut command_scratch = Vec::with_capacity(1024);
+        let mut command_buf = [0; MAX_COMMAND_LINE_BYTES];
+        let mut command_scratch = [0; MAX_COMMAND_LINE_BYTES];
         let mut command_batch = CommandBatch::new();
 
         assert!(
@@ -4966,8 +5141,8 @@ mod tests {
             .unwrap();
 
         let mut reader = BufReader::with_capacity(1024, server);
-        let mut command_buf = Vec::with_capacity(1024);
-        let mut command_scratch = Vec::with_capacity(1024);
+        let mut command_buf = [0; MAX_COMMAND_LINE_BYTES];
+        let mut command_scratch = [0; MAX_COMMAND_LINE_BYTES];
         let mut command_batch = CommandBatch::new();
 
         assert!(
@@ -4999,8 +5174,8 @@ mod tests {
             .unwrap();
 
         let mut reader = BufReader::with_capacity(1024, server);
-        let mut command_buf = Vec::with_capacity(1024);
-        let mut command_scratch = Vec::with_capacity(1024);
+        let mut command_buf = [0; MAX_COMMAND_LINE_BYTES];
+        let mut command_scratch = [0; MAX_COMMAND_LINE_BYTES];
         let mut command_batch = CommandBatch::new();
 
         assert!(
@@ -5055,8 +5230,8 @@ mod tests {
             .unwrap();
 
         let mut reader = BufReader::with_capacity(1024, server);
-        let mut command_buf = Vec::with_capacity(1024);
-        let mut command_scratch = Vec::with_capacity(1024);
+        let mut command_buf = [0; MAX_COMMAND_LINE_BYTES];
+        let mut command_scratch = [0; MAX_COMMAND_LINE_BYTES];
         let mut command_batch = CommandBatch::new();
 
         assert!(
@@ -5092,8 +5267,8 @@ mod tests {
         drop(client);
 
         let mut reader = BufReader::with_capacity(1024, server);
-        let mut command_buf = Vec::with_capacity(1024);
-        let mut command_scratch = Vec::with_capacity(1024);
+        let mut command_buf = [0; MAX_COMMAND_LINE_BYTES];
+        let mut command_scratch = [0; MAX_COMMAND_LINE_BYTES];
         let mut command_batch = CommandBatch::new();
 
         let err = read_command_batch(
@@ -5907,5 +6082,42 @@ mod tests {
                 .any(|window| window == STAT_RESPONSE)
         );
         assert!(output.ends_with(b"500 unknown command\r\n"));
+    }
+
+    #[test]
+    fn synchronous_hot_path_units_do_not_allocate() {
+        let config = ServerConfig::from_args(test_args());
+        let stats = Stats::new();
+        let mut output = FixedWrite::<4096>::new();
+
+        assert_no_allocations(
+            "request parse, scan, serialize, and generated response",
+            || {
+                let request = RequestLine::parse(b"BODY 1\r\n");
+                assert_eq!(request.kind(), RequestKind::Body);
+
+                let mut seen = 0;
+                let consumed =
+                    for_each_request_line_in_batch(b"ARTICLE 1\r\nBODY 2\r\n", 8, |_| {
+                        seen += 1;
+                    });
+                assert_eq!(seen, 2);
+                assert_eq!(consumed, b"ARTICLE 1\r\nBODY 2\r\n".len());
+
+                output.clear();
+                Request::body_number(42).unwrap().write_wire_to(&mut output);
+                assert_eq!(output.as_slice(), b"BODY 42\r\n");
+
+                output.clear();
+                assert!(!process_request_to_buffer(
+                    request,
+                    &config,
+                    &stats,
+                    &mut output,
+                ));
+                assert!(output.as_slice().starts_with(BODY_RESPONSE_PREFIX));
+                assert!(output.as_slice().ends_with(DOT_TERMINATOR));
+            },
+        );
     }
 }
