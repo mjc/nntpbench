@@ -384,26 +384,119 @@ mod tests {
         ]
     }
 
-    fn response_line_oracle(buffer: &[u8]) -> ResponseLineStatus {
-        for index in 0..buffer.len() {
-            match buffer[index] {
-                b'\r' if index + 1 == buffer.len() => return ResponseLineStatus::NeedMore,
-                b'\r' if buffer[index + 1] == b'\n' => {
-                    return ResponseLineStatus::CompleteAt(index + 2);
-                }
-                b'\r' | b'\n' => return ResponseLineStatus::Invalid,
-                _ => {}
+    fn strict_response_line_crlf_oracle(buffer: &[u8]) -> ResponseLineStatus {
+        let mut index = 0;
+        while index < buffer.len() {
+            let byte = buffer[index];
+            if byte == b'\n' {
+                return ResponseLineStatus::Invalid;
             }
+            if byte == b'\r' {
+                return match buffer.get(index + 1) {
+                    Some(b'\n') => ResponseLineStatus::CompleteAt(index + 2),
+                    Some(_) => ResponseLineStatus::Invalid,
+                    None => ResponseLineStatus::NeedMore,
+                };
+            }
+            index += 1;
         }
 
         ResponseLineStatus::NeedMore
     }
 
+    fn crlf_line_end_oracle(buffer: &[u8], start: usize) -> Option<usize> {
+        if start > buffer.len() {
+            return None;
+        }
+
+        let mut index = start;
+        while index + 1 < buffer.len() {
+            if buffer[index] == b'\r' && buffer[index + 1] == b'\n' {
+                return Some(index + 2);
+            }
+            index += 1;
+        }
+
+        None
+    }
+
     fn terminator_end_oracle(buffer: &[u8]) -> Option<usize> {
+        let mut index = 0;
+        while index + 4 < buffer.len() {
+            if buffer[index] == b'\r'
+                && buffer[index + 1] == b'\n'
+                && buffer[index + 2] == b'.'
+                && buffer[index + 3] == b'\r'
+                && buffer[index + 4] == b'\n'
+            {
+                return Some(index + 5);
+            }
+            index += 1;
+        }
+
+        None
+    }
+
+    fn dot_terminated_block_end_oracle(buffer: &[u8], start: usize) -> Option<usize> {
+        let slice = buffer.get(start..)?;
+        let empty_end =
+            (slice.len() >= 3 && slice[0] == b'.' && slice[1] == b'\r' && slice[2] == b'\n')
+                .then_some(start + 3);
+
+        let non_empty_end = terminator_end_oracle(slice).map(|end| start + end);
+        match (empty_end, non_empty_end) {
+            (Some(empty), Some(non_empty)) => Some(empty.min(non_empty)),
+            (Some(empty), None) => Some(empty),
+            (None, Some(non_empty)) => Some(non_empty),
+            (None, None) => None,
+        }
+    }
+
+    fn strip_crlf_oracle(buffer: &[u8]) -> Option<&[u8]> {
+        if buffer.len() >= 2
+            && buffer[buffer.len() - 2] == b'\r'
+            && buffer[buffer.len() - 1] == b'\n'
+        {
+            Some(&buffer[..buffer.len() - 2])
+        } else {
+            None
+        }
+    }
+
+    fn strip_dot_terminator_suffix_oracle(buffer: &[u8]) -> Option<&[u8]> {
+        if buffer.len() >= 3
+            && buffer[buffer.len() - 3] == b'.'
+            && buffer[buffer.len() - 2] == b'\r'
+            && buffer[buffer.len() - 1] == b'\n'
+        {
+            Some(&buffer[..buffer.len() - 3])
+        } else {
+            None
+        }
+    }
+
+    fn append_dot_terminator_oracle(mut buffer: Vec<u8>) -> Vec<u8> {
+        if !matches!(buffer.as_slice(), [.., b'\r', b'\n']) {
+            buffer.push(b'\r');
+            buffer.push(b'\n');
+        }
+        buffer.push(b'.');
+        buffer.push(b'\r');
+        buffer.push(b'\n');
         buffer
-            .windows(crate::TERMINATOR.len())
-            .position(|window| window == crate::TERMINATOR)
-            .map(|start| start + crate::TERMINATOR.len())
+    }
+
+    #[allow(clippy::manual_saturating_arithmetic)]
+    fn target_before_dot_terminator_oracle(target_bytes: usize) -> usize {
+        target_bytes.checked_sub(3).unwrap_or_default()
+    }
+
+    fn is_dot_terminator_line_oracle(previous_line_ended_with_crlf: bool, line: &[u8]) -> bool {
+        previous_line_ended_with_crlf
+            && line.len() == 3
+            && line[0] == b'.'
+            && line[1] == b'\r'
+            && line[2] == b'\n'
     }
 
     fn remove_rfc_multiline_terminators(buffer: &mut [u8]) {
@@ -430,6 +523,67 @@ mod tests {
         }
 
         None
+    }
+
+    fn streaming_terminator_oracle(chunks: &[&[u8]]) -> Option<usize> {
+        let mut concatenated = Vec::new();
+        for chunk in chunks {
+            concatenated.extend_from_slice(chunk);
+        }
+        terminator_end_oracle(&concatenated)
+    }
+
+    fn assert_streaming_matches_oracle_for_one_two_three_chunks(data: &[u8]) {
+        let expected = streaming_terminator_oracle(&[data]);
+        assert_eq!(
+            streaming_terminator_end(&[data]),
+            expected,
+            "one chunk {data:?}"
+        );
+
+        for first_end in 0..=data.len() {
+            let chunks = [&data[..first_end], &data[first_end..]];
+            assert_eq!(
+                streaming_terminator_end(&chunks),
+                expected,
+                "two chunks split {first_end} data {data:?}",
+            );
+        }
+
+        for first_end in 0..=data.len() {
+            for second_end in first_end..=data.len() {
+                let chunks = [
+                    &data[..first_end],
+                    &data[first_end..second_end],
+                    &data[second_end..],
+                ];
+                assert_eq!(
+                    streaming_terminator_end(&chunks),
+                    expected,
+                    "three chunks splits {first_end}/{second_end} data {data:?}",
+                );
+            }
+        }
+    }
+
+    fn empty_multiline_streaming_end(chunks: &[&[u8]]) -> Option<usize> {
+        let mut detector = EmptyMultilineTerminator::default();
+        let mut consumed_before_chunk = 0;
+
+        for chunk in chunks {
+            match detector.detect(chunk) {
+                EmptyTerminatorStatus::FoundAt(end) => return Some(consumed_before_chunk + end),
+                EmptyTerminatorStatus::NeedMore => consumed_before_chunk += chunk.len(),
+                EmptyTerminatorStatus::NotFound { .. } => return None,
+            }
+        }
+
+        None
+    }
+
+    fn empty_multiline_content_start_oracle(buffer: &[u8]) -> Option<usize> {
+        (buffer.len() >= 3 && buffer[0] == b'.' && buffer[1] == b'\r' && buffer[2] == b'\n')
+            .then_some(3)
     }
 
     fn streaming_terminator_end_for_all_partitions(data: &[u8]) {
@@ -524,6 +678,121 @@ mod tests {
         assert_eq!(output, b"body\r\n.\r\n");
         assert_eq!(target_before_dot_terminator(2), 0);
         assert_eq!(target_before_dot_terminator(10), 7);
+    }
+
+    #[test]
+    fn line_helpers_match_rfc_crlf_oracles_on_regression_cases() {
+        // RFC 3977 section 3.1 defines CRLF as the line terminator:
+        // https://www.rfc-editor.org/rfc/rfc3977#section-3.1
+        for input in [
+            b"".as_slice(),
+            b"\r".as_slice(),
+            b"\n".as_slice(),
+            b"\r\n".as_slice(),
+            b"line\r\ntrailer".as_slice(),
+            b"line\ntrailer\r\n".as_slice(),
+            b"line\rtrailer\r\n".as_slice(),
+            b"line\r\r\n".as_slice(),
+        ] {
+            assert_eq!(
+                detect_response_line_end(input),
+                strict_response_line_crlf_oracle(input),
+                "{input:?}",
+            );
+            assert_eq!(strip_crlf(input), strip_crlf_oracle(input), "{input:?}");
+            for start in 0..=input.len() + 1 {
+                assert_eq!(
+                    find_crlf_line_end(input, start),
+                    crlf_line_end_oracle(input, start),
+                    "start {start} input {input:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dot_block_helpers_match_rfc_oracles_on_regression_cases() {
+        // RFC 3977 section 3.1.1 defines "." CRLF as the empty multiline block and
+        // CRLF "." CRLF as the terminator after non-empty multiline content:
+        // https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1
+        for input in [
+            b".\r\n".as_slice(),
+            b".\r\ntrailer".as_slice(),
+            b"body\r\n.\r\n".as_slice(),
+            b"body\r\n.\r\ntrailer".as_slice(),
+            b"body\n.\r\nbody\r\n.\r\n".as_slice(),
+            b"body\r.\r\nbody\r\n.\r\n".as_slice(),
+            b"body\r\n.\nbody\r\n.\r\n".as_slice(),
+            b"body\r\n.\rbody\r\n.\r\n".as_slice(),
+            b"body\r\n..\r\nbody\r\n.\r\n".as_slice(),
+            b"body\r\n.body\r\nbody\r\n.\r\n".as_slice(),
+            b"prefix.\r\n".as_slice(),
+        ] {
+            assert_eq!(
+                strip_dot_terminator_suffix(input),
+                strip_dot_terminator_suffix_oracle(input),
+                "{input:?}",
+            );
+            for start in 0..=input.len() + 1 {
+                assert_eq!(
+                    find_dot_terminated_block_end(input, start),
+                    dot_terminated_block_end_oracle(input, start),
+                    "start {start} input {input:?}",
+                );
+            }
+        }
+
+        for (previous, line) in [
+            (true, b".\r\n".as_slice()),
+            (false, b".\r\n".as_slice()),
+            (true, b".\n".as_slice()),
+            (true, b".\r".as_slice()),
+            (true, b"..\r\n".as_slice()),
+            (true, b".body\r\n".as_slice()),
+        ] {
+            assert_eq!(
+                is_dot_terminator_line(previous, line),
+                is_dot_terminator_line_oracle(previous, line),
+                "previous {previous} line {line:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn append_and_target_helpers_match_rfc_oracles_on_regression_cases() {
+        // RFC 3977 sections 3.1 and 3.1.1 require CRLF line endings and "." CRLF
+        // multiline termination:
+        // https://www.rfc-editor.org/rfc/rfc3977#section-3.1
+        // https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1
+        for input in [
+            b"".as_slice(),
+            b"body".as_slice(),
+            b"body\r".as_slice(),
+            b"body\n".as_slice(),
+            b"body\r\n".as_slice(),
+            b"body\r\n.\r\n".as_slice(),
+        ] {
+            let mut crlf_output = input.to_vec();
+            append_crlf(&mut crlf_output);
+            let mut expected_crlf = input.to_vec();
+            expected_crlf.extend_from_slice(b"\r\n");
+            assert_eq!(crlf_output, expected_crlf, "{input:?}");
+
+            let mut dot_output = input.to_vec();
+            append_dot_terminator(&mut dot_output);
+            assert_eq!(
+                dot_output,
+                append_dot_terminator_oracle(input.to_vec()),
+                "{input:?}",
+            );
+        }
+
+        for target_bytes in 0..8 {
+            assert_eq!(
+                target_before_dot_terminator(target_bytes),
+                target_before_dot_terminator_oracle(target_bytes),
+            );
+        }
     }
 
     #[test]
@@ -638,8 +907,12 @@ mod tests {
             b"x\n.\r\n\r\n.\r\n".as_slice(),
             b"x\r\n.\n\r\n.\r\n".as_slice(),
             b"x\r\n.\r\r\n.\r\n".as_slice(),
+            b"\r\n.\r\n\r\n.\r\n".as_slice(),
+            b"\r\n.\r\n.\r\n".as_slice(),
+            b"\r\n.\r\nx\r\n.\r\n".as_slice(),
         ] {
             streaming_terminator_end_for_all_partitions(data);
+            assert_streaming_matches_oracle_for_one_two_three_chunks(data);
         }
     }
 
@@ -754,6 +1027,97 @@ mod tests {
     }
 
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(1024))]
+
+        #[test]
+        fn crlf_line_helpers_match_independent_oracles(
+            input in vec(dangerous_wire_bytes(), 0..80),
+            start in 0_usize..96,
+        ) {
+            // RFC 3977 section 3.1 requires CRLF line termination. These central helpers
+            // must agree with independent byte-by-byte oracles for arbitrary buffers and
+            // arbitrary caller offsets:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-3.1
+            prop_assert_eq!(
+                detect_response_line_end(&input),
+                strict_response_line_crlf_oracle(&input),
+            );
+            prop_assert_eq!(strip_crlf(&input), strip_crlf_oracle(&input));
+            prop_assert_eq!(
+                find_crlf_line_end(&input, start),
+                crlf_line_end_oracle(&input, start),
+            );
+        }
+
+        #[test]
+        fn dot_block_helpers_match_independent_oracles(
+            prefix in vec(dangerous_wire_bytes(), 0..16),
+            mut body in vec(dangerous_wire_bytes(), 0..64),
+            trailer in vec(dangerous_wire_bytes(), 0..16),
+            start_offset in 0_usize..20,
+            terminator_case in 0_u8..3,
+        ) {
+            // RFC 3977 section 3.1.1 defines the multiline terminator as "." CRLF at
+            // content start for an empty block, or CRLF "." CRLF after non-empty content.
+            // The block finder must honor caller offsets, near misses, and trailers:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1
+            remove_rfc_multiline_terminators(&mut body);
+
+            let mut input = prefix;
+            let start = input.len().min(start_offset);
+            input.extend_from_slice(&body);
+            match terminator_case {
+                0 => input.extend_from_slice(b".\r\n"),
+                1 => input.extend_from_slice(b"\r\n.\r\n"),
+                _ => input.extend_from_slice(b"\r\n.\n"),
+            }
+            input.extend_from_slice(&trailer);
+
+            prop_assert_eq!(
+                find_dot_terminated_block_end(&input, start),
+                dot_terminated_block_end_oracle(&input, start),
+            );
+            prop_assert_eq!(
+                strip_dot_terminator_suffix(&input),
+                strip_dot_terminator_suffix_oracle(&input),
+            );
+        }
+
+        #[test]
+        fn append_and_small_predicate_helpers_match_independent_oracles(
+            input in vec(dangerous_wire_bytes(), 0..80),
+            target_bytes in any::<usize>(),
+            previous_line_ended_with_crlf in any::<bool>(),
+            line in vec(dangerous_wire_bytes(), 0..12),
+        ) {
+            // RFC 3977 sections 3.1 and 3.1.1 require CRLF line endings and "." CRLF
+            // multiline termination. Append, sizing, and dot-line predicates should match
+            // simple output/predicate oracles over arbitrary bytes:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-3.1
+            // https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1
+            let mut crlf_output = input.clone();
+            append_crlf(&mut crlf_output);
+            let mut expected_crlf = input.clone();
+            expected_crlf.push(b'\r');
+            expected_crlf.push(b'\n');
+            prop_assert_eq!(crlf_output, expected_crlf);
+
+            let mut dot_output = input.clone();
+            append_dot_terminator(&mut dot_output);
+            prop_assert_eq!(dot_output, append_dot_terminator_oracle(input));
+
+            prop_assert_eq!(
+                target_before_dot_terminator(target_bytes),
+                target_before_dot_terminator_oracle(target_bytes),
+            );
+            prop_assert_eq!(
+                is_dot_terminator_line(previous_line_ended_with_crlf, &line),
+                is_dot_terminator_line_oracle(previous_line_ended_with_crlf, &line),
+            );
+        }
+    }
+
+    proptest! {
         #![proptest_config(ProptestConfig::with_cases(512))]
 
         #[test]
@@ -772,7 +1136,10 @@ mod tests {
             }
             input.extend_from_slice(&suffix);
 
-            prop_assert_eq!(detect_response_line_end(&input), response_line_oracle(&input));
+            prop_assert_eq!(
+                detect_response_line_end(&input),
+                strict_response_line_crlf_oracle(&input),
+            );
         }
 
         #[test]
@@ -801,6 +1168,35 @@ mod tests {
                     body,
                 );
             }
+        }
+
+        #[test]
+        fn compact_multiline_terminator_matches_rfc_oracle_for_one_two_three_chunks(
+            prefix in vec(dangerous_wire_bytes(), 0..8),
+            mut body in vec(dangerous_wire_bytes(), 0..16),
+            trailer in vec(dangerous_wire_bytes(), 0..8),
+            near_miss in prop::sample::select(vec![
+                b"".to_vec(),
+                b"\n.\r\n".to_vec(),
+                b"\r.\r\n".to_vec(),
+                b"\r\n.\n".to_vec(),
+                b"\r\n.\r".to_vec(),
+                b"..\r\n".to_vec(),
+                b".body\r\n".to_vec(),
+            ]),
+        ) {
+            // RFC 3977 section 3.1.1 requires the first complete CRLF "." CRLF to win,
+            // regardless of whether it is split across one, two, or three reads. Compact
+            // generated buffers keep the nested split schedule exhaustive:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1
+            remove_rfc_multiline_terminators(&mut body);
+            let mut input = prefix;
+            input.extend_from_slice(&body);
+            input.extend_from_slice(&near_miss);
+            input.extend_from_slice(b"\r\n.\r\n");
+            input.extend_from_slice(&trailer);
+
+            assert_streaming_matches_oracle_for_one_two_three_chunks(&input);
         }
 
         #[test]
@@ -886,6 +1282,46 @@ mod tests {
                     split,
                     input,
                 );
+            }
+        }
+
+        #[test]
+        fn empty_multiline_terminator_matches_content_start_oracle_for_one_two_three_chunks(
+            trailer in vec(dangerous_wire_bytes(), 0..8),
+        ) {
+            // RFC 3977 section 3.1.1 represents an empty multiline response as "." CRLF
+            // immediately at content start. This exhausts one-, two-, and three-read
+            // schedules for the compact content-start buffer:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1
+            let mut input = b".\r\n".to_vec();
+            input.extend_from_slice(&trailer);
+            let expected = empty_multiline_content_start_oracle(&input);
+
+            prop_assert_eq!(empty_multiline_streaming_end(&[&input]), expected);
+            for first_end in 0..=input.len() {
+                prop_assert_eq!(
+                    empty_multiline_streaming_end(&[&input[..first_end], &input[first_end..]]),
+                    expected,
+                    "two chunks split {} input {:?}",
+                    first_end,
+                    input,
+                );
+            }
+            for first_end in 0..=input.len() {
+                for second_end in first_end..=input.len() {
+                    prop_assert_eq!(
+                        empty_multiline_streaming_end(&[
+                            &input[..first_end],
+                            &input[first_end..second_end],
+                            &input[second_end..],
+                        ]),
+                        expected,
+                        "three chunks splits {}/{} input {:?}",
+                        first_end,
+                        second_end,
+                        input,
+                    );
+                }
             }
         }
 
