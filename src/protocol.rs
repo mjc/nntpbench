@@ -9,6 +9,8 @@ pub mod article;
 
 pub use article::{Article, ArticleNumber, ArticleParseError, HeaderIter, Headers};
 
+pub const MAX_ARTICLE_NUMBER: u64 = 2_147_483_647;
+
 /// Raw NNTP status code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StatusCode(u16);
@@ -1137,7 +1139,7 @@ pub enum ArticleRef<'a> {
 impl<'a> ArticleRef<'a> {
     /// Construct a numeric article reference after validation.
     pub const fn from_number(value: u64) -> Result<Self, InvalidArticleRef> {
-        if value == 0 {
+        if value == 0 || value > MAX_ARTICLE_NUMBER {
             return Err(InvalidArticleRef);
         }
         Ok(Self::Number(value))
@@ -1313,8 +1315,6 @@ fn validate_listgroup_range(value: &str) -> Result<(), InvalidListGroupRange> {
 struct InvalidArticleNumberToken;
 
 fn validate_article_number_token(value: &str) -> Result<(), InvalidArticleNumberToken> {
-    const MAX_ARTICLE_NUMBER: u64 = 2_147_483_647;
-
     if value.is_empty() || value.len() > 16 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err(InvalidArticleNumberToken);
     }
@@ -3938,6 +3938,10 @@ mod tests {
         assert!(quit.message_id().is_none());
         assert!(Request::article("<bad id>").is_err());
         assert!(Request::article_number(0).is_err());
+        assert!(Request::article_number(MAX_ARTICLE_NUMBER + 1).is_err());
+        assert!(Request::body_number(MAX_ARTICLE_NUMBER + 1).is_err());
+        assert!(Request::head_number(MAX_ARTICLE_NUMBER + 1).is_err());
+        assert!(Request::stat_number(MAX_ARTICLE_NUMBER + 1).is_err());
         assert!(Request::body_selector("1-10").is_err());
         assert!(Request::group("").is_err());
         assert!(Request::listgroup("<a@b>").is_err());

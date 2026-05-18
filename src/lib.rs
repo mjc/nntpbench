@@ -1240,7 +1240,7 @@ fn typed_request_for_command(
     total_clients: usize,
 ) -> io::Result<Request<'static>> {
     let kind = client_command_kind(command_id, mix);
-    if segments.is_none() && command_id != 0 {
+    if segments.is_none() && (1..=crate::protocol::MAX_ARTICLE_NUMBER).contains(&command_id) {
         return match kind {
             ClientCommandMix::Article => Request::article_number(command_id)
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid article number")),
@@ -3632,6 +3632,39 @@ mod tests {
         assert_eq!(snapshot.article_requests, 1);
         assert_eq!(snapshot.body_requests, 1);
         assert_eq!(snapshot.pipeline_batches, 1);
+    }
+
+    #[test]
+    fn typed_request_for_command_uses_message_id_after_numeric_article_range() {
+        let request = typed_request_for_command(
+            i32::MAX as u64 + 1,
+            0,
+            ClientCommandMix::Article,
+            None,
+            0,
+            1,
+        )
+        .unwrap();
+
+        match request {
+            Request::Article { article_ref } => assert_eq!(
+                article_ref.message_id().map(MessageId::as_str),
+                Some("<bench.2147483648@nntpbench.local>")
+            ),
+            other => panic!("expected message-id ARTICLE fallback, got {other:?}"),
+        }
+
+        let request =
+            typed_request_for_command(i32::MAX as u64 + 2, 0, ClientCommandMix::Body, None, 0, 1)
+                .unwrap();
+
+        match request {
+            Request::Body { article_ref } => assert_eq!(
+                article_ref.message_id().map(MessageId::as_str),
+                Some("<bench.2147483649@nntpbench.local>")
+            ),
+            other => panic!("expected message-id BODY fallback, got {other:?}"),
+        }
     }
 
     #[tokio::test]

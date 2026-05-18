@@ -2068,6 +2068,7 @@ struct ResponseDecoder {
     kind: RequestKind,
     buffered_len: usize,
     status: Option<(StatusCode, usize)>,
+    empty_content_terminator_prefix_len: usize,
     tail: TailBuffer,
 }
 
@@ -2077,6 +2078,7 @@ impl ResponseDecoder {
             kind,
             buffered_len: 0,
             status: None,
+            empty_content_terminator_prefix_len: 0,
             tail: TailBuffer::default(),
         }
     }
@@ -2110,11 +2112,14 @@ impl ResponseDecoder {
         }
 
         let content_chunk = &buffer[content_chunk_start..];
-        if content_chunk_start == status_end && content_chunk.starts_with(b".\r\n") {
-            return Ok(DecodeProgress::Complete {
-                status,
-                consumed: content_chunk_start + 3,
-            });
+        if content_chunk_start == status_end || self.empty_content_terminator_prefix_len > 0 {
+            match self.detect_empty_content_terminator(content_chunk, content_chunk_start) {
+                EmptyContentTerminator::Complete { consumed } => {
+                    return Ok(DecodeProgress::Complete { status, consumed });
+                }
+                EmptyContentTerminator::NeedMore => return Ok(DecodeProgress::NeedMore),
+                EmptyContentTerminator::NotTerminator => {}
+            }
         }
 
         match self.tail.detect_terminator(content_chunk) {
@@ -2128,12 +2133,52 @@ impl ResponseDecoder {
             }
         }
     }
+
+    fn detect_empty_content_terminator(
+        &mut self,
+        content_chunk: &[u8],
+        content_chunk_start: usize,
+    ) -> EmptyContentTerminator {
+        const EMPTY_TERMINATOR: &[u8; 3] = b".\r\n";
+
+        let already_matched = self.empty_content_terminator_prefix_len;
+        let remaining = &EMPTY_TERMINATOR[already_matched..];
+        let matched = content_chunk
+            .iter()
+            .zip(remaining.iter())
+            .take_while(|(actual, expected)| actual == expected)
+            .count();
+
+        if already_matched + matched == EMPTY_TERMINATOR.len() {
+            return EmptyContentTerminator::Complete {
+                consumed: content_chunk_start + matched,
+            };
+        }
+
+        if matched == content_chunk.len() {
+            self.empty_content_terminator_prefix_len += matched;
+            return EmptyContentTerminator::NeedMore;
+        }
+
+        if already_matched != 0 {
+            self.tail.update(&EMPTY_TERMINATOR[..already_matched]);
+        }
+        self.empty_content_terminator_prefix_len = 0;
+        EmptyContentTerminator::NotTerminator
+    }
 }
 
 #[derive(Debug)]
 enum DecodeProgress {
     NeedMore,
     Complete { status: StatusCode, consumed: usize },
+}
+
+#[derive(Debug)]
+enum EmptyContentTerminator {
+    NeedMore,
+    Complete { consumed: usize },
+    NotTerminator,
 }
 
 #[derive(Debug)]
@@ -2776,6 +2821,31 @@ mod tests {
         assert_eq!(consumed, buffer.len());
         assert_eq!(response.status().as_u16(), 101);
         assert_eq!(response.as_bytes(), buffer);
+    }
+
+    #[test]
+    fn decoder_completes_empty_multiline_response_with_split_terminator() {
+        for split in 1..3 {
+            let mut decoder = ResponseDecoder::new(RequestKind::Capabilities);
+            let mut buffer = b"101 Capability list:\r\n".to_vec();
+            buffer.extend_from_slice(&b".\r\n"[..split]);
+            assert!(matches!(
+                decoder.push(&buffer).unwrap(),
+                DecodeProgress::NeedMore
+            ));
+
+            buffer.extend_from_slice(&b".\r\n"[split..]);
+            let DecodeProgress::Complete { status, consumed } = decoder.push(&buffer).unwrap()
+            else {
+                panic!("decoder should complete for split {split}");
+            };
+            let response =
+                response_from_bytes(RequestKind::Capabilities, status, &buffer[..consumed]);
+
+            assert_eq!(consumed, buffer.len());
+            assert_eq!(response.status().as_u16(), 101);
+            assert_eq!(response.as_bytes(), buffer);
+        }
     }
 
     #[test]
