@@ -13,10 +13,12 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-use crate::protocol::{ArticleRef, Request};
+use crate::protocol::{
+    ArticleRef, Request, ResponseFrameDecoder, ResponseFrameParse, ResponseInitialParse,
+};
 use crate::terminator::{
     DOT_TERMINATOR, EmptyMultilineTerminator, EmptyTerminatorStatus, MultilineTerminatorDetector,
-    ResponseLineStatus, TerminatorStatus, crlf_normalized_payload_lines, detect_response_line_end,
+    TerminatorStatus, crlf_normalized_payload_lines,
 };
 use crate::{
     Article, ArticleParseError, ArticleSelector, ArticleTransfer, AuthInfoKind, AuthInfoValue,
@@ -26,7 +28,7 @@ use crate::{
 
 const DRAINED_PENDING_READ_BYTES: usize = 64 * 1024;
 const OWNED_RESPONSE_PREALLOC_BYTES: usize = 8 * 1024 * 1024;
-const STREAMING_STATUS_LINE_BYTES: usize = 1024;
+const STREAMING_STATUS_LINE_BYTES: usize = crate::protocol::MAX_INITIAL_RESPONSE_LINE_BYTES;
 
 /// Options for the typed one-connection client prototype.
 #[derive(Debug, Clone, Copy)]
@@ -2074,83 +2076,24 @@ impl From<crate::protocol::InvalidListGroupRangeOrGroupName> for TypedClientErro
 
 #[derive(Debug)]
 struct ResponseDecoder {
-    kind: RequestKind,
-    buffered_len: usize,
-    status: Option<(StatusCode, usize)>,
-    empty_terminator: EmptyMultilineTerminator,
-    tail: MultilineTerminatorDetector,
+    inner: ResponseFrameDecoder,
 }
 
 impl ResponseDecoder {
     fn new(kind: RequestKind) -> Self {
         Self {
-            kind,
-            buffered_len: 0,
-            status: None,
-            empty_terminator: EmptyMultilineTerminator::default(),
-            tail: MultilineTerminatorDetector::default(),
+            inner: ResponseFrameDecoder::new(kind),
         }
     }
 
     fn push(&mut self, buffer: &[u8]) -> Result<DecodeProgress, TypedClientError> {
-        let chunk_start = self.buffered_len;
-        self.buffered_len = buffer.len();
-
-        let (status, status_end) = match self.status {
-            Some(value) => value,
-            None => {
-                let status_end = match detect_response_line_end(buffer) {
-                    ResponseLineStatus::CompleteAt(status_end) => status_end,
-                    ResponseLineStatus::NeedMore => return Ok(DecodeProgress::NeedMore),
-                    ResponseLineStatus::Invalid => return Err(TypedClientError::InvalidStatusLine),
-                };
-                let status =
-                    StatusCode::parse(buffer).ok_or(TypedClientError::InvalidStatusLine)?;
-                self.status = Some((status, status_end));
-                if !self.kind.expects_multiline_response(status) {
-                    return Ok(DecodeProgress::Complete {
-                        status,
-                        consumed: status_end,
-                    });
-                }
-                (status, status_end)
-            }
-        };
-
-        let content_chunk_start = chunk_start.max(status_end);
-        if content_chunk_start >= buffer.len() {
-            return Ok(DecodeProgress::NeedMore);
-        }
-
-        let content_chunk = &buffer[content_chunk_start..];
-        if content_chunk_start == status_end || self.empty_terminator.is_active() {
-            match self.empty_terminator.detect(content_chunk) {
-                EmptyTerminatorStatus::FoundAt(end) => {
-                    return Ok(DecodeProgress::Complete {
-                        status,
-                        consumed: content_chunk_start + end,
-                    });
-                }
-                EmptyTerminatorStatus::NeedMore => return Ok(DecodeProgress::NeedMore),
-                EmptyTerminatorStatus::NotFound {
-                    previous_prefix_len,
-                } => {
-                    if previous_prefix_len != 0 {
-                        self.tail.update(&DOT_TERMINATOR[..previous_prefix_len]);
-                    }
-                }
-            }
-        }
-
-        match self.tail.detect_terminator(content_chunk) {
-            TerminatorStatus::FoundAt(end) => Ok(DecodeProgress::Complete {
-                status,
-                consumed: content_chunk_start + end,
+        match self.inner.decode(buffer) {
+            ResponseFrameParse::Complete(response) => Ok(DecodeProgress::Complete {
+                status: response.status(),
+                consumed: response.consumed(),
             }),
-            TerminatorStatus::NotFound => {
-                self.tail.update(content_chunk);
-                Ok(DecodeProgress::NeedMore)
-            }
+            ResponseFrameParse::NeedMore => Ok(DecodeProgress::NeedMore),
+            ResponseFrameParse::Invalid => Err(TypedClientError::InvalidStatusLine),
         }
     }
 }
@@ -2199,19 +2142,21 @@ impl StreamingResponseDecoder {
                     self.status_len += 1;
                     consumed += 1;
 
-                    match detect_response_line_end(&self.status_buf[..self.status_len]) {
-                        ResponseLineStatus::CompleteAt(_) => {
-                            let status = StatusCode::parse(&self.status_buf[..self.status_len])
-                                .ok_or(TypedClientError::InvalidStatusLine)?;
+                    match crate::protocol::ResponseInitial::parse(
+                        self.kind,
+                        &self.status_buf[..self.status_len],
+                    ) {
+                        ResponseInitialParse::Complete(initial) => {
+                            let status = initial.status();
                             self.status = Some(status);
-                            if !self.kind.expects_multiline_response(status) {
+                            if !initial.descriptor().framing().is_multiline() {
                                 return Ok(StreamingDecodeProgress::Complete { status, consumed });
                             }
                             content_start = consumed;
                             break;
                         }
-                        ResponseLineStatus::NeedMore => {}
-                        ResponseLineStatus::Invalid => {
+                        ResponseInitialParse::NeedMore => {}
+                        ResponseInitialParse::Invalid => {
                             return Err(TypedClientError::InvalidStatusLine);
                         }
                     }
@@ -3274,6 +3219,35 @@ mod tests {
     }
 
     #[test]
+    fn decoder_compact_frames_do_not_allocate() {
+        // RFC 3977 section 9.4 frames responses as either an initial response
+        // line alone or that line followed by a multi-line data block.
+        let mut stat_decoder = ResponseDecoder::new(RequestKind::Stat);
+        let mut body_decoder = ResponseDecoder::new(RequestKind::Body);
+
+        crate::COUNT_TEST_ALLOCATIONS.with(|enabled| enabled.set(false));
+        crate::TEST_ALLOCATIONS.store(0, std::sync::atomic::Ordering::Relaxed);
+        crate::COUNT_TEST_ALLOCATIONS.with(|enabled| enabled.set(true));
+
+        assert!(matches!(
+            stat_decoder.push(b"223 1 <stat@test> article retrieved\r\n"),
+            Ok(DecodeProgress::Complete { status, consumed })
+                if status.as_u16() == 223
+                    && consumed == b"223 1 <stat@test> article retrieved\r\n".len()
+        ));
+        assert!(matches!(
+            body_decoder.push(b"222 1 <body@test> body follows\r\nbody\r\n.\r\n"),
+            Ok(DecodeProgress::Complete { status, consumed })
+                if status.as_u16() == 222
+                    && consumed == b"222 1 <body@test> body follows\r\nbody\r\n.\r\n".len()
+        ));
+
+        crate::COUNT_TEST_ALLOCATIONS.with(|enabled| enabled.set(false));
+        let allocations = crate::TEST_ALLOCATIONS.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(allocations, 0, "compact decoder push allocated");
+    }
+
+    #[test]
     fn decoder_waits_for_complete_crlf_status_line() {
         // RFC 3977 section 3.1 requires CRLF, not a lone final CR, to terminate the
         // response initial line. The decoder must keep waiting until LF arrives:
@@ -3334,6 +3308,71 @@ mod tests {
                 "{input:?}"
             );
         }
+    }
+
+    #[test]
+    fn decoder_enforces_rfc_initial_response_line_limit() {
+        // RFC 3977 section 3.1 limits the response initial line to 512 octets,
+        // including the status code and terminating CRLF.
+        let mut exact = Vec::from(b"223 ".as_slice());
+        exact.resize(crate::protocol::MAX_INITIAL_RESPONSE_LINE_BYTES - 2, b'x');
+        exact.extend_from_slice(b"\r\n");
+        assert_eq!(
+            exact.len(),
+            crate::protocol::MAX_INITIAL_RESPONSE_LINE_BYTES
+        );
+        assert!(matches!(
+            ResponseDecoder::new(RequestKind::Stat).push(&exact),
+            Ok(DecodeProgress::Complete { .. })
+        ));
+
+        let mut too_long_complete = Vec::from(b"223 ".as_slice());
+        too_long_complete.resize(crate::protocol::MAX_INITIAL_RESPONSE_LINE_BYTES - 1, b'x');
+        too_long_complete.extend_from_slice(b"\r\n");
+        assert_eq!(
+            too_long_complete.len(),
+            crate::protocol::MAX_INITIAL_RESPONSE_LINE_BYTES + 1
+        );
+        assert!(matches!(
+            ResponseDecoder::new(RequestKind::Stat).push(&too_long_complete),
+            Err(TypedClientError::InvalidStatusLine)
+        ));
+
+        let mut too_long_incomplete = Vec::from(b"223 ".as_slice());
+        too_long_incomplete.resize(crate::protocol::MAX_INITIAL_RESPONSE_LINE_BYTES, b'x');
+        assert!(matches!(
+            ResponseDecoder::new(RequestKind::Stat).push(&too_long_incomplete),
+            Err(TypedClientError::InvalidStatusLine)
+        ));
+    }
+
+    #[test]
+    fn streaming_decoder_enforces_rfc_initial_response_line_limit() {
+        // RFC 3977 section 3.1 applies the same 512-octet initial-line limit
+        // when the line arrives across streaming chunks.
+        let mut exact = Vec::from(b"223 ".as_slice());
+        exact.resize(crate::protocol::MAX_INITIAL_RESPONSE_LINE_BYTES - 2, b'x');
+        exact.extend_from_slice(b"\r\n");
+        let split = 17;
+        let mut decoder = StreamingResponseDecoder::new(RequestKind::Stat);
+        assert!(matches!(
+            decoder.push(&exact[..split]),
+            Ok(StreamingDecodeProgress::NeedMore { consumed }) if consumed == split
+        ));
+        assert!(matches!(
+            decoder.push(&exact[split..]),
+            Ok(StreamingDecodeProgress::Complete { status, consumed })
+                if status.as_u16() == 223 && consumed == exact.len() - split
+        ));
+
+        let mut too_long = Vec::from(b"223 ".as_slice());
+        too_long.resize(crate::protocol::MAX_INITIAL_RESPONSE_LINE_BYTES, b'x');
+        too_long.push(b'x');
+        let mut decoder = StreamingResponseDecoder::new(RequestKind::Stat);
+        assert!(matches!(
+            decoder.push(&too_long),
+            Err(TypedClientError::InvalidStatusLine)
+        ));
     }
 
     #[test]
