@@ -24,6 +24,10 @@ use crate::{
     StatusCode, Wildmat,
 };
 
+const DRAINED_PENDING_READ_BYTES: usize = 64 * 1024;
+const OWNED_RESPONSE_PREALLOC_BYTES: usize = 8 * 1024 * 1024;
+const STREAMING_STATUS_LINE_BYTES: usize = 1024;
+
 /// Options for the typed one-connection client prototype.
 #[derive(Debug, Clone, Copy)]
 pub struct TypedClientOptions {
@@ -2158,6 +2162,124 @@ enum DecodeProgress {
 }
 
 #[derive(Debug)]
+struct StreamingResponseDecoder {
+    kind: RequestKind,
+    status: Option<StatusCode>,
+    status_buf: [u8; STREAMING_STATUS_LINE_BYTES],
+    status_len: usize,
+    content_started: bool,
+    empty_terminator: EmptyMultilineTerminator,
+    tail: MultilineTerminatorDetector,
+}
+
+impl StreamingResponseDecoder {
+    fn new(kind: RequestKind) -> Self {
+        Self {
+            kind,
+            status: None,
+            status_buf: [0; STREAMING_STATUS_LINE_BYTES],
+            status_len: 0,
+            content_started: false,
+            empty_terminator: EmptyMultilineTerminator::default(),
+            tail: MultilineTerminatorDetector::default(),
+        }
+    }
+
+    fn push(&mut self, chunk: &[u8]) -> Result<StreamingDecodeProgress, TypedClientError> {
+        let mut content_start = 0;
+        let status = match self.status {
+            Some(status) => status,
+            None => {
+                let mut consumed = 0;
+                while consumed < chunk.len() {
+                    if self.status_len == self.status_buf.len() {
+                        return Err(TypedClientError::InvalidStatusLine);
+                    }
+                    self.status_buf[self.status_len] = chunk[consumed];
+                    self.status_len += 1;
+                    consumed += 1;
+
+                    match detect_response_line_end(&self.status_buf[..self.status_len]) {
+                        ResponseLineStatus::CompleteAt(_) => {
+                            let status = StatusCode::parse(&self.status_buf[..self.status_len])
+                                .ok_or(TypedClientError::InvalidStatusLine)?;
+                            self.status = Some(status);
+                            if !self.kind.expects_multiline_response(status) {
+                                return Ok(StreamingDecodeProgress::Complete { status, consumed });
+                            }
+                            content_start = consumed;
+                            break;
+                        }
+                        ResponseLineStatus::NeedMore => {}
+                        ResponseLineStatus::Invalid => {
+                            return Err(TypedClientError::InvalidStatusLine);
+                        }
+                    }
+                }
+
+                let Some(status) = self.status else {
+                    return Ok(StreamingDecodeProgress::NeedMore {
+                        consumed: chunk.len(),
+                    });
+                };
+                status
+            }
+        };
+
+        if content_start >= chunk.len() {
+            return Ok(StreamingDecodeProgress::NeedMore {
+                consumed: chunk.len(),
+            });
+        }
+
+        let content_chunk = &chunk[content_start..];
+        if !self.content_started || self.empty_terminator.is_active() {
+            match self.empty_terminator.detect(content_chunk) {
+                EmptyTerminatorStatus::FoundAt(end) => {
+                    return Ok(StreamingDecodeProgress::Complete {
+                        status,
+                        consumed: content_start + end,
+                    });
+                }
+                EmptyTerminatorStatus::NeedMore => {
+                    return Ok(StreamingDecodeProgress::NeedMore {
+                        consumed: chunk.len(),
+                    });
+                }
+                EmptyTerminatorStatus::NotFound {
+                    previous_prefix_len,
+                } => {
+                    self.content_started = true;
+                    if previous_prefix_len != 0 {
+                        self.tail.update(&DOT_TERMINATOR[..previous_prefix_len]);
+                    }
+                }
+            }
+        }
+
+        match self.tail.detect_terminator(content_chunk) {
+            TerminatorStatus::FoundAt(end) => Ok(StreamingDecodeProgress::Complete {
+                status,
+                consumed: content_start + end,
+            }),
+            TerminatorStatus::NotFound => {
+                self.content_started = true;
+                self.tail.update(content_chunk);
+                Ok(StreamingDecodeProgress::NeedMore {
+                    consumed: chunk.len(),
+                })
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+enum StreamingDecodeProgress {
+    NeedMore { consumed: usize },
+    Complete { status: StatusCode, consumed: usize },
+}
+
+#[derive(Debug)]
 struct QueuedRequest {
     request: Request<'static>,
     response_tx: oneshot::Sender<Result<CompletedRequest, SharedEngineError>>,
@@ -2747,12 +2869,12 @@ async fn run_reader_task(
 
 async fn run_reader_task_owned(
     mut reader: OwnedReadHalf,
-    read_chunk_bytes: usize,
+    _read_chunk_bytes: usize,
     mut inflight_rx: mpsc::Receiver<InFlightRequest>,
     poisoned: Arc<Mutex<Option<SharedEngineError>>>,
     writer_abort: tokio::task::AbortHandle,
 ) {
-    let mut pending_read = BytesMut::with_capacity(read_chunk_bytes.saturating_mul(2));
+    let mut pending_read = BytesMut::with_capacity(OWNED_RESPONSE_PREALLOC_BYTES);
 
     while let Some(inflight_request) = inflight_rx.recv().await {
         let InFlightRequest {
@@ -2792,7 +2914,14 @@ async fn run_reader_task_owned(
                 }
             }
 
-            pending_read.reserve(read_chunk_bytes);
+            if pending_read.capacity() == pending_read.len() {
+                let error = SharedEngineError::InvalidStatusLine;
+                let _ = response_tx.send(Err(error.clone()));
+                writer_abort.abort();
+                poison_reader_engine(&poisoned, &mut inflight_rx, error).await;
+                return;
+            }
+
             let read = match reader.read_buf(&mut pending_read).await {
                 Ok(read) => read,
                 Err(err) => {
@@ -2825,36 +2954,45 @@ async fn run_reader_task_drained(
     poisoned: Arc<Mutex<Option<SharedEngineError>>>,
     writer_abort: tokio::task::AbortHandle,
 ) {
-    let mut pending_read = BytesMut::with_capacity(read_chunk_bytes.saturating_mul(4));
+    let mut pending_read = [0; DRAINED_PENDING_READ_BYTES];
+    let mut pending_len = 0usize;
     let mut pending_start = 0usize;
+    let read_chunk_bytes = read_chunk_bytes.min(DRAINED_PENDING_READ_BYTES);
 
     while let Some(inflight_request) = inflight_rx.recv().await {
-        compact_drained_pending_read(&mut pending_read, &mut pending_start, read_chunk_bytes);
+        compact_drained_pending_read(&mut pending_read, &mut pending_start, &mut pending_len);
 
         let InFlightRequest {
             request,
             kind,
             response_tx,
         } = inflight_request;
-        let mut decoder = ResponseDecoder::new(kind);
+        let mut decoder = StreamingResponseDecoder::new(kind);
+        let mut bytes_len = 0usize;
 
         loop {
-            if pending_start < pending_read.len() {
-                match decoder.push(&pending_read[pending_start..]) {
-                    Ok(DecodeProgress::NeedMore) => {}
-                    Ok(DecodeProgress::Complete {
+            if pending_start < pending_len {
+                match decoder.push(&pending_read[pending_start..pending_len]) {
+                    Ok(StreamingDecodeProgress::NeedMore { consumed }) => {
+                        bytes_len += consumed;
+                        pending_start += consumed;
+                        if pending_start == pending_len {
+                            pending_len = 0;
+                            pending_start = 0;
+                        }
+                    }
+                    Ok(StreamingDecodeProgress::Complete {
                         status: _status,
                         consumed,
                     }) => {
+                        bytes_len += consumed;
                         pending_start += consumed;
-                        if pending_start == pending_read.len() {
-                            pending_read.clear();
+                        if pending_start == pending_len {
+                            pending_len = 0;
                             pending_start = 0;
                         }
 
-                        let response = CompletedResponse::Drained(DrainedResponse {
-                            bytes_len: consumed,
-                        });
+                        let response = CompletedResponse::Drained(DrainedResponse { bytes_len });
                         let _ = response_tx.send(Ok(CompletedRequest { request, response }));
                         break;
                     }
@@ -2875,8 +3013,26 @@ async fn run_reader_task_drained(
                 }
             }
 
-            pending_read.reserve(read_chunk_bytes);
-            let read = match reader.read_buf(&mut pending_read).await {
+            if pending_len == pending_read.len() {
+                compact_drained_pending_read(
+                    &mut pending_read,
+                    &mut pending_start,
+                    &mut pending_len,
+                );
+                if pending_len == pending_read.len() {
+                    let error = SharedEngineError::InvalidStatusLine;
+                    let _ = response_tx.send(Err(error.clone()));
+                    writer_abort.abort();
+                    poison_reader_engine(&poisoned, &mut inflight_rx, error).await;
+                    return;
+                }
+            }
+
+            let read_len = read_chunk_bytes.min(pending_read.len() - pending_len);
+            let read = match reader
+                .read(&mut pending_read[pending_len..pending_len + read_len])
+                .await
+            {
                 Ok(read) => read,
                 Err(err) => {
                     let error = SharedEngineError::Io {
@@ -2897,35 +3053,30 @@ async fn run_reader_task_drained(
                 poison_reader_engine(&poisoned, &mut inflight_rx, error).await;
                 return;
             }
+
+            pending_len += read;
         }
     }
 }
 
 fn compact_drained_pending_read(
-    pending_read: &mut BytesMut,
+    pending_read: &mut [u8; DRAINED_PENDING_READ_BYTES],
     pending_start: &mut usize,
-    min_spare: usize,
+    pending_len: &mut usize,
 ) {
     if *pending_start == 0 {
         return;
     }
 
-    if *pending_start == pending_read.len() {
-        pending_read.clear();
+    if *pending_start == *pending_len {
+        *pending_len = 0;
         *pending_start = 0;
         return;
     }
 
-    if pending_read.capacity().saturating_sub(pending_read.len()) >= min_spare {
-        return;
-    }
-
-    let pending_len = pending_read.len();
-    let tail_len = pending_len - *pending_start;
-    pending_read
-        .as_mut()
-        .copy_within(*pending_start..pending_len, 0);
-    pending_read.truncate(tail_len);
+    let tail_len = *pending_len - *pending_start;
+    pending_read.copy_within(*pending_start..*pending_len, 0);
+    *pending_len = tail_len;
     *pending_start = 0;
 }
 
@@ -3570,25 +3721,94 @@ mod tests {
     }
 
     #[test]
+    fn streaming_drained_decoder_does_not_allocate_for_large_multiline_responses() {
+        let mut body_decoder = StreamingResponseDecoder::new(RequestKind::Body);
+        let body_status = b"222 1 <large@test> body follows\r\n";
+        let mut over_decoder = StreamingResponseDecoder::new(RequestKind::Over);
+        let over_status = b"224 Overview information follows\r\n";
+        let body_line =
+            b"This is synthetic NNTP article payload for throughput and latency benchmarking\r\n";
+        let over_line = b"123456\tSubject\tposter@example.test\tFri, 15 May 2026 00:00:00 +0000\t<message@example.test>\t<ref@example.test>\t1048576\t12000\r\n";
+        let terminator = b".\r\n";
+        let mut bytes = 0usize;
+
+        crate::COUNT_TEST_ALLOCATIONS.with(|enabled| enabled.set(false));
+        crate::TEST_ALLOCATIONS.store(0, std::sync::atomic::Ordering::Relaxed);
+        crate::COUNT_TEST_ALLOCATIONS.with(|enabled| enabled.set(true));
+
+        assert!(matches!(
+            body_decoder.push(body_status).unwrap(),
+            StreamingDecodeProgress::NeedMore { .. }
+        ));
+        bytes += body_status.len();
+
+        while bytes < 1024 * 1024 {
+            assert!(matches!(
+                body_decoder.push(body_line).unwrap(),
+                StreamingDecodeProgress::NeedMore { .. }
+            ));
+            bytes += body_line.len();
+        }
+
+        let StreamingDecodeProgress::Complete { consumed, .. } =
+            body_decoder.push(terminator).unwrap()
+        else {
+            panic!("streaming decoder should complete at RFC terminator");
+        };
+        assert_eq!(consumed, terminator.len());
+
+        bytes = 0;
+        assert!(matches!(
+            over_decoder.push(over_status).unwrap(),
+            StreamingDecodeProgress::NeedMore { .. }
+        ));
+        bytes += over_status.len();
+
+        while bytes < 5 * 1024 * 1024 {
+            assert!(matches!(
+                over_decoder.push(over_line).unwrap(),
+                StreamingDecodeProgress::NeedMore { .. }
+            ));
+            bytes += over_line.len();
+        }
+
+        let StreamingDecodeProgress::Complete { consumed, .. } =
+            over_decoder.push(terminator).unwrap()
+        else {
+            panic!("streaming OVER decoder should complete at RFC terminator");
+        };
+        assert_eq!(consumed, terminator.len());
+
+        crate::COUNT_TEST_ALLOCATIONS.with(|enabled| enabled.set(false));
+        assert_eq!(
+            crate::TEST_ALLOCATIONS.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[test]
     fn compact_drained_pending_read_clears_fully_consumed_buffer() {
-        let mut pending_read = BytesMut::from(&b"abc"[..]);
-        let mut pending_start = pending_read.len();
+        let mut pending_read = [0; DRAINED_PENDING_READ_BYTES];
+        pending_read[..3].copy_from_slice(b"abc");
+        let mut pending_len = 3;
+        let mut pending_start = pending_len;
 
-        compact_drained_pending_read(&mut pending_read, &mut pending_start, 8);
+        compact_drained_pending_read(&mut pending_read, &mut pending_start, &mut pending_len);
 
-        assert!(pending_read.is_empty());
+        assert_eq!(pending_len, 0);
         assert_eq!(pending_start, 0);
     }
 
     #[test]
     fn compact_drained_pending_read_moves_leftover_prefix_between_responses() {
-        let mut pending_read = BytesMut::with_capacity(8);
-        pending_read.extend_from_slice(b"abcd1234");
+        let mut pending_read = [0; DRAINED_PENDING_READ_BYTES];
+        pending_read[..8].copy_from_slice(b"abcd1234");
+        let mut pending_len = 8;
         let mut pending_start = 4;
 
-        compact_drained_pending_read(&mut pending_read, &mut pending_start, 4);
+        compact_drained_pending_read(&mut pending_read, &mut pending_start, &mut pending_len);
 
-        assert_eq!(&pending_read[..], b"1234");
+        assert_eq!(&pending_read[..pending_len], b"1234");
         assert_eq!(pending_start, 0);
     }
 
