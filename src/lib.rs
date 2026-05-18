@@ -29,7 +29,7 @@ use tokio::time;
 use crate::terminator::{
     BoundedResponseLineStatus, DOT_TERMINATOR, ResponseLineStatus,
     detect_bounded_response_line_end, detect_response_line_end_from, find_crlf_line_end,
-    find_dot_terminated_block_end, is_dot_terminator_line, strip_complete_crlf_line, strip_crlf,
+    find_dot_terminated_block_end, strip_complete_crlf_line,
 };
 #[cfg(test)]
 use crate::terminator::{
@@ -1600,7 +1600,6 @@ async fn serve_session_inner(
     let mut reader = BufReader::with_capacity(SERVER_READER_CAPACITY, reader);
     let max_pipeline_depth = config.max_pipeline_depth.min(MAX_SERVER_PIPELINE_DEPTH);
     let mut command_line = [0; MAX_COMMAND_LINE_BYTES];
-    let mut command_scratch = [0; MAX_COMMAND_LINE_BYTES];
     let mut command_batch = CommandBatch::new();
     let mut pending_write = PendingWrite::new(config.pending_write_bytes);
 
@@ -1610,7 +1609,6 @@ async fn serve_session_inner(
         if !read_command_batch(
             &mut reader,
             &mut command_line,
-            &mut command_scratch,
             &mut command_batch,
             max_pipeline_depth,
         )
@@ -2496,7 +2494,6 @@ type CommandBatch = ArrayVec<ParsedCommand, MAX_SERVER_PIPELINE_DEPTH>;
 async fn read_command_batch<R>(
     reader: &mut BufReader<R>,
     command_line: &mut [u8; MAX_COMMAND_LINE_BYTES],
-    command_scratch: &mut [u8; MAX_COMMAND_LINE_BYTES],
     command_batch: &mut CommandBatch,
     max_pipeline_depth: usize,
 ) -> io::Result<bool>
@@ -2507,13 +2504,7 @@ where
     let Some(line_len) = read_crlf_line_into(reader, command_line).await? else {
         return Ok(false);
     };
-    push_command(
-        reader,
-        &command_line[..line_len],
-        command_scratch,
-        command_batch,
-    )
-    .await?;
+    push_command(reader, &command_line[..line_len], command_batch).await?;
 
     while command_batch.len() < max_pipeline_depth {
         if find_crlf_line_end(reader.buffer(), 0).is_none() {
@@ -2523,13 +2514,7 @@ where
         let Some(line_len) = read_crlf_line_into(reader, command_line).await? else {
             break;
         };
-        push_command(
-            reader,
-            &command_line[..line_len],
-            command_scratch,
-            command_batch,
-        )
-        .await?;
+        push_command(reader, &command_line[..line_len], command_batch).await?;
     }
 
     Ok(true)
@@ -2573,7 +2558,6 @@ where
 async fn push_command<R>(
     reader: &mut BufReader<R>,
     line: &[u8],
-    command_scratch: &mut [u8; MAX_COMMAND_LINE_BYTES],
     command_batch: &mut CommandBatch,
 ) -> io::Result<()>
 where
@@ -2588,7 +2572,7 @@ where
     let command = parse_command_line(line);
     let kind = command.kind;
     if matches!(kind, RequestKind::TakeThis) {
-        read_dot_terminated_body(reader, command_scratch).await?;
+        read_dot_terminated_body(reader).await?;
     }
     command_batch.push(command);
     Ok(())
@@ -2600,32 +2584,87 @@ fn parse_command_line(line: &[u8]) -> ParsedCommand {
     }
 }
 
-async fn read_dot_terminated_body<R>(
-    reader: &mut BufReader<R>,
-    command_scratch: &mut [u8; MAX_COMMAND_LINE_BYTES],
-) -> io::Result<()>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TakeThisBodyState {
+    LineStart,
+    LineStartDot,
+    LineStartDotCr,
+    Line,
+    LineCr,
+}
+
+async fn read_dot_terminated_body<R>(reader: &mut BufReader<R>) -> io::Result<()>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
-    let mut previous_line_ended_with_crlf = true;
+    let mut state = TakeThisBodyState::LineStart;
     loop {
-        let Some(read) = read_crlf_line_into(reader, command_scratch).await? else {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "truncated TAKETHIS body",
             ));
-        };
-        let line = &command_scratch[..read];
-        if strip_complete_crlf_line(line).is_none() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "TAKETHIS body line missing CRLF terminator",
-            ));
         }
-        if is_dot_terminator_line(previous_line_ended_with_crlf, line) {
-            return Ok(());
+
+        let mut consumed = 0;
+        for &byte in available {
+            consumed += 1;
+            state = match (state, byte) {
+                (TakeThisBodyState::LineStart, b'.') => TakeThisBodyState::LineStartDot,
+                (TakeThisBodyState::LineStart, b'\r') => TakeThisBodyState::LineCr,
+                (TakeThisBodyState::LineStart, b'\n') => {
+                    reader.consume(consumed);
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "TAKETHIS body line missing CRLF terminator",
+                    ));
+                }
+                (TakeThisBodyState::LineStart, _) => TakeThisBodyState::Line,
+
+                (TakeThisBodyState::LineStartDot, b'\r') => TakeThisBodyState::LineStartDotCr,
+                (TakeThisBodyState::LineStartDot, b'\n') => {
+                    reader.consume(consumed);
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "TAKETHIS body line missing CRLF terminator",
+                    ));
+                }
+                (TakeThisBodyState::LineStartDot, _) => TakeThisBodyState::Line,
+
+                (TakeThisBodyState::LineStartDotCr, b'\n') => {
+                    reader.consume(consumed);
+                    return Ok(());
+                }
+                (TakeThisBodyState::LineStartDotCr, _) => {
+                    reader.consume(consumed);
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "TAKETHIS body line missing CRLF terminator",
+                    ));
+                }
+
+                (TakeThisBodyState::Line, b'\r') => TakeThisBodyState::LineCr,
+                (TakeThisBodyState::Line, b'\n') => {
+                    reader.consume(consumed);
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "TAKETHIS body line missing CRLF terminator",
+                    ));
+                }
+                (TakeThisBodyState::Line, _) => TakeThisBodyState::Line,
+
+                (TakeThisBodyState::LineCr, b'\n') => TakeThisBodyState::LineStart,
+                (TakeThisBodyState::LineCr, _) => {
+                    reader.consume(consumed);
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "TAKETHIS body line missing CRLF terminator",
+                    ));
+                }
+            };
         }
-        previous_line_ended_with_crlf = strip_crlf(line).is_some();
+        reader.consume(consumed);
     }
 }
 
@@ -3098,18 +3137,11 @@ mod tests {
         let server = ChunkedRead::new(&[b"ART".as_slice(), b"ICLE 1\r\nBODY 2\r\n".as_slice()]);
         let mut reader = BufReader::with_capacity(32, server);
         let mut command_buf = [0; MAX_COMMAND_LINE_BYTES];
-        let mut command_scratch = [0; MAX_COMMAND_LINE_BYTES];
         let mut command_batch = CommandBatch::new();
         assert!(
-            read_command_batch(
-                &mut reader,
-                &mut command_buf,
-                &mut command_scratch,
-                &mut command_batch,
-                4,
-            )
-            .await
-            .unwrap()
+            read_command_batch(&mut reader, &mut command_buf, &mut command_batch, 4)
+                .await
+                .unwrap()
         );
         assert_eq!(
             command_batch
@@ -3119,15 +3151,9 @@ mod tests {
             vec![RequestKind::Article, RequestKind::Body]
         );
         assert!(
-            !read_command_batch(
-                &mut reader,
-                &mut command_buf,
-                &mut command_scratch,
-                &mut command_batch,
-                4,
-            )
-            .await
-            .unwrap()
+            !read_command_batch(&mut reader, &mut command_buf, &mut command_batch, 4)
+                .await
+                .unwrap()
         );
     }
 
@@ -3135,18 +3161,11 @@ mod tests {
     async fn read_command_batch_reports_reader_error() {
         let mut reader = BufReader::with_capacity(32, FailingRead);
         let mut command_buf = [0; MAX_COMMAND_LINE_BYTES];
-        let mut command_scratch = [0; MAX_COMMAND_LINE_BYTES];
         let mut command_batch = CommandBatch::new();
 
-        let err = read_command_batch(
-            &mut reader,
-            &mut command_buf,
-            &mut command_scratch,
-            &mut command_batch,
-            1,
-        )
-        .await
-        .unwrap_err();
+        let err = read_command_batch(&mut reader, &mut command_buf, &mut command_batch, 1)
+            .await
+            .unwrap_err();
 
         assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
     }
@@ -5393,19 +5412,12 @@ mod tests {
 
         let mut reader = BufReader::with_capacity(1024, server);
         let mut command_buf = [0; MAX_COMMAND_LINE_BYTES];
-        let mut command_scratch = [0; MAX_COMMAND_LINE_BYTES];
         let mut command_batch = CommandBatch::new();
 
         assert!(
-            read_command_batch(
-                &mut reader,
-                &mut command_buf,
-                &mut command_scratch,
-                &mut command_batch,
-                8,
-            )
-            .await
-            .unwrap()
+            read_command_batch(&mut reader, &mut command_buf, &mut command_batch, 8)
+                .await
+                .unwrap()
         );
         assert_eq!(
             command_batch
@@ -5428,19 +5440,12 @@ mod tests {
         drop(client);
         let mut reader = BufReader::with_capacity(1024, server);
         let mut command_buf = [0; MAX_COMMAND_LINE_BYTES];
-        let mut command_scratch = [0; MAX_COMMAND_LINE_BYTES];
         let mut command_batch = CommandBatch::new();
 
         assert!(
-            !read_command_batch(
-                &mut reader,
-                &mut command_buf,
-                &mut command_scratch,
-                &mut command_batch,
-                8,
-            )
-            .await
-            .unwrap()
+            !read_command_batch(&mut reader, &mut command_buf, &mut command_batch, 8)
+                .await
+                .unwrap()
         );
         assert!(command_batch.is_empty());
     }
@@ -5452,19 +5457,12 @@ mod tests {
 
         let mut reader = BufReader::with_capacity(1024, server);
         let mut command_buf = [0; MAX_COMMAND_LINE_BYTES];
-        let mut command_scratch = [0; MAX_COMMAND_LINE_BYTES];
         let mut command_batch = CommandBatch::new();
 
         assert!(
-            read_command_batch(
-                &mut reader,
-                &mut command_buf,
-                &mut command_scratch,
-                &mut command_batch,
-                8,
-            )
-            .await
-            .unwrap()
+            read_command_batch(&mut reader, &mut command_buf, &mut command_batch, 8)
+                .await
+                .unwrap()
         );
         assert_eq!(
             command_batch
@@ -5485,19 +5483,12 @@ mod tests {
 
         let mut reader = BufReader::with_capacity(1024, server);
         let mut command_buf = [0; MAX_COMMAND_LINE_BYTES];
-        let mut command_scratch = [0; MAX_COMMAND_LINE_BYTES];
         let mut command_batch = CommandBatch::new();
 
         assert!(
-            read_command_batch(
-                &mut reader,
-                &mut command_buf,
-                &mut command_scratch,
-                &mut command_batch,
-                2,
-            )
-            .await
-            .unwrap()
+            read_command_batch(&mut reader, &mut command_buf, &mut command_batch, 2)
+                .await
+                .unwrap()
         );
         assert_eq!(
             command_batch
@@ -5518,19 +5509,12 @@ mod tests {
 
         let mut reader = BufReader::with_capacity(1024, server);
         let mut command_buf = [0; MAX_COMMAND_LINE_BYTES];
-        let mut command_scratch = [0; MAX_COMMAND_LINE_BYTES];
         let mut command_batch = CommandBatch::new();
 
         assert!(
-            read_command_batch(
-                &mut reader,
-                &mut command_buf,
-                &mut command_scratch,
-                &mut command_batch,
-                2,
-            )
-            .await
-            .unwrap()
+            read_command_batch(&mut reader, &mut command_buf, &mut command_batch, 2)
+                .await
+                .unwrap()
         );
         assert_eq!(
             command_batch
@@ -5541,15 +5525,9 @@ mod tests {
         );
 
         assert!(
-            read_command_batch(
-                &mut reader,
-                &mut command_buf,
-                &mut command_scratch,
-                &mut command_batch,
-                2,
-            )
-            .await
-            .unwrap()
+            read_command_batch(&mut reader, &mut command_buf, &mut command_batch, 2)
+                .await
+                .unwrap()
         );
         assert_eq!(
             command_batch
@@ -5574,19 +5552,41 @@ mod tests {
 
         let mut reader = BufReader::with_capacity(1024, server);
         let mut command_buf = [0; MAX_COMMAND_LINE_BYTES];
-        let mut command_scratch = [0; MAX_COMMAND_LINE_BYTES];
         let mut command_batch = CommandBatch::new();
 
         assert!(
-            read_command_batch(
-                &mut reader,
-                &mut command_buf,
-                &mut command_scratch,
-                &mut command_batch,
-                8,
-            )
-            .await
-            .unwrap()
+            read_command_batch(&mut reader, &mut command_buf, &mut command_batch, 8)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            command_batch
+                .iter()
+                .map(|command| command.kind)
+                .collect::<Vec<_>>(),
+            vec![RequestKind::TakeThis, RequestKind::Quit]
+        );
+    }
+
+    #[tokio::test]
+    async fn read_command_batch_accepts_long_takethis_body_lines() {
+        // RFC 3977 section 3.1 limits command lines, but section 3.1.1
+        // multiline data blocks are terminated by "." CRLF rather than a
+        // 512-octet command-line bound.
+        let (mut client, server) = tokio::io::duplex(2048);
+        let mut wire = b"TAKETHIS <take@test>\r\nHeader: value\r\n".to_vec();
+        wire.extend(std::iter::repeat_n(b'x', MAX_COMMAND_LINE_BYTES + 128));
+        wire.extend_from_slice(b"\r\n.\r\nQUIT\r\n");
+        client.write_all(&wire).await.unwrap();
+
+        let mut reader = BufReader::with_capacity(128, server);
+        let mut command_buf = [0; MAX_COMMAND_LINE_BYTES];
+        let mut command_batch = CommandBatch::new();
+
+        assert!(
+            read_command_batch(&mut reader, &mut command_buf, &mut command_batch, 8)
+                .await
+                .unwrap()
         );
         assert_eq!(
             command_batch
@@ -5611,18 +5611,11 @@ mod tests {
 
         let mut reader = BufReader::with_capacity(1024, server);
         let mut command_buf = [0; MAX_COMMAND_LINE_BYTES];
-        let mut command_scratch = [0; MAX_COMMAND_LINE_BYTES];
         let mut command_batch = CommandBatch::new();
 
-        let err = read_command_batch(
-            &mut reader,
-            &mut command_buf,
-            &mut command_scratch,
-            &mut command_batch,
-            8,
-        )
-        .await
-        .unwrap_err();
+        let err = read_command_batch(&mut reader, &mut command_buf, &mut command_batch, 8)
+            .await
+            .unwrap_err();
 
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(command_batch.is_empty());

@@ -860,7 +860,8 @@ mod proptests {
             | RequestKind::ListHeaders
             | RequestKind::ListDistribPats => code == 215,
             RequestKind::Over | RequestKind::Xover => code == 224,
-            RequestKind::Hdr | RequestKind::Xhdr => code == 225,
+            RequestKind::Hdr => code == 225,
+            RequestKind::Xhdr => code == 221 || code == 225,
             RequestKind::NewNews => code == 230,
             RequestKind::NewGroups => code == 231,
             RequestKind::Unknown => status_implies_multiline(code),
@@ -2109,6 +2110,10 @@ static RESPONSE_DESCRIPTORS: &[ResponseDescriptor] = &[
     response_descriptor(RequestKind::Over, 224, ResponseFraming::Multiline),
     response_descriptor(RequestKind::Xover, 224, ResponseFraming::Multiline),
     response_descriptor(RequestKind::Hdr, 225, ResponseFraming::Multiline),
+    // RFC 2980 section 2.1.6 specifies XHDR as returning 221 with multiline
+    // data. RFC 3977 standardized HDR as 225, but real servers still expose
+    // the deployed XHDR 221 form.
+    response_descriptor(RequestKind::Xhdr, 221, ResponseFraming::Multiline),
     response_descriptor(RequestKind::Xhdr, 225, ResponseFraming::Multiline),
     // RFC 3977 section 6.3 transfer/posting commands.
     response_descriptor(RequestKind::Post, 340, ResponseFraming::SingleLine),
@@ -4044,6 +4049,7 @@ mod tests {
         assert!(RequestKind::ListHeaders.expects_multiline_response(StatusCode(215)));
         assert!(RequestKind::ListDistribPats.expects_multiline_response(StatusCode(215)));
         assert!(RequestKind::Over.expects_multiline_response(StatusCode(224)));
+        assert!(RequestKind::Xhdr.expects_multiline_response(StatusCode(221)));
         assert!(RequestKind::Xhdr.expects_multiline_response(StatusCode(225)));
         assert!(RequestKind::NewGroups.expects_multiline_response(StatusCode(231)));
         assert!(RequestKind::NewNews.expects_multiline_response(StatusCode(230)));
@@ -4082,6 +4088,10 @@ mod tests {
         );
         assert_eq!(
             ResponseFraming::for_request_status(RequestKind::Unknown, StatusCode(220)),
+            ResponseFraming::Multiline
+        );
+        assert_eq!(
+            ResponseFraming::for_request_status(RequestKind::Xhdr, StatusCode(221)),
             ResponseFraming::Multiline
         );
     }

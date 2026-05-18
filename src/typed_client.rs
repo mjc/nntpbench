@@ -3401,6 +3401,27 @@ mod tests {
     }
 
     #[test]
+    fn decoder_treats_rfc2980_xhdr_221_as_multiline() {
+        // RFC 2980 section 2.1.6 specifies XHDR as a 221 multiline response.
+        // The decoder must consume through the dot line so pipelined reads do
+        // not leave XHDR payload bytes in the socket buffer.
+        let mut decoder = ResponseDecoder::new(RequestKind::Xhdr);
+        let buffer = b"221 Header follows\r\n1 Subject\r\n.\r\nNEXT";
+
+        let DecodeProgress::Complete { status, consumed } = decoder.push(buffer).unwrap() else {
+            panic!("decoder should complete");
+        };
+        let response = response_from_bytes(RequestKind::Xhdr, status, &buffer[..consumed]);
+
+        assert_eq!(consumed, b"221 Header follows\r\n1 Subject\r\n.\r\n".len());
+        assert_eq!(response.status().as_u16(), 221);
+        assert_eq!(
+            response.as_bytes(),
+            b"221 Header follows\r\n1 Subject\r\n.\r\n"
+        );
+    }
+
+    #[test]
     fn decoder_completes_empty_multiline_response() {
         // RFC 3977 section 3.1.1 represents an empty multiline response as "." CRLF
         // immediately after the response initial line:
