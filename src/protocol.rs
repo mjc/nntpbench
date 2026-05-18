@@ -594,9 +594,7 @@ mod proptests {
             return expected;
         }
 
-        for raw_line in payload.split_inclusive(|byte| *byte == b'\n') {
-            let line = raw_line.strip_suffix(b"\n").unwrap_or(raw_line);
-            let line = line.strip_suffix(b"\r").unwrap_or(line);
+        for line in crlf_normalized_payload_lines(payload) {
             if line.starts_with(b".") {
                 expected.push(b'.');
             }
@@ -605,6 +603,17 @@ mod proptests {
         }
         expected.extend_from_slice(b".\r\n");
         expected
+    }
+
+    fn dangerous_transfer_bytes() -> impl Strategy<Value = u8> {
+        prop_oneof![
+            Just(b'\r'),
+            Just(b'\n'),
+            Just(b'.'),
+            Just(b' '),
+            b'0'..=b'9',
+            b'a'..=b'z',
+        ]
     }
 
     fn request_kind_strategy() -> BoxedStrategy<RequestKind> {
@@ -988,6 +997,10 @@ mod proptests {
             transfer_case in transfer_case_strategy(),
             mask in vec(any::<bool>(), 5..=24),
         ) {
+            // RFC 3977 section 3.1.1 defines command continuations such as TAKETHIS as
+            // multiline data blocks: lines are CRLF-terminated, dot-prefixed data lines are
+            // dot-stuffed, and the block ends with the single "." CRLF terminator:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1
             let first_line = transfer_case.first_line();
             let (verb, rest) = first_line
                 .split_once(' ')
@@ -1011,6 +1024,57 @@ mod proptests {
                 }
                 TransferCase::TakeThis(_, payload) => {
                     prop_assert_eq!(wire, expected_transfer_wire(&first_line, payload));
+                }
+            }
+        }
+
+        #[test]
+        fn takethis_wire_normalizes_lines_dot_stuffs_and_has_one_final_terminator(
+            message_id in message_id_strategy(),
+            payload in vec(dangerous_transfer_bytes(), 0..96),
+        ) {
+            // RFC 3977 section 3.1.1 requires multiline block lines to end with CRLF,
+            // forbids bare CR/LF inside those lines, requires dot-stuffing for data lines
+            // beginning with ".", and reserves a single "." CRLF line as the terminator:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1
+            let request = Request::takethis(&message_id, &payload).unwrap();
+            let mut wire = Vec::new();
+            request.write_wire_to(&mut wire);
+
+            let command_end = memchr::memmem::find(&wire, b"\r\n").expect("command CRLF") + 2;
+            let expected_command = format!("TAKETHIS {message_id}\r\n");
+            prop_assert_eq!(&wire[..command_end], expected_command.as_bytes());
+            prop_assert!(wire.ends_with(b".\r\n"));
+
+            let mut line_start = command_end;
+            let mut terminator_count = 0;
+            while line_start < wire.len() {
+                let relative = memchr::memmem::find(&wire[line_start..], b"\r\n")
+                    .expect("data line CRLF");
+                let line_end = line_start + relative;
+                let line = &wire[line_start..line_end];
+                prop_assert!(!line.contains(&b'\r'), "{wire:?}");
+                prop_assert!(!line.contains(&b'\n'), "{wire:?}");
+                if line == b"." {
+                    terminator_count += 1;
+                    prop_assert_eq!(line_end + 2, wire.len(), "{:?}", wire);
+                }
+                line_start = line_end + 2;
+            }
+
+            prop_assert_eq!(terminator_count, 1, "{:?}", wire);
+
+            for line in crlf_normalized_payload_lines(&payload) {
+                if line.starts_with(b".") {
+                    let mut stuffed = Vec::with_capacity(line.len() + 1);
+                    stuffed.push(b'.');
+                    stuffed.extend_from_slice(line);
+                    prop_assert!(
+                        wire.windows(stuffed.len()).any(|window| window == stuffed.as_slice()),
+                        "missing stuffed line {:?} in {:?}",
+                        stuffed,
+                        wire,
+                    );
                 }
             }
         }
@@ -3015,9 +3079,7 @@ fn write_transfer_request_wire(
         return;
     }
 
-    for raw_line in payload.split_inclusive(|byte| *byte == b'\n') {
-        let line = raw_line.strip_suffix(b"\n").unwrap_or(raw_line);
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
+    for line in crlf_normalized_payload_lines(payload) {
         if line.starts_with(b".") {
             output.push(b'.');
         }
@@ -3026,6 +3088,50 @@ fn write_transfer_request_wire(
     }
 
     output.extend_from_slice(b".\r\n");
+}
+
+pub(crate) fn crlf_normalized_payload_lines(payload: &[u8]) -> CrlfNormalizedPayloadLines<'_> {
+    CrlfNormalizedPayloadLines { payload, start: 0 }
+}
+
+pub(crate) struct CrlfNormalizedPayloadLines<'a> {
+    payload: &'a [u8],
+    start: usize,
+}
+
+impl<'a> Iterator for CrlfNormalizedPayloadLines<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.start >= self.payload.len() {
+            return None;
+        }
+
+        let mut index = self.start;
+        while index < self.payload.len() {
+            match self.payload[index] {
+                b'\r' => {
+                    let line = &self.payload[self.start..index];
+                    index += 1;
+                    if index < self.payload.len() && self.payload[index] == b'\n' {
+                        index += 1;
+                    }
+                    self.start = index;
+                    return Some(line);
+                }
+                b'\n' => {
+                    let line = &self.payload[self.start..index];
+                    self.start = index + 1;
+                    return Some(line);
+                }
+                _ => index += 1,
+            }
+        }
+
+        let line = &self.payload[self.start..];
+        self.start = self.payload.len();
+        Some(line)
+    }
 }
 
 fn write_simple_request_wire(output: &mut Vec<u8>, verb: &[u8]) {
