@@ -2014,15 +2014,12 @@ where
 }
 
 fn find_dot_terminated_block_end(input: &[u8], start: usize) -> Option<usize> {
-    let mut cursor = start;
-    loop {
-        let relative_lf = memchr::memchr(b'\n', &input[cursor..])?;
-        let end = cursor + relative_lf + 1;
-        if trim_line_slice(&input[cursor..end]) == b"." {
-            return Some(end);
-        }
-        cursor = end;
+    let slice = input.get(start..)?;
+    if slice.starts_with(b".\r\n") {
+        return Some(start + b".\r\n".len());
     }
+
+    memchr::memmem::find(slice, TERMINATOR).map(|end| start + end + TERMINATOR.len())
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -2413,6 +2410,7 @@ async fn read_dot_terminated_body<R>(
 where
     R: tokio::io::AsyncRead + Unpin,
 {
+    let mut previous_line_ended_with_crlf = true;
     loop {
         command_scratch.clear();
         let read = reader.read_until(b'\n', command_scratch).await?;
@@ -2422,16 +2420,13 @@ where
                 "truncated TAKETHIS body",
             ));
         }
-        if trim_command_terminator(command_scratch) == b"." {
+        if previous_line_ended_with_crlf
+            && command_scratch.strip_suffix(b"\r\n") == Some(b".".as_slice())
+        {
             return Ok(());
         }
+        previous_line_ended_with_crlf = command_scratch.ends_with(b"\r\n");
     }
-}
-
-fn trim_command_terminator(line: &[u8]) -> &[u8] {
-    line.strip_suffix(b"\r\n")
-        .or_else(|| line.strip_suffix(b"\n"))
-        .unwrap_or(line)
 }
 
 pub fn generate_article(target_bytes: usize, body: &[u8]) -> Box<[u8]> {
@@ -2490,9 +2485,39 @@ fn ensure_terminated(response: &mut Vec<u8>) {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+    use proptest::collection::vec;
+    use proptest::prelude::*;
     use std::pin::Pin;
     use std::task::{Context, Poll};
     use tokio::io::AsyncReadExt;
+
+    fn dangerous_takethis_body_bytes() -> impl Strategy<Value = u8> {
+        prop_oneof![
+            Just(b'\r'),
+            Just(b'\n'),
+            Just(b'.'),
+            Just(b' '),
+            b'0'..=b'9',
+            b'a'..=b'z',
+        ]
+    }
+
+    fn remove_rfc_dot_terminators(buffer: &mut [u8]) {
+        while let Some(start) = buffer
+            .windows(TERMINATOR.len())
+            .position(|window| window == TERMINATOR)
+        {
+            buffer[start + 2] = b'x';
+        }
+    }
+
+    fn exact_dot_terminated_block_end(input: &[u8], start: usize) -> Option<usize> {
+        let slice = input.get(start..)?;
+        if slice.starts_with(b".\r\n") {
+            return Some(start + b".\r\n".len());
+        }
+        memchr::memmem::find(slice, TERMINATOR).map(|end| start + end + TERMINATOR.len())
+    }
 
     fn test_args() -> ServerArgs {
         ServerArgs {
@@ -5067,6 +5092,10 @@ mod tests {
 
     #[tokio::test]
     async fn read_command_batch_consumes_takethis_payload_as_one_command() {
+        // RFC 3977 section 3.1.1 uses "." CRLF as the multiline block terminator.
+        // A complete TAKETHIS command body must be consumed as part of the TAKETHIS command
+        // so the following command is parsed only after the terminating dot line:
+        // https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1
         let (mut client, server) = tokio::io::duplex(1024);
         client
             .write_all(b"TAKETHIS <take@test>\r\nHeader: value\r\n\r\nbody\r\n.\r\nQUIT\r\n")
@@ -5096,6 +5125,37 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![RequestKind::TakeThis, RequestKind::Quit]
         );
+    }
+
+    #[tokio::test]
+    async fn read_command_batch_rejects_lf_only_takethis_terminator() {
+        // RFC 3977 section 3.1.1 requires the TAKETHIS data block terminator to be
+        // "." CRLF. A bare-LF "." line must not end the body or expose the next command:
+        // https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1
+        let (mut client, server) = tokio::io::duplex(1024);
+        client
+            .write_all(b"TAKETHIS <take@test>\r\nHeader: value\r\n\r\nbody\n.\nQUIT\r\n")
+            .await
+            .unwrap();
+        drop(client);
+
+        let mut reader = BufReader::with_capacity(1024, server);
+        let mut command_buf = Vec::with_capacity(1024);
+        let mut command_scratch = Vec::with_capacity(1024);
+        let mut command_batch = CommandBatch::new();
+
+        let err = read_command_batch(
+            &mut reader,
+            &mut command_buf,
+            &mut command_scratch,
+            &mut command_batch,
+            8,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(command_batch.is_empty());
     }
 
     #[tokio::test]
@@ -5420,6 +5480,10 @@ mod tests {
 
     #[test]
     fn for_each_request_line_in_batch_skips_incomplete_takethis_until_body_finishes() {
+        // RFC 3977 section 3.1.1 requires a complete "." CRLF terminator before a
+        // TAKETHIS body is complete. Without that dot line, the batch scanner must not
+        // expose the TAKETHIS command or any following bytes as separate commands:
+        // https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1
         let mut batch = Vec::with_capacity(4);
         let input = b"TAKETHIS <take@test>\r\nHeader: value\r\n\r\nbody\r\nQUIT\r\n";
         let consumed = for_each_request_line_in_batch(input, 8, |request| {
@@ -5428,6 +5492,94 @@ mod tests {
 
         assert_eq!(consumed, 0);
         assert!(batch.is_empty());
+    }
+
+    #[test]
+    fn for_each_request_line_in_batch_requires_crlf_dot_terminator_for_takethis() {
+        // RFC 3977 section 3.1.1 names "." CRLF as the multiline terminator. The batch
+        // scanner must not treat "." LF as a complete TAKETHIS body terminator even if a
+        // later command line has a valid CRLF:
+        // https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1
+        let mut batch = Vec::with_capacity(4);
+        let input = b"TAKETHIS <take@test>\r\nHeader: value\r\n\r\nbody\n.\nQUIT\r\n";
+        let consumed = for_each_request_line_in_batch(input, 8, |request| {
+            batch.push(request.kind());
+        });
+
+        assert_eq!(consumed, 0);
+        assert!(batch.is_empty());
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+
+        #[test]
+        fn batch_scanner_requires_exact_rfc_takethis_dot_terminator(
+            mut prefix in vec(dangerous_takethis_body_bytes(), 0..32),
+            mut suffix in vec(dangerous_takethis_body_bytes(), 0..32),
+            near_miss in prop::sample::select(vec![
+                b".\n".to_vec(),
+                b".\r".to_vec(),
+                b".\r ".to_vec(),
+                b"..\r\n".to_vec(),
+                b".body\r\n".to_vec(),
+                b"\n.\r\n".to_vec(),
+                b"\r.\r\n".to_vec(),
+                b"\r\n.\n".to_vec(),
+            ]),
+        ) {
+            // RFC 3977 section 3.1.1 reserves only "." CRLF as the command-continuation
+            // terminator. Generated TAKETHIS bodies containing bare-LF, incomplete-CR, or
+            // dot-stuffed near misses must not be exposed as complete commands:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1
+            remove_rfc_dot_terminators(&mut prefix);
+            remove_rfc_dot_terminators(&mut suffix);
+            let mut input = b"TAKETHIS <take@test>\r\n".to_vec();
+            input.push(b'x');
+            input.extend_from_slice(&prefix);
+            input.extend_from_slice(&near_miss);
+            input.extend_from_slice(&suffix);
+            prop_assume!(exact_dot_terminated_block_end(&input, b"TAKETHIS <take@test>\r\n".len()).is_none());
+            input.extend_from_slice(b"QUIT\r\n");
+
+            let mut batch = Vec::with_capacity(4);
+            let consumed = for_each_request_line_in_batch(&input, 8, |request| {
+                batch.push(request.kind());
+            });
+
+            prop_assert_eq!(consumed, 0, "{:?}", input);
+            prop_assert!(batch.is_empty(), "{:?}", input);
+        }
+
+        #[test]
+        fn batch_scanner_consumes_takethis_through_first_rfc_dot_terminator(
+            mut body in vec(dangerous_takethis_body_bytes(), 0..48),
+            trailer in "[A-Za-z0-9 ._-]{0,16}",
+        ) {
+            // RFC 3977 section 3.1.1 says the first "." CRLF line ends a TAKETHIS
+            // continuation. The scanner must consume exactly through that dot line and
+            // then allow the following request line to be parsed separately:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1
+            remove_rfc_dot_terminators(&mut body);
+            body.insert(0, b'x');
+            body.push(b'x');
+            let mut input = b"TAKETHIS <take@test>\r\n".to_vec();
+            input.extend_from_slice(&body);
+            input.extend_from_slice(b"\r\n");
+            input.extend_from_slice(b".\r\nQUIT\r\n");
+            input.extend_from_slice(trailer.as_bytes());
+
+            let mut batch = Vec::with_capacity(4);
+            let consumed = for_each_request_line_in_batch(&input, 8, |request| {
+                batch.push(request.kind());
+            });
+
+            prop_assert_eq!(batch, vec![RequestKind::TakeThis, RequestKind::Quit]);
+            prop_assert_eq!(
+                consumed,
+                b"TAKETHIS <take@test>\r\n".len() + body.len() + b"\r\n.\r\nQUIT\r\n".len()
+            );
+        }
     }
 
     #[test]
