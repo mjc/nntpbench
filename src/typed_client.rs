@@ -12,7 +12,7 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-use crate::protocol::{ArticleRef, Request};
+use crate::protocol::{ArticleRef, Request, crlf_normalized_payload_lines};
 use crate::tail_buffer::{
     EmptyMultilineTerminator, EmptyTerminatorStatus, MultilineTerminatorDetector,
     ResponseLineStatus, TerminatorStatus, detect_response_line_end,
@@ -2376,9 +2376,7 @@ where
         return Ok(());
     }
 
-    for raw_line in payload.split_inclusive(|byte| *byte == b'\n') {
-        let line = raw_line.strip_suffix(b"\n").unwrap_or(raw_line);
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
+    for line in crlf_normalized_payload_lines(payload) {
         if line.starts_with(b".") {
             let mut slices = [
                 IoSlice::new(b"."),
@@ -2697,6 +2695,85 @@ fn shared_engine_error_from_typed(err: TypedClientError) -> SharedEngineError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::collection::vec;
+    use proptest::prelude::*;
+
+    fn dangerous_wire_bytes() -> impl Strategy<Value = u8> {
+        prop_oneof![
+            Just(b'\r'),
+            Just(b'\n'),
+            Just(b'.'),
+            Just(b' '),
+            b'0'..=b'9',
+            b'a'..=b'z',
+        ]
+    }
+
+    fn terminator_end_oracle(buffer: &[u8]) -> Option<usize> {
+        buffer
+            .windows(crate::TERMINATOR.len())
+            .position(|window| window == crate::TERMINATOR)
+            .map(|start| start + crate::TERMINATOR.len())
+    }
+
+    fn remove_rfc_multiline_terminators(buffer: &mut [u8]) {
+        while let Some(start) = buffer
+            .windows(crate::TERMINATOR.len())
+            .position(|window| window == crate::TERMINATOR)
+        {
+            buffer[start + 2] = b'x';
+        }
+    }
+
+    fn complete_after_split(kind: RequestKind, frame: &[u8], split: usize) -> (StatusCode, usize) {
+        let mut decoder = ResponseDecoder::new(kind);
+        match decoder
+            .push(&frame[..split])
+            .expect("first decoder push should succeed")
+        {
+            DecodeProgress::Complete { status, consumed } => (status, consumed),
+            DecodeProgress::NeedMore => match decoder
+                .push(frame)
+                .expect("second decoder push should succeed")
+            {
+                DecodeProgress::Complete { status, consumed } => (status, consumed),
+                DecodeProgress::NeedMore => panic!("decoder did not complete at split {split}"),
+            },
+        }
+    }
+
+    fn assert_decoder_completes_on_all_three_push_schedules(
+        kind: RequestKind,
+        frame: &[u8],
+        expected_status: u16,
+        expected_consumed: usize,
+    ) {
+        for first in 0..=frame.len() {
+            for second in first..=frame.len() {
+                let mut decoder = ResponseDecoder::new(kind);
+                for prefix_len in [first, second, frame.len()] {
+                    let progress = decoder
+                        .push(&frame[..prefix_len])
+                        .expect("decoder push should succeed");
+                    if prefix_len < expected_consumed {
+                        assert!(
+                            matches!(progress, DecodeProgress::NeedMore),
+                            "completed before frame end: first {first} second {second} prefix {prefix_len} frame {frame:?}",
+                        );
+                    } else {
+                        let DecodeProgress::Complete { status, consumed } = progress else {
+                            panic!(
+                                "decoder did not complete: first {first} second {second} prefix {prefix_len} frame {frame:?}"
+                            );
+                        };
+                        assert_eq!(status.as_u16(), expected_status);
+                        assert_eq!(consumed, expected_consumed);
+                        break;
+                    }
+                }
+            }
+        }
+    }
 
     async fn assert_read_request(stream: &mut tokio::net::TcpStream, expected: &[u8]) {
         let mut request = vec![0_u8; expected.len()];
@@ -2714,6 +2791,10 @@ mod tests {
 
     #[test]
     fn decoder_completes_single_line_error_without_waiting_for_terminator() {
+        // RFC 3977 section 3.1 says the response initial line is CRLF-terminated.
+        // Error statuses for ARTICLE are single-line responses, so the decoder must stop
+        // after that CRLF without waiting for any multiline terminator:
+        // https://www.rfc-editor.org/rfc/rfc3977#section-3.1
         let mut decoder = ResponseDecoder::new(RequestKind::Article);
         let DecodeProgress::Complete { status, consumed } = decoder
             .push(b"430 no article with that message-id\r\n")
@@ -2738,6 +2819,9 @@ mod tests {
 
     #[test]
     fn decoder_waits_for_complete_crlf_status_line() {
+        // RFC 3977 section 3.1 requires CRLF, not a lone final CR, to terminate the
+        // response initial line. The decoder must keep waiting until LF arrives:
+        // https://www.rfc-editor.org/rfc/rfc3977#section-3.1
         let mut decoder = ResponseDecoder::new(RequestKind::Article);
         assert!(matches!(
             decoder
@@ -2759,6 +2843,9 @@ mod tests {
 
     #[test]
     fn decoder_rejects_bare_lf_status_line() {
+        // RFC 3977 section 3.1 defines response lines as CRLF-terminated.
+        // A bare LF before CRLF is malformed and must not be treated as a line ending:
+        // https://www.rfc-editor.org/rfc/rfc3977#section-3.1
         for input in [
             b"430 no article with that message-id\n".as_slice(),
             b"430 no article with that message-id\nextra\r\n".as_slice(),
@@ -2776,6 +2863,9 @@ mod tests {
 
     #[test]
     fn decoder_rejects_embedded_cr_in_status_line() {
+        // RFC 3977 section 3.1 gives CR meaning only as the first byte of CRLF.
+        // Embedded or doubled CR before the status-line terminator is invalid:
+        // https://www.rfc-editor.org/rfc/rfc3977#section-3.1
         for input in [
             b"430 no article with that message-id\r extra\r\n".as_slice(),
             b"430 no article with that message-id\r\r\n".as_slice(),
@@ -2792,6 +2882,9 @@ mod tests {
 
     #[test]
     fn decoder_completes_multiline_response_across_chunks() {
+        // RFC 3977 section 3.1.1 terminates multiline data with CRLF "." CRLF.
+        // The decoder must retain enough state to recognize that sequence across reads:
+        // https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1
         let mut decoder = ResponseDecoder::new(RequestKind::Body);
         let mut buffer = b"222 1 <a@b> body follows\r\nbody\r".to_vec();
         assert!(matches!(
@@ -2814,6 +2907,9 @@ mod tests {
 
     #[test]
     fn decoder_completes_empty_multiline_response() {
+        // RFC 3977 section 3.1.1 represents an empty multiline response as "." CRLF
+        // immediately after the response initial line:
+        // https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1
         let mut decoder = ResponseDecoder::new(RequestKind::Capabilities);
         let buffer = b"101 Capability list:\r\n.\r\n";
 
@@ -2829,6 +2925,9 @@ mod tests {
 
     #[test]
     fn decoder_completes_empty_multiline_response_across_pushes() {
+        // RFC 3977 section 3.1.1 allows the empty "." CRLF terminator to arrive in a
+        // later read; the decoder must still treat it as content-start termination:
+        // https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1
         let mut decoder = ResponseDecoder::new(RequestKind::Capabilities);
         let mut buffer = b"101 Capability list:\r\n".to_vec();
         assert!(matches!(
@@ -2849,6 +2948,9 @@ mod tests {
 
     #[test]
     fn decoder_completes_empty_multiline_response_with_split_terminator() {
+        // RFC 3977 section 3.1.1 defines the empty multiline body as exactly "." CRLF.
+        // This exercises all split positions inside that three-byte terminator:
+        // https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1
         for split in 1..3 {
             let mut decoder = ResponseDecoder::new(RequestKind::Capabilities);
             let mut buffer = b"101 Capability list:\r\n".to_vec();
@@ -2874,6 +2976,9 @@ mod tests {
 
     #[test]
     fn decoder_does_not_treat_start_of_next_chunk_as_terminator() {
+        // RFC 3977 section 3.1.1 requires CRLF before the dot line. A dot that merely
+        // starts the next read after body bytes is data, not the terminator:
+        // https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1
         let mut decoder = ResponseDecoder::new(RequestKind::Body);
         let mut buffer = b"222 1 <a@b> body follows\r\nbody".to_vec();
         assert!(matches!(
@@ -2896,6 +3001,215 @@ mod tests {
             response.as_bytes(),
             b"222 1 <a@b> body follows\r\nbody.\r\nstill body\r\n.\r\n"
         );
+    }
+
+    #[test]
+    fn decoder_rejects_bare_lf_before_later_crlf_status_line() {
+        // RFC 3977 section 3.1 requires the response initial line to end with CRLF.
+        // A malformed line like "210 foo\nboo \r\n" must fail at the bare LF instead of
+        // resynchronizing on the later CRLF:
+        // https://www.rfc-editor.org/rfc/rfc3977#section-3.1
+        assert!(matches!(
+            ResponseDecoder::new(RequestKind::Article).push(b"210 foo\nboo \r\n"),
+            Err(TypedClientError::InvalidStatusLine)
+        ));
+    }
+
+    #[test]
+    fn decoder_handles_all_three_push_schedules_for_overlapping_terminators() {
+        // RFC 3977 sections 3.1 and 3.1.1 define exact response-line and multiline
+        // terminators. This exhausts every three-push schedule for compact frames with
+        // trailers and overlapping dot-line shapes, so state carried between pushes cannot
+        // move completion earlier or later than the first RFC terminator:
+        // https://www.rfc-editor.org/rfc/rfc3977#section-3.1
+        // https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1
+        let single = b"430 no article\r\n222 later\r\n.\r\n";
+        assert_decoder_completes_on_all_three_push_schedules(
+            RequestKind::Article,
+            single,
+            430,
+            b"430 no article\r\n".len(),
+        );
+
+        let empty = b"101 Capability list:\r\n.\r\n222 later\r\n.\r\n";
+        assert_decoder_completes_on_all_three_push_schedules(
+            RequestKind::Capabilities,
+            empty,
+            101,
+            b"101 Capability list:\r\n.\r\n".len(),
+        );
+
+        let non_empty = b"222 1 <a@b> body follows\r\nxx\r\n.\r\n.\r\n";
+        assert_decoder_completes_on_all_three_push_schedules(
+            RequestKind::Body,
+            non_empty,
+            222,
+            b"222 1 <a@b> body follows\r\nxx\r\n.\r\n".len(),
+        );
+
+        let near_miss = b"222 1 <a@b> body follows\r\nx\n.\r\nx\r\n.\r\n";
+        assert_decoder_completes_on_all_three_push_schedules(
+            RequestKind::Body,
+            near_miss,
+            222,
+            b"222 1 <a@b> body follows\r\nx\n.\r\nx\r\n.\r\n".len(),
+        );
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        #[test]
+        fn decoder_consumes_single_line_response_at_rfc_crlf_for_every_split(
+            trailer in vec(dangerous_wire_bytes(), 0..24),
+        ) {
+            // RFC 3977 section 3.1 terminates single-line responses at the status-line CRLF.
+            // Extra bytes may belong to a later response, so every read split must report
+            // consumption at exactly that CRLF and never include trailer bytes:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-3.1
+            let status_line = b"430 no article with that message-id\r\n";
+            let mut frame = status_line.to_vec();
+            frame.extend_from_slice(&trailer);
+
+            for split in 0..=frame.len() {
+                let (status, consumed) = complete_after_split(RequestKind::Article, &frame, split);
+                prop_assert_eq!(status.as_u16(), 430);
+                prop_assert_eq!(
+                    consumed,
+                    status_line.len(),
+                    "split {} frame {:?}",
+                    split,
+                    frame,
+                );
+            }
+        }
+
+        #[test]
+        fn decoder_consumes_empty_multiline_response_at_rfc_dot_crlf_for_every_split(
+            trailer in vec(dangerous_wire_bytes(), 0..24),
+        ) {
+            // RFC 3977 section 3.1.1 allows an empty multiline response whose content is
+            // exactly "." CRLF after the response initial line. The decoder must consume
+            // that frame, across every split, and leave any trailer for the next response:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1
+            let response = b"101 Capability list:\r\n.\r\n";
+            let mut frame = response.to_vec();
+            frame.extend_from_slice(&trailer);
+
+            for split in 0..=frame.len() {
+                let (status, consumed) = complete_after_split(RequestKind::Capabilities, &frame, split);
+                prop_assert_eq!(status.as_u16(), 101);
+                prop_assert_eq!(
+                    consumed,
+                    response.len(),
+                    "split {} frame {:?}",
+                    split,
+                    frame,
+                );
+            }
+        }
+
+        #[test]
+        fn decoder_consumes_non_empty_multiline_response_at_first_rfc_terminator_for_every_split(
+            mut body in vec(dangerous_wire_bytes(), 0..48),
+            trailer in vec(dangerous_wire_bytes(), 0..24),
+        ) {
+            // RFC 3977 section 3.1.1 terminates multiline data at the first CRLF "." CRLF.
+            // Generated body bytes are scrubbed of that exact sequence before appending the
+            // real terminator, so any early completion is a decoder bug:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1
+            remove_rfc_multiline_terminators(&mut body);
+            body.insert(0, b'x');
+            body.push(b'x');
+            let status_line = b"222 1 <a@b> body follows\r\n";
+            let mut frame = status_line.to_vec();
+            frame.extend_from_slice(&body);
+            frame.extend_from_slice(crate::TERMINATOR);
+            frame.extend_from_slice(&trailer);
+            let expected_consumed = status_line.len() + body.len() + crate::TERMINATOR.len();
+
+            for split in 0..=frame.len() {
+                let (status, consumed) = complete_after_split(RequestKind::Body, &frame, split);
+                prop_assert_eq!(status.as_u16(), 222);
+                prop_assert_eq!(
+                    consumed,
+                    expected_consumed,
+                    "split {} frame {:?}",
+                    split,
+                    frame,
+                );
+            }
+        }
+
+        #[test]
+        fn decoder_rejects_malformed_status_lines_before_any_later_crlf(
+            before in "[0-9]{3} [A-Za-z0-9 ]{0,20}",
+            after in "[A-Za-z0-9 ]{0,20}",
+            bad_separator in prop::sample::select(vec![b"\n".to_vec(), b"\r ".to_vec(), b"\r\r".to_vec()]),
+        ) {
+            // RFC 3977 section 3.1 uses CRLF as the only response-line terminator.
+            // If bare LF or non-terminal CR appears first, the decoder must reject the
+            // frame immediately instead of scanning forward to a later CRLF:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-3.1
+            let mut frame = before.into_bytes();
+            frame.extend_from_slice(&bad_separator);
+            frame.extend_from_slice(after.as_bytes());
+            frame.extend_from_slice(b"\r\n");
+
+            prop_assert!(matches!(
+                ResponseDecoder::new(RequestKind::Article).push(&frame),
+                Err(TypedClientError::InvalidStatusLine),
+            ));
+        }
+
+        #[test]
+        fn decoder_ignores_multiline_near_misses_until_first_rfc_terminator_for_every_split(
+            mut prefix in vec(dangerous_wire_bytes(), 0..24),
+            mut suffix in vec(dangerous_wire_bytes(), 0..24),
+            near_miss in prop::sample::select(vec![
+                b"\n.\r\n".to_vec(),
+                b"\r.\r\n".to_vec(),
+                b"\r\n.\n".to_vec(),
+                b"\r\n.\r".to_vec(),
+                b".foo\r\n".to_vec(),
+                b"..\r\n".to_vec(),
+                b"body.\r\n".to_vec(),
+            ]),
+            trailer in vec(dangerous_wire_bytes(), 0..16),
+        ) {
+            // RFC 3977 section 3.1.1 names only CRLF "." CRLF as the multiline
+            // terminator. Bare-LF, bare-CR, and dot-prefixed near misses must remain body
+            // data until the first exact terminator is reached:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1
+            remove_rfc_multiline_terminators(&mut prefix);
+            remove_rfc_multiline_terminators(&mut suffix);
+            let status_line = b"222 1 <a@b> body follows\r\n";
+            let mut body = prefix;
+            body.extend_from_slice(&near_miss);
+            body.extend_from_slice(&suffix);
+            remove_rfc_multiline_terminators(&mut body);
+            body.insert(0, b'x');
+            body.push(b'x');
+
+            let mut frame = status_line.to_vec();
+            frame.extend_from_slice(&body);
+            frame.extend_from_slice(crate::TERMINATOR);
+            frame.extend_from_slice(&trailer);
+            let expected_consumed = status_line.len()
+                + terminator_end_oracle(&frame[status_line.len()..]).expect("terminator");
+
+            for split in 0..=frame.len() {
+                let (status, consumed) = complete_after_split(RequestKind::Body, &frame, split);
+                prop_assert_eq!(status.as_u16(), 222);
+                prop_assert_eq!(
+                    consumed,
+                    expected_consumed,
+                    "split {} frame {:?}",
+                    split,
+                    frame,
+                );
+            }
+        }
     }
 
     #[tokio::test]
