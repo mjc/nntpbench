@@ -2000,11 +2000,11 @@ where
     let mut count = 0;
 
     while count < max_pipeline_depth {
-        let Some(end) = find_crlf_line_end(input, start) else {
-            break;
+        let end = match detect_response_line_end(&input[start..]) {
+            ResponseLineStatus::CompleteAt(end) => start + end,
+            ResponseLineStatus::NeedMore | ResponseLineStatus::Invalid => break,
         };
-        let line = strip_crlf(&input[start..end]).unwrap_or(&input[start..end]);
-        let request = RequestLine::parse(line);
+        let request = RequestLine::parse(&input[start..end]);
         if matches!(request.kind(), RequestKind::TakeThis) {
             let Some(body_end) = find_dot_terminated_block_end(input, end) else {
                 break;
@@ -2382,7 +2382,7 @@ where
 
 fn parse_command_line(command_arena: &[u8], line_start: usize) -> ParsedCommand {
     let line = &command_arena[line_start..];
-    let line_end = line_start + strip_crlf(line).map_or(line.len(), <[u8]>::len);
+    let line_end = line_start + line.len();
     ParsedCommand {
         kind: RequestLine::parse(&command_arena[line_start..line_end]).kind(),
         line_range: line_start..line_end,
@@ -2405,6 +2405,17 @@ where
                 io::ErrorKind::UnexpectedEof,
                 "truncated TAKETHIS body",
             ));
+        }
+        match detect_response_line_end(command_scratch) {
+            ResponseLineStatus::CompleteAt(end) if end == command_scratch.len() => {}
+            ResponseLineStatus::CompleteAt(_)
+            | ResponseLineStatus::NeedMore
+            | ResponseLineStatus::Invalid => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "TAKETHIS body line missing CRLF terminator",
+                ));
+            }
         }
         if is_dot_terminator_line(previous_line_ended_with_crlf, command_scratch) {
             return Ok(());
@@ -2690,7 +2701,7 @@ mod tests {
         let mut stats = SessionStats::default();
         let mut pending = PendingWrite::new();
         let mut writer = FailingWriter;
-        let command_arena = b"ARTICLE 1".to_vec();
+        let command_arena = b"ARTICLE 1\r\n".to_vec();
         let command = ParsedCommand {
             kind: RequestKind::Article,
             line_range: 0..command_arena.len(),
@@ -2904,57 +2915,6 @@ mod tests {
             buf.put_slice(chunk);
             Poll::Ready(Ok(()))
         }
-    }
-
-    #[test]
-    fn parses_request_kinds_case_insensitively() {
-        assert_eq!(
-            RequestLine::parse(b"ARTICLE <x@y>").kind(),
-            RequestKind::Article
-        );
-        assert_eq!(RequestLine::parse(b"ARTICLE").kind(), RequestKind::Article);
-        assert_eq!(RequestLine::parse(b"body 123").kind(), RequestKind::Body);
-        assert_eq!(RequestLine::parse(b"BoDy").kind(), RequestKind::Body);
-        assert_eq!(
-            RequestLine::parse(b"CAPABILITIES").kind(),
-            RequestKind::Capabilities
-        );
-        assert_eq!(
-            RequestLine::parse(b"capabilities").kind(),
-            RequestKind::Capabilities
-        );
-        assert_eq!(RequestLine::parse(b"DATE").kind(), RequestKind::Date);
-        assert_eq!(RequestLine::parse(b"date").kind(), RequestKind::Date);
-        assert_eq!(
-            RequestLine::parse(b"MODE READER").kind(),
-            RequestKind::ModeReader
-        );
-        assert_eq!(
-            RequestLine::parse(b"mode reader").kind(),
-            RequestKind::ModeReader
-        );
-        assert_eq!(RequestLine::parse(b"QUIT").kind(), RequestKind::Quit);
-        assert_eq!(RequestLine::parse(b"quit").kind(), RequestKind::Quit);
-        assert_eq!(RequestLine::parse(b"HEAD 1").kind(), RequestKind::Head);
-        assert_eq!(
-            RequestLine::parse(b"ARTICLEZ 1").kind(),
-            RequestKind::Unknown
-        );
-        assert_eq!(
-            RequestLine::parse(b"MODE TRANSIT").kind(),
-            RequestKind::Unknown
-        );
-    }
-
-    #[test]
-    fn centralized_command_line_stripping_requires_rfc_crlf() {
-        // RFC 3977 section 3.1 defines command/response lines as CRLF-terminated:
-        // https://www.rfc-editor.org/rfc/rfc3977#section-3.1
-        // Command parsing must use the centralized strict CRLF helper, so bare LF
-        // is not silently normalized as a valid NNTP line ending.
-        assert_eq!(strip_crlf(b"ARTICLE 1\r\n"), Some(b"ARTICLE 1".as_slice()));
-        assert_eq!(strip_crlf(b"BODY 1\n"), None);
-        assert_eq!(strip_crlf(b"QUIT"), None);
     }
 
     #[test]
@@ -3400,6 +3360,31 @@ mod tests {
         let err = read_greeting(&mut client, &mut buffer).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_greeting_rejects_malformed_crlf_recovery() {
+        // RFC 3977 section 3.1 defines response lines as CRLF-terminated. A greeting
+        // with bare LF, bare CR, or malformed CR before a later CRLF must fail at the
+        // malformed byte instead of resynchronizing:
+        // https://www.rfc-editor.org/rfc/rfc3977#section-3.1
+        for greeting in [
+            b"201 nntpbench mock server ready\n".as_slice(),
+            b"201 nntpbench mock server ready\r later\r\n".as_slice(),
+            b"201 nntpbench mock server ready\r\r\n".as_slice(),
+        ] {
+            let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                stream.write_all(greeting).await.unwrap();
+            });
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            let mut buffer = [0_u8; 128];
+            let err = read_greeting(&mut client, &mut buffer).await.unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{greeting:?}");
+            server.await.unwrap();
+        }
     }
 
     #[tokio::test]
@@ -5121,7 +5106,7 @@ mod tests {
         .await
         .unwrap_err();
 
-        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(command_batch.is_empty());
     }
 
@@ -5559,13 +5544,13 @@ mod tests {
         let mut output = Vec::new();
 
         assert!(!process_request_to_buffer(
-            RequestLine::parse(b"ARTICLE <bench@nntpbench.local>"),
+            RequestLine::parse(b"ARTICLE <bench@nntpbench.local>\r\n"),
             &config,
             &stats,
             &mut output,
         ));
         assert!(process_request_to_buffer(
-            RequestLine::parse(b"QUIT"),
+            RequestLine::parse(b"QUIT\r\n"),
             &config,
             &stats,
             &mut output,
@@ -5585,67 +5570,67 @@ mod tests {
         let mut output = Vec::new();
 
         assert!(!process_request_to_buffer(
-            RequestLine::parse(b"LIST ACTIVE"),
+            RequestLine::parse(b"LIST ACTIVE\r\n"),
             &config,
             &stats,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
-            RequestLine::parse(b"LIST ACTIVE.TIMES"),
+            RequestLine::parse(b"LIST ACTIVE.TIMES\r\n"),
             &config,
             &stats,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
-            RequestLine::parse(b"LIST ACTIVE.TIMES comp.lang.*"),
+            RequestLine::parse(b"LIST ACTIVE.TIMES comp.lang.*\r\n"),
             &config,
             &stats,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
-            RequestLine::parse(b"LIST NEWSGROUPS"),
+            RequestLine::parse(b"LIST NEWSGROUPS\r\n"),
             &config,
             &stats,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
-            RequestLine::parse(b"LIST NEWSGROUPS comp.lang.*"),
+            RequestLine::parse(b"LIST NEWSGROUPS comp.lang.*\r\n"),
             &config,
             &stats,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
-            RequestLine::parse(b"LIST OVERVIEW.FMT"),
+            RequestLine::parse(b"LIST OVERVIEW.FMT\r\n"),
             &config,
             &stats,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
-            RequestLine::parse(b"LIST HEADERS"),
+            RequestLine::parse(b"LIST HEADERS\r\n"),
             &config,
             &stats,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
-            RequestLine::parse(b"LIST DISTRIB.PATS"),
+            RequestLine::parse(b"LIST DISTRIB.PATS\r\n"),
             &config,
             &stats,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
-            RequestLine::parse(b"HELP"),
+            RequestLine::parse(b"HELP\r\n"),
             &config,
             &stats,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
-            RequestLine::parse(b"MODE READER"),
+            RequestLine::parse(b"MODE READER\r\n"),
             &config,
             &stats,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
-            RequestLine::parse(b"DATE"),
+            RequestLine::parse(b"DATE\r\n"),
             &config,
             &stats,
             &mut output,
@@ -5678,49 +5663,49 @@ mod tests {
         let mut output = Vec::new();
 
         assert!(!process_request_to_buffer(
-            RequestLine::parse(b"POST"),
+            RequestLine::parse(b"POST\r\n"),
             &config,
             &stats,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
-            RequestLine::parse(b"IHAVE <article@test>"),
+            RequestLine::parse(b"IHAVE <article@test>\r\n"),
             &config,
             &stats,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
-            RequestLine::parse(b"CHECK <article@test>"),
+            RequestLine::parse(b"CHECK <article@test>\r\n"),
             &config,
             &stats,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
-            RequestLine::parse(b"TAKETHIS <article@test>"),
+            RequestLine::parse(b"TAKETHIS <article@test>\r\n"),
             &config,
             &stats,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
-            RequestLine::parse(b"AUTHINFO USER bench"),
+            RequestLine::parse(b"AUTHINFO USER bench\r\n"),
             &config,
             &stats,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
-            RequestLine::parse(b"AUTHINFO PASS bench"),
+            RequestLine::parse(b"AUTHINFO PASS bench\r\n"),
             &config,
             &stats,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
-            RequestLine::parse(b"AUTHINFO SASL bench"),
+            RequestLine::parse(b"AUTHINFO SASL bench\r\n"),
             &config,
             &stats,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
-            RequestLine::parse(b"STARTTLS"),
+            RequestLine::parse(b"STARTTLS\r\n"),
             &config,
             &stats,
             &mut output,
@@ -5750,25 +5735,25 @@ mod tests {
         let mut output = Vec::new();
 
         assert!(!process_request_to_buffer(
-            RequestLine::parse(b"OVER 1-10"),
+            RequestLine::parse(b"OVER 1-10\r\n"),
             &config,
             &stats,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
-            RequestLine::parse(b"OVER <overview@test>"),
+            RequestLine::parse(b"OVER <overview@test>\r\n"),
             &config,
             &stats,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
-            RequestLine::parse(b"XOVER 1-10"),
+            RequestLine::parse(b"XOVER 1-10\r\n"),
             &config,
             &stats,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
-            RequestLine::parse(b"XOVER <overview@test>"),
+            RequestLine::parse(b"XOVER <overview@test>\r\n"),
             &config,
             &stats,
             &mut output,
@@ -5788,43 +5773,43 @@ mod tests {
         let mut output = Vec::new();
 
         assert!(!process_request_to_buffer(
-            RequestLine::parse(b"GROUP alt.binaries.test"),
+            RequestLine::parse(b"GROUP alt.binaries.test\r\n"),
             &config,
             &stats,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
-            RequestLine::parse(b"LISTGROUP"),
+            RequestLine::parse(b"LISTGROUP\r\n"),
             &config,
             &stats,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
-            RequestLine::parse(b"LISTGROUP alt.binaries.test"),
+            RequestLine::parse(b"LISTGROUP alt.binaries.test\r\n"),
             &config,
             &stats,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
-            RequestLine::parse(b"LISTGROUP 1-"),
+            RequestLine::parse(b"LISTGROUP 1-\r\n"),
             &config,
             &stats,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
-            RequestLine::parse(b"LISTGROUP alt.binaries.test 1-10"),
+            RequestLine::parse(b"LISTGROUP alt.binaries.test 1-10\r\n"),
             &config,
             &stats,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
-            RequestLine::parse(b"LAST"),
+            RequestLine::parse(b"LAST\r\n"),
             &config,
             &stats,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
-            RequestLine::parse(b"NEXT"),
+            RequestLine::parse(b"NEXT\r\n"),
             &config,
             &stats,
             &mut output,
@@ -5853,13 +5838,13 @@ mod tests {
         let mut output = Vec::new();
 
         assert!(!process_request_to_buffer(
-            RequestLine::parse(b"NEWGROUPS 231231 235959 GMT"),
+            RequestLine::parse(b"NEWGROUPS 231231 235959 GMT\r\n"),
             &config,
             &stats,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
-            RequestLine::parse(b"NEWNEWS alt.binaries.test 231231 235959 GMT"),
+            RequestLine::parse(b"NEWNEWS alt.binaries.test 231231 235959 GMT\r\n"),
             &config,
             &stats,
             &mut output,
@@ -5876,31 +5861,31 @@ mod tests {
         let mut output = Vec::new();
 
         assert!(!process_request_to_buffer(
-            RequestLine::parse(b"BODY <body@test>"),
+            RequestLine::parse(b"BODY <body@test>\r\n"),
             &config,
             &stats,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
-            RequestLine::parse(b"CAPABILITIES"),
+            RequestLine::parse(b"CAPABILITIES\r\n"),
             &config,
             &stats,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
-            RequestLine::parse(b"HEAD 1"),
+            RequestLine::parse(b"HEAD 1\r\n"),
             &config,
             &stats,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
-            RequestLine::parse(b"STAT 1"),
+            RequestLine::parse(b"STAT 1\r\n"),
             &config,
             &stats,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
-            RequestLine::parse(b"XYZZY 1"),
+            RequestLine::parse(b"XYZZY 1\r\n"),
             &config,
             &stats,
             &mut output,

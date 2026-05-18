@@ -2,7 +2,10 @@
 
 use std::borrow::Cow;
 
-use crate::terminator::{DOT_TERMINATOR, append_crlf, crlf_normalized_payload_lines, strip_crlf};
+use crate::terminator::{
+    DOT_TERMINATOR, ResponseLineStatus, append_crlf, crlf_normalized_payload_lines,
+    detect_response_line_end,
+};
 
 pub mod article;
 
@@ -690,7 +693,7 @@ mod proptests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(64))]
+        #![proptest_config(ProptestConfig::with_cases(1024))]
 
         #[test]
         fn status_code_parse_accepts_any_three_digit_prefix(
@@ -827,18 +830,18 @@ mod proptests {
             family in article_family_strategy(),
             selector in selector_case_strategy(),
             mask in vec(any::<bool>(), 4..=7),
-            spacing in prop_oneof![Just(" ".to_string()), Just("   ".to_string())],
-            suffix in prop_oneof![Just("".to_string()), Just("\r\n".to_string()), Just(" \r\n".to_string())],
         ) {
+            // RFC 3977 section 3.1 defines commands as CRLF-terminated lines:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-3.1
             let verb = mixed_case(family.as_verb(), &mask);
             let selector_text = match &selector {
                 SelectorCase::Current => String::new(),
                 SelectorCase::Number(number) | SelectorCase::MessageId(number) => number.clone(),
             };
             let line = if selector_text.is_empty() {
-                format!("{verb}{suffix}")
+                format!("{verb}\r\n")
             } else {
-                format!("{verb}{spacing}{selector_text}{suffix}")
+                format!("{verb} {selector_text}\r\n")
             };
 
             let parsed = RequestLine::parse(line.as_bytes());
@@ -853,6 +856,30 @@ mod proptests {
                 SelectorCase::Current | SelectorCase::Number(_) => {
                     prop_assert!(parsed.message_id().is_none());
                 }
+            }
+        }
+
+        #[test]
+        fn request_line_requires_rfc_crlf_framing(
+            prefix in "[A-Za-z0-9][A-Za-z0-9 ._-]{0,32}",
+            bad_separator in prop::sample::select(vec![
+                b"".to_vec(),
+                b"\n".to_vec(),
+                b"\r".to_vec(),
+                b"\r ".to_vec(),
+                b"\r\r".to_vec(),
+            ]),
+            trailer in "[A-Za-z0-9 ._-]{0,16}",
+        ) {
+            // RFC 3977 section 3.1 defines command lines as CRLF-terminated. A direct
+            // request-line parse must reject unframed input, bare LF, bare CR, and malformed
+            // CRLF recovery instead of normalizing or resynchronizing:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-3.1
+            let mut line = prefix.into_bytes();
+            line.extend_from_slice(&bad_separator);
+            line.extend_from_slice(trailer.as_bytes());
+            if !line.ends_with(crate::CRLF) {
+                prop_assert_eq!(RequestLine::parse(&line).kind(), RequestKind::Unknown);
             }
         }
 
@@ -953,7 +980,9 @@ mod proptests {
             command in fixed_command_strategy(),
             mask in vec(any::<bool>(), 3..=12),
         ) {
-            let line = mixed_case(command.canonical_line(), &mask);
+            // RFC 3977 section 3.1 defines commands as CRLF-terminated lines:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-3.1
+            let line = format!("{}\r\n", mixed_case(command.canonical_line(), &mask));
             let parsed = RequestLine::parse(line.as_bytes());
             prop_assert_eq!(parsed.kind(), command.kind());
             let mut wire = Vec::new();
@@ -970,7 +999,9 @@ mod proptests {
             mask in vec(any::<bool>(), 4..=32),
         ) {
             let canonical = list_case.canonical_line();
-            let line = mixed_case(&canonical, &mask);
+            // RFC 3977 section 3.1 defines commands as CRLF-terminated lines:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-3.1
+            let line = format!("{}\r\n", mixed_case(&canonical, &mask));
             let parsed = RequestLine::parse(line.as_bytes());
             prop_assert_eq!(parsed.kind(), list_case.kind());
             let mut wire = Vec::new();
@@ -984,7 +1015,9 @@ mod proptests {
             mask in vec(any::<bool>(), 13..=32),
         ) {
             let canonical = auth_case.canonical_line();
-            let line = mixed_case(&canonical, &mask);
+            // RFC 3977 section 3.1 defines commands as CRLF-terminated lines:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-3.1
+            let line = format!("{}\r\n", mixed_case(&canonical, &mask));
             let parsed = RequestLine::parse(line.as_bytes());
             prop_assert_eq!(parsed.kind(), auth_case.kind());
             let mut wire = Vec::new();
@@ -1006,9 +1039,9 @@ mod proptests {
                 .split_once(' ')
                 .map_or((first_line.as_str(), ""), |(verb, rest)| (verb, rest));
             let line = if rest.is_empty() {
-                mixed_case(verb, &mask)
+                format!("{}\r\n", mixed_case(verb, &mask))
             } else {
-                format!("{} {}", mixed_case(verb, &mask), rest)
+                format!("{} {rest}\r\n", mixed_case(verb, &mask))
             };
             let parsed = RequestLine::parse(line.as_bytes());
             prop_assert_eq!(parsed.kind(), transfer_case.kind());
@@ -2780,11 +2813,25 @@ impl<'a> RequestLine<'a> {
     /// Parse a raw command line into borrowed protocol pieces.
     #[must_use]
     pub fn parse(line: &'a [u8]) -> Self {
-        let line = strip_crlf(line).unwrap_or(line);
+        let ResponseLineStatus::CompleteAt(end) = detect_response_line_end(line) else {
+            return Self {
+                kind: RequestKind::Unknown,
+                verb: line,
+                args: &[],
+            };
+        };
+        if end != line.len() {
+            return Self {
+                kind: RequestKind::Unknown,
+                verb: line,
+                args: &[],
+            };
+        };
+        let line = &line[..line.len() - crate::CRLF.len()];
         let split = memchr::memchr(b' ', line).unwrap_or(line.len());
         let verb = &line[..split];
         let args = if split < line.len() {
-            line[split + 1..].trim_ascii()
+            &line[split + 1..]
         } else {
             &[]
         };
@@ -3252,67 +3299,87 @@ mod tests {
     #[test]
     fn request_line_parses_current_command_set() {
         assert_eq!(
-            RequestLine::parse(b"ARTICLE <a@b>").kind(),
+            RequestLine::parse(b"ARTICLE <a@b>\r\n").kind(),
             RequestKind::Article
         );
-        assert_eq!(RequestLine::parse(b"ARTICLE").kind(), RequestKind::Article);
-        assert_eq!(RequestLine::parse(b"body 123").kind(), RequestKind::Body);
-        assert_eq!(RequestLine::parse(b"HEAD <a@b>").kind(), RequestKind::Head);
-        assert_eq!(RequestLine::parse(b"HELP").kind(), RequestKind::Help);
-        assert_eq!(RequestLine::parse(b"STAT <a@b>").kind(), RequestKind::Stat);
         assert_eq!(
-            RequestLine::parse(b"LIST ACTIVE").kind(),
+            RequestLine::parse(b"ARTICLE\r\n").kind(),
+            RequestKind::Article
+        );
+        assert_eq!(
+            RequestLine::parse(b"body 123\r\n").kind(),
+            RequestKind::Body
+        );
+        assert_eq!(
+            RequestLine::parse(b"HEAD <a@b>\r\n").kind(),
+            RequestKind::Head
+        );
+        assert_eq!(RequestLine::parse(b"HELP\r\n").kind(), RequestKind::Help);
+        assert_eq!(
+            RequestLine::parse(b"STAT <a@b>\r\n").kind(),
+            RequestKind::Stat
+        );
+        assert_eq!(
+            RequestLine::parse(b"LIST ACTIVE\r\n").kind(),
             RequestKind::ListActive
         );
         assert_eq!(
-            RequestLine::parse(b"LIST ACTIVE.TIMES comp.lang.*").kind(),
+            RequestLine::parse(b"LIST ACTIVE.TIMES comp.lang.*\r\n").kind(),
             RequestKind::ListActiveTimes
         );
         assert_eq!(
-            RequestLine::parse(b"LIST NEWSGROUPS comp.lang.*").kind(),
+            RequestLine::parse(b"LIST NEWSGROUPS comp.lang.*\r\n").kind(),
             RequestKind::ListNewsgroups
         );
         assert_eq!(
-            RequestLine::parse(b"LIST OVERVIEW.FMT").kind(),
+            RequestLine::parse(b"LIST OVERVIEW.FMT\r\n").kind(),
             RequestKind::ListOverviewFmt
         );
         assert_eq!(
-            RequestLine::parse(b"LIST HEADERS").kind(),
+            RequestLine::parse(b"LIST HEADERS\r\n").kind(),
             RequestKind::ListHeaders
         );
         assert_eq!(
-            RequestLine::parse(b"LIST DISTRIB.PATS").kind(),
+            RequestLine::parse(b"LIST DISTRIB.PATS\r\n").kind(),
             RequestKind::ListDistribPats
         );
-        assert_eq!(RequestLine::parse(b"OVER 1-10").kind(), RequestKind::Over);
-        assert_eq!(RequestLine::parse(b"XOVER 1-10").kind(), RequestKind::Xover);
         assert_eq!(
-            RequestLine::parse(b"HDR Subject 1").kind(),
+            RequestLine::parse(b"OVER 1-10\r\n").kind(),
+            RequestKind::Over
+        );
+        assert_eq!(
+            RequestLine::parse(b"XOVER 1-10\r\n").kind(),
+            RequestKind::Xover
+        );
+        assert_eq!(
+            RequestLine::parse(b"HDR Subject 1\r\n").kind(),
             RequestKind::Hdr
         );
         assert_eq!(
-            RequestLine::parse(b"XHDR Subject 1").kind(),
+            RequestLine::parse(b"XHDR Subject 1\r\n").kind(),
             RequestKind::Xhdr
         );
         assert_eq!(
             RequestLine::parse(b"CAPABILITIES\r\n").kind(),
             RequestKind::Capabilities
         );
-        assert_eq!(RequestLine::parse(b"DATE").kind(), RequestKind::Date);
+        assert_eq!(RequestLine::parse(b"DATE\r\n").kind(), RequestKind::Date);
         assert_eq!(
-            RequestLine::parse(b"MODE READER").kind(),
+            RequestLine::parse(b"MODE READER\r\n").kind(),
             RequestKind::ModeReader
         );
-        assert_eq!(RequestLine::parse(b"QUIT").kind(), RequestKind::Quit);
-        assert_eq!(RequestLine::parse(b"HEAD 1").kind(), RequestKind::Head);
+        assert_eq!(RequestLine::parse(b"QUIT\r\n").kind(), RequestKind::Quit);
+        assert_eq!(RequestLine::parse(b"HEAD 1\r\n").kind(), RequestKind::Head);
         assert_eq!(
-            RequestLine::parse(b"MODE TRANSIT").kind(),
+            RequestLine::parse(b"MODE TRANSIT\r\n").kind(),
             RequestKind::Unknown
         );
     }
 
     #[test]
     fn request_line_classifies_rfc_command_matrix_case_insensitively() {
+        // RFC 3977 section 3.1 defines commands as CRLF-terminated lines:
+        // https://www.rfc-editor.org/rfc/rfc3977#section-3.1
         for (line, expected) in [
             (b"ARTICLE <a@b>".as_slice(), RequestKind::Article),
             (b"BODY <a@b>".as_slice(), RequestKind::Body),
@@ -3386,27 +3453,47 @@ mod tests {
             (b"quit".as_slice(), RequestKind::Quit),
             (b"XYZZY".as_slice(), RequestKind::Unknown),
         ] {
-            assert_eq!(RequestLine::parse(line).kind(), expected, "{line:?}");
+            let mut framed = line.to_vec();
+            framed.extend_from_slice(b"\r\n");
+            assert_eq!(RequestLine::parse(&framed).kind(), expected, "{line:?}");
+        }
+    }
+
+    #[test]
+    fn request_line_rejects_unframed_or_malformed_command_lines() {
+        // RFC 3977 section 3.1 defines CRLF as the command line terminator:
+        // https://www.rfc-editor.org/rfc/rfc3977#section-3.1
+        for line in [
+            b"ARTICLE <a@b>".as_slice(),
+            b"ARTICLE <a@b>\n".as_slice(),
+            b"ARTICLE <a@b>\r".as_slice(),
+            b"ARTICLE <a@b>\r \r\n".as_slice(),
+        ] {
+            assert_eq!(RequestLine::parse(line).kind(), RequestKind::Unknown);
         }
     }
 
     #[test]
     fn request_line_exposes_message_id_when_args_are_exact_id() {
         assert_eq!(
-            RequestLine::parse(b"ARTICLE <a@b>")
+            RequestLine::parse(b"ARTICLE <a@b>\r\n")
                 .message_id()
                 .unwrap()
                 .as_str(),
             "<a@b>"
         );
-        assert!(RequestLine::parse(b"ARTICLE").message_id().is_none());
-        assert!(RequestLine::parse(b"ARTICLE 1").message_id().is_none());
-        assert!(RequestLine::parse(b"BODY 2").message_id().is_none());
-        assert!(RequestLine::parse(b"HEAD 3").message_id().is_none());
-        assert!(RequestLine::parse(b"STAT 4").message_id().is_none());
-        assert!(RequestLine::parse(b"ARTICLE <a b>").message_id().is_none());
+        assert!(RequestLine::parse(b"ARTICLE\r\n").message_id().is_none());
+        assert!(RequestLine::parse(b"ARTICLE 1\r\n").message_id().is_none());
+        assert!(RequestLine::parse(b"BODY 2\r\n").message_id().is_none());
+        assert!(RequestLine::parse(b"HEAD 3\r\n").message_id().is_none());
+        assert!(RequestLine::parse(b"STAT 4\r\n").message_id().is_none());
         assert!(
-            RequestLine::parse(b"ARTICLE <a@b> extra")
+            RequestLine::parse(b"ARTICLE <a b>\r\n")
+                .message_id()
+                .is_none()
+        );
+        assert!(
+            RequestLine::parse(b"ARTICLE <a@b> extra\r\n")
                 .message_id()
                 .is_none()
         );
@@ -3415,9 +3502,13 @@ mod tests {
     #[test]
     fn request_line_preserves_rfc_selector_arguments() {
         for (line, expected_verb, expected_args) in [
-            (b"ARTICLE".as_slice(), b"ARTICLE".as_slice(), b"".as_slice()),
             (
-                b"ARTICLE 42".as_slice(),
+                b"ARTICLE\r\n".as_slice(),
+                b"ARTICLE".as_slice(),
+                b"".as_slice(),
+            ),
+            (
+                b"ARTICLE 42\r\n".as_slice(),
                 b"ARTICLE".as_slice(),
                 b"42".as_slice(),
             ),
@@ -3426,9 +3517,13 @@ mod tests {
                 b"BODY".as_slice(),
                 b"<body@test>".as_slice(),
             ),
-            (b"HEAD 9".as_slice(), b"HEAD".as_slice(), b"9".as_slice()),
             (
-                b"STAT <stat@test>".as_slice(),
+                b"HEAD 9\r\n".as_slice(),
+                b"HEAD".as_slice(),
+                b"9".as_slice(),
+            ),
+            (
+                b"STAT <stat@test>\r\n".as_slice(),
                 b"STAT".as_slice(),
                 b"<stat@test>".as_slice(),
             ),
