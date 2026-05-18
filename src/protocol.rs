@@ -6,13 +6,19 @@ use std::io::Write;
 
 #[cfg(test)]
 use crate::terminator::append_crlf;
-use crate::terminator::{DOT_TERMINATOR, crlf_normalized_payload_lines, strip_complete_crlf_line};
+use crate::terminator::{
+    BoundedResponseLineStatus, DOT_TERMINATOR, crlf_normalized_payload_lines,
+    detect_bounded_response_line_end, find_dot_terminated_block, strip_complete_crlf_line,
+};
 
 pub mod article;
 
 pub use article::{Article, ArticleNumber, ArticleParseError, HeaderIter, Headers};
 
 pub const MAX_ARTICLE_NUMBER: u64 = 2_147_483_647;
+/// RFC 3977 section 3.1 command lines and response initial lines are limited
+/// to 512 octets, including the terminating CRLF pair.
+pub(crate) const MAX_INITIAL_RESPONSE_LINE_BYTES: usize = 512;
 
 /// Raw NNTP status code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -64,6 +70,179 @@ impl StatusCode {
         let code = self.0;
         code >= 400 && code < 600
     }
+}
+
+/// Borrowed whole NNTP response frame parsed from bytes received from the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResponseFrame<'a> {
+    kind: RequestKind,
+    descriptor: ResponseDescriptor,
+    bytes: &'a [u8],
+    status_line: &'a [u8],
+    content: &'a [u8],
+    terminator: &'a [u8],
+    status: StatusCode,
+    consumed: usize,
+}
+
+impl<'a> ResponseFrame<'a> {
+    /// Parse a complete RFC 3977 response frame from the beginning of `buffer`.
+    ///
+    /// RFC 3977 section 9.4 defines the two response shapes: a simple response
+    /// is just the initial response line, while a multi-line response is that
+    /// line plus a dot-terminated data block from section 3.1.1.
+    #[must_use]
+    pub fn parse(kind: RequestKind, buffer: &'a [u8]) -> ResponseFrameParse<'a> {
+        let status_line_end =
+            match detect_bounded_response_line_end(buffer, MAX_INITIAL_RESPONSE_LINE_BYTES) {
+                BoundedResponseLineStatus::CompleteAt(end) => end,
+                BoundedResponseLineStatus::NeedMore => return ResponseFrameParse::NeedMore,
+                BoundedResponseLineStatus::Invalid | BoundedResponseLineStatus::TooLong => {
+                    return ResponseFrameParse::Invalid;
+                }
+            };
+
+        let Some(status) = StatusCode::parse(buffer) else {
+            return ResponseFrameParse::Invalid;
+        };
+        let descriptor = ResponseDescriptor::for_request_status(kind, status);
+
+        let (consumed, content, terminator) = if descriptor.framing().is_multiline() {
+            let Some(block) = find_dot_terminated_block(buffer, status_line_end) else {
+                return ResponseFrameParse::NeedMore;
+            };
+            (block.block_end(), block.content(), block.terminator())
+        } else {
+            (
+                status_line_end,
+                &buffer[status_line_end..status_line_end],
+                &buffer[status_line_end..status_line_end],
+            )
+        };
+
+        ResponseFrameParse::Complete(Self {
+            kind,
+            descriptor,
+            bytes: &buffer[..consumed],
+            status_line: &buffer[..status_line_end],
+            content,
+            terminator,
+            status,
+            consumed,
+        })
+    }
+
+    #[must_use]
+    pub const fn kind(self) -> RequestKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub const fn descriptor(self) -> ResponseDescriptor {
+        self.descriptor
+    }
+
+    #[must_use]
+    pub const fn bytes(self) -> &'a [u8] {
+        self.bytes
+    }
+
+    #[must_use]
+    pub const fn status_line(self) -> &'a [u8] {
+        self.status_line
+    }
+
+    #[must_use]
+    pub const fn content(self) -> &'a [u8] {
+        self.content
+    }
+
+    #[must_use]
+    pub const fn terminator(self) -> &'a [u8] {
+        self.terminator
+    }
+
+    #[must_use]
+    pub const fn status(self) -> StatusCode {
+        self.status
+    }
+
+    #[must_use]
+    pub const fn consumed(self) -> usize {
+        self.consumed
+    }
+}
+
+/// Parse status for a borrowed whole NNTP response frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseFrameParse<'a> {
+    Complete(ResponseFrame<'a>),
+    NeedMore,
+    Invalid,
+}
+
+/// Stateless protocol response decoder for callers that already retain pending bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ResponseFrameDecoder {
+    kind: RequestKind,
+}
+
+impl ResponseFrameDecoder {
+    #[must_use]
+    pub(crate) const fn new(kind: RequestKind) -> Self {
+        Self { kind }
+    }
+
+    #[must_use]
+    pub(crate) fn decode<'a>(self, buffer: &'a [u8]) -> ResponseFrameParse<'a> {
+        ResponseFrame::parse(self.kind, buffer)
+    }
+}
+
+/// Protocol status-line result for streaming callers that cannot retain a full frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ResponseInitial {
+    status: StatusCode,
+    descriptor: ResponseDescriptor,
+}
+
+impl ResponseInitial {
+    #[must_use]
+    pub(crate) fn parse(kind: RequestKind, buffer: &[u8]) -> ResponseInitialParse {
+        match detect_bounded_response_line_end(buffer, MAX_INITIAL_RESPONSE_LINE_BYTES) {
+            BoundedResponseLineStatus::CompleteAt(_) => {
+                let Some(status) = StatusCode::parse(buffer) else {
+                    return ResponseInitialParse::Invalid;
+                };
+                ResponseInitialParse::Complete(Self {
+                    status,
+                    descriptor: ResponseDescriptor::for_request_status(kind, status),
+                })
+            }
+            BoundedResponseLineStatus::NeedMore => ResponseInitialParse::NeedMore,
+            BoundedResponseLineStatus::Invalid | BoundedResponseLineStatus::TooLong => {
+                ResponseInitialParse::Invalid
+            }
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn status(self) -> StatusCode {
+        self.status
+    }
+
+    #[must_use]
+    pub(crate) const fn descriptor(self) -> ResponseDescriptor {
+        self.descriptor
+    }
+}
+
+/// Parse status for a streaming response initial line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResponseInitialParse {
+    Complete(ResponseInitial),
+    NeedMore,
+    Invalid,
 }
 
 #[cfg(test)]
@@ -1122,6 +1301,52 @@ mod proptests {
         }
 
         #[test]
+        fn response_iterator_matches_descriptor_lookup_for_known_request_statuses(
+            kind in request_kind_strategy(),
+        ) {
+            for descriptor in responses_for_request(kind) {
+                prop_assert_eq!(
+                    ResponseDescriptor::for_request_status(kind, descriptor.status_code()),
+                    descriptor,
+                    "{:?} {}",
+                    kind,
+                    descriptor.status,
+                );
+            }
+        }
+
+        #[test]
+        fn response_framing_lookup_matches_rfc_matrix(
+            kind in request_kind_strategy(),
+            code in 100_u16..600,
+        ) {
+            let status = StatusCode(code);
+            let descriptor = ResponseDescriptor::for_request_status(kind, status);
+            prop_assert_eq!(descriptor.kind(), kind);
+            prop_assert_eq!(descriptor.status_code(), status);
+            prop_assert_eq!(
+                descriptor.framing().is_multiline(),
+                expected_multiline(kind, code),
+            );
+        }
+
+        #[test]
+        fn response_framing_iterator_has_no_duplicate_statuses_for_request(
+            kind in request_kind_strategy(),
+        ) {
+            let mut seen = [false; 1000];
+            for descriptor in responses_for_request(kind) {
+                let index = usize::from(descriptor.status);
+                prop_assert!(
+                    !seen[index],
+                    "duplicate response metadata for {kind:?} status {}",
+                    descriptor.status,
+                );
+                seen[index] = true;
+            }
+        }
+
+        #[test]
         fn request_accessors_match_constructed_payloads(
             group in group_name_strategy(),
             range in listgroup_range_strategy(),
@@ -1776,34 +2001,166 @@ impl RequestKind {
     /// Whether this request expects a multiline response for the given status.
     #[must_use]
     pub fn expects_multiline_response(self, status: StatusCode) -> bool {
+        ResponseFraming::for_request_status(self, status).is_multiline()
+    }
+}
+
+/// Protocol framing for a response after its status line has been parsed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseFraming {
+    SingleLine,
+    Multiline,
+    Unexpected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResponseDescriptor {
+    kind: RequestKind,
+    status: u16,
+    framing: ResponseFraming,
+}
+
+impl ResponseDescriptor {
+    #[must_use]
+    pub const fn kind(self) -> RequestKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub const fn status_code(self) -> StatusCode {
+        StatusCode(self.status)
+    }
+
+    #[must_use]
+    pub const fn framing(self) -> ResponseFraming {
+        self.framing
+    }
+
+    /// Return the full protocol response descriptor for a request/status pair.
+    #[must_use]
+    pub fn for_request_status(kind: RequestKind, status: StatusCode) -> Self {
+        // RFC 3977 section 3.2.1 generic errors are single-line. Keep that
+        // hot path ahead of command metadata so clients do not wait for a
+        // dot terminator after 4xx/5xx failures.
         if status.is_error() {
-            return false;
+            return response_descriptor(kind, status.as_u16(), ResponseFraming::SingleLine);
         }
 
-        matches!(
-            (self, status.as_u16()),
-            (Self::Article, 220)
-                | (Self::Head, 221)
-                | (Self::Body, 222)
-                | (Self::ListGroup, 211)
-                | (Self::Help, 100)
-                | (Self::Capabilities, 101)
-                | (
-                    Self::List
-                        | Self::ListActive
-                        | Self::ListActiveTimes
-                        | Self::ListNewsgroups
-                        | Self::ListOverviewFmt
-                        | Self::ListHeaders
-                        | Self::ListDistribPats,
-                    215,
-                )
-                | (Self::Over | Self::Xover, 224)
-                | (Self::Hdr | Self::Xhdr, 225)
-                | (Self::NewNews, 230)
-                | (Self::NewGroups, 231)
-        ) || matches!(self, Self::Unknown) && status_implies_multiline(status.as_u16())
+        responses_for_request(kind)
+            .find(|descriptor| descriptor.status_code() == status)
+            .unwrap_or_else(|| {
+                // RFC 3977 section 3.2 says extensions keep response framing
+                // code-driven except for the 211 GROUP/LISTGROUP exception.
+                // Unknown request kinds therefore fall back to status metadata.
+                let framing = if matches!(kind, RequestKind::Unknown)
+                    && status_implies_multiline(status.as_u16())
+                {
+                    ResponseFraming::Multiline
+                } else if matches!(kind, RequestKind::Unknown) {
+                    ResponseFraming::SingleLine
+                } else {
+                    ResponseFraming::Unexpected
+                };
+                response_descriptor(kind, status.as_u16(), framing)
+            })
     }
+}
+
+// RFC 3977 section 3.2: response codes normally determine framing, but 211 is
+// the historical exception: GROUP returns a single-line 211 and LISTGROUP
+// returns a multi-line 211. RFC 3977 section 9.4 defines the generic
+// simple-response vs multi-line-response grammar.
+static RESPONSE_DESCRIPTORS: &[ResponseDescriptor] = &[
+    // RFC 3977 section 6.2 article retrieval commands.
+    response_descriptor(RequestKind::Article, 220, ResponseFraming::Multiline),
+    response_descriptor(RequestKind::Head, 221, ResponseFraming::Multiline),
+    response_descriptor(RequestKind::Body, 222, ResponseFraming::Multiline),
+    response_descriptor(RequestKind::Stat, 223, ResponseFraming::SingleLine),
+    // RFC 3977 section 6.1 newsgroup and article selection commands.
+    response_descriptor(RequestKind::Group, 211, ResponseFraming::SingleLine),
+    response_descriptor(RequestKind::ListGroup, 211, ResponseFraming::Multiline),
+    response_descriptor(RequestKind::Last, 223, ResponseFraming::SingleLine),
+    response_descriptor(RequestKind::Next, 223, ResponseFraming::SingleLine),
+    // RFC 3977 section 7 information commands.
+    response_descriptor(RequestKind::Date, 111, ResponseFraming::SingleLine),
+    response_descriptor(RequestKind::Help, 100, ResponseFraming::Multiline),
+    response_descriptor(RequestKind::NewGroups, 231, ResponseFraming::Multiline),
+    response_descriptor(RequestKind::NewNews, 230, ResponseFraming::Multiline),
+    response_descriptor(RequestKind::List, 215, ResponseFraming::Multiline),
+    response_descriptor(RequestKind::ListActive, 215, ResponseFraming::Multiline),
+    response_descriptor(
+        RequestKind::ListActiveTimes,
+        215,
+        ResponseFraming::Multiline,
+    ),
+    response_descriptor(RequestKind::ListNewsgroups, 215, ResponseFraming::Multiline),
+    response_descriptor(
+        RequestKind::ListOverviewFmt,
+        215,
+        ResponseFraming::Multiline,
+    ),
+    response_descriptor(RequestKind::ListHeaders, 215, ResponseFraming::Multiline),
+    response_descriptor(
+        RequestKind::ListDistribPats,
+        215,
+        ResponseFraming::Multiline,
+    ),
+    // RFC 3977 section 8 overview and header commands.
+    response_descriptor(RequestKind::Over, 224, ResponseFraming::Multiline),
+    response_descriptor(RequestKind::Xover, 224, ResponseFraming::Multiline),
+    response_descriptor(RequestKind::Hdr, 225, ResponseFraming::Multiline),
+    response_descriptor(RequestKind::Xhdr, 225, ResponseFraming::Multiline),
+    // RFC 3977 section 6.3 transfer/posting commands.
+    response_descriptor(RequestKind::Post, 340, ResponseFraming::SingleLine),
+    response_descriptor(RequestKind::Post, 240, ResponseFraming::SingleLine),
+    response_descriptor(RequestKind::Ihave, 335, ResponseFraming::SingleLine),
+    response_descriptor(RequestKind::Ihave, 235, ResponseFraming::SingleLine),
+    // RFC 4644 streaming extension commands.
+    response_descriptor(RequestKind::Check, 238, ResponseFraming::SingleLine),
+    response_descriptor(RequestKind::TakeThis, 239, ResponseFraming::SingleLine),
+    // RFC 4643 AUTHINFO USER/PASS extension.
+    response_descriptor(RequestKind::AuthInfoUser, 381, ResponseFraming::SingleLine),
+    response_descriptor(RequestKind::AuthInfoUser, 281, ResponseFraming::SingleLine),
+    response_descriptor(RequestKind::AuthInfoPass, 281, ResponseFraming::SingleLine),
+    response_descriptor(RequestKind::AuthInfo, 281, ResponseFraming::SingleLine),
+    // RFC 3977 section 5 connection/session commands and RFC 4642 STARTTLS.
+    response_descriptor(RequestKind::Capabilities, 101, ResponseFraming::Multiline),
+    response_descriptor(RequestKind::ModeReader, 200, ResponseFraming::SingleLine),
+    response_descriptor(RequestKind::ModeReader, 201, ResponseFraming::SingleLine),
+    response_descriptor(RequestKind::Quit, 205, ResponseFraming::SingleLine),
+    response_descriptor(RequestKind::StartTls, 382, ResponseFraming::SingleLine),
+];
+
+const fn response_descriptor(
+    kind: RequestKind,
+    status: u16,
+    framing: ResponseFraming,
+) -> ResponseDescriptor {
+    ResponseDescriptor {
+        kind,
+        status,
+        framing,
+    }
+}
+
+impl ResponseFraming {
+    /// Return the RFC response framing for a request/status pair.
+    #[must_use]
+    pub fn for_request_status(kind: RequestKind, status: StatusCode) -> Self {
+        ResponseDescriptor::for_request_status(kind, status).framing()
+    }
+
+    #[must_use]
+    pub const fn is_multiline(self) -> bool {
+        matches!(self, Self::Multiline)
+    }
+}
+
+fn responses_for_request(kind: RequestKind) -> impl Iterator<Item = ResponseDescriptor> {
+    RESPONSE_DESCRIPTORS
+        .iter()
+        .copied()
+        .filter(move |descriptor| descriptor.kind == kind)
 }
 
 /// Typed client request for the current typed NNTP surface.
@@ -2833,7 +3190,7 @@ impl<'a> RequestLine<'a> {
         };
 
         Self {
-            kind: classify_verb(verb, args),
+            kind: classify_request_kind(verb, args),
             verb,
             args,
         }
@@ -2866,82 +3223,184 @@ impl<'a> RequestLine<'a> {
     }
 }
 
-fn classify_verb(verb: &[u8], arg: &[u8]) -> RequestKind {
-    match verb.len() {
-        3 if eq_ignore_ascii_case_const(verb, b"HDR") => RequestKind::Hdr,
-        4 if eq_ignore_ascii_case_const(verb, b"BODY") => RequestKind::Body,
-        4 if eq_ignore_ascii_case_const(verb, b"DATE") => RequestKind::Date,
-        4 if eq_ignore_ascii_case_const(verb, b"HEAD") => RequestKind::Head,
-        4 if eq_ignore_ascii_case_const(verb, b"HELP") => RequestKind::Help,
-        4 if eq_ignore_ascii_case_const(verb, b"LAST") => RequestKind::Last,
-        4 if eq_ignore_ascii_case_const(verb, b"LIST") => classify_list_kind(arg),
-        4 if eq_ignore_ascii_case_const(verb, b"MODE") && eq_ignore_ascii_case(arg, b"READER") => {
-            RequestKind::ModeReader
+#[derive(Debug, Clone, Copy)]
+struct CommandDescriptor {
+    verb: &'static [u8],
+    kind: CommandKind,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CommandKind {
+    Direct(RequestKind),
+    List,
+    AuthInfo,
+    Mode,
+}
+
+static COMMAND_DESCRIPTORS: &[CommandDescriptor] = &[
+    // RFC 3977 section 9.2 command-line ABNF lists the base NNTP verbs.
+    // RFC 3977 section 3.1 says command keywords are case-insensitive.
+    CommandDescriptor {
+        verb: b"ARTICLE",
+        kind: CommandKind::Direct(RequestKind::Article),
+    },
+    CommandDescriptor {
+        verb: b"AUTHINFO",
+        kind: CommandKind::AuthInfo,
+    },
+    CommandDescriptor {
+        verb: b"BODY",
+        kind: CommandKind::Direct(RequestKind::Body),
+    },
+    CommandDescriptor {
+        verb: b"CAPABILITIES",
+        kind: CommandKind::Direct(RequestKind::Capabilities),
+    },
+    CommandDescriptor {
+        verb: b"CHECK",
+        kind: CommandKind::Direct(RequestKind::Check),
+    },
+    CommandDescriptor {
+        verb: b"DATE",
+        kind: CommandKind::Direct(RequestKind::Date),
+    },
+    CommandDescriptor {
+        verb: b"GROUP",
+        kind: CommandKind::Direct(RequestKind::Group),
+    },
+    CommandDescriptor {
+        verb: b"HDR",
+        kind: CommandKind::Direct(RequestKind::Hdr),
+    },
+    CommandDescriptor {
+        verb: b"HEAD",
+        kind: CommandKind::Direct(RequestKind::Head),
+    },
+    CommandDescriptor {
+        verb: b"HELP",
+        kind: CommandKind::Direct(RequestKind::Help),
+    },
+    CommandDescriptor {
+        verb: b"IHAVE",
+        kind: CommandKind::Direct(RequestKind::Ihave),
+    },
+    CommandDescriptor {
+        verb: b"LAST",
+        kind: CommandKind::Direct(RequestKind::Last),
+    },
+    CommandDescriptor {
+        verb: b"LIST",
+        kind: CommandKind::List,
+    },
+    CommandDescriptor {
+        verb: b"LISTGROUP",
+        kind: CommandKind::Direct(RequestKind::ListGroup),
+    },
+    CommandDescriptor {
+        verb: b"MODE",
+        kind: CommandKind::Mode,
+    },
+    CommandDescriptor {
+        verb: b"NEWGROUPS",
+        kind: CommandKind::Direct(RequestKind::NewGroups),
+    },
+    CommandDescriptor {
+        verb: b"NEWNEWS",
+        kind: CommandKind::Direct(RequestKind::NewNews),
+    },
+    CommandDescriptor {
+        verb: b"NEXT",
+        kind: CommandKind::Direct(RequestKind::Next),
+    },
+    CommandDescriptor {
+        verb: b"OVER",
+        kind: CommandKind::Direct(RequestKind::Over),
+    },
+    CommandDescriptor {
+        verb: b"POST",
+        kind: CommandKind::Direct(RequestKind::Post),
+    },
+    CommandDescriptor {
+        verb: b"QUIT",
+        kind: CommandKind::Direct(RequestKind::Quit),
+    },
+    CommandDescriptor {
+        verb: b"STARTTLS",
+        kind: CommandKind::Direct(RequestKind::StartTls),
+    },
+    CommandDescriptor {
+        verb: b"STAT",
+        kind: CommandKind::Direct(RequestKind::Stat),
+    },
+    CommandDescriptor {
+        verb: b"TAKETHIS",
+        kind: CommandKind::Direct(RequestKind::TakeThis),
+    },
+    CommandDescriptor {
+        verb: b"XHDR",
+        kind: CommandKind::Direct(RequestKind::Xhdr),
+    },
+    CommandDescriptor {
+        verb: b"XOVER",
+        kind: CommandKind::Direct(RequestKind::Xover),
+    },
+];
+
+static LIST_SUBCOMMANDS: &[(&[u8], RequestKind)] = &[
+    // RFC 3977 section 7.6 defines LIST variants and notes that variants
+    // such as "LIST ACTIVE" are shorthand for a LIST subcommand, not separate
+    // top-level verbs.
+    (b"ACTIVE", RequestKind::ListActive),
+    (b"ACTIVE.TIMES", RequestKind::ListActiveTimes),
+    (b"NEWSGROUPS", RequestKind::ListNewsgroups),
+    (b"OVERVIEW.FMT", RequestKind::ListOverviewFmt),
+    (b"HEADERS", RequestKind::ListHeaders),
+    (b"DISTRIB.PATS", RequestKind::ListDistribPats),
+];
+
+static AUTHINFO_SUBCOMMANDS: &[(&[u8], RequestKind)] = &[
+    // RFC 4643 section 2.3 defines AUTHINFO USER/PASS. Unknown AUTHINFO
+    // subcommands are kept as RequestKind::AuthInfo for extension handling.
+    (b"USER", RequestKind::AuthInfoUser),
+    (b"PASS", RequestKind::AuthInfoPass),
+];
+
+fn classify_request_kind(verb: &[u8], args: &[u8]) -> RequestKind {
+    let Some(descriptor) = COMMAND_DESCRIPTORS
+        .iter()
+        .find(|descriptor| eq_ignore_ascii_case_const(verb, descriptor.verb))
+    else {
+        return RequestKind::Unknown;
+    };
+
+    match descriptor.kind {
+        CommandKind::Direct(kind) => kind,
+        CommandKind::List => classify_subcommand(args, LIST_SUBCOMMANDS, RequestKind::List),
+        CommandKind::AuthInfo => {
+            classify_subcommand(args, AUTHINFO_SUBCOMMANDS, RequestKind::AuthInfo)
         }
-        4 if eq_ignore_ascii_case_const(verb, b"NEXT") => RequestKind::Next,
-        4 if eq_ignore_ascii_case_const(verb, b"OVER") => RequestKind::Over,
-        4 if eq_ignore_ascii_case_const(verb, b"POST") => RequestKind::Post,
-        4 if eq_ignore_ascii_case_const(verb, b"QUIT") => RequestKind::Quit,
-        4 if eq_ignore_ascii_case_const(verb, b"STAT") => RequestKind::Stat,
-        4 if eq_ignore_ascii_case_const(verb, b"XHDR") => RequestKind::Xhdr,
-        5 if eq_ignore_ascii_case_const(verb, b"CHECK") => RequestKind::Check,
-        5 if eq_ignore_ascii_case_const(verb, b"GROUP") => RequestKind::Group,
-        5 if eq_ignore_ascii_case_const(verb, b"IHAVE") => RequestKind::Ihave,
-        5 if eq_ignore_ascii_case_const(verb, b"XOVER") => RequestKind::Xover,
-        7 if eq_ignore_ascii_case_const(verb, b"ARTICLE") => RequestKind::Article,
-        7 if eq_ignore_ascii_case_const(verb, b"NEWNEWS") => RequestKind::NewNews,
-        8 if eq_ignore_ascii_case_const(verb, b"AUTHINFO") => classify_authinfo_kind(arg),
-        8 if eq_ignore_ascii_case_const(verb, b"STARTTLS") => RequestKind::StartTls,
-        8 if eq_ignore_ascii_case_const(verb, b"TAKETHIS") => RequestKind::TakeThis,
-        9 if eq_ignore_ascii_case_const(verb, b"LISTGROUP") => RequestKind::ListGroup,
-        9 if eq_ignore_ascii_case_const(verb, b"NEWGROUPS") => RequestKind::NewGroups,
-        12 if eq_ignore_ascii_case_const(verb, b"CAPABILITIES") => RequestKind::Capabilities,
-        _ => RequestKind::Unknown,
+        CommandKind::Mode if eq_ignore_ascii_case_const(args, b"READER") => RequestKind::ModeReader,
+        CommandKind::Mode => RequestKind::Unknown,
     }
 }
 
-fn classify_list_kind(arg: &[u8]) -> RequestKind {
-    let subcommand = arg
+fn classify_subcommand(
+    args: &[u8],
+    table: &[(&'static [u8], RequestKind)],
+    default: RequestKind,
+) -> RequestKind {
+    let subcommand = args
         .split(|byte| byte.is_ascii_whitespace())
         .find(|segment| !segment.is_empty());
-    match subcommand {
-        Some(segment) if eq_ignore_ascii_case_const(segment, b"ACTIVE") => RequestKind::ListActive,
-        Some(segment) if eq_ignore_ascii_case_const(segment, b"ACTIVE.TIMES") => {
-            RequestKind::ListActiveTimes
-        }
-        Some(segment) if eq_ignore_ascii_case_const(segment, b"NEWSGROUPS") => {
-            RequestKind::ListNewsgroups
-        }
-        Some(segment) if eq_ignore_ascii_case_const(segment, b"OVERVIEW.FMT") => {
-            RequestKind::ListOverviewFmt
-        }
-        Some(segment) if eq_ignore_ascii_case_const(segment, b"HEADERS") => {
-            RequestKind::ListHeaders
-        }
-        Some(segment) if eq_ignore_ascii_case_const(segment, b"DISTRIB.PATS") => {
-            RequestKind::ListDistribPats
-        }
-        _ => RequestKind::List,
-    }
-}
 
-fn classify_authinfo_kind(arg: &[u8]) -> RequestKind {
-    let subcommand = arg
-        .split(|byte| byte.is_ascii_whitespace())
-        .find(|segment| !segment.is_empty());
-    match subcommand {
-        Some(segment) if eq_ignore_ascii_case_const(segment, b"USER") => RequestKind::AuthInfoUser,
-        Some(segment) if eq_ignore_ascii_case_const(segment, b"PASS") => RequestKind::AuthInfoPass,
-        _ => RequestKind::AuthInfo,
-    }
-}
+    let Some(subcommand) = subcommand else {
+        return default;
+    };
 
-fn eq_ignore_ascii_case(actual: &[u8], expected_upper: &[u8]) -> bool {
-    actual.len() == expected_upper.len()
-        && actual
-            .iter()
-            .zip(expected_upper)
-            .all(|(left, right)| left.to_ascii_uppercase() == *right)
+    table
+        .iter()
+        .find_map(|(wire, kind)| eq_ignore_ascii_case_const(subcommand, wire).then_some(*kind))
+        .unwrap_or(default)
 }
 
 const fn eq_ignore_ascii_case_const(left: &[u8], right: &[u8]) -> bool {
@@ -3567,6 +4026,9 @@ mod tests {
 
     #[test]
     fn request_kind_multiline_expectation_matches_supported_responses() {
+        // RFC 3977 sections 3.2 and 9.4 make response framing protocol
+        // metadata, not a typed-client concern. This matrix also covers the
+        // command-dependent 211 exception called out in RFC 3977 section 3.2.
         assert!(RequestKind::Article.expects_multiline_response(StatusCode(220)));
         assert!(RequestKind::Head.expects_multiline_response(StatusCode(221)));
         assert!(RequestKind::Body.expects_multiline_response(StatusCode(222)));
@@ -3598,6 +4060,158 @@ mod tests {
         assert!(!RequestKind::ModeReader.expects_multiline_response(StatusCode(201)));
         assert!(!RequestKind::Quit.expects_multiline_response(StatusCode(205)));
         assert!(!RequestKind::Article.expects_multiline_response(StatusCode(430)));
+    }
+
+    #[test]
+    fn response_framing_reports_multiline_single_line_and_unexpected_statuses() {
+        assert_eq!(
+            ResponseFraming::for_request_status(RequestKind::ListGroup, StatusCode(211)),
+            ResponseFraming::Multiline
+        );
+        assert_eq!(
+            ResponseFraming::for_request_status(RequestKind::Group, StatusCode(211)),
+            ResponseFraming::SingleLine
+        );
+        assert_eq!(
+            ResponseFraming::for_request_status(RequestKind::Article, StatusCode(430)),
+            ResponseFraming::SingleLine
+        );
+        assert_eq!(
+            ResponseFraming::for_request_status(RequestKind::Article, StatusCode(223)),
+            ResponseFraming::Unexpected
+        );
+        assert_eq!(
+            ResponseFraming::for_request_status(RequestKind::Unknown, StatusCode(220)),
+            ResponseFraming::Multiline
+        );
+    }
+
+    #[test]
+    fn response_frame_parse_returns_borrowed_whole_response_parts() {
+        // RFC 3977 section 9.4 defines multi-line responses as the initial
+        // response line followed by the section 3.1.1 dot-terminated block.
+        let wire = b"222 1 <body@test> body follows\r\nbody line\r\n.\r\nNEXT";
+        let response = match ResponseFrame::parse(RequestKind::Body, wire) {
+            ResponseFrameParse::Complete(response) => response,
+            other => panic!("unexpected parse result: {other:?}"),
+        };
+
+        assert_eq!(response.kind(), RequestKind::Body);
+        assert_eq!(response.status(), StatusCode(222));
+        assert_eq!(response.descriptor().framing(), ResponseFraming::Multiline);
+        assert_eq!(
+            response.status_line(),
+            b"222 1 <body@test> body follows\r\n"
+        );
+        assert_eq!(response.content(), b"body line\r\n");
+        assert_eq!(response.terminator(), b".\r\n");
+        assert_eq!(
+            response.bytes(),
+            b"222 1 <body@test> body follows\r\nbody line\r\n.\r\n"
+        );
+        assert_eq!(response.consumed(), response.bytes().len());
+    }
+
+    #[test]
+    fn response_frame_parse_returns_single_line_frame_without_waiting_for_dot() {
+        let wire = b"430 no article with that message-id\r\n.\r\n";
+        let response = match ResponseFrame::parse(RequestKind::Article, wire) {
+            ResponseFrameParse::Complete(response) => response,
+            other => panic!("unexpected parse result: {other:?}"),
+        };
+
+        assert_eq!(response.status(), StatusCode(430));
+        assert_eq!(response.descriptor().framing(), ResponseFraming::SingleLine);
+        assert_eq!(
+            response.status_line(),
+            b"430 no article with that message-id\r\n"
+        );
+        assert_eq!(response.content(), b"");
+        assert_eq!(response.terminator(), b"");
+        assert_eq!(response.bytes(), b"430 no article with that message-id\r\n");
+        assert_eq!(
+            response.consumed(),
+            b"430 no article with that message-id\r\n".len()
+        );
+    }
+
+    #[test]
+    fn response_frame_parse_reports_need_more_and_invalid_without_allocating() {
+        crate::COUNT_TEST_ALLOCATIONS.with(|enabled| enabled.set(false));
+        crate::TEST_ALLOCATIONS.store(0, std::sync::atomic::Ordering::Relaxed);
+        crate::COUNT_TEST_ALLOCATIONS.with(|enabled| enabled.set(true));
+
+        assert!(matches!(
+            ResponseFrame::parse(RequestKind::Body, b"222 body follows\r\nbody"),
+            ResponseFrameParse::NeedMore
+        ));
+        assert!(matches!(
+            ResponseFrame::parse(RequestKind::Body, b"222 body follows\nbody\r\n.\r\n"),
+            ResponseFrameParse::Invalid
+        ));
+        assert!(matches!(
+            ResponseFrame::parse(RequestKind::Capabilities, b"101 capabilities follow\r\n.\r\n"),
+            ResponseFrameParse::Complete(response)
+                if response.content().is_empty() && response.terminator() == b".\r\n"
+        ));
+
+        crate::COUNT_TEST_ALLOCATIONS.with(|enabled| enabled.set(false));
+        let allocations = crate::TEST_ALLOCATIONS.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(allocations, 0, "borrowed response frame parsing allocated");
+    }
+
+    #[test]
+    fn protocol_parse_and_framing_metadata_do_not_allocate() {
+        crate::COUNT_TEST_ALLOCATIONS.with(|enabled| enabled.set(false));
+        crate::TEST_ALLOCATIONS.store(0, std::sync::atomic::Ordering::Relaxed);
+        crate::COUNT_TEST_ALLOCATIONS.with(|enabled| enabled.set(true));
+
+        let cases = [
+            (
+                b"ARTICLE <a@b>\r\n".as_slice(),
+                RequestKind::Article,
+                StatusCode(220),
+            ),
+            (b"BODY 1\r\n".as_slice(), RequestKind::Body, StatusCode(222)),
+            (b"HEAD 1\r\n".as_slice(), RequestKind::Head, StatusCode(221)),
+            (b"STAT 1\r\n".as_slice(), RequestKind::Stat, StatusCode(223)),
+            (b"LIST\r\n".as_slice(), RequestKind::List, StatusCode(215)),
+            (
+                b"LIST ACTIVE.TIMES comp.*\r\n".as_slice(),
+                RequestKind::ListActiveTimes,
+                StatusCode(215),
+            ),
+            (
+                b"AUTHINFO USER bench\r\n".as_slice(),
+                RequestKind::AuthInfoUser,
+                StatusCode(381),
+            ),
+            (
+                b"MODE READER\r\n".as_slice(),
+                RequestKind::ModeReader,
+                StatusCode(201),
+            ),
+            (
+                b"CAPABILITIES\r\n".as_slice(),
+                RequestKind::Capabilities,
+                StatusCode(101),
+            ),
+            (b"QUIT\r\n".as_slice(), RequestKind::Quit, StatusCode(205)),
+        ];
+
+        for (line, kind, status) in cases {
+            assert_eq!(RequestLine::parse(line).kind(), kind);
+            let descriptor = ResponseDescriptor::for_request_status(kind, status);
+            assert_eq!(descriptor.kind(), kind);
+            assert_eq!(descriptor.status_code(), status);
+            for descriptor in responses_for_request(kind) {
+                let _ = descriptor.status_code();
+            }
+        }
+
+        crate::COUNT_TEST_ALLOCATIONS.with(|enabled| enabled.set(false));
+        let allocations = crate::TEST_ALLOCATIONS.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(allocations, 0, "protocol metadata hot path allocated");
     }
 
     #[test]
