@@ -2904,7 +2904,7 @@ async fn run_reader_task_drained(
     poisoned: Arc<Mutex<Option<SharedEngineError>>>,
     writer_abort: tokio::task::AbortHandle,
 ) {
-    let mut pending_read = [0; DRAINED_PENDING_READ_BYTES];
+    let mut pending_read = Box::new([0; DRAINED_PENDING_READ_BYTES]);
     let mut pending_len = 0usize;
     let mut pending_start = 0usize;
     let read_chunk_bytes = read_chunk_bytes.min(DRAINED_PENDING_READ_BYTES);

@@ -1900,6 +1900,41 @@ struct PendingWrite {
     len: usize,
 }
 
+struct GeneratedResponse<'a> {
+    prefix: &'a [u8],
+    target_bytes: usize,
+}
+
+impl<'a> GeneratedResponse<'a> {
+    const fn new(prefix: &'a [u8], target_bytes: usize) -> Self {
+        Self {
+            prefix,
+            target_bytes,
+        }
+    }
+
+    async fn write_to<W>(
+        self,
+        writer: &mut W,
+        pending_write: &mut PendingWrite,
+        session_stats: &mut SessionStats,
+    ) -> io::Result<()>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        let mut written = 0;
+        write_response(writer, pending_write, self.prefix, session_stats).await?;
+        written += self.prefix.len();
+
+        while written < self.target_bytes {
+            write_response(writer, pending_write, BODY_LINE, session_stats).await?;
+            written += BODY_LINE.len();
+        }
+
+        write_response(writer, pending_write, DOT_TERMINATOR, session_stats).await
+    }
+}
+
 #[cfg_attr(coverage_nightly, coverage(off))]
 impl PendingWrite {
     fn new() -> Self {
@@ -2118,16 +2153,9 @@ async fn write_generated_response<W>(
 where
     W: AsyncWrite + Unpin,
 {
-    let mut written = 0;
-    write_response(writer, pending_write, prefix, session_stats).await?;
-    written += prefix.len();
-
-    while written < target_bytes {
-        write_response(writer, pending_write, BODY_LINE, session_stats).await?;
-        written += BODY_LINE.len();
-    }
-
-    write_response(writer, pending_write, DOT_TERMINATOR, session_stats).await
+    GeneratedResponse::new(prefix, target_bytes)
+        .write_to(writer, pending_write, session_stats)
+        .await
 }
 
 fn write_generated_response_to<W>(
@@ -6361,5 +6389,14 @@ mod tests {
                 assert!(output.as_slice().ends_with(DOT_TERMINATOR));
             },
         );
+    }
+
+    #[test]
+    fn generated_response_descriptor_does_not_allocate() {
+        assert_no_allocations("generated response descriptor construction", || {
+            let response = GeneratedResponse::new(BODY_RESPONSE_PREFIX, 1024 * 1024);
+            assert_eq!(response.prefix, BODY_RESPONSE_PREFIX);
+            assert_eq!(response.target_bytes, 1024 * 1024);
+        });
     }
 }
