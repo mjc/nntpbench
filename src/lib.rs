@@ -142,7 +142,7 @@ const MAX_COMMAND_LINE_BYTES: usize = protocol::MAX_INITIAL_RESPONSE_LINE_BYTES;
 const MAX_SERVER_PIPELINE_DEPTH: usize = 1024;
 const SERVER_READER_CAPACITY: usize = 256 * 1024;
 const CLIENT_READER_CAPACITY: usize = 256 * 1024;
-const MAX_PENDING_WRITE_BYTES: usize = 64 * 1024;
+const MAX_PENDING_WRITE_BYTES: usize = 1024 * 1024;
 const HIGH_THROUGHPUT_SOCKET_BUFFER: usize = 16 * 1024 * 1024;
 const PROCESS_CLOCK_TICK: Duration = Duration::from_millis(10);
 const TCP_LINGER_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1896,7 +1896,7 @@ where
 }
 
 struct PendingWrite {
-    buf: [u8; MAX_PENDING_WRITE_BYTES],
+    buf: Box<[u8; MAX_PENDING_WRITE_BYTES]>,
     len: usize,
 }
 
@@ -1939,7 +1939,7 @@ impl<'a> GeneratedResponse<'a> {
 impl PendingWrite {
     fn new() -> Self {
         Self {
-            buf: [0; MAX_PENDING_WRITE_BYTES],
+            buf: Box::new([0; MAX_PENDING_WRITE_BYTES]),
             len: 0,
         }
     }
@@ -2952,14 +2952,14 @@ mod tests {
     async fn pending_write_flushes_when_full_and_writes_oversized_directly() {
         let mut sink = tokio::io::sink();
         let mut pending = PendingWrite::new();
-        let first = [b'a'; 40 * 1024];
-        let second = [b'b'; 40 * 1024];
+        let first = vec![b'a'; MAX_PENDING_WRITE_BYTES - 16];
+        let second = vec![b'b'; 32];
         pending.push(&mut sink, &first).await.unwrap();
         assert_eq!(pending.len, first.len());
         pending.push(&mut sink, &second).await.unwrap();
         assert_eq!(pending.len, second.len());
 
-        let huge = [b'c'; MAX_PENDING_WRITE_BYTES + 1];
+        let huge = vec![b'c'; MAX_PENDING_WRITE_BYTES + 1];
         pending.push(&mut sink, &huge).await.unwrap();
         assert_eq!(pending.len, 0);
     }
