@@ -1930,9 +1930,11 @@ impl<'a> GeneratedResponse<'a> {
         write_response(writer, pending_write, self.prefix, session_stats).await?;
         written += self.prefix.len();
 
-        while written < self.target_bytes {
-            write_response(writer, pending_write, BODY_LINE, session_stats).await?;
-            written += BODY_LINE.len();
+        if written < self.target_bytes {
+            let payload_bytes = pending_write
+                .push_repeated(writer, BODY_LINE, self.target_bytes - written)
+                .await?;
+            session_stats.bytes_sent += payload_bytes as u64;
         }
 
         write_response(writer, pending_write, DOT_TERMINATOR, session_stats).await
@@ -1965,6 +1967,57 @@ impl PendingWrite {
         self.buf[self.len..end].copy_from_slice(response);
         self.len = end;
         Ok(())
+    }
+
+    async fn push_repeated<W>(
+        &mut self,
+        writer: &mut W,
+        response: &[u8],
+        min_bytes: usize,
+    ) -> io::Result<usize>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        if response.is_empty() {
+            return Ok(0);
+        }
+
+        let mut remaining = min_bytes.div_ceil(response.len());
+        while remaining > 0 {
+            if response.len() > self.buf.len() {
+                self.write_with_response(writer, response).await?;
+                remaining -= 1;
+                continue;
+            }
+
+            if self.len + response.len() > self.buf.len() {
+                self.flush(writer).await?;
+            }
+
+            let available = self.buf.len() - self.len;
+            let copies = remaining.min(available / response.len());
+            if copies == 0 {
+                self.flush(writer).await?;
+                continue;
+            }
+
+            let start = self.len;
+            let bytes = copies * response.len();
+            self.buf[start..start + response.len()].copy_from_slice(response);
+
+            let mut filled = response.len();
+            while filled < bytes {
+                let copy_len = filled.min(bytes - filled);
+                self.buf
+                    .copy_within(start..start + copy_len, start + filled);
+                filled += copy_len;
+            }
+
+            self.len += bytes;
+            remaining -= copies;
+        }
+
+        Ok(min_bytes.div_ceil(response.len()) * response.len())
     }
 
     async fn write_with_response<W>(&mut self, writer: &mut W, response: &[u8]) -> io::Result<()>
@@ -3006,6 +3059,19 @@ mod tests {
             writer.bytes,
             [DATE_RESPONSE, b"220 large response\r\nbody\r\n.\r\n"].concat()
         );
+    }
+
+    #[tokio::test]
+    async fn pending_write_repeats_chunks_without_oversized_stack_buffers() {
+        let mut sink = tokio::io::sink();
+        let mut pending = PendingWrite::new(128);
+        let written = pending
+            .push_repeated(&mut sink, b"abcd", 130)
+            .await
+            .unwrap();
+
+        assert_eq!(written, 132);
+        assert_eq!(pending.len, 4);
     }
 
     #[tokio::test]
