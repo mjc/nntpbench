@@ -1,6 +1,17 @@
-//! Tail buffer and terminator helpers for multiline NNTP responses.
+//! Response line and multiline terminator helpers for NNTP responses.
 
 pub const TERMINATOR_TAIL_SIZE: usize = 4;
+
+/// Status of strict NNTP response-line CRLF scanning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseLineStatus {
+    /// Complete CRLF-terminated line found at this position, after the CRLF.
+    CompleteAt(usize),
+    /// More bytes are needed before the line can be classified.
+    NeedMore,
+    /// A bare LF or non-terminal CR was found before the line terminator.
+    Invalid,
+}
 
 /// Status of terminator detection in a chunk.
 #[derive(Debug, Clone, Copy)]
@@ -28,17 +39,34 @@ impl TerminatorStatus {
     }
 }
 
-/// Helper for tracking the last few bytes of streamed data.
+/// Find a strict CRLF-terminated NNTP response line.
+#[must_use]
+pub fn detect_response_line_end(buffer: &[u8]) -> ResponseLineStatus {
+    for index in 0..buffer.len() {
+        match buffer[index] {
+            b'\r' if index + 1 == buffer.len() => return ResponseLineStatus::NeedMore,
+            b'\r' if buffer[index + 1] == b'\n' => {
+                return ResponseLineStatus::CompleteAt(index + 2);
+            }
+            b'\r' | b'\n' => return ResponseLineStatus::Invalid,
+            _ => {}
+        }
+    }
+
+    ResponseLineStatus::NeedMore
+}
+
+/// Streaming detector for NNTP multiline response terminators.
 ///
-/// Used to detect terminators that span across chunk boundaries.
+/// Internally keeps enough trailing bytes to detect `\r\n.\r\n` across chunk boundaries.
 #[derive(Debug, Default)]
-pub struct TailBuffer {
+pub struct MultilineTerminatorDetector {
     data: [u8; TERMINATOR_TAIL_SIZE],
     len: usize,
 }
 
-impl TailBuffer {
-    /// Update tail with the last bytes from a chunk.
+impl MultilineTerminatorDetector {
+    /// Update detector state with the last bytes from a chunk.
     ///
     /// Maintains the last `TERMINATOR_TAIL_SIZE` bytes of the concatenation of
     /// all prior chunks. When `chunk` is smaller than `TERMINATOR_TAIL_SIZE`,
@@ -62,7 +90,7 @@ impl TailBuffer {
         }
     }
 
-    /// Get the tail data as a slice.
+    /// Get the retained trailing data as a slice.
     #[must_use]
     pub fn as_slice(&self) -> &[u8] {
         &self.data[..self.len]
@@ -107,6 +135,68 @@ impl TailBuffer {
             (None, None) => TerminatorStatus::NotFound,
         }
     }
+}
+
+/// Tracks whether an empty multiline block terminator has started at content start.
+#[derive(Debug, Default)]
+pub struct EmptyMultilineTerminator {
+    prefix_len: usize,
+}
+
+impl EmptyMultilineTerminator {
+    /// Detect `.\r\n` only when the caller knows scanning is at multiline content start.
+    #[must_use]
+    pub fn detect(&mut self, chunk: &[u8]) -> EmptyTerminatorStatus {
+        const EMPTY_TERMINATOR: &[u8; 3] = b".\r\n";
+
+        let already_matched = self.prefix_len;
+        if already_matched == 0 && chunk.first().is_some_and(|byte| *byte != b'.') {
+            return EmptyTerminatorStatus::NotFound {
+                previous_prefix_len: 0,
+            };
+        }
+
+        let remaining = &EMPTY_TERMINATOR[already_matched..];
+        let matched = chunk
+            .iter()
+            .zip(remaining.iter())
+            .take_while(|(actual, expected)| actual == expected)
+            .count();
+
+        if already_matched + matched == EMPTY_TERMINATOR.len() {
+            self.prefix_len = 0;
+            return EmptyTerminatorStatus::FoundAt(matched);
+        }
+
+        if matched == chunk.len() {
+            self.prefix_len += matched;
+            return EmptyTerminatorStatus::NeedMore;
+        }
+
+        let previous_prefix_len = self.prefix_len;
+        self.prefix_len = 0;
+        EmptyTerminatorStatus::NotFound {
+            previous_prefix_len,
+        }
+    }
+
+    /// Returns true when a prior call matched a prefix of `.\r\n`.
+    #[must_use]
+    pub const fn is_active(&self) -> bool {
+        self.prefix_len != 0
+    }
+}
+
+/// Status of empty multiline terminator detection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmptyTerminatorStatus {
+    /// Complete empty terminator found at this position within the current chunk.
+    FoundAt(usize),
+    /// Current bytes are a prefix of `.\r\n`; more bytes are needed.
+    NeedMore,
+    /// The bytes did not continue the empty terminator. Any prior prefix length is returned
+    /// so callers can fold those bytes into normal multiline terminator tail state.
+    NotFound { previous_prefix_len: usize },
 }
 
 /// Find the position of the NNTP multiline terminator in data.
@@ -178,6 +268,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn response_line_end_requires_crlf() {
+        // RFC 3977 section 3.1 defines the response initial line as CRLF-terminated:
+        // https://www.rfc-editor.org/rfc/rfc3977#section-3.1
+        for (input, expected) in [
+            (
+                b"200 service ready\r\n".as_slice(),
+                ResponseLineStatus::CompleteAt(b"200 service ready\r\n".len()),
+            ),
+            (
+                b"101 Capability list:\r\nVERSION 2\r\n.\r\n".as_slice(),
+                ResponseLineStatus::CompleteAt(b"101 Capability list:\r\n".len()),
+            ),
+            (b"430 no article\r".as_slice(), ResponseLineStatus::NeedMore),
+            (b"430 no article".as_slice(), ResponseLineStatus::NeedMore),
+            (b"430 no article\n".as_slice(), ResponseLineStatus::Invalid),
+            (
+                b"430 no article\nbody\r\n".as_slice(),
+                ResponseLineStatus::Invalid,
+            ),
+            (
+                b"430 no article\r body\r\n".as_slice(),
+                ResponseLineStatus::Invalid,
+            ),
+            (
+                b"430 no article\r\r\n".as_slice(),
+                ResponseLineStatus::Invalid,
+            ),
+        ] {
+            assert_eq!(detect_response_line_end(input), expected, "{input:?}");
+        }
+    }
+
+    #[test]
     fn terminator_status_reports_found_and_write_length() {
         assert!(TerminatorStatus::FoundAt(3).is_found());
         assert_eq!(TerminatorStatus::FoundAt(3).write_len(9), 3);
@@ -187,66 +310,81 @@ mod tests {
     }
 
     #[test]
-    fn tail_update_appends_until_full_then_rolls() {
-        let mut tail = TailBuffer::default();
-        tail.update(b"ab");
-        assert_eq!(tail.as_slice(), b"ab");
-        assert_eq!(tail.len(), 2);
+    fn detector_update_appends_until_full_then_rolls() {
+        let mut detector = MultilineTerminatorDetector::default();
+        detector.update(b"ab");
+        assert_eq!(detector.as_slice(), b"ab");
+        assert_eq!(detector.len(), 2);
 
-        tail.update(b"cd");
-        assert_eq!(tail.as_slice(), b"abcd");
-        assert_eq!(tail.len(), 4);
+        detector.update(b"cd");
+        assert_eq!(detector.as_slice(), b"abcd");
+        assert_eq!(detector.len(), 4);
 
-        tail.update(b"ef");
-        assert_eq!(tail.as_slice(), b"cdef");
+        detector.update(b"ef");
+        assert_eq!(detector.as_slice(), b"cdef");
 
-        tail.update(b"012345");
-        assert_eq!(tail.as_slice(), b"2345");
+        detector.update(b"012345");
+        assert_eq!(detector.as_slice(), b"2345");
 
-        tail.update(b"");
-        assert_eq!(tail.as_slice(), b"2345");
+        detector.update(b"");
+        assert_eq!(detector.as_slice(), b"2345");
     }
 
     #[test]
     fn detect_terminator_prefers_earliest_boundary_or_chunk_match() {
-        let mut tail = TailBuffer::default();
-        tail.update(b"abc\r");
-        assert_eq!(tail.detect_terminator(b"\n.\r\npayload").write_len(99), 4);
+        // RFC 3977 section 3.1.1 defines non-empty multiline termination as CRLF "." CRLF:
+        // https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1
+        let mut detector = MultilineTerminatorDetector::default();
+        detector.update(b"abc\r");
+        assert_eq!(
+            detector.detect_terminator(b"\n.\r\npayload").write_len(99),
+            4
+        );
 
-        let mut tail = TailBuffer::default();
-        tail.update(b"abc\r");
-        assert_eq!(tail.detect_terminator(b"\n.\r\n\r\n.\r\n").write_len(99), 4);
+        let mut detector = MultilineTerminatorDetector::default();
+        detector.update(b"abc\r");
+        assert_eq!(
+            detector
+                .detect_terminator(b"\n.\r\n\r\n.\r\n")
+                .write_len(99),
+            4
+        );
 
-        let tail = TailBuffer::default();
-        assert_eq!(tail.detect_terminator(b"abc\r\n.\r\n").write_len(99), 8);
-        assert!(!tail.detect_terminator(b".\r\n").is_found());
-        assert!(!tail.detect_terminator(b"abc").is_found());
+        let detector = MultilineTerminatorDetector::default();
+        assert_eq!(detector.detect_terminator(b"abc\r\n.\r\n").write_len(99), 8);
+        assert!(!detector.detect_terminator(b".\r\n").is_found());
+        assert!(!detector.detect_terminator(b"abc").is_found());
     }
 
     #[test]
     fn spanning_terminator_handles_all_split_positions() {
-        let mut tail = TailBuffer::default();
-        assert_eq!(tail.find_spanning_terminator(b"\n.\r\n"), None);
+        // RFC 3977 section 3.1.1: the terminator can arrive split across TCP reads.
+        // https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1
+        let mut detector = MultilineTerminatorDetector::default();
+        assert_eq!(detector.find_spanning_terminator(b"\n.\r\n"), None);
         assert_eq!(find_spanning_terminator(b"", 0, b"", 0), None);
 
-        tail.update(b"a\r");
-        assert_eq!(tail.find_spanning_terminator(b"\n.\r\nx"), Some(4));
+        detector.update(b"a\r");
+        assert_eq!(detector.find_spanning_terminator(b"\n.\r\nx"), Some(4));
 
-        let mut tail = TailBuffer::default();
-        tail.update(b"a\r\n");
-        assert_eq!(tail.find_spanning_terminator(b".\r\nx"), Some(3));
+        let mut detector = MultilineTerminatorDetector::default();
+        detector.update(b"a\r\n");
+        assert_eq!(detector.find_spanning_terminator(b".\r\nx"), Some(3));
 
-        let mut tail = TailBuffer::default();
-        tail.update(b"a\r\n.");
-        assert_eq!(tail.find_spanning_terminator(b"\r\nx"), Some(2));
+        let mut detector = MultilineTerminatorDetector::default();
+        detector.update(b"a\r\n.");
+        assert_eq!(detector.find_spanning_terminator(b"\r\nx"), Some(2));
 
-        let mut tail = TailBuffer::default();
-        tail.update(b"a\r\n.\r");
-        assert_eq!(tail.find_spanning_terminator(b"\nx"), Some(1));
+        let mut detector = MultilineTerminatorDetector::default();
+        detector.update(b"a\r\n.\r");
+        assert_eq!(detector.find_spanning_terminator(b"\nx"), Some(1));
     }
 
     #[test]
     fn terminator_content_end_handles_empty_and_non_empty_content() {
+        // Full-frame parsing uses CRLF "." CRLF for non-empty content; the empty-content
+        // "." CRLF case is intentionally handled by EmptyMultilineTerminator.
+        // RFC 3977 section 3.1.1: https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1
         assert_eq!(find_terminator_content_end(b".\r\n", 0), None);
         assert_eq!(
             find_terminator_content_end(b"body\r\n.\r\nnext", 0),
@@ -261,14 +399,94 @@ mod tests {
 
     #[test]
     fn terminator_detection_requires_crlf_sequences() {
-        let tail = TailBuffer::default();
+        // Bare LF and bare CR are not NNTP line terminators; multiline termination requires
+        // the exact CRLF "." CRLF sequence from RFC 3977 section 3.1.1.
+        // https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1
+        let detector = MultilineTerminatorDetector::default();
         for data in [
             b"line1\nline2\n.\n".as_slice(),
             b"line1\rline2\r.\r".as_slice(),
             b"line1\r\nline2\n.\r\n".as_slice(),
+            b"line1\r\n.\n".as_slice(),
+            b"line1\r\n.\r".as_slice(),
         ] {
-            assert!(!tail.detect_terminator(data).is_found(), "{data:?}");
+            assert!(!detector.detect_terminator(data).is_found(), "{data:?}");
             assert_eq!(find_terminator_content_end(data, 0), None, "{data:?}");
+        }
+    }
+
+    #[test]
+    fn empty_multiline_terminator_tracks_split_prefixes() {
+        // RFC 3977 section 3.1.1 defines an empty multiline block as "." CRLF immediately
+        // after the response initial line. This detector only handles that content-start case.
+        // https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1
+        let mut detector = EmptyMultilineTerminator::default();
+        assert_eq!(detector.detect(b"."), EmptyTerminatorStatus::NeedMore);
+        assert_eq!(detector.detect(b"\r"), EmptyTerminatorStatus::NeedMore);
+        assert_eq!(
+            detector.detect(b"\nbody"),
+            EmptyTerminatorStatus::FoundAt(1)
+        );
+
+        let mut detector = EmptyMultilineTerminator::default();
+        assert_eq!(
+            detector.detect(b".x"),
+            EmptyTerminatorStatus::NotFound {
+                previous_prefix_len: 0
+            }
+        );
+
+        let mut detector = EmptyMultilineTerminator::default();
+        assert_eq!(detector.detect(b"."), EmptyTerminatorStatus::NeedMore);
+        assert_eq!(
+            detector.detect(b"x"),
+            EmptyTerminatorStatus::NotFound {
+                previous_prefix_len: 1
+            }
+        );
+    }
+
+    #[test]
+    fn empty_multiline_terminator_handles_all_split_positions() {
+        // RFC 3977 section 3.1.1 empty multiline block: "." CRLF.
+        // https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1
+        for split in 0..3 {
+            let mut detector = EmptyMultilineTerminator::default();
+            let terminator = b".\r\n";
+
+            if split > 0 {
+                assert_eq!(
+                    detector.detect(&terminator[..split]),
+                    EmptyTerminatorStatus::NeedMore,
+                    "split {split}"
+                );
+            }
+
+            assert_eq!(
+                detector.detect(&terminator[split..]),
+                EmptyTerminatorStatus::FoundAt(terminator.len() - split),
+                "split {split}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_multiline_terminator_does_not_match_non_empty_content() {
+        // RFC 3977 section 3.1.1 uses "." CRLF only for an empty block or a dot line.
+        // If the content starts with any other byte, normal CRLF "." CRLF scanning must handle it.
+        // https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1
+        for input in [
+            b"body\r\n.\r\n".as_slice(),
+            b"..dot-stuffed\r\n.\r\n".as_slice(),
+            b".not-a-terminator\r\n.\r\n".as_slice(),
+        ] {
+            assert_eq!(
+                EmptyMultilineTerminator::default().detect(input),
+                EmptyTerminatorStatus::NotFound {
+                    previous_prefix_len: 0,
+                },
+                "{input:?}"
+            );
         }
     }
 }

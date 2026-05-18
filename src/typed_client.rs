@@ -13,7 +13,10 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::protocol::{ArticleRef, Request};
-use crate::tail_buffer::{TailBuffer, TerminatorStatus};
+use crate::tail_buffer::{
+    EmptyMultilineTerminator, EmptyTerminatorStatus, MultilineTerminatorDetector,
+    ResponseLineStatus, TerminatorStatus, detect_response_line_end,
+};
 use crate::{
     Article, ArticleParseError, ArticleSelector, ArticleTransfer, AuthInfoValue, GroupName,
     HeaderName, ListGroupRange, MessageId, NntpDate, NntpTime, RequestKind, StatusCode, Wildmat,
@@ -2068,8 +2071,8 @@ struct ResponseDecoder {
     kind: RequestKind,
     buffered_len: usize,
     status: Option<(StatusCode, usize)>,
-    empty_content_terminator_prefix_len: usize,
-    tail: TailBuffer,
+    empty_terminator: EmptyMultilineTerminator,
+    tail: MultilineTerminatorDetector,
 }
 
 impl ResponseDecoder {
@@ -2078,8 +2081,8 @@ impl ResponseDecoder {
             kind,
             buffered_len: 0,
             status: None,
-            empty_content_terminator_prefix_len: 0,
-            tail: TailBuffer::default(),
+            empty_terminator: EmptyMultilineTerminator::default(),
+            tail: MultilineTerminatorDetector::default(),
         }
     }
 
@@ -2090,8 +2093,10 @@ impl ResponseDecoder {
         let (status, status_end) = match self.status {
             Some(value) => value,
             None => {
-                let Some(status_end) = status_line_end(buffer) else {
-                    return Ok(DecodeProgress::NeedMore);
+                let status_end = match detect_response_line_end(buffer) {
+                    ResponseLineStatus::CompleteAt(status_end) => status_end,
+                    ResponseLineStatus::NeedMore => return Ok(DecodeProgress::NeedMore),
+                    ResponseLineStatus::Invalid => return Err(TypedClientError::InvalidStatusLine),
                 };
                 let status =
                     StatusCode::parse(buffer).ok_or(TypedClientError::InvalidStatusLine)?;
@@ -2112,13 +2117,22 @@ impl ResponseDecoder {
         }
 
         let content_chunk = &buffer[content_chunk_start..];
-        if content_chunk_start == status_end || self.empty_content_terminator_prefix_len > 0 {
-            match self.detect_empty_content_terminator(content_chunk, content_chunk_start) {
-                EmptyContentTerminator::Complete { consumed } => {
-                    return Ok(DecodeProgress::Complete { status, consumed });
+        if content_chunk_start == status_end || self.empty_terminator.is_active() {
+            match self.empty_terminator.detect(content_chunk) {
+                EmptyTerminatorStatus::FoundAt(end) => {
+                    return Ok(DecodeProgress::Complete {
+                        status,
+                        consumed: content_chunk_start + end,
+                    });
                 }
-                EmptyContentTerminator::NeedMore => return Ok(DecodeProgress::NeedMore),
-                EmptyContentTerminator::NotTerminator => {}
+                EmptyTerminatorStatus::NeedMore => return Ok(DecodeProgress::NeedMore),
+                EmptyTerminatorStatus::NotFound {
+                    previous_prefix_len,
+                } => {
+                    if previous_prefix_len != 0 {
+                        self.tail.update(&b".\r\n"[..previous_prefix_len]);
+                    }
+                }
             }
         }
 
@@ -2133,52 +2147,12 @@ impl ResponseDecoder {
             }
         }
     }
-
-    fn detect_empty_content_terminator(
-        &mut self,
-        content_chunk: &[u8],
-        content_chunk_start: usize,
-    ) -> EmptyContentTerminator {
-        const EMPTY_TERMINATOR: &[u8; 3] = b".\r\n";
-
-        let already_matched = self.empty_content_terminator_prefix_len;
-        let remaining = &EMPTY_TERMINATOR[already_matched..];
-        let matched = content_chunk
-            .iter()
-            .zip(remaining.iter())
-            .take_while(|(actual, expected)| actual == expected)
-            .count();
-
-        if already_matched + matched == EMPTY_TERMINATOR.len() {
-            return EmptyContentTerminator::Complete {
-                consumed: content_chunk_start + matched,
-            };
-        }
-
-        if matched == content_chunk.len() {
-            self.empty_content_terminator_prefix_len += matched;
-            return EmptyContentTerminator::NeedMore;
-        }
-
-        if already_matched != 0 {
-            self.tail.update(&EMPTY_TERMINATOR[..already_matched]);
-        }
-        self.empty_content_terminator_prefix_len = 0;
-        EmptyContentTerminator::NotTerminator
-    }
 }
 
 #[derive(Debug)]
 enum DecodeProgress {
     NeedMore,
     Complete { status: StatusCode, consumed: usize },
-}
-
-#[derive(Debug)]
-enum EmptyContentTerminator {
-    NeedMore,
-    Complete { consumed: usize },
-    NotTerminator,
 }
 
 #[derive(Debug)]
@@ -2720,10 +2694,6 @@ fn shared_engine_error_from_typed(err: TypedClientError) -> SharedEngineError {
     }
 }
 
-fn status_line_end(buffer: &[u8]) -> Option<usize> {
-    memchr::memchr(b'\n', buffer).map(|index| index + 1)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2764,6 +2734,60 @@ mod tests {
             response.as_bytes(),
             b"430 no article with that message-id\r\n"
         );
+    }
+
+    #[test]
+    fn decoder_waits_for_complete_crlf_status_line() {
+        let mut decoder = ResponseDecoder::new(RequestKind::Article);
+        assert!(matches!(
+            decoder
+                .push(b"430 no article with that message-id\r")
+                .unwrap(),
+            DecodeProgress::NeedMore
+        ));
+
+        let DecodeProgress::Complete { status, consumed } = decoder
+            .push(b"430 no article with that message-id\r\n")
+            .unwrap()
+        else {
+            panic!("decoder should complete once CRLF arrives");
+        };
+
+        assert_eq!(consumed, b"430 no article with that message-id\r\n".len());
+        assert_eq!(status.as_u16(), 430);
+    }
+
+    #[test]
+    fn decoder_rejects_bare_lf_status_line() {
+        for input in [
+            b"430 no article with that message-id\n".as_slice(),
+            b"430 no article with that message-id\nextra\r\n".as_slice(),
+            b"430 no article with that message-id\n\r\n".as_slice(),
+        ] {
+            assert!(
+                matches!(
+                    ResponseDecoder::new(RequestKind::Article).push(input),
+                    Err(TypedClientError::InvalidStatusLine)
+                ),
+                "{input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn decoder_rejects_embedded_cr_in_status_line() {
+        for input in [
+            b"430 no article with that message-id\r extra\r\n".as_slice(),
+            b"430 no article with that message-id\r\r\n".as_slice(),
+        ] {
+            assert!(
+                matches!(
+                    ResponseDecoder::new(RequestKind::Article).push(input),
+                    Err(TypedClientError::InvalidStatusLine)
+                ),
+                "{input:?}"
+            );
+        }
     }
 
     #[test]

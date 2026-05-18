@@ -5,7 +5,7 @@
 //! performance-sensitive helper changes stay measurable.
 
 use divan::{Bencher, black_box};
-use nntpbench::tail_buffer::{TailBuffer, TerminatorStatus};
+use nntpbench::tail_buffer::{MultilineTerminatorDetector, TerminatorStatus};
 use nntpbench::{Article, Headers, StatusCode};
 
 fn main() {
@@ -39,12 +39,12 @@ mod status_code_parsing {
 }
 
 mod terminator_finding {
-    use super::{Bencher, TailBuffer, TerminatorStatus, black_box};
+    use super::{Bencher, MultilineTerminatorDetector, TerminatorStatus, black_box};
 
     #[inline]
     fn find_terminator(data: &[u8]) -> Option<usize> {
-        let tail = TailBuffer::default();
-        match tail.detect_terminator(data) {
+        let detector = MultilineTerminatorDetector::default();
+        match detector.detect_terminator(data) {
             TerminatorStatus::FoundAt(pos) => Some(pos),
             TerminatorStatus::NotFound => None,
         }
@@ -79,9 +79,9 @@ Article body line 5\r\n\
 
     #[divan::bench(sample_count = 1000, sample_size = 100)]
     fn spanning_boundary_response(bencher: Bencher) {
-        let mut tail = TailBuffer::default();
-        tail.update(SPANNING_TAIL);
-        bencher.bench(|| black_box(tail.detect_terminator(black_box(SPANNING_CHUNK))));
+        let mut detector = MultilineTerminatorDetector::default();
+        detector.update(SPANNING_TAIL);
+        bencher.bench(|| black_box(detector.detect_terminator(black_box(SPANNING_CHUNK))));
     }
 }
 
