@@ -230,19 +230,12 @@ fn find_spanning_terminator(
         return None;
     }
 
-    if tail_len >= 1
-        && current_len >= 4
-        && tail[tail_len - 1] == b'\r'
-        && current[..4] == *b"\n.\r\n"
+    if tail_len >= 4
+        && current_len >= 1
+        && tail[tail_len - 4..tail_len] == *b"\r\n.\r"
+        && current[0] == b'\n'
     {
-        return Some(4);
-    }
-    if tail_len >= 2
-        && current_len >= 3
-        && tail[tail_len - 2..tail_len] == *b"\r\n"
-        && current[..3] == *b".\r\n"
-    {
-        return Some(3);
+        return Some(1);
     }
     if tail_len >= 3
         && current_len >= 2
@@ -251,12 +244,19 @@ fn find_spanning_terminator(
     {
         return Some(2);
     }
-    if tail_len >= 4
-        && current_len >= 1
-        && tail[tail_len - 4..tail_len] == *b"\r\n.\r"
-        && current[0] == b'\n'
+    if tail_len >= 2
+        && current_len >= 3
+        && tail[tail_len - 2..tail_len] == *b"\r\n"
+        && current[..3] == *b".\r\n"
     {
-        return Some(1);
+        return Some(3);
+    }
+    if tail_len >= 1
+        && current_len >= 4
+        && tail[tail_len - 1] == b'\r'
+        && current[..4] == *b"\n.\r\n"
+    {
+        return Some(4);
     }
 
     None
@@ -266,6 +266,94 @@ fn find_spanning_terminator(
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+    use proptest::collection::vec;
+    use proptest::prelude::*;
+
+    fn dangerous_wire_bytes() -> impl Strategy<Value = u8> {
+        prop_oneof![
+            Just(b'\r'),
+            Just(b'\n'),
+            Just(b'.'),
+            Just(b' '),
+            b'0'..=b'9',
+            b'a'..=b'z',
+        ]
+    }
+
+    fn response_line_oracle(buffer: &[u8]) -> ResponseLineStatus {
+        for index in 0..buffer.len() {
+            match buffer[index] {
+                b'\r' if index + 1 == buffer.len() => return ResponseLineStatus::NeedMore,
+                b'\r' if buffer[index + 1] == b'\n' => {
+                    return ResponseLineStatus::CompleteAt(index + 2);
+                }
+                b'\r' | b'\n' => return ResponseLineStatus::Invalid,
+                _ => {}
+            }
+        }
+
+        ResponseLineStatus::NeedMore
+    }
+
+    fn terminator_end_oracle(buffer: &[u8]) -> Option<usize> {
+        buffer
+            .windows(crate::TERMINATOR.len())
+            .position(|window| window == crate::TERMINATOR)
+            .map(|start| start + crate::TERMINATOR.len())
+    }
+
+    fn remove_rfc_multiline_terminators(buffer: &mut [u8]) {
+        while let Some(start) = buffer
+            .windows(crate::TERMINATOR.len())
+            .position(|window| window == crate::TERMINATOR)
+        {
+            buffer[start + 2] = b'x';
+        }
+    }
+
+    fn streaming_terminator_end(chunks: &[&[u8]]) -> Option<usize> {
+        let mut detector = MultilineTerminatorDetector::default();
+        let mut consumed_before_chunk = 0;
+
+        for chunk in chunks {
+            match detector.detect_terminator(chunk) {
+                TerminatorStatus::FoundAt(end) => return Some(consumed_before_chunk + end),
+                TerminatorStatus::NotFound => {
+                    detector.update(chunk);
+                    consumed_before_chunk += chunk.len();
+                }
+            }
+        }
+
+        None
+    }
+
+    fn streaming_terminator_end_for_all_partitions(data: &[u8]) {
+        let expected = terminator_end_oracle(data);
+        let partition_count = if data.is_empty() {
+            1
+        } else {
+            1_usize << (data.len() - 1)
+        };
+
+        for mask in 0..partition_count {
+            let mut chunks = Vec::new();
+            let mut start = 0;
+            for boundary in 1..data.len() {
+                if (mask & (1_usize << (boundary - 1))) != 0 {
+                    chunks.push(&data[start..boundary]);
+                    start = boundary;
+                }
+            }
+            chunks.push(&data[start..]);
+
+            assert_eq!(
+                streaming_terminator_end(&chunks),
+                expected,
+                "mask {mask:b} data {data:?}",
+            );
+        }
+    }
 
     #[test]
     fn response_line_end_requires_crlf() {
@@ -302,6 +390,9 @@ mod tests {
 
     #[test]
     fn terminator_status_reports_found_and_write_length() {
+        // RFC 3977 section 3.1.1 frames multiline data with a finite terminator.
+        // This status helper must report the exact writable prefix before that terminator:
+        // https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1
         assert!(TerminatorStatus::FoundAt(3).is_found());
         assert_eq!(TerminatorStatus::FoundAt(3).write_len(9), 3);
 
@@ -311,6 +402,9 @@ mod tests {
 
     #[test]
     fn detector_update_appends_until_full_then_rolls() {
+        // RFC 3977 section 3.1.1 allows CRLF "." CRLF to span reads, so the detector
+        // keeps the final four bytes needed to match the next byte of that sequence:
+        // https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1
         let mut detector = MultilineTerminatorDetector::default();
         detector.update(b"ab");
         assert_eq!(detector.as_slice(), b"ab");
@@ -378,6 +472,37 @@ mod tests {
         let mut detector = MultilineTerminatorDetector::default();
         detector.update(b"a\r\n.\r");
         assert_eq!(detector.find_spanning_terminator(b"\nx"), Some(1));
+
+        // RFC 3977 section 3.1.1 requires the first complete CRLF "." CRLF to win.
+        // When one terminator is completed by the first current byte and another starts
+        // immediately after it, the boundary completion must be preferred:
+        // https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1
+        let mut detector = MultilineTerminatorDetector::default();
+        detector.update(b"xx\r\n.\r");
+        assert_eq!(detector.find_spanning_terminator(b"\n.\r\n"), Some(1));
+        assert_eq!(detector.detect_terminator(b"\n.\r\n").write_len(99), 1);
+    }
+
+    #[test]
+    fn terminator_detection_handles_all_partitions_of_overlapping_sequences() {
+        // RFC 3977 section 3.1.1 requires the first complete CRLF "." CRLF to terminate
+        // a multiline block. These compact byte strings contain overlapping terminator
+        // starts, near misses, and immediate trailers; every possible read partition must
+        // produce the same earliest endpoint as the full-buffer oracle:
+        // https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1
+        for data in [
+            b"\r\n.\r\n".as_slice(),
+            b"x\r\n.\r\n".as_slice(),
+            b"xx\r\n.\r\n".as_slice(),
+            b"xx\r\n.\r\n.\r\n".as_slice(),
+            b"x\r\n.\r\nx".as_slice(),
+            b"x\r\n.\r\n.\r\nx".as_slice(),
+            b"x\n.\r\n\r\n.\r\n".as_slice(),
+            b"x\r\n.\n\r\n.\r\n".as_slice(),
+            b"x\r\n.\r\r\n.\r\n".as_slice(),
+        ] {
+            streaming_terminator_end_for_all_partitions(data);
+        }
     }
 
     #[test]
@@ -486,6 +611,169 @@ mod tests {
                     previous_prefix_len: 0,
                 },
                 "{input:?}"
+            );
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+
+        #[test]
+        fn response_line_end_matches_rfc_crlf_oracle(
+            prefix in vec(dangerous_wire_bytes(), 0..32),
+            suffix in vec(dangerous_wire_bytes(), 0..16),
+            add_crlf in any::<bool>(),
+        ) {
+            // RFC 3977 section 3.1 requires the response initial line to end with CRLF.
+            // The property compares the implementation against an independent oracle so
+            // bare LF, embedded CR, and incomplete final CR cannot be accepted accidentally:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-3.1
+            let mut input = prefix;
+            if add_crlf {
+                input.extend_from_slice(b"\r\n");
+            }
+            input.extend_from_slice(&suffix);
+
+            prop_assert_eq!(detect_response_line_end(&input), response_line_oracle(&input));
+        }
+
+        #[test]
+        fn non_empty_multiline_terminator_matches_rfc_oracle_for_every_split(
+            mut body in vec(dangerous_wire_bytes(), 0..48),
+            trailer in vec(dangerous_wire_bytes(), 0..16),
+        ) {
+            // RFC 3977 section 3.1.1 terminates non-empty multiline response data with
+            // the first exact CRLF "." CRLF sequence. This exercises every TCP read split
+            // for each generated byte stream and requires the streaming detector to stop
+            // at the same earliest terminator as the oracle:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1
+            remove_rfc_multiline_terminators(&mut body);
+            body.insert(0, b'x');
+            body.push(b'x');
+            body.extend_from_slice(crate::TERMINATOR);
+            body.extend_from_slice(&trailer);
+            let expected = terminator_end_oracle(&body);
+
+            for split in 0..=body.len() {
+                prop_assert_eq!(
+                    streaming_terminator_end(&[&body[..split], &body[split..]]),
+                    expected,
+                    "split {} body {:?}",
+                    split,
+                    body,
+                );
+            }
+        }
+
+        #[test]
+        fn multiline_terminator_rejects_near_misses_for_every_split(
+            prefix in vec(dangerous_wire_bytes(), 0..24),
+            suffix in vec(dangerous_wire_bytes(), 0..24),
+            near_miss in prop::sample::select(vec![
+                b"\n.\r\n".to_vec(),
+                b"\r.\r\n".to_vec(),
+                b"\r\n.\n".to_vec(),
+                b"\r\n.\r".to_vec(),
+                b".\r\n".to_vec(),
+                b".foo\r\n".to_vec(),
+                b"..\r\n".to_vec(),
+                b"body.\r\n".to_vec(),
+            ]),
+        ) {
+            // RFC 3977 section 3.1.1 names one terminator byte sequence: CRLF "." CRLF.
+            // These generated buffers contain tempting partial or dot-prefixed shapes, but
+            // must not be treated as terminators unless the exact sequence appears elsewhere:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1
+            let mut input = prefix;
+            input.extend_from_slice(&near_miss);
+            input.extend_from_slice(&suffix);
+            let expected = terminator_end_oracle(&input);
+
+            for split in 0..=input.len() {
+                prop_assert_eq!(
+                    streaming_terminator_end(&[&input[..split], &input[split..]]),
+                    expected,
+                    "split {} input {:?}",
+                    split,
+                    input,
+                );
+            }
+        }
+
+        #[test]
+        fn terminator_content_end_matches_non_empty_rfc_oracle(
+            prefix in vec(dangerous_wire_bytes(), 0..12),
+            mut content in vec(dangerous_wire_bytes(), 0..48),
+            trailer in vec(dangerous_wire_bytes(), 0..12),
+        ) {
+            // RFC 3977 section 3.1.1 excludes the terminator itself from multiline content.
+            // For a complete non-empty frame, content ends immediately after the CRLF before
+            // the dot line; the empty "." CRLF case remains a separate detector concern:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1
+            content.extend_from_slice(crate::TERMINATOR);
+            content.extend_from_slice(&trailer);
+            let mut input = prefix;
+            let start = input.len();
+            input.extend_from_slice(&content);
+
+            let expected = terminator_end_oracle(&input[start..]).map(|end| start + end - 3);
+            prop_assert_eq!(find_terminator_content_end(&input, start), expected);
+        }
+
+        #[test]
+        fn empty_multiline_terminator_matches_content_start_rfc_oracle(
+            suffix in vec(dangerous_wire_bytes(), 0..16),
+            split in 0_usize..=3,
+        ) {
+            // RFC 3977 section 3.1.1 allows an empty multiline response to be represented by
+            // "." CRLF immediately after the response initial line. The empty detector must
+            // accept every split of exactly that content-start sequence and consume no trailer:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1
+            let mut input = b".\r\n".to_vec();
+            input.extend_from_slice(&suffix);
+            let mut detector = EmptyMultilineTerminator::default();
+
+            let first = &input[..split];
+            let second = &input[split..];
+            if split == 3 {
+                prop_assert_eq!(detector.detect(first), EmptyTerminatorStatus::FoundAt(3));
+            } else {
+                if !first.is_empty() {
+                    prop_assert_eq!(detector.detect(first), EmptyTerminatorStatus::NeedMore);
+                }
+                prop_assert_eq!(
+                    detector.detect(second),
+                    EmptyTerminatorStatus::FoundAt(3 - split),
+                    "split {} input {:?}",
+                    split,
+                    input,
+                );
+            }
+        }
+
+        #[test]
+        fn empty_multiline_terminator_rejects_non_empty_dot_prefixed_content(
+            suffix in vec(dangerous_wire_bytes(), 0..16),
+            bad_start in prop::sample::select(vec![
+                b".\n".to_vec(),
+                b".\r ".to_vec(),
+                b".x".to_vec(),
+                b"..".to_vec(),
+                b".body\r\n".to_vec(),
+            ]),
+        ) {
+            // RFC 3977 section 3.1.1 gives "." CRLF special meaning only as the complete
+            // empty content-start terminator. Other dot-prefixed starts are data or malformed
+            // fragments and must not be accepted as complete empty responses:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1
+            let mut input = bad_start;
+            input.extend_from_slice(&suffix);
+
+            prop_assert_ne!(
+                EmptyMultilineTerminator::default().detect(&input),
+                EmptyTerminatorStatus::FoundAt(3),
+                "{:?}",
+                input,
             );
         }
     }
