@@ -155,7 +155,12 @@ const MAX_SERVER_PIPELINE_DEPTH: usize = 1024;
 const SERVER_READER_CAPACITY: usize = 256 * 1024;
 const CLIENT_READER_CAPACITY: usize = 256 * 1024;
 const DEFAULT_PENDING_WRITE_BYTES: usize = 800 * 1024;
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 const HIGH_THROUGHPUT_SOCKET_BUFFER: usize = 16 * 1024 * 1024;
+#[cfg(target_os = "macos")]
+const DEFAULT_SOCKET_BUFFER: usize = 1024 * 1024;
+#[cfg(not(target_os = "macos"))]
+const DEFAULT_SOCKET_BUFFER: usize = HIGH_THROUGHPUT_SOCKET_BUFFER;
 const PROCESS_CLOCK_TICK: Duration = Duration::from_millis(10);
 const TCP_LINGER_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(target_os = "linux")]
@@ -206,11 +211,11 @@ pub struct ServerArgs {
     pub nodelay: bool,
 
     /// Socket receive buffer size for accepted sockets. Use 0 to leave the OS default.
-    #[arg(long, default_value_t = HIGH_THROUGHPUT_SOCKET_BUFFER)]
+    #[arg(long, default_value_t = DEFAULT_SOCKET_BUFFER)]
     pub socket_recv_buffer: usize,
 
     /// Socket send buffer size for accepted sockets. Use 0 to leave the OS default.
-    #[arg(long, default_value_t = HIGH_THROUGHPUT_SOCKET_BUFFER)]
+    #[arg(long, default_value_t = DEFAULT_SOCKET_BUFFER)]
     pub socket_send_buffer: usize,
 
     /// Print benchmark statistics at this interval. Use 0 to disable periodic output.
@@ -443,11 +448,11 @@ pub struct ClientArgs {
     pub nodelay: bool,
 
     /// Socket receive buffer size in bytes. Use 0 to leave the OS default.
-    #[arg(long, default_value_t = HIGH_THROUGHPUT_SOCKET_BUFFER)]
+    #[arg(long, default_value_t = DEFAULT_SOCKET_BUFFER)]
     pub socket_recv_buffer: usize,
 
     /// Socket send buffer size in bytes. Use 0 to leave the OS default.
-    #[arg(long, default_value_t = HIGH_THROUGHPUT_SOCKET_BUFFER)]
+    #[arg(long, default_value_t = DEFAULT_SOCKET_BUFFER)]
     pub socket_send_buffer: usize,
 
     /// Print final machine-readable CSV: requests,bytes,elapsed_s,cpu_s,rss_kib.
@@ -549,11 +554,11 @@ pub struct TypedClientArgs {
     pub nodelay: bool,
 
     /// Socket receive buffer size in bytes. Use 0 to leave the OS default.
-    #[arg(long, default_value_t = HIGH_THROUGHPUT_SOCKET_BUFFER)]
+    #[arg(long, default_value_t = DEFAULT_SOCKET_BUFFER)]
     pub socket_recv_buffer: usize,
 
     /// Socket send buffer size in bytes. Use 0 to leave the OS default.
-    #[arg(long, default_value_t = HIGH_THROUGHPUT_SOCKET_BUFFER)]
+    #[arg(long, default_value_t = DEFAULT_SOCKET_BUFFER)]
     pub socket_send_buffer: usize,
 
     /// Print final machine-readable CSV: requests,bytes,elapsed_s,cpu_s,rss_kib.
