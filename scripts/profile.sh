@@ -3,13 +3,16 @@ set -e
 
 # CPU profiling for nntpbench
 #
-# Builds with frame pointers, runs under perf, generates flamegraph.
+# Builds with frame pointers, then uses the native CPU profiler:
+#   Linux: perf + inferno flamegraph
+#   macOS: sample text profile
 # The default target runs `nntpbench server`; pass server args after the target.
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR"
 
+PLATFORM="$(uname -s)"
 ATTACH_PID=""
 TARGET="server"
 EXTRA_ARGS=()
@@ -25,6 +28,10 @@ while [[ $# -gt 0 ]]; do
             echo "Options:"
             echo "  --pid PID   Attach to an already-running process instead of launching one"
             echo ""
+            echo "Environment:"
+            echo "  PROFILE_SECONDS       macOS sample duration, default 10"
+            echo "  SAMPLE_INTERVAL_MS    macOS sample interval, default 1"
+            echo ""
             echo "Arguments:"
             echo '  TARGET    server (default), nntpbench, or a custom path'
             echo "  ARGS...   Extra arguments passed to the binary"
@@ -35,7 +42,7 @@ while [[ $# -gt 0 ]]; do
             echo "  ./scripts/profile.sh nntpbench server --listen 127.0.0.1:1199"
             echo "  ./scripts/profile.sh --pid 12345"
             echo ""
-            echo "Stop nntpbench normally with Ctrl-C to generate flamegraph.svg"
+            echo "Linux writes flamegraph.svg. macOS writes sample.txt."
             exit 0
             ;;
         --pid)
@@ -82,51 +89,96 @@ case "$TARGET" in
         ;;
 esac
 
-# Check deps
-if ! command -v inferno-collapse-perf &> /dev/null; then
-    echo "Installing inferno..."
-    cargo install inferno
-fi
+build_profile_binary() {
+    if [ -z "$ATTACH_PID" ] && [ -n "$BIN_NAME" ]; then
+        echo "Building $BIN_NAME..."
+        RUSTFLAGS="-C target-cpu=native -C force-frame-pointers=yes" cargo build --profile profiling --bin "$BIN_NAME"
+    fi
+}
 
-# Fix perf permissions
-echo 0 | sudo tee /proc/sys/kernel/kptr_restrict > /dev/null
-echo -1 | sudo tee /proc/sys/kernel/perf_event_paranoid > /dev/null
+run_macos_sample() {
+    local pid="$1"
+    local output="${2:-sample.txt}"
+    local seconds="${PROFILE_SECONDS:-10}"
+    local interval_ms="${SAMPLE_INTERVAL_MS:-1}"
 
-# Set terminal title for tmux/terminal identification
-printf '\033]0;perf: nntpbench CPU\007'
+    if ! command -v sample &> /dev/null; then
+        echo "Error: macOS sample tool not found"
+        exit 1
+    fi
 
-# Build with native CPU + frame pointers (only the binary we need)
-if [ -z "$ATTACH_PID" ] && [ -n "$BIN_NAME" ]; then
-    echo "Building $BIN_NAME..."
-    RUSTFLAGS="-C target-cpu=native -C force-frame-pointers=yes" cargo build --profile profiling --bin "$BIN_NAME"
-fi
+    echo "Sampling PID $pid for ${seconds}s at ${interval_ms}ms intervals..."
+    sample "$pid" "$seconds" "$interval_ms" -mayDie -file "$output"
+    echo "Done: $output"
+}
 
-# Record using frame pointers
-set +e
-if [ -n "$ATTACH_PID" ]; then
-    echo "Attaching to PID $ATTACH_PID..."
-    echo "Press Ctrl-C to stop recording and generate flamegraph."
+case "$PLATFORM" in
+  Darwin)
+    printf '\033]0;sample: nntpbench CPU\007'
+    build_profile_binary
+
+    if [ -n "$ATTACH_PID" ]; then
+        run_macos_sample "$ATTACH_PID" sample.txt
+    else
+        echo "Profiling: $BINARY ${RUN_ARGS[*]} ${EXTRA_ARGS[*]}"
+        "$BINARY" "${RUN_ARGS[@]}" "${EXTRA_ARGS[@]}" &
+        APP_PID=$!
+        set +e
+        run_macos_sample "$APP_PID" sample.txt
+        SAMPLE_STATUS=$?
+        if kill -0 "$APP_PID" 2>/dev/null; then
+            kill -INT "$APP_PID" 2>/dev/null || true
+        fi
+        wait "$APP_PID" 2>/dev/null || true
+        set -e
+        exit "$SAMPLE_STATUS"
+    fi
+    ;;
+
+  Linux)
+    if ! command -v inferno-collapse-perf &> /dev/null; then
+        echo "Installing inferno..."
+        cargo install inferno
+    fi
+
+    echo 0 | sudo tee /proc/sys/kernel/kptr_restrict > /dev/null
+    echo -1 | sudo tee /proc/sys/kernel/perf_event_paranoid > /dev/null
+
+    printf '\033]0;perf: nntpbench CPU\007'
+    build_profile_binary
+
+    set +e
+    if [ -n "$ATTACH_PID" ]; then
+        echo "Attaching to PID $ATTACH_PID..."
+        echo "Press Ctrl-C to stop recording and generate flamegraph."
+        echo ""
+        perf record -g --call-graph fp -F 997 -p "$ATTACH_PID"
+    else
+        echo "Profiling: $BINARY ${RUN_ARGS[*]} ${EXTRA_ARGS[*]}"
+        echo "Stop nntpbench normally to generate flamegraph."
+        echo ""
+        perf record -g --call-graph fp -F 997 "$BINARY" "${RUN_ARGS[@]}" "${EXTRA_ARGS[@]}"
+    fi
+    set -e
+
     echo ""
-    perf record -g --call-graph fp -F 997 -p "$ATTACH_PID"
-else
-    echo "Profiling: $BINARY ${RUN_ARGS[*]} ${EXTRA_ARGS[*]}"
-    echo "Stop nntpbench normally to generate flamegraph."
+    echo "Generating flamegraph from perf.data..."
+
+    if [ ! -f perf.data ]; then
+        echo "Error: perf.data not found"
+        exit 1
+    fi
+
+    perf script 2>/dev/null | inferno-collapse-perf | inferno-flamegraph > flamegraph.svg
+
+    echo "Done: flamegraph.svg"
     echo ""
-    perf record -g --call-graph fp -F 997 "$BINARY" "${RUN_ARGS[@]}" "${EXTRA_ARGS[@]}"
-fi
-set -e
+    echo "Open with: firefox flamegraph.svg"
+    echo "Analyze with: ./scripts/parse_flamegraph flamegraph.svg summary"
+    ;;
 
-echo ""
-echo "Generating flamegraph from perf.data..."
-
-if [ ! -f perf.data ]; then
-    echo "Error: perf.data not found"
+  *)
+    echo "Error: unsupported platform: $PLATFORM"
     exit 1
-fi
-
-perf script 2>/dev/null | inferno-collapse-perf | inferno-flamegraph > flamegraph.svg
-
-echo "Done: flamegraph.svg"
-echo ""
-echo "Open with: firefox flamegraph.svg"
-echo "Analyze with: ./scripts/parse_flamegraph flamegraph.svg summary"
+    ;;
+esac
