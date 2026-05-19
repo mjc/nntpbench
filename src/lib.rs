@@ -17,7 +17,6 @@ use std::time::{Duration, Instant};
 
 use arrayvec::ArrayVec;
 use clap::{ArgAction, Parser, ValueEnum};
-use md5::{Digest, Md5};
 use socket2::{Domain, Protocol, SockRef, Socket, Type};
 use tokio::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
@@ -77,9 +76,18 @@ unsafe impl GlobalAlloc for CountingAllocator {
     }
 }
 
+mod article_store;
 pub mod protocol;
 pub mod terminator;
 pub mod typed_client;
+
+use article_store::{
+    ArticleDownloadTarget, ArticleStoreKey, download_target_label, open_article_response,
+    read_article_targets, request_for_download_target, verify_article_response_file,
+    write_article_response_file, write_failed_article_response_file,
+};
+#[cfg(test)]
+use article_store::{article_id_tree_path, message_id_tree_path};
 
 pub use protocol::{
     Article, ArticleNumber, ArticleParseError, ArticleRef, ArticleSelector, ArticleTransfer,
@@ -670,12 +678,6 @@ pub enum TypedRequestKind {
 #[derive(Debug)]
 struct SegmentSet {
     ids: Box<[MessageId<'static>]>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ArticleDownloadTarget {
-    Number(u64),
-    MessageId(MessageId<'static>),
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -1690,23 +1692,6 @@ async fn send_authinfo(
         .map_err(map_typed_client_error)
 }
 
-fn request_for_download_target(target: &ArticleDownloadTarget) -> io::Result<Request<'static>> {
-    match target {
-        ArticleDownloadTarget::Number(article_id) => Request::article_number(*article_id)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid article id")),
-        ArticleDownloadTarget::MessageId(message_id) => Ok(Request::Article {
-            article_ref: ArticleRef::MessageId(message_id.clone()),
-        }),
-    }
-}
-
-fn download_target_label(target: &ArticleDownloadTarget) -> String {
-    match target {
-        ArticleDownloadTarget::Number(article_id) => article_id.to_string(),
-        ArticleDownloadTarget::MessageId(message_id) => message_id.as_str().to_string(),
-    }
-}
-
 async fn authenticate_owned_connection(
     connection: &TypedClientConnection,
     auth_user: Option<AuthInfoValue<'static>>,
@@ -1758,32 +1743,6 @@ async fn authenticate_owned_connection(
     Ok(())
 }
 
-fn write_article_response_file(
-    root: &Path,
-    target: &ArticleDownloadTarget,
-    response: &[u8],
-) -> io::Result<()> {
-    let path = article_download_target_path(root, target);
-    write_article_response_file_at(&path, response)
-}
-
-fn write_failed_article_response_file(
-    root: &Path,
-    target: &ArticleDownloadTarget,
-    response: &[u8],
-) -> io::Result<PathBuf> {
-    let path = article_download_target_path(&root.join("failed"), target);
-    write_article_response_file_at(&path, response)?;
-    Ok(path)
-}
-
-fn write_article_response_file_at(path: &Path, response: &[u8]) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(path, response)
-}
-
 async fn join_article_disk_task(disk_tasks: &mut JoinSet<io::Result<()>>) -> io::Result<()> {
     match disk_tasks.join_next().await {
         Some(Ok(result)) => result,
@@ -1827,80 +1786,6 @@ fn handle_article_id_response(
             ),
         )),
     }
-}
-
-fn verify_article_response_file(
-    root: Option<&Path>,
-    target: &ArticleDownloadTarget,
-    response: &[u8],
-) -> io::Result<()> {
-    let Some(root) = root else {
-        return Ok(());
-    };
-    let path = article_download_target_path(root, target);
-    if !path.exists() {
-        return Ok(());
-    }
-
-    let expected = md5_file(&path)?;
-    let mut received_hasher = Md5::new();
-    received_hasher.update(response);
-    let received = received_hasher.finalize();
-    if expected.as_slice() == received.as_slice() {
-        return Ok(());
-    }
-
-    Err(io::Error::new(
-        io::ErrorKind::InvalidData,
-        format!(
-            "ARTICLE {} MD5 mismatch: expected {} from {}, received {}",
-            download_target_label(target),
-            hex_lower(expected.as_slice()),
-            path.display(),
-            hex_lower(received.as_slice())
-        ),
-    ))
-}
-
-fn md5_file(path: &Path) -> io::Result<md5::digest::Output<Md5>> {
-    let mut file = fs::File::open(path)?;
-    let mut hasher = Md5::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            return Ok(hasher.finalize());
-        }
-        hasher.update(&buffer[..read]);
-    }
-}
-
-fn article_download_target_path(root: &Path, target: &ArticleDownloadTarget) -> PathBuf {
-    match target {
-        ArticleDownloadTarget::Number(article_id) => article_id_tree_path(root, *article_id),
-        ArticleDownloadTarget::MessageId(message_id) => message_id_tree_path(root, message_id),
-    }
-}
-
-fn article_id_tree_path(root: &Path, article_id: u64) -> PathBuf {
-    root.join(format!("{:03}", article_id / 1_000_000))
-        .join(format!("{:03}", (article_id / 1_000) % 1_000))
-        .join(article_id.to_string())
-}
-
-fn message_id_tree_path(root: &Path, message_id: &MessageId<'_>) -> PathBuf {
-    let encoded = hex_lower(message_id.as_str().as_bytes());
-    root.join("msgid").join(&encoded[..2]).join(encoded)
-}
-
-fn hex_lower(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    out
 }
 
 fn transfer_limit_reached(stats: &Stats, transfer_bytes: u64) -> bool {
@@ -2055,52 +1940,6 @@ fn read_segments(path: &std::path::Path) -> io::Result<SegmentSet> {
     Ok(SegmentSet {
         ids: ids.into_boxed_slice(),
     })
-}
-
-fn read_article_targets(path: &Path) -> io::Result<Vec<ArticleDownloadTarget>> {
-    let contents = fs::read_to_string(path)?;
-    let mut targets = Vec::new();
-
-    for (line_index, line) in contents.lines().enumerate() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-
-        if line.bytes().all(|byte| byte.is_ascii_digit()) {
-            let id = line.parse::<u64>().map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("invalid article number on line {}", line_index + 1),
-                )
-            })?;
-            if id == 0 || id > crate::protocol::MAX_ARTICLE_NUMBER {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("article number out of RFC range on line {}", line_index + 1),
-                ));
-            }
-            targets.push(ArticleDownloadTarget::Number(id));
-            continue;
-        }
-
-        let id = MessageId::from_str_or_wrap(line).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("invalid article message-id on line {}", line_index + 1),
-            )
-        })?;
-        targets.push(ArticleDownloadTarget::MessageId(id));
-    }
-
-    if targets.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("no article selectors found in {}", path.display()),
-        ));
-    }
-
-    Ok(targets)
 }
 
 fn normalize_msgid(value: &str) -> Vec<u8> {
@@ -2399,27 +2238,15 @@ where
         RequestKind::Article => {
             session_stats.article_requests += 1;
             if config.article_dir.is_some() {
-                if let Some(article_id) = command.article_id
-                    && write_article_response_from_file(
-                        writer,
-                        pending_write,
-                        config,
-                        article_id,
-                        session_stats,
-                    )
-                    .await?
-                {
-                    return Ok(false);
-                }
-                if let Some(message_id) = command.message_id.as_ref()
-                    && write_article_message_id_response_from_file(
-                        writer,
-                        pending_write,
-                        config,
-                        message_id,
-                        session_stats,
-                    )
-                    .await?
+                if write_stored_article_response(
+                    writer,
+                    pending_write,
+                    config,
+                    command.article_id,
+                    command.message_id.as_ref(),
+                    session_stats,
+                )
+                .await?
                 {
                     return Ok(false);
                 }
@@ -2812,15 +2639,14 @@ where
         RequestKind::Article => {
             stats.article_requests.fetch_add(1, Ordering::Relaxed);
             if config.article_dir.is_some() {
-                if let Some(article_id) = parse_article_id_arg(request.args())
-                    && write_article_response_file_to(output, config, article_id, stats)
-                        .expect("response write failed")
-                {
-                    return false;
-                }
-                if let Some(message_id) = request.message_id()
-                    && write_article_message_id_response_file_to(output, config, &message_id, stats)
-                        .expect("response write failed")
+                if write_stored_article_response_to(
+                    output,
+                    config,
+                    parse_article_id_arg(request.args()),
+                    request.message_id().as_ref(),
+                    stats,
+                )
+                .expect("response write failed")
                 {
                     return false;
                 }
@@ -2964,49 +2790,38 @@ where
         .await
 }
 
-async fn write_article_response_from_file<W>(
-    writer: &mut W,
-    pending_write: &mut PendingWrite,
+fn open_stored_article_response(
     config: &ServerConfig,
-    article_id: u64,
-    session_stats: &mut SessionStats,
-) -> io::Result<bool>
-where
-    W: AsyncWrite + Unpin,
-{
+    article_id: Option<u64>,
+    message_id: Option<&MessageId<'_>>,
+) -> io::Result<Option<fs::File>> {
     let Some(root) = config.article_dir.as_ref() else {
-        return Ok(false);
+        return Ok(None);
     };
-    let path = article_id_tree_path(root, article_id);
-    let file = match fs::File::open(path) {
-        Ok(file) => file,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(err) => return Err(err),
-    };
-
-    pending_write.flush(writer).await?;
-    write_file_response_to_async(writer, file, session_stats).await?;
-    Ok(true)
+    if let Some(article_id) = article_id
+        && let Some(file) = open_article_response(root, ArticleStoreKey::Number(article_id))?
+    {
+        return Ok(Some(file));
+    }
+    if let Some(message_id) = message_id {
+        return open_article_response(root, ArticleStoreKey::MessageId(message_id));
+    }
+    Ok(None)
 }
 
-async fn write_article_message_id_response_from_file<W>(
+async fn write_stored_article_response<W>(
     writer: &mut W,
     pending_write: &mut PendingWrite,
     config: &ServerConfig,
-    message_id: &MessageId<'_>,
+    article_id: Option<u64>,
+    message_id: Option<&MessageId<'_>>,
     session_stats: &mut SessionStats,
 ) -> io::Result<bool>
 where
     W: AsyncWrite + Unpin,
 {
-    let Some(root) = config.article_dir.as_ref() else {
+    let Some(file) = open_stored_article_response(config, article_id, message_id)? else {
         return Ok(false);
-    };
-    let path = message_id_tree_path(root, message_id);
-    let file = match fs::File::open(path) {
-        Ok(file) => file,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(err) => return Err(err),
     };
 
     pending_write.flush(writer).await?;
@@ -3064,45 +2879,18 @@ where
     Ok(())
 }
 
-fn write_article_response_file_to<W>(
+fn write_stored_article_response_to<W>(
     output: &mut W,
     config: &ServerConfig,
-    article_id: u64,
+    article_id: Option<u64>,
+    message_id: Option<&MessageId<'_>>,
     stats: &Stats,
 ) -> io::Result<bool>
 where
     W: Write,
 {
-    let Some(root) = config.article_dir.as_ref() else {
+    let Some(file) = open_stored_article_response(config, article_id, message_id)? else {
         return Ok(false);
-    };
-    let path = article_id_tree_path(root, article_id);
-    let file = match fs::File::open(path) {
-        Ok(file) => file,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(err) => return Err(err),
-    };
-    write_file_response_to(output, file, stats)?;
-    Ok(true)
-}
-
-fn write_article_message_id_response_file_to<W>(
-    output: &mut W,
-    config: &ServerConfig,
-    message_id: &MessageId<'_>,
-    stats: &Stats,
-) -> io::Result<bool>
-where
-    W: Write,
-{
-    let Some(root) = config.article_dir.as_ref() else {
-        return Ok(false);
-    };
-    let path = message_id_tree_path(root, message_id);
-    let file = match fs::File::open(path) {
-        Ok(file) => file,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(err) => return Err(err),
     };
     write_file_response_to(output, file, stats)?;
     Ok(true)
