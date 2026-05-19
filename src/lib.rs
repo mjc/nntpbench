@@ -1423,57 +1423,39 @@ impl ArticleIdDownloadSession {
         .map_err(map_typed_client_error)?;
         authenticate_owned_connection(&connection, self.auth_user, self.auth_pass).await?;
 
-        for index in (self.client_index..self.article_targets.len()).step_by(self.total_clients) {
-            if stop.load(Ordering::Acquire) {
-                break;
+        let mut pending = VecDeque::with_capacity(self.pipeline_depth);
+        let mut next_index = self.client_index;
+
+        loop {
+            while !stop.load(Ordering::Acquire)
+                && pending.len() < self.pipeline_depth
+                && next_index < self.article_targets.len()
+            {
+                let target = &self.article_targets[next_index];
+                let pending_response = connection
+                    .queue_request(request_for_download_target(target)?)
+                    .await
+                    .map_err(map_typed_client_error)?;
+                pending.push_back((next_index, pending_response));
+                next_index = next_index.saturating_add(self.total_clients);
             }
 
+            let Some((index, pending_response)) = pending.pop_front() else {
+                break;
+            };
             let target = &self.article_targets[index];
-            let response = connection
-                .execute(request_for_download_target(target)?)
+            let response = pending_response
+                .receive()
                 .await
                 .map_err(map_typed_client_error)?;
 
-            stats.commands.fetch_add(1, Ordering::Relaxed);
-            stats.article_requests.fetch_add(1, Ordering::Relaxed);
-            stats
-                .bytes_sent
-                .fetch_add(response.as_bytes().len() as u64, Ordering::Relaxed);
-
-            match response.status().as_u16() {
-                220 => {
-                    if let Err(err) = verify_article_response_file(
-                        self.verify_dir.as_deref().map(PathBuf::as_path),
-                        target,
-                        response.as_bytes(),
-                    ) {
-                        if err.kind() == io::ErrorKind::InvalidData {
-                            let failed_path = write_failed_article_response_file(
-                                &self.output_dir,
-                                target,
-                                response.as_bytes(),
-                            )?;
-                            eprintln!(
-                                "ARTICLE {} verification failed; saved received response to {}",
-                                download_target_label(target),
-                                failed_path.display()
-                            );
-                        }
-                        return Err(err);
-                    }
-                    write_article_response_file(&self.output_dir, target, response.as_bytes())?;
-                }
-                430 => {}
-                status => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "ARTICLE {} returned unexpected status {status}",
-                            download_target_label(target)
-                        ),
-                    ));
-                }
-            }
+            handle_article_id_response(
+                target,
+                response,
+                &self.output_dir,
+                self.verify_dir.as_deref().map(PathBuf::as_path),
+                stats,
+            )?;
         }
 
         Ok(())
@@ -1781,6 +1763,50 @@ fn write_article_response_file_at(path: &Path, response: &[u8]) -> io::Result<()
         fs::create_dir_all(parent)?;
     }
     fs::write(path, response)
+}
+
+fn handle_article_id_response(
+    target: &ArticleDownloadTarget,
+    response: OwnedResponse,
+    output_dir: &Path,
+    verify_dir: Option<&Path>,
+    stats: &Stats,
+) -> io::Result<()> {
+    stats.commands.fetch_add(1, Ordering::Relaxed);
+    stats.article_requests.fetch_add(1, Ordering::Relaxed);
+    stats
+        .bytes_sent
+        .fetch_add(response.as_bytes().len() as u64, Ordering::Relaxed);
+
+    match response.status().as_u16() {
+        220 => {
+            if let Err(err) = verify_article_response_file(verify_dir, target, response.as_bytes())
+            {
+                if err.kind() == io::ErrorKind::InvalidData {
+                    let failed_path = write_failed_article_response_file(
+                        output_dir,
+                        target,
+                        response.as_bytes(),
+                    )?;
+                    eprintln!(
+                        "ARTICLE {} verification failed; saved received response to {}",
+                        download_target_label(target),
+                        failed_path.display()
+                    );
+                }
+                return Err(err);
+            }
+            write_article_response_file(output_dir, target, response.as_bytes())
+        }
+        430 => Ok(()),
+        status => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "ARTICLE {} returned unexpected status {status}",
+                download_target_label(target)
+            ),
+        )),
+    }
 }
 
 fn verify_article_response_file(
@@ -5038,21 +5064,13 @@ mod tests {
 
             let mut scratch = [0_u8; 128];
             let mut pending = Vec::new();
-            while pending.iter().filter(|byte| **byte == b'\n').count() < 1 {
+            while pending.iter().filter(|byte| **byte == b'\n').count() < 2 {
                 let read = stream.read(&mut scratch).await.unwrap();
                 assert_ne!(read, 0);
                 pending.extend_from_slice(&scratch[..read]);
             }
-            assert_eq!(&pending[..], b"ARTICLE 1\r\n");
-            pending.clear();
+            assert_eq!(&pending[..], b"ARTICLE 1\r\nARTICLE 2\r\n");
             stream.write_all(response).await.unwrap();
-
-            while pending.iter().filter(|byte| **byte == b'\n').count() < 1 {
-                let read = stream.read(&mut scratch).await.unwrap();
-                assert_ne!(read, 0);
-                pending.extend_from_slice(&scratch[..read]);
-            }
-            assert_eq!(&pending[..], b"ARTICLE 2\r\n");
             stream.write_all(ARTICLE_NOT_FOUND_RESPONSE).await.unwrap();
         });
 
@@ -5068,6 +5086,7 @@ mod tests {
         args.article_output_dir = Some(output_dir.clone());
         args.article_verify_dir = Some(verify_dir.clone());
         args.connections = 1;
+        args.pipeline_depth = 2;
         args.stats_interval_secs = 0;
 
         run_client(args).await.unwrap();
