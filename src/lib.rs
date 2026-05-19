@@ -82,12 +82,14 @@ pub mod terminator;
 pub mod typed_client;
 
 use article_store::{
-    ArticleDownloadTarget, ArticleStoreKey, download_target_label, open_article_response,
-    read_article_targets, request_for_download_target, verify_article_response_file,
-    write_article_response_file, write_failed_article_response_file,
+    ArticleDownloadTarget, ArticleStoreKey, article_ref_for_download_target, download_target_label,
+    open_article_response, read_article_targets, verify_article_response_file_into,
+    write_article_response_file_into, write_failed_article_response_file_into,
 };
 #[cfg(test)]
-use article_store::{article_id_tree_path, message_id_tree_path};
+use article_store::{
+    article_download_target_path_into, article_id_tree_path, message_id_tree_path,
+};
 
 pub use protocol::{
     Article, ArticleNumber, ArticleParseError, ArticleRef, ArticleSelector, ArticleTransfer,
@@ -1434,6 +1436,8 @@ impl ArticleIdDownloadSession {
         .await?;
 
         let mut pending = VecDeque::with_capacity(self.pipeline_depth);
+        let mut output_path = PathBuf::with_capacity(1024);
+        let mut verify_path = PathBuf::with_capacity(1024);
         let mut next_index = self.client_index;
 
         loop {
@@ -1442,10 +1446,9 @@ impl ArticleIdDownloadSession {
                 && next_index < self.article_targets.len()
             {
                 let target = &self.article_targets[next_index];
-                let request = request_for_download_target(target)?;
-                let kind = request.kind();
-                crate::typed_client::write_request_wire(&mut stream, &request).await?;
-                pending.push_back((next_index, kind));
+                let article_ref = article_ref_for_download_target(target)?;
+                crate::typed_client::write_article_request_wire(&mut stream, &article_ref).await?;
+                pending.push_back((next_index, RequestKind::Article));
                 next_index = next_index.saturating_add(self.total_clients);
             }
 
@@ -1470,6 +1473,8 @@ impl ArticleIdDownloadSession {
                 response.as_bytes(),
                 &self.output_dir,
                 self.verify_dir.as_deref().map(PathBuf::as_path),
+                &mut output_path,
+                &mut verify_path,
             )?;
         }
 
@@ -1732,22 +1737,30 @@ fn handle_article_id_response(
     response: &[u8],
     output_dir: &Path,
     verify_dir: Option<&Path>,
+    output_path: &mut PathBuf,
+    verify_path: &mut PathBuf,
 ) -> io::Result<()> {
     match status.as_u16() {
         220 => {
-            if let Err(err) = verify_article_response_file(verify_dir, target, response) {
+            if let Err(err) =
+                verify_article_response_file_into(verify_dir, target, response, verify_path)
+            {
                 if err.kind() == io::ErrorKind::InvalidData {
-                    let failed_path =
-                        write_failed_article_response_file(output_dir, target, response)?;
+                    write_failed_article_response_file_into(
+                        output_dir,
+                        target,
+                        response,
+                        output_path,
+                    )?;
                     eprintln!(
                         "ARTICLE {} verification failed; saved received response to {}",
                         download_target_label(target),
-                        failed_path.display()
+                        output_path.display()
                     );
                 }
                 return Err(err);
             }
-            write_article_response_file(output_dir, target, response)
+            write_article_response_file_into(output_dir, target, response, output_path)
         }
         430 => Ok(()),
         status => Err(io::Error::new(
@@ -7413,6 +7426,16 @@ mod tests {
             ids: vec![MessageId::from_shared(Arc::<str>::from("<segment@test>")).unwrap()]
                 .into_boxed_slice(),
         };
+        let article_target = ArticleDownloadTarget::MessageId(
+            MessageId::from_shared(Arc::<str>::from("<article-path@test>")).unwrap(),
+        );
+        let mut article_path = PathBuf::with_capacity(2048);
+        article_download_target_path_into(
+            &mut article_path,
+            Path::new("/tmp/nntpbench-hot-path"),
+            &article_target,
+        )
+        .unwrap();
 
         assert_no_allocations(
             "request parse, scan, serialize, and generated response",
@@ -7445,6 +7468,18 @@ mod tests {
                     segment_request.message_id().map(MessageId::as_str),
                     Some("<segment@test>")
                 );
+
+                let article_ref = article_ref_for_download_target(&article_target).unwrap();
+                assert_eq!(
+                    article_ref.message_id().map(MessageId::as_str),
+                    Some("<article-path@test>")
+                );
+                article_download_target_path_into(
+                    &mut article_path,
+                    Path::new("/tmp/nntpbench-hot-path"),
+                    &article_target,
+                )
+                .unwrap();
 
                 output.clear();
                 assert!(!process_request_to_buffer(

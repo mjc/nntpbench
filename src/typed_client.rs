@@ -2597,6 +2597,16 @@ where
     }
 }
 
+pub(crate) async fn write_article_request_wire<W>(
+    writer: &mut W,
+    article_ref: &ArticleRef<'_>,
+) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    write_article_ref_request_wire(writer, b"ARTICLE", article_ref).await
+}
+
 #[doc(hidden)]
 pub async fn bench_write_request_wire_to_sink(request: &Request<'static>) -> io::Result<()> {
     let mut writer = tokio::io::sink();
