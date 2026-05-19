@@ -27,14 +27,12 @@ use tokio::task::JoinSet;
 use tokio::time;
 
 use crate::terminator::{
-    BoundedResponseLineStatus, DOT_TERMINATOR, ResponseLineStatus,
+    BoundedResponseLineStatus, DOT_TERMINATOR, ResponseLineStatus, append_dot_terminator,
     detect_bounded_response_line_end, detect_response_line_end_from, find_crlf_line_end,
     find_dot_terminated_block_end, strip_complete_crlf_line,
 };
 #[cfg(test)]
-use crate::terminator::{
-    append_dot_terminator, strip_dot_terminator_suffix, target_before_dot_terminator,
-};
+use crate::terminator::{strip_dot_terminator_suffix, target_before_dot_terminator};
 
 #[cfg(test)]
 #[global_allocator]
@@ -637,11 +635,11 @@ pub struct TypedFetchArgs {
     pub nodelay: bool,
 
     /// Socket receive buffer size in bytes. Use 0 to leave the OS default.
-    #[arg(long, default_value_t = HIGH_THROUGHPUT_SOCKET_BUFFER)]
+    #[arg(long, default_value_t = DEFAULT_SOCKET_BUFFER)]
     pub socket_recv_buffer: usize,
 
     /// Socket send buffer size in bytes. Use 0 to leave the OS default.
-    #[arg(long, default_value_t = HIGH_THROUGHPUT_SOCKET_BUFFER)]
+    #[arg(long, default_value_t = DEFAULT_SOCKET_BUFFER)]
     pub socket_send_buffer: usize,
 }
 
@@ -2406,11 +2404,10 @@ where
                 .await?;
                 return Ok(false);
             }
-            write_generated_response(
+            write_response(
                 writer,
                 pending_write,
-                ARTICLE_RESPONSE_PREFIX,
-                config.article_bytes,
+                config.article_response(),
                 session_stats,
             )
             .await?;
@@ -2428,14 +2425,7 @@ where
         }
         RequestKind::Body => {
             session_stats.body_requests += 1;
-            write_generated_response(
-                writer,
-                pending_write,
-                BODY_RESPONSE_PREFIX,
-                config.body_bytes,
-                session_stats,
-            )
-            .await?;
+            write_response(writer, pending_write, config.body_response(), session_stats).await?;
             Ok(false)
         }
         RequestKind::List => {
@@ -2618,28 +2608,46 @@ impl<'a> GeneratedResponse<'a> {
             target_bytes,
         }
     }
+}
 
-    async fn write_to<W>(
-        self,
-        writer: &mut W,
-        pending_write: &mut PendingWrite,
-        session_stats: &mut SessionStats,
-    ) -> io::Result<()>
-    where
-        W: AsyncWrite + Unpin,
-    {
-        let mut written = 0;
-        write_response(writer, pending_write, self.prefix, session_stats).await?;
-        written += self.prefix.len();
+fn build_generated_response(prefix: &[u8], target_bytes: usize) -> Box<[u8]> {
+    let response = GeneratedResponse::new(prefix, target_bytes);
+    let mut buffer = Vec::with_capacity(response.total_len());
+    buffer.extend_from_slice(response.prefix);
 
-        if written < self.target_bytes {
-            let payload_bytes = pending_write
-                .push_repeated(writer, BODY_LINE, self.target_bytes - written)
-                .await?;
-            session_stats.bytes_sent += payload_bytes as u64;
-        }
+    if response.prefix.len() < response.target_bytes {
+        append_repeated_payload_at_least(
+            &mut buffer,
+            BODY_LINE,
+            response.target_bytes - response.prefix.len(),
+        );
+    }
 
-        write_response(writer, pending_write, DOT_TERMINATOR, session_stats).await
+    append_dot_terminator(&mut buffer);
+    buffer.into_boxed_slice()
+}
+
+fn append_repeated_payload_at_least(buffer: &mut Vec<u8>, line: &[u8], min_bytes: usize) {
+    if line.is_empty() {
+        return;
+    }
+
+    let copies = min_bytes.div_ceil(line.len());
+    buffer.reserve(copies * line.len());
+    for _ in 0..copies {
+        buffer.extend_from_slice(line);
+    }
+}
+
+impl GeneratedResponse<'_> {
+    fn total_len(&self) -> usize {
+        let payload_bytes = if self.prefix.len() < self.target_bytes {
+            let missing = self.target_bytes - self.prefix.len();
+            missing.div_ceil(BODY_LINE.len()) * BODY_LINE.len()
+        } else {
+            0
+        };
+        self.prefix.len() + payload_bytes + DOT_TERMINATOR.len()
     }
 }
 
@@ -2669,57 +2677,6 @@ impl PendingWrite {
         self.buf[self.len..end].copy_from_slice(response);
         self.len = end;
         Ok(())
-    }
-
-    async fn push_repeated<W>(
-        &mut self,
-        writer: &mut W,
-        response: &[u8],
-        min_bytes: usize,
-    ) -> io::Result<usize>
-    where
-        W: AsyncWrite + Unpin,
-    {
-        if response.is_empty() {
-            return Ok(0);
-        }
-
-        let mut remaining = min_bytes.div_ceil(response.len());
-        while remaining > 0 {
-            if response.len() > self.buf.len() {
-                self.write_with_response(writer, response).await?;
-                remaining -= 1;
-                continue;
-            }
-
-            if self.len + response.len() > self.buf.len() {
-                self.flush(writer).await?;
-            }
-
-            let available = self.buf.len() - self.len;
-            let copies = remaining.min(available / response.len());
-            if copies == 0 {
-                self.flush(writer).await?;
-                continue;
-            }
-
-            let start = self.len;
-            let bytes = copies * response.len();
-            self.buf[start..start + response.len()].copy_from_slice(response);
-
-            let mut filled = response.len();
-            while filled < bytes {
-                let copy_len = filled.min(bytes - filled);
-                self.buf
-                    .copy_within(start..start + copy_len, start + filled);
-                filled += copy_len;
-            }
-
-            self.len += bytes;
-            remaining -= copies;
-        }
-
-        Ok(min_bytes.div_ceil(response.len()) * response.len())
     }
 
     async fn write_with_response<W>(&mut self, writer: &mut W, response: &[u8]) -> io::Result<()>
@@ -2805,13 +2762,12 @@ where
                     .expect("response write failed");
                 return false;
             }
-            write_generated_response_to(
-                output,
-                ARTICLE_RESPONSE_PREFIX,
-                config.article_bytes,
-                stats,
-            )
-            .expect("response write failed");
+            stats
+                .bytes_sent
+                .fetch_add(config.article_response().len() as u64, Ordering::Relaxed);
+            output
+                .write_all(config.article_response())
+                .expect("response write failed");
             return false;
         }
         RequestKind::Head => {
@@ -2824,7 +2780,11 @@ where
         }
         RequestKind::Body => {
             stats.body_requests.fetch_add(1, Ordering::Relaxed);
-            write_generated_response_to(output, BODY_RESPONSE_PREFIX, config.body_bytes, stats)
+            stats
+                .bytes_sent
+                .fetch_add(config.body_response().len() as u64, Ordering::Relaxed);
+            output
+                .write_all(config.body_response())
                 .expect("response write failed");
             return false;
         }
@@ -2921,22 +2881,6 @@ where
     pending_write.write_with_response(writer, response).await
 }
 
-#[cfg_attr(coverage_nightly, coverage(off))]
-async fn write_generated_response<W>(
-    writer: &mut W,
-    pending_write: &mut PendingWrite,
-    prefix: &[u8],
-    target_bytes: usize,
-    session_stats: &mut SessionStats,
-) -> io::Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
-    GeneratedResponse::new(prefix, target_bytes)
-        .write_to(writer, pending_write, session_stats)
-        .await
-}
-
 fn open_stored_article_response(
     config: &ServerConfig,
     article_id: Option<u64>,
@@ -3001,37 +2945,6 @@ where
         writer.write_all(&buffer[..read]).await?;
         session_stats.bytes_sent += read as u64;
     }
-}
-
-fn write_generated_response_to<W>(
-    output: &mut W,
-    prefix: &[u8],
-    target_bytes: usize,
-    stats: &Stats,
-) -> io::Result<()>
-where
-    W: Write,
-{
-    let mut written = 0;
-    output.write_all(prefix)?;
-    written += prefix.len();
-    stats
-        .bytes_sent
-        .fetch_add(prefix.len() as u64, Ordering::Relaxed);
-
-    while written < target_bytes {
-        output.write_all(BODY_LINE)?;
-        written += BODY_LINE.len();
-        stats
-            .bytes_sent
-            .fetch_add(BODY_LINE.len() as u64, Ordering::Relaxed);
-    }
-
-    output.write_all(DOT_TERMINATOR)?;
-    stats
-        .bytes_sent
-        .fetch_add(DOT_TERMINATOR.len() as u64, Ordering::Relaxed);
-    Ok(())
 }
 
 fn write_stored_article_response_to<W>(
@@ -3108,6 +3021,8 @@ where
 pub struct ServerConfig {
     pub body_bytes: usize,
     pub article_bytes: usize,
+    body_response: Box<[u8]>,
+    article_response: Box<[u8]>,
     pub article_dir: Option<Arc<PathBuf>>,
     pub max_connections: usize,
     pub max_pipeline_depth: usize,
@@ -3121,9 +3036,14 @@ pub struct ServerConfig {
 
 impl ServerConfig {
     pub fn from_args(args: ServerArgs) -> Self {
+        let body_response = build_generated_response(BODY_RESPONSE_PREFIX, args.body_bytes);
+        let article_response =
+            build_generated_response(ARTICLE_RESPONSE_PREFIX, args.article_bytes);
         Self {
             body_bytes: args.body_bytes,
             article_bytes: args.article_bytes,
+            body_response,
+            article_response,
             article_dir: args.article_dir.map(Arc::new),
             max_connections: args.max_connections,
             max_pipeline_depth: args.max_pipeline_depth.clamp(1, 1024),
@@ -3142,6 +3062,14 @@ impl ServerConfig {
 
     pub fn stat_response(&self) -> &[u8] {
         STAT_RESPONSE
+    }
+
+    pub fn body_response(&self) -> &[u8] {
+        &self.body_response
+    }
+
+    pub fn article_response(&self) -> &[u8] {
+        &self.article_response
     }
 }
 
@@ -4049,19 +3977,6 @@ mod tests {
             writer.bytes,
             [DATE_RESPONSE, b"220 large response\r\nbody\r\n.\r\n"].concat()
         );
-    }
-
-    #[tokio::test]
-    async fn pending_write_repeats_chunks_without_oversized_stack_buffers() {
-        let mut sink = tokio::io::sink();
-        let mut pending = PendingWrite::new(128);
-        let written = pending
-            .push_repeated(&mut sink, b"abcd", 130)
-            .await
-            .unwrap();
-
-        assert_eq!(written, 132);
-        assert_eq!(pending.len, 4);
     }
 
     #[tokio::test]
