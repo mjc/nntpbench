@@ -8,7 +8,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -863,19 +863,14 @@ impl TypedClientConnection {
             options.socket_send_buffer,
         )
         .await?;
-        let mut read_buffer = vec![
-            0;
-            options
-                .read_buffer_bytes
-                .max(crate::terminator::TERMINATOR_TAIL_SIZE)
-        ]
-        .into_boxed_slice();
-        crate::read_greeting(&mut stream, &mut read_buffer).await?;
+        crate::read_greeting(&mut stream).await?;
         let (reader, writer) = stream.into_split();
         let (request_tx, request_rx) = mpsc::channel(options.pipeline_depth.max(1));
         let (inflight_tx, inflight_rx) = mpsc::channel(options.pipeline_depth.max(1));
         let poisoned = Arc::new(Mutex::new(None));
-        let read_chunk_bytes = read_buffer.len();
+        let read_chunk_bytes = options
+            .read_buffer_bytes
+            .max(crate::terminator::TERMINATOR_TAIL_SIZE);
 
         let writer_task = tokio::spawn(run_writer_task(
             writer,
@@ -1748,6 +1743,8 @@ struct ConnectionHandle {
 pub struct OwnedResponse {
     kind: RequestKind,
     status: StatusCode,
+    content_start: usize,
+    content_end: usize,
     bytes: Bytes,
 }
 
@@ -1770,9 +1767,15 @@ impl OwnedResponse {
         &self.bytes
     }
 
+    /// Borrowed response payload bytes, excluding the initial line and any dot terminator.
+    #[must_use]
+    pub fn content(&self) -> &[u8] {
+        &self.bytes[self.content_start..self.content_end]
+    }
+
     /// Parse the response as an ARTICLE/HEAD/BODY/STAT article-style frame.
     pub fn parse_article(&self) -> Result<Article<'_>, ArticleParseError> {
-        Article::parse(&self.bytes)
+        Article::parse_framed(&self.bytes, self.content_start, self.content_end)
     }
 }
 
@@ -2044,6 +2047,8 @@ impl ResponseDecoder {
             ResponseFrameParse::Complete(response) => Ok(DecodeProgress::Complete {
                 status: response.status(),
                 consumed: response.consumed(),
+                content_start: response.content_start(),
+                content_end: response.content_end(),
             }),
             ResponseFrameParse::NeedMore => Ok(DecodeProgress::NeedMore),
             ResponseFrameParse::Invalid => Err(TypedClientError::InvalidStatusLine),
@@ -2054,7 +2059,12 @@ impl ResponseDecoder {
 #[derive(Debug)]
 enum DecodeProgress {
     NeedMore,
-    Complete { status: StatusCode, consumed: usize },
+    Complete {
+        status: StatusCode,
+        consumed: usize,
+        content_start: usize,
+        content_end: usize,
+    },
 }
 
 #[derive(Debug)]
@@ -2212,7 +2222,9 @@ pub fn bench_streaming_decode_response(
 ) -> Result<(StatusCode, usize), TypedClientError> {
     let mut decoder = StreamingResponseDecoder::new(kind);
     match decoder.push(response)? {
-        StreamingDecodeProgress::Complete { status, consumed } => Ok((status, consumed)),
+        StreamingDecodeProgress::Complete {
+            status, consumed, ..
+        } => Ok((status, consumed)),
         StreamingDecodeProgress::NeedMore { .. } => Err(TypedClientError::UnexpectedEof),
     }
 }
@@ -2316,7 +2328,7 @@ impl<'a> DrainedResponseFrame<'a> {
 }
 
 pub(crate) struct DrainedResponseReader {
-    pending_read: Box<[u8; DRAINED_PENDING_READ_BYTES]>,
+    pending_read: Vec<u8>,
     pending_len: usize,
     pending_start: usize,
     read_chunk_bytes: usize,
@@ -2325,10 +2337,10 @@ pub(crate) struct DrainedResponseReader {
 impl DrainedResponseReader {
     pub(crate) fn new(read_chunk_bytes: usize) -> Self {
         Self {
-            pending_read: Box::new([0; DRAINED_PENDING_READ_BYTES]),
+            pending_read: Vec::with_capacity(DRAINED_PENDING_READ_BYTES),
             pending_len: 0,
             pending_start: 0,
-            read_chunk_bytes: read_chunk_bytes.min(DRAINED_PENDING_READ_BYTES),
+            read_chunk_bytes: read_chunk_bytes.clamp(1, DRAINED_PENDING_READ_BYTES),
         }
     }
 
@@ -2340,6 +2352,10 @@ impl DrainedResponseReader {
     where
         R: AsyncRead + Unpin,
     {
+        if self.pending_len == 0 {
+            self.pending_start = 0;
+            self.pending_read.clear();
+        }
         let mut decoder = StreamingResponseDecoder::new(kind);
         let mut bytes_len = 0usize;
 
@@ -2352,14 +2368,18 @@ impl DrainedResponseReader {
                         if self.pending_start == self.pending_len {
                             self.pending_len = 0;
                             self.pending_start = 0;
+                            self.pending_read.clear();
                         }
                     }
-                    Ok(StreamingDecodeProgress::Complete { status, consumed }) => {
+                    Ok(StreamingDecodeProgress::Complete {
+                        status, consumed, ..
+                    }) => {
                         bytes_len += consumed;
                         self.pending_start += consumed;
                         if self.pending_start == self.pending_len {
                             self.pending_len = 0;
                             self.pending_start = 0;
+                            self.pending_read.clear();
                         }
 
                         return Ok(DrainedResponse { status, bytes_len });
@@ -2368,24 +2388,24 @@ impl DrainedResponseReader {
                 }
             }
 
-            if self.pending_len == self.pending_read.len() {
+            if self.pending_len == self.pending_read.capacity() {
                 compact_drained_pending_read(
                     &mut self.pending_read,
                     &mut self.pending_start,
                     &mut self.pending_len,
                 );
-                if self.pending_len == self.pending_read.len() {
+                if self.pending_len == self.pending_read.capacity() {
                     return Err(TypedClientError::InvalidStatusLine);
                 }
             }
 
-            let read_len = self
-                .read_chunk_bytes
-                .min(self.pending_read.len() - self.pending_len);
-            let read = reader
-                .read(&mut self.pending_read[self.pending_len..self.pending_len + read_len])
-                .await
-                .map_err(TypedClientError::Io)?;
+            let read = read_into_pending(
+                reader,
+                &mut self.pending_read,
+                self.pending_len,
+                self.read_chunk_bytes,
+            )
+            .await?;
 
             if read == 0 {
                 return Err(TypedClientError::UnexpectedEof);
@@ -2403,6 +2423,10 @@ impl DrainedResponseReader {
     where
         R: AsyncRead + Unpin,
     {
+        if self.pending_len == 0 {
+            self.pending_start = 0;
+            self.pending_read.clear();
+        }
         let mut frame_start = self.pending_start;
 
         loop {
@@ -2411,7 +2435,9 @@ impl DrainedResponseReader {
                     .push(&self.pending_read[frame_start..self.pending_len])
                 {
                     Ok(DecodeProgress::NeedMore) => {}
-                    Ok(DecodeProgress::Complete { status, consumed }) => {
+                    Ok(DecodeProgress::Complete {
+                        status, consumed, ..
+                    }) => {
                         let frame_end = frame_start + consumed;
                         self.pending_start = frame_end;
                         if self.pending_start == self.pending_len {
@@ -2427,25 +2453,26 @@ impl DrainedResponseReader {
                 }
             }
 
-            if self.pending_len == self.pending_read.len() {
+            if self.pending_len == self.pending_read.capacity() {
                 if frame_start == 0 {
                     return Err(TypedClientError::InvalidStatusLine);
                 }
                 let frame_len = self.pending_len - frame_start;
                 self.pending_read
                     .copy_within(frame_start..self.pending_len, 0);
+                self.pending_read.truncate(frame_len);
                 self.pending_start = 0;
                 self.pending_len = frame_len;
                 frame_start = 0;
             }
 
-            let read_len = self
-                .read_chunk_bytes
-                .min(self.pending_read.len() - self.pending_len);
-            let read = reader
-                .read(&mut self.pending_read[self.pending_len..self.pending_len + read_len])
-                .await
-                .map_err(TypedClientError::Io)?;
+            let read = read_into_pending(
+                reader,
+                &mut self.pending_read,
+                self.pending_len,
+                self.read_chunk_bytes,
+            )
+            .await?;
 
             if read == 0 {
                 return Err(TypedClientError::UnexpectedEof);
@@ -2961,15 +2988,18 @@ async fn run_reader_task(
             if !pending_read.is_empty() {
                 match decoder.push(&pending_read) {
                     Ok(DecodeProgress::NeedMore) => {}
-                    Ok(DecodeProgress::Complete { status, consumed }) => {
+                    Ok(DecodeProgress::Complete {
+                        status,
+                        consumed,
+                        content_start,
+                        content_end,
+                    }) => {
                         let bytes = pending_read.split_to(consumed).freeze();
-                        if pending_read.capacity() < OWNED_RESPONSE_PREALLOC_BYTES {
-                            pending_read
-                                .reserve(OWNED_RESPONSE_PREALLOC_BYTES - pending_read.capacity());
-                        }
                         let response = CompletedResponse::Owned(OwnedResponse {
                             kind,
                             status,
+                            content_start,
+                            content_end,
                             bytes,
                         });
                         let _ = response_tx.send(Ok(CompletedRequest { request, response }));
@@ -2990,6 +3020,10 @@ async fn run_reader_task(
                         return;
                     }
                 }
+            }
+
+            if pending_read.is_empty() && pending_read.capacity() < OWNED_RESPONSE_PREALLOC_BYTES {
+                pending_read.reserve(OWNED_RESPONSE_PREALLOC_BYTES - pending_read.capacity());
             }
 
             if pending_read.capacity() == pending_read.len() {
@@ -3029,8 +3063,39 @@ async fn run_reader_task(
     }
 }
 
+async fn read_into_pending<R>(
+    reader: &mut R,
+    pending_read: &mut Vec<u8>,
+    pending_len: usize,
+    read_chunk_bytes: usize,
+) -> Result<usize, TypedClientError>
+where
+    R: AsyncRead + Unpin,
+{
+    debug_assert_eq!(pending_read.len(), pending_len);
+    let read_len = read_chunk_bytes.min(pending_read.capacity() - pending_len);
+    poll_fn(|cx| {
+        let mut read_buf = ReadBuf::uninit(&mut pending_read.spare_capacity_mut()[..read_len]);
+        match Pin::new(&mut *reader).poll_read(cx, &mut read_buf) {
+            std::task::Poll::Ready(Ok(())) => {
+                let read = read_buf.filled().len();
+                // `poll_read` initialized exactly `read` bytes in the spare capacity.
+                unsafe {
+                    pending_read.set_len(pending_len + read);
+                }
+                std::task::Poll::Ready(Ok(read))
+            }
+            std::task::Poll::Ready(Err(err)) => {
+                std::task::Poll::Ready(Err(TypedClientError::Io(err)))
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    })
+    .await
+}
+
 fn compact_drained_pending_read(
-    pending_read: &mut [u8; DRAINED_PENDING_READ_BYTES],
+    pending_read: &mut Vec<u8>,
     pending_start: &mut usize,
     pending_len: &mut usize,
 ) {
@@ -3041,11 +3106,13 @@ fn compact_drained_pending_read(
     if *pending_start == *pending_len {
         *pending_len = 0;
         *pending_start = 0;
+        pending_read.clear();
         return;
     }
 
     let tail_len = *pending_len - *pending_start;
     pending_read.copy_within(*pending_start..*pending_len, 0);
+    pending_read.truncate(tail_len);
     *pending_len = tail_len;
     *pending_start = 0;
 }
@@ -3152,12 +3219,16 @@ mod tests {
             .push(&frame[..split])
             .expect("first decoder push should succeed")
         {
-            DecodeProgress::Complete { status, consumed } => (status, consumed),
+            DecodeProgress::Complete {
+                status, consumed, ..
+            } => (status, consumed),
             DecodeProgress::NeedMore => match decoder
                 .push(frame)
                 .expect("second decoder push should succeed")
             {
-                DecodeProgress::Complete { status, consumed } => (status, consumed),
+                DecodeProgress::Complete {
+                    status, consumed, ..
+                } => (status, consumed),
                 DecodeProgress::NeedMore => panic!("decoder did not complete at split {split}"),
             },
         }
@@ -3182,7 +3253,10 @@ mod tests {
                             "completed before frame end: first {first} second {second} prefix {prefix_len} frame {frame:?}",
                         );
                     } else {
-                        let DecodeProgress::Complete { status, consumed } = progress else {
+                        let DecodeProgress::Complete {
+                            status, consumed, ..
+                        } = progress
+                        else {
                             panic!(
                                 "decoder did not complete: first {first} second {second} prefix {prefix_len} frame {frame:?}"
                             );
@@ -3203,9 +3277,16 @@ mod tests {
     }
 
     fn response_from_bytes(kind: RequestKind, status: StatusCode, bytes: &[u8]) -> OwnedResponse {
+        let ResponseFrameParse::Complete(frame) = ResponseFrameDecoder::new(kind).decode(bytes)
+        else {
+            panic!("test response frame should parse");
+        };
+        assert_eq!(frame.status(), status);
         OwnedResponse {
             kind,
             status,
+            content_start: frame.content_start(),
+            content_end: frame.content_end(),
             bytes: Bytes::copy_from_slice(bytes),
         }
     }
@@ -3217,7 +3298,9 @@ mod tests {
         // after that CRLF without waiting for any multiline terminator:
         // https://www.rfc-editor.org/rfc/rfc3977#section-3.1
         let mut decoder = ResponseDecoder::new(RequestKind::Article);
-        let DecodeProgress::Complete { status, consumed } = decoder
+        let DecodeProgress::Complete {
+            status, consumed, ..
+        } = decoder
             .push(b"430 no article with that message-id\r\n")
             .unwrap()
         else {
@@ -3251,13 +3334,13 @@ mod tests {
 
         assert!(matches!(
             stat_decoder.push(b"223 1 <stat@test> article retrieved\r\n"),
-            Ok(DecodeProgress::Complete { status, consumed })
+            Ok(DecodeProgress::Complete { status, consumed, .. })
                 if status.as_u16() == 223
                     && consumed == b"223 1 <stat@test> article retrieved\r\n".len()
         ));
         assert!(matches!(
             body_decoder.push(b"222 1 <body@test> body follows\r\nbody\r\n.\r\n"),
-            Ok(DecodeProgress::Complete { status, consumed })
+            Ok(DecodeProgress::Complete { status, consumed, .. })
                 if status.as_u16() == 222
                     && consumed == b"222 1 <body@test> body follows\r\nbody\r\n.\r\n".len()
         ));
@@ -3280,7 +3363,9 @@ mod tests {
             DecodeProgress::NeedMore
         ));
 
-        let DecodeProgress::Complete { status, consumed } = decoder
+        let DecodeProgress::Complete {
+            status, consumed, ..
+        } = decoder
             .push(b"430 no article with that message-id\r\n")
             .unwrap()
         else {
@@ -3381,7 +3466,7 @@ mod tests {
         ));
         assert!(matches!(
             decoder.push(&exact[split..]),
-            Ok(StreamingDecodeProgress::Complete { status, consumed })
+            Ok(StreamingDecodeProgress::Complete { status, consumed, .. })
                 if status.as_u16() == 223 && consumed == exact.len() - split
         ));
 
@@ -3407,7 +3492,10 @@ mod tests {
             DecodeProgress::NeedMore
         ));
         buffer.extend_from_slice(b"\n.\r\n");
-        let DecodeProgress::Complete { status, consumed } = decoder.push(&buffer).unwrap() else {
+        let DecodeProgress::Complete {
+            status, consumed, ..
+        } = decoder.push(&buffer).unwrap()
+        else {
             panic!("decoder should complete");
         };
         let response = response_from_bytes(RequestKind::Body, status, &buffer[..consumed]);
@@ -3428,7 +3516,10 @@ mod tests {
         let mut decoder = ResponseDecoder::new(RequestKind::Xhdr);
         let buffer = b"221 Header follows\r\n1 Subject\r\n.\r\nNEXT";
 
-        let DecodeProgress::Complete { status, consumed } = decoder.push(buffer).unwrap() else {
+        let DecodeProgress::Complete {
+            status, consumed, ..
+        } = decoder.push(buffer).unwrap()
+        else {
             panic!("decoder should complete");
         };
         let response = response_from_bytes(RequestKind::Xhdr, status, &buffer[..consumed]);
@@ -3449,7 +3540,10 @@ mod tests {
         let mut decoder = ResponseDecoder::new(RequestKind::Capabilities);
         let buffer = b"101 Capability list:\r\n.\r\n";
 
-        let DecodeProgress::Complete { status, consumed } = decoder.push(buffer).unwrap() else {
+        let DecodeProgress::Complete {
+            status, consumed, ..
+        } = decoder.push(buffer).unwrap()
+        else {
             panic!("decoder should complete");
         };
         let response = response_from_bytes(RequestKind::Capabilities, status, &buffer[..consumed]);
@@ -3472,7 +3566,10 @@ mod tests {
         ));
 
         buffer.extend_from_slice(b".\r\n");
-        let DecodeProgress::Complete { status, consumed } = decoder.push(&buffer).unwrap() else {
+        let DecodeProgress::Complete {
+            status, consumed, ..
+        } = decoder.push(&buffer).unwrap()
+        else {
             panic!("decoder should complete");
         };
         let response = response_from_bytes(RequestKind::Capabilities, status, &buffer[..consumed]);
@@ -3497,7 +3594,9 @@ mod tests {
             ));
 
             buffer.extend_from_slice(&b".\r\n"[split..]);
-            let DecodeProgress::Complete { status, consumed } = decoder.push(&buffer).unwrap()
+            let DecodeProgress::Complete {
+                status, consumed, ..
+            } = decoder.push(&buffer).unwrap()
             else {
                 panic!("decoder should complete for split {split}");
             };
@@ -3523,7 +3622,10 @@ mod tests {
         ));
 
         buffer.extend_from_slice(b".\r\nstill body\r\n.\r\n");
-        let DecodeProgress::Complete { status, consumed } = decoder.push(&buffer).unwrap() else {
+        let DecodeProgress::Complete {
+            status, consumed, ..
+        } = decoder.push(&buffer).unwrap()
+        else {
             panic!("decoder should complete");
         };
         let response = response_from_bytes(RequestKind::Body, status, &buffer[..consumed]);
@@ -3817,7 +3919,7 @@ mod tests {
                             "decoder needed more after passing RFC terminator: offset {offset} expected {expected_consumed}",
                         );
                     }
-                    StreamingDecodeProgress::Complete { status, consumed } => {
+                    StreamingDecodeProgress::Complete { status, consumed, .. } => {
                         prop_assert_eq!(status.as_u16(), expected_status);
                         prop_assert!(consumed <= chunk.len());
                         prop_assert_eq!(
@@ -3865,7 +3967,10 @@ mod tests {
             b"222 1 <a@b> body follows\r\nbody\r\n.\r\n220 1 <b@c> article follows\r\nh: v\r\n\r\nx\r\n.\r\n";
 
         let mut first = ResponseDecoder::new(RequestKind::Body);
-        let DecodeProgress::Complete { status, consumed } = first.push(chunk).unwrap() else {
+        let DecodeProgress::Complete {
+            status, consumed, ..
+        } = first.push(chunk).unwrap()
+        else {
             panic!("first decoder should complete");
         };
         let response = response_from_bytes(RequestKind::Body, status, &chunk[..consumed]);
@@ -3879,6 +3984,7 @@ mod tests {
         let DecodeProgress::Complete {
             status: second_status,
             consumed: second_consumed,
+            ..
         } = second.push(&chunk[consumed..]).unwrap()
         else {
             panic!("second decoder should complete");
@@ -3993,8 +4099,8 @@ mod tests {
 
     #[test]
     fn compact_drained_pending_read_clears_fully_consumed_buffer() {
-        let mut pending_read = [0; DRAINED_PENDING_READ_BYTES];
-        pending_read[..3].copy_from_slice(b"abc");
+        let mut pending_read = Vec::with_capacity(DRAINED_PENDING_READ_BYTES);
+        pending_read.extend_from_slice(b"abc");
         let mut pending_len = 3;
         let mut pending_start = pending_len;
 
@@ -4006,8 +4112,8 @@ mod tests {
 
     #[test]
     fn compact_drained_pending_read_moves_leftover_prefix_between_responses() {
-        let mut pending_read = [0; DRAINED_PENDING_READ_BYTES];
-        pending_read[..8].copy_from_slice(b"abcd1234");
+        let mut pending_read = Vec::with_capacity(DRAINED_PENDING_READ_BYTES);
+        pending_read.extend_from_slice(b"abcd1234");
         let mut pending_len = 8;
         let mut pending_start = 4;
 

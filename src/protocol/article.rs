@@ -1116,6 +1116,35 @@ impl<'a> Article<'a> {
         }
     }
 
+    /// Parse a response frame whose multiline content boundary was already found.
+    ///
+    /// This is for callers that already performed RFC 3977 section 3.1.1
+    /// dot-terminator framing and can pass the payload range directly.
+    pub(crate) fn parse_framed(
+        buf: &'a [u8],
+        content_start: usize,
+        content_end: usize,
+    ) -> Result<Self, ArticleParseError> {
+        if content_start > content_end || content_end > buf.len() {
+            return Err(ArticleParseError::BufferTooShort);
+        }
+
+        let first_line_end =
+            strict_crlf_line_content_end_from(buf, 0).ok_or(ArticleParseError::BufferTooShort)?;
+        if first_line_end + 2 != content_start {
+            return Err(ArticleParseError::BufferTooShort);
+        }
+
+        let status_code = parse_status_code(buf)?;
+        match status_code {
+            220 => Self::parse_article_framed(buf, first_line_end, content_start, content_end),
+            221 => Self::parse_head_framed(buf, first_line_end, content_start, content_end),
+            222 => Self::parse_body_framed(buf, first_line_end, content_start, content_end),
+            223 => Self::parse_stat_framed(buf, first_line_end, content_start, content_end),
+            _ => Err(ArticleParseError::InvalidStatusCode(status_code)),
+        }
+    }
+
     fn parse_article(buf: &'a [u8]) -> Result<Self, ArticleParseError> {
         let first_line_end =
             strict_crlf_line_content_end_from(buf, 0).ok_or(ArticleParseError::BufferTooShort)?;
@@ -1176,6 +1205,82 @@ impl<'a> Article<'a> {
         let (message_id, article_number) = parse_first_line(&buf[..first_line_end])?;
         let content_start = first_line_end + 2;
         if content_start < buf.len() && !buf[content_start..].starts_with(DOT_TERMINATOR) {
+            return Err(ArticleParseError::UnexpectedBody);
+        }
+
+        Ok(Self {
+            message_id,
+            article_number,
+            headers: None,
+            body: None,
+        })
+    }
+
+    fn parse_article_framed(
+        buf: &'a [u8],
+        first_line_end: usize,
+        content_start: usize,
+        content_end: usize,
+    ) -> Result<Self, ArticleParseError> {
+        let (message_id, article_number) = parse_first_line(&buf[..first_line_end])?;
+        let separator_pos = find_blank_line(&buf[..content_end], content_start)?;
+        let headers = Some(Headers::parse(&buf[content_start..separator_pos + 2])?);
+        let body_start = separator_pos + 4;
+        if body_start > content_end {
+            return Err(ArticleParseError::BufferTooShort);
+        }
+
+        Ok(Self {
+            message_id,
+            article_number,
+            headers,
+            body: Some(&buf[body_start..content_end]),
+        })
+    }
+
+    fn parse_head_framed(
+        buf: &'a [u8],
+        first_line_end: usize,
+        content_start: usize,
+        content_end: usize,
+    ) -> Result<Self, ArticleParseError> {
+        let (message_id, article_number) = parse_first_line(&buf[..first_line_end])?;
+        if find_blank_line(&buf[..content_end], content_start).is_ok() {
+            return Err(ArticleParseError::UnexpectedBody);
+        }
+
+        Ok(Self {
+            message_id,
+            article_number,
+            headers: Some(Headers::parse(&buf[content_start..content_end])?),
+            body: None,
+        })
+    }
+
+    fn parse_body_framed(
+        buf: &'a [u8],
+        first_line_end: usize,
+        content_start: usize,
+        content_end: usize,
+    ) -> Result<Self, ArticleParseError> {
+        let (message_id, article_number) = parse_first_line(&buf[..first_line_end])?;
+
+        Ok(Self {
+            message_id,
+            article_number,
+            headers: None,
+            body: Some(&buf[content_start..content_end]),
+        })
+    }
+
+    fn parse_stat_framed(
+        buf: &'a [u8],
+        first_line_end: usize,
+        content_start: usize,
+        content_end: usize,
+    ) -> Result<Self, ArticleParseError> {
+        let (message_id, article_number) = parse_first_line(&buf[..first_line_end])?;
+        if content_start != content_end {
             return Err(ArticleParseError::UnexpectedBody);
         }
 

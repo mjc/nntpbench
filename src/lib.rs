@@ -1418,15 +1418,9 @@ impl ArticleIdDownloadSession {
             self.socket_send_buffer,
         )
         .await?;
-        let mut read_buffer = vec![
-            0;
-            self.read_buffer_bytes
-                .max(crate::terminator::TERMINATOR_TAIL_SIZE)
-        ]
-        .into_boxed_slice();
-        read_greeting(&mut stream, &mut read_buffer).await?;
+        read_greeting(&mut stream).await?;
         let mut response_reader =
-            crate::typed_client::DrainedResponseReader::new(read_buffer.len());
+            crate::typed_client::DrainedResponseReader::new(self.read_buffer_bytes);
         authenticate_client_stream(
             &mut stream,
             &mut response_reader,
@@ -1544,15 +1538,9 @@ impl TypedClientSession {
             self.socket_send_buffer,
         )
         .await?;
-        let mut read_buffer = vec![
-            0;
-            self.read_buffer_bytes
-                .max(crate::terminator::TERMINATOR_TAIL_SIZE)
-        ]
-        .into_boxed_slice();
-        read_greeting(&mut stream, &mut read_buffer).await?;
+        read_greeting(&mut stream).await?;
         let mut response_reader =
-            crate::typed_client::DrainedResponseReader::new(read_buffer.len());
+            crate::typed_client::DrainedResponseReader::new(self.read_buffer_bytes);
         self.authenticate(&mut stream, &mut response_reader).await?;
 
         let mut in_flight = 0_usize;
@@ -1842,10 +1830,7 @@ async fn write_typed_message_id_request(
     kind: ClientCommandMix,
     message_id: &MessageId<'_>,
 ) -> io::Result<()> {
-    let article_ref = ArticleRef::MessageId(
-        MessageId::from_borrowed(message_id.as_str())
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid message-id"))?,
-    );
+    let article_ref = ArticleRef::MessageId(message_id.clone());
     write_typed_article_ref_request(stream, kind, &article_ref).await
 }
 
@@ -2175,7 +2160,8 @@ fn process_rss_kib() -> u64 {
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
-async fn read_greeting(stream: &mut TcpStream, buffer: &mut [u8]) -> io::Result<()> {
+async fn read_greeting(stream: &mut TcpStream) -> io::Result<()> {
+    let mut buffer = [0_u8; protocol::MAX_INITIAL_RESPONSE_LINE_BYTES];
     let mut total = 0;
     loop {
         if total == buffer.len() {
@@ -4765,8 +4751,7 @@ mod tests {
             drop(stream);
         });
         let mut client = TcpStream::connect(addr).await.unwrap();
-        let mut buffer = [0_u8; 16];
-        let err = read_greeting(&mut client, &mut buffer).await.unwrap_err();
+        let err = read_greeting(&mut client).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
         server.await.unwrap();
 
@@ -4774,11 +4759,11 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            stream.write_all(b"201 no newline yet").await.unwrap();
+            let greeting = vec![b'x'; protocol::MAX_INITIAL_RESPONSE_LINE_BYTES + 1];
+            stream.write_all(&greeting).await.unwrap();
         });
         let mut client = TcpStream::connect(addr).await.unwrap();
-        let mut buffer = [0_u8; 8];
-        let err = read_greeting(&mut client, &mut buffer).await.unwrap_err();
+        let err = read_greeting(&mut client).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         server.await.unwrap();
     }
@@ -4797,8 +4782,7 @@ mod tests {
             stream.write_all(&greeting).await.unwrap();
         });
         let mut client = TcpStream::connect(addr).await.unwrap();
-        let mut buffer = [0_u8; protocol::MAX_INITIAL_RESPONSE_LINE_BYTES];
-        read_greeting(&mut client, &mut buffer).await.unwrap();
+        read_greeting(&mut client).await.unwrap();
         server.await.unwrap();
     }
 
@@ -4820,8 +4804,7 @@ mod tests {
                 stream.write_all(greeting).await.unwrap();
             });
             let mut client = TcpStream::connect(addr).await.unwrap();
-            let mut buffer = [0_u8; 128];
-            let err = read_greeting(&mut client, &mut buffer).await.unwrap_err();
+            let err = read_greeting(&mut client).await.unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{greeting:?}");
             server.await.unwrap();
         }

@@ -83,6 +83,8 @@ pub struct ResponseFrame<'a> {
     status_line: &'a [u8],
     content: &'a [u8],
     terminator: &'a [u8],
+    content_start: usize,
+    content_end: usize,
     status: StatusCode,
     consumed: usize,
 }
@@ -129,6 +131,8 @@ impl<'a> ResponseFrame<'a> {
             status_line: &buffer[..status_line_end],
             content,
             terminator,
+            content_start: status_line_end,
+            content_end: status_line_end + content.len(),
             status,
             consumed,
         })
@@ -162,6 +166,16 @@ impl<'a> ResponseFrame<'a> {
     #[must_use]
     pub const fn terminator(self) -> &'a [u8] {
         self.terminator
+    }
+
+    #[must_use]
+    pub const fn content_start(self) -> usize {
+        self.content_start
+    }
+
+    #[must_use]
+    pub const fn content_end(self) -> usize {
+        self.content_end
     }
 
     #[must_use]
