@@ -7,9 +7,9 @@ use std::cell::Cell;
 use std::collections::VecDeque;
 use std::fs;
 use std::future::poll_fn;
-use std::io::{self, IoSlice, Write};
+use std::io::{self, IoSlice, Read, Write};
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use arrayvec::ArrayVec;
 use clap::{ArgAction, Parser, ValueEnum};
+use md5::{Digest, Md5};
 use socket2::{Domain, Protocol, SockRef, Socket, Type};
 use tokio::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
@@ -136,6 +137,7 @@ pub const STAT_RESPONSE: &[u8] = b"223 1 <article.1@nntpbench.local> article ret
 pub const HELP_RESPONSE: &[u8] =
     b"100 help text follows\r\nLIST\r\nCAPABILITIES\r\nDATE\r\nMODE-READER\r\nQUIT\r\n.\r\n";
 pub const QUIT_RESPONSE: &[u8] = b"205 closing connection\r\n";
+pub const ARTICLE_NOT_FOUND_RESPONSE: &[u8] = b"430 no article with that number\r\n";
 const BODY_RESPONSE_PREFIX: &[u8] = b"222 1 <article.1@nntpbench.local> body follows\r\n";
 const ARTICLE_RESPONSE_PREFIX: &[u8] = b"220 1 <article.1@nntpbench.local> article follows\r\nPath: nntpbench.local!mock\r\nFrom: Bench User <bench@nntpbench.local>\r\nNewsgroups: alt.binaries.bench\r\nSubject: nntpbench synthetic article\r\nMessage-ID: <article.1@nntpbench.local>\r\nDate: Fri, 15 May 2026 00:00:00 +0000\r\n\r\n";
 const MAX_COMMAND_LINE_BYTES: usize = protocol::MAX_INITIAL_RESPONSE_LINE_BYTES;
@@ -164,6 +166,10 @@ pub struct ServerArgs {
     /// Approximate full article bytes returned for ARTICLE, including headers.
     #[arg(long, default_value_t = 68 * 1024)]
     pub article_bytes: usize,
+
+    /// Directory tree containing complete ARTICLE response frames keyed by ARTICLE selector.
+    #[arg(long)]
+    pub article_dir: Option<PathBuf>,
 
     /// Maximum concurrent accepted sessions.
     #[arg(long, default_value_t = 4096)]
@@ -366,6 +372,18 @@ pub struct ClientArgs {
     #[arg(long)]
     pub auth_pass: Option<String>,
 
+    /// File containing ARTICLE numbers or message-IDs to fetch, one per line.
+    #[arg(long)]
+    pub article_ids: Option<PathBuf>,
+
+    /// Directory tree where fetched ARTICLE responses are stored by ARTICLE selector.
+    #[arg(long)]
+    pub article_output_dir: Option<PathBuf>,
+
+    /// Directory tree containing expected ARTICLE response frames to verify with MD5 when present.
+    #[arg(long)]
+    pub article_verify_dir: Option<PathBuf>,
+
     /// Total ARTICLE/BODY commands to complete. Use 0 to disable this limit.
     #[arg(long, default_value_t = 0)]
     pub requests: u64,
@@ -459,6 +477,18 @@ pub struct TypedClientArgs {
     /// AUTHINFO PASS value sent once per connection before workload requests.
     #[arg(long)]
     pub auth_pass: Option<String>,
+
+    /// File containing ARTICLE numbers or message-IDs to fetch, one per line.
+    #[arg(long)]
+    pub article_ids: Option<PathBuf>,
+
+    /// Directory tree where fetched ARTICLE responses are stored by ARTICLE selector.
+    #[arg(long)]
+    pub article_output_dir: Option<PathBuf>,
+
+    /// Directory tree containing expected ARTICLE response frames to verify with MD5 when present.
+    #[arg(long)]
+    pub article_verify_dir: Option<PathBuf>,
 
     /// Total typed ARTICLE/BODY requests to complete. Use 0 to disable this limit.
     #[arg(long, default_value_t = 0)]
@@ -642,6 +672,12 @@ struct SegmentSet {
     ids: Box<[MessageId<'static>]>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ArticleDownloadTarget {
+    Number(u64),
+    MessageId(MessageId<'static>),
+}
+
 #[cfg_attr(coverage_nightly, coverage(off))]
 pub async fn run_client(args: ClientArgs) -> io::Result<()> {
     let config = TypedClientConfig::from_client_args(args)?;
@@ -656,6 +692,10 @@ pub async fn run_typed_client(args: TypedClientArgs) -> io::Result<()> {
 
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn run_typed_workload(config: TypedClientConfig) -> io::Result<()> {
+    if config.article_targets.is_some() {
+        return run_article_id_download_workload(config).await;
+    }
+
     let start_cpu_ticks = process_cpu_ticks();
     let started = Instant::now();
     let stats = Arc::new(Stats::new());
@@ -705,6 +745,103 @@ async fn run_typed_workload(config: TypedClientConfig) -> io::Result<()> {
         let requests = requests_for_connection(config.requests, config.total_clients, global_index);
         let session = TypedClientSession::new(&config, global_index, next_start_id, requests);
         next_start_id = next_start_id.wrapping_add(requests);
+        let stats = stats.clone();
+        let stop = stop.clone();
+        sessions.spawn(async move { session.run(stats, stop).await });
+    }
+
+    while let Some(result) = sessions.join_next().await {
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                stats.errors.fetch_add(1, Ordering::Relaxed);
+                stop.store(true, Ordering::Release);
+                sessions.abort_all();
+                return Err(err);
+            }
+            Err(err) => {
+                stats.errors.fetch_add(1, Ordering::Relaxed);
+                stop.store(true, Ordering::Release);
+                sessions.abort_all();
+                return Err(io::Error::other(err));
+            }
+        }
+    }
+
+    if config.csv {
+        let snapshot = stats.snapshot();
+        println!(
+            "{},{},{:.9},{:.9},{}",
+            snapshot.commands,
+            snapshot.bytes_sent,
+            started.elapsed().as_secs_f64(),
+            cpu_seconds_since(start_cpu_ticks),
+            process_rss_kib()
+        );
+    } else {
+        stats.print_snapshot("final");
+    }
+    Ok(())
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn run_article_id_download_workload(config: TypedClientConfig) -> io::Result<()> {
+    let start_cpu_ticks = process_cpu_ticks();
+    let started = Instant::now();
+    let stats = Arc::new(Stats::new());
+    let stop = Arc::new(AtomicBool::new(false));
+    let article_targets = config
+        .article_targets
+        .clone()
+        .expect("article id workload requires targets");
+    let output_dir = config
+        .article_output_dir
+        .clone()
+        .expect("article id workload requires output dir");
+
+    eprintln!(
+        "nntpbench client connecting to {} article_targets={} output_dir={} connections={} total_clients={} client_offset={}",
+        config.connect,
+        article_targets.len(),
+        output_dir.display(),
+        config.connections,
+        config.total_clients,
+        config.client_offset
+    );
+
+    if config.stats_interval != Duration::ZERO {
+        tokio::spawn(report_stats(stats.clone(), config.stats_interval));
+    }
+
+    tokio::spawn({
+        let stop = stop.clone();
+        async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                stop.store(true, Ordering::Release);
+            }
+        }
+    });
+
+    if config.duration != Duration::ZERO {
+        tokio::spawn({
+            let stop = stop.clone();
+            let duration = config.duration;
+            async move {
+                time::sleep(duration).await;
+                stop.store(true, Ordering::Release);
+            }
+        });
+    }
+
+    let mut sessions = JoinSet::new();
+    for connection_index in 0..config.connections {
+        let global_index = config.client_offset + connection_index;
+        let session = ArticleIdDownloadSession::new(
+            &config,
+            global_index,
+            article_targets.clone(),
+            output_dir.clone(),
+        );
         let stats = stats.clone();
         let stop = stop.clone();
         sessions.spawn(async move { session.run(stats, stop).await });
@@ -1040,6 +1177,9 @@ struct TypedClientConfig {
     segments: Option<Arc<SegmentSet>>,
     auth_user: Option<AuthInfoValue<'static>>,
     auth_pass: Option<AuthInfoValue<'static>>,
+    article_targets: Option<Arc<[ArticleDownloadTarget]>>,
+    article_output_dir: Option<Arc<PathBuf>>,
+    article_verify_dir: Option<Arc<PathBuf>>,
     requests: u64,
     transfer_bytes: u64,
     duration: Duration,
@@ -1065,6 +1205,9 @@ impl TypedClientConfig {
             args.segments,
             args.auth_user,
             args.auth_pass,
+            args.article_ids,
+            args.article_output_dir,
+            args.article_verify_dir,
             args.requests,
             args.transfer_bytes,
             args.duration_secs,
@@ -1090,6 +1233,9 @@ impl TypedClientConfig {
             args.segments,
             args.auth_user,
             args.auth_pass,
+            args.article_ids,
+            args.article_output_dir,
+            args.article_verify_dir,
             args.requests,
             args.transfer_bytes,
             args.duration_secs,
@@ -1115,6 +1261,9 @@ impl TypedClientConfig {
         segments: Option<PathBuf>,
         auth_user: Option<String>,
         auth_pass: Option<String>,
+        article_ids: Option<PathBuf>,
+        article_output_dir: Option<PathBuf>,
+        article_verify_dir: Option<PathBuf>,
         requests: u64,
         transfer_bytes: u64,
         duration_secs: u64,
@@ -1144,6 +1293,32 @@ impl TypedClientConfig {
             .map(Arc::new);
         let auth_user = validate_client_auth_value(auth_user, "auth user")?;
         let auth_pass = validate_client_auth_value(auth_pass, "auth pass")?;
+        let article_targets = if let Some(path) = article_ids.as_deref() {
+            Some(Arc::from(read_article_targets(path)?.into_boxed_slice()))
+        } else {
+            None
+        };
+        if article_targets.is_some() && article_output_dir.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--article-output-dir is required with --article-ids",
+            ));
+        }
+        if article_targets.is_none() && article_output_dir.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--article-ids is required with --article-output-dir",
+            ));
+        }
+        if article_targets.is_none() && article_verify_dir.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--article-ids is required with --article-verify-dir",
+            ));
+        }
+        if let Some(output_dir) = article_output_dir.as_ref() {
+            fs::create_dir_all(output_dir)?;
+        }
 
         Ok(Self {
             connect,
@@ -1151,6 +1326,9 @@ impl TypedClientConfig {
             segments,
             auth_user,
             auth_pass,
+            article_targets,
+            article_output_dir: article_output_dir.map(Arc::new),
+            article_verify_dir: article_verify_dir.map(Arc::new),
             requests,
             transfer_bytes,
             duration: Duration::from_secs(duration_secs),
@@ -1175,6 +1353,130 @@ impl TypedClientConfig {
             connect.set_port(self.ports[global_index % self.ports.len()]);
         }
         connect
+    }
+}
+
+#[derive(Debug)]
+struct ArticleIdDownloadSession {
+    connect: SocketAddr,
+    auth_user: Option<AuthInfoValue<'static>>,
+    auth_pass: Option<AuthInfoValue<'static>>,
+    article_targets: Arc<[ArticleDownloadTarget]>,
+    output_dir: Arc<PathBuf>,
+    verify_dir: Option<Arc<PathBuf>>,
+    client_index: usize,
+    total_clients: usize,
+    read_buffer_bytes: usize,
+    pipeline_depth: usize,
+    nodelay: bool,
+    socket_recv_buffer: usize,
+    socket_send_buffer: usize,
+}
+
+impl ArticleIdDownloadSession {
+    fn new(
+        config: &TypedClientConfig,
+        global_index: usize,
+        article_targets: Arc<[ArticleDownloadTarget]>,
+        output_dir: Arc<PathBuf>,
+    ) -> Self {
+        Self {
+            connect: config.endpoint_for(global_index),
+            auth_user: config.auth_user.clone(),
+            auth_pass: config.auth_pass.clone(),
+            article_targets,
+            output_dir,
+            verify_dir: config.article_verify_dir.clone(),
+            client_index: global_index,
+            total_clients: config.total_clients,
+            read_buffer_bytes: config.read_buffer_bytes,
+            pipeline_depth: config.pipeline_depth,
+            nodelay: config.nodelay,
+            socket_recv_buffer: config.socket_recv_buffer,
+            socket_send_buffer: config.socket_send_buffer,
+        }
+    }
+
+    async fn run(self, stats: Arc<Stats>, stop: Arc<AtomicBool>) -> io::Result<()> {
+        stats.accepted_connections.fetch_add(1, Ordering::Relaxed);
+        stats.active_connections.fetch_add(1, Ordering::Relaxed);
+
+        let result = self.run_inner(&stats, &stop).await;
+        stats.active_connections.fetch_sub(1, Ordering::Relaxed);
+        result
+    }
+
+    async fn run_inner(self, stats: &Stats, stop: &AtomicBool) -> io::Result<()> {
+        let connection = TypedClientConnection::connect_with_options(
+            self.connect,
+            TypedClientOptions {
+                read_buffer_bytes: self
+                    .read_buffer_bytes
+                    .max(crate::terminator::TERMINATOR_TAIL_SIZE),
+                nodelay: self.nodelay,
+                socket_recv_buffer: self.socket_recv_buffer,
+                socket_send_buffer: self.socket_send_buffer,
+                pipeline_depth: self.pipeline_depth,
+            },
+        )
+        .await
+        .map_err(map_typed_client_error)?;
+        authenticate_owned_connection(&connection, self.auth_user, self.auth_pass).await?;
+
+        for index in (self.client_index..self.article_targets.len()).step_by(self.total_clients) {
+            if stop.load(Ordering::Acquire) {
+                break;
+            }
+
+            let target = &self.article_targets[index];
+            let response = connection
+                .execute(request_for_download_target(target)?)
+                .await
+                .map_err(map_typed_client_error)?;
+
+            stats.commands.fetch_add(1, Ordering::Relaxed);
+            stats.article_requests.fetch_add(1, Ordering::Relaxed);
+            stats
+                .bytes_sent
+                .fetch_add(response.as_bytes().len() as u64, Ordering::Relaxed);
+
+            match response.status().as_u16() {
+                220 => {
+                    if let Err(err) = verify_article_response_file(
+                        self.verify_dir.as_deref().map(PathBuf::as_path),
+                        target,
+                        response.as_bytes(),
+                    ) {
+                        if err.kind() == io::ErrorKind::InvalidData {
+                            let failed_path = write_failed_article_response_file(
+                                &self.output_dir,
+                                target,
+                                response.as_bytes(),
+                            )?;
+                            eprintln!(
+                                "ARTICLE {} verification failed; saved received response to {}",
+                                download_target_label(target),
+                                failed_path.display()
+                            );
+                        }
+                        return Err(err);
+                    }
+                    write_article_response_file(&self.output_dir, target, response.as_bytes())?;
+                }
+                430 => {}
+                status => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "ARTICLE {} returned unexpected status {status}",
+                            download_target_label(target)
+                        ),
+                    ));
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -1387,6 +1689,174 @@ async fn send_authinfo(
         .map_err(map_typed_client_error)
 }
 
+fn request_for_download_target(target: &ArticleDownloadTarget) -> io::Result<Request<'static>> {
+    match target {
+        ArticleDownloadTarget::Number(article_id) => Request::article_number(*article_id)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid article id")),
+        ArticleDownloadTarget::MessageId(message_id) => Ok(Request::Article {
+            article_ref: ArticleRef::MessageId(message_id.clone()),
+        }),
+    }
+}
+
+fn download_target_label(target: &ArticleDownloadTarget) -> String {
+    match target {
+        ArticleDownloadTarget::Number(article_id) => article_id.to_string(),
+        ArticleDownloadTarget::MessageId(message_id) => message_id.as_str().to_string(),
+    }
+}
+
+async fn authenticate_owned_connection(
+    connection: &TypedClientConnection,
+    auth_user: Option<AuthInfoValue<'static>>,
+    auth_pass: Option<AuthInfoValue<'static>>,
+) -> io::Result<()> {
+    let mut user_status = None;
+    if let Some(value) = auth_user {
+        let response = connection
+            .execute(Request::AuthInfo {
+                kind: AuthInfoKind::User,
+                value,
+            })
+            .await
+            .map_err(map_typed_client_error)?;
+        let status = response.status().as_u16();
+        if status != 281 && status != 381 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("AUTHINFO USER rejected with status {status}"),
+            ));
+        }
+        user_status = Some(status);
+    }
+
+    if auth_pass.is_none() && user_status == Some(381) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "AUTHINFO USER requires AUTHINFO PASS",
+        ));
+    }
+
+    if let Some(value) = auth_pass {
+        let response = connection
+            .execute(Request::AuthInfo {
+                kind: AuthInfoKind::Pass,
+                value,
+            })
+            .await
+            .map_err(map_typed_client_error)?;
+        let status = response.status().as_u16();
+        if status != 281 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("AUTHINFO PASS rejected with status {status}"),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn write_article_response_file(
+    root: &Path,
+    target: &ArticleDownloadTarget,
+    response: &[u8],
+) -> io::Result<()> {
+    let path = article_download_target_path(root, target);
+    write_article_response_file_at(&path, response)
+}
+
+fn write_failed_article_response_file(
+    root: &Path,
+    target: &ArticleDownloadTarget,
+    response: &[u8],
+) -> io::Result<PathBuf> {
+    let path = article_download_target_path(&root.join("failed"), target);
+    write_article_response_file_at(&path, response)?;
+    Ok(path)
+}
+
+fn write_article_response_file_at(path: &Path, response: &[u8]) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, response)
+}
+
+fn verify_article_response_file(
+    root: Option<&Path>,
+    target: &ArticleDownloadTarget,
+    response: &[u8],
+) -> io::Result<()> {
+    let Some(root) = root else {
+        return Ok(());
+    };
+    let path = article_download_target_path(root, target);
+    if !path.exists() {
+        return Ok(());
+    }
+
+    let expected = md5_file(&path)?;
+    let mut received_hasher = Md5::new();
+    received_hasher.update(response);
+    let received = received_hasher.finalize();
+    if expected.as_slice() == received.as_slice() {
+        return Ok(());
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "ARTICLE {} MD5 mismatch: expected {} from {}, received {}",
+            download_target_label(target),
+            hex_lower(expected.as_slice()),
+            path.display(),
+            hex_lower(received.as_slice())
+        ),
+    ))
+}
+
+fn md5_file(path: &Path) -> io::Result<md5::digest::Output<Md5>> {
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Md5::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(hasher.finalize());
+        }
+        hasher.update(&buffer[..read]);
+    }
+}
+
+fn article_download_target_path(root: &Path, target: &ArticleDownloadTarget) -> PathBuf {
+    match target {
+        ArticleDownloadTarget::Number(article_id) => article_id_tree_path(root, *article_id),
+        ArticleDownloadTarget::MessageId(message_id) => message_id_tree_path(root, message_id),
+    }
+}
+
+fn article_id_tree_path(root: &Path, article_id: u64) -> PathBuf {
+    root.join(format!("{:03}", article_id / 1_000_000))
+        .join(format!("{:03}", (article_id / 1_000) % 1_000))
+        .join(article_id.to_string())
+}
+
+fn message_id_tree_path(root: &Path, message_id: &MessageId<'_>) -> PathBuf {
+    let encoded = hex_lower(message_id.as_str().as_bytes());
+    root.join("msgid").join(&encoded[..2]).join(encoded)
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
 fn transfer_limit_reached(stats: &Stats, transfer_bytes: u64) -> bool {
     transfer_bytes != 0 && stats.bytes_sent.load(Ordering::Relaxed) >= transfer_bytes
 }
@@ -1539,6 +2009,52 @@ fn read_segments(path: &std::path::Path) -> io::Result<SegmentSet> {
     Ok(SegmentSet {
         ids: ids.into_boxed_slice(),
     })
+}
+
+fn read_article_targets(path: &Path) -> io::Result<Vec<ArticleDownloadTarget>> {
+    let contents = fs::read_to_string(path)?;
+    let mut targets = Vec::new();
+
+    for (line_index, line) in contents.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        if line.bytes().all(|byte| byte.is_ascii_digit()) {
+            let id = line.parse::<u64>().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid article number on line {}", line_index + 1),
+                )
+            })?;
+            if id == 0 || id > crate::protocol::MAX_ARTICLE_NUMBER {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("article number out of RFC range on line {}", line_index + 1),
+                ));
+            }
+            targets.push(ArticleDownloadTarget::Number(id));
+            continue;
+        }
+
+        let id = MessageId::from_str_or_wrap(line).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid article message-id on line {}", line_index + 1),
+            )
+        })?;
+        targets.push(ArticleDownloadTarget::MessageId(id));
+    }
+
+    if targets.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("no article selectors found in {}", path.display()),
+        ));
+    }
+
+    Ok(targets)
 }
 
 fn normalize_msgid(value: &str) -> Vec<u8> {
@@ -1836,6 +2352,40 @@ where
     match command.kind {
         RequestKind::Article => {
             session_stats.article_requests += 1;
+            if config.article_dir.is_some() {
+                if let Some(article_id) = command.article_id
+                    && write_article_response_from_file(
+                        writer,
+                        pending_write,
+                        config,
+                        article_id,
+                        session_stats,
+                    )
+                    .await?
+                {
+                    return Ok(false);
+                }
+                if let Some(message_id) = command.message_id.as_ref()
+                    && write_article_message_id_response_from_file(
+                        writer,
+                        pending_write,
+                        config,
+                        message_id,
+                        session_stats,
+                    )
+                    .await?
+                {
+                    return Ok(false);
+                }
+                write_response(
+                    writer,
+                    pending_write,
+                    ARTICLE_NOT_FOUND_RESPONSE,
+                    session_stats,
+                )
+                .await?;
+                return Ok(false);
+            }
             write_generated_response(
                 writer,
                 pending_write,
@@ -2215,6 +2765,27 @@ where
     let response = match request.kind() {
         RequestKind::Article => {
             stats.article_requests.fetch_add(1, Ordering::Relaxed);
+            if config.article_dir.is_some() {
+                if let Some(article_id) = parse_article_id_arg(request.args())
+                    && write_article_response_file_to(output, config, article_id, stats)
+                        .expect("response write failed")
+                {
+                    return false;
+                }
+                if let Some(message_id) = request.message_id()
+                    && write_article_message_id_response_file_to(output, config, &message_id, stats)
+                        .expect("response write failed")
+                {
+                    return false;
+                }
+                stats
+                    .bytes_sent
+                    .fetch_add(ARTICLE_NOT_FOUND_RESPONSE.len() as u64, Ordering::Relaxed);
+                output
+                    .write_all(ARTICLE_NOT_FOUND_RESPONSE)
+                    .expect("response write failed");
+                return false;
+            }
             write_generated_response_to(
                 output,
                 ARTICLE_RESPONSE_PREFIX,
@@ -2347,6 +2918,75 @@ where
         .await
 }
 
+async fn write_article_response_from_file<W>(
+    writer: &mut W,
+    pending_write: &mut PendingWrite,
+    config: &ServerConfig,
+    article_id: u64,
+    session_stats: &mut SessionStats,
+) -> io::Result<bool>
+where
+    W: AsyncWrite + Unpin,
+{
+    let Some(root) = config.article_dir.as_ref() else {
+        return Ok(false);
+    };
+    let path = article_id_tree_path(root, article_id);
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err),
+    };
+
+    pending_write.flush(writer).await?;
+    write_file_response_to_async(writer, file, session_stats).await?;
+    Ok(true)
+}
+
+async fn write_article_message_id_response_from_file<W>(
+    writer: &mut W,
+    pending_write: &mut PendingWrite,
+    config: &ServerConfig,
+    message_id: &MessageId<'_>,
+    session_stats: &mut SessionStats,
+) -> io::Result<bool>
+where
+    W: AsyncWrite + Unpin,
+{
+    let Some(root) = config.article_dir.as_ref() else {
+        return Ok(false);
+    };
+    let path = message_id_tree_path(root, message_id);
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err),
+    };
+
+    pending_write.flush(writer).await?;
+    write_file_response_to_async(writer, file, session_stats).await?;
+    Ok(true)
+}
+
+async fn write_file_response_to_async<W>(
+    writer: &mut W,
+    mut file: fs::File,
+    session_stats: &mut SessionStats,
+) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(());
+        }
+        writer.write_all(&buffer[..read]).await?;
+        session_stats.bytes_sent += read as u64;
+    }
+}
+
 fn write_generated_response_to<W>(
     output: &mut W,
     prefix: &[u8],
@@ -2376,6 +3016,65 @@ where
         .bytes_sent
         .fetch_add(DOT_TERMINATOR.len() as u64, Ordering::Relaxed);
     Ok(())
+}
+
+fn write_article_response_file_to<W>(
+    output: &mut W,
+    config: &ServerConfig,
+    article_id: u64,
+    stats: &Stats,
+) -> io::Result<bool>
+where
+    W: Write,
+{
+    let Some(root) = config.article_dir.as_ref() else {
+        return Ok(false);
+    };
+    let path = article_id_tree_path(root, article_id);
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err),
+    };
+    write_file_response_to(output, file, stats)?;
+    Ok(true)
+}
+
+fn write_article_message_id_response_file_to<W>(
+    output: &mut W,
+    config: &ServerConfig,
+    message_id: &MessageId<'_>,
+    stats: &Stats,
+) -> io::Result<bool>
+where
+    W: Write,
+{
+    let Some(root) = config.article_dir.as_ref() else {
+        return Ok(false);
+    };
+    let path = message_id_tree_path(root, message_id);
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err),
+    };
+    write_file_response_to(output, file, stats)?;
+    Ok(true)
+}
+
+fn write_file_response_to<W>(output: &mut W, mut file: fs::File, stats: &Stats) -> io::Result<()>
+where
+    W: Write,
+{
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(());
+        }
+        output.write_all(&buffer[..read])?;
+        stats.bytes_sent.fetch_add(read as u64, Ordering::Relaxed);
+    }
 }
 
 async fn flush_pending<W>(writer: &mut W, pending_write: &mut PendingWrite) -> io::Result<()>
@@ -2417,6 +3116,7 @@ where
 pub struct ServerConfig {
     pub body_bytes: usize,
     pub article_bytes: usize,
+    pub article_dir: Option<Arc<PathBuf>>,
     pub max_connections: usize,
     pub max_pipeline_depth: usize,
     pub stats_interval: Duration,
@@ -2432,6 +3132,7 @@ impl ServerConfig {
         Self {
             body_bytes: args.body_bytes,
             article_bytes: args.article_bytes,
+            article_dir: args.article_dir.map(Arc::new),
             max_connections: args.max_connections,
             max_pipeline_depth: args.max_pipeline_depth.clamp(1, 1024),
             stats_interval: Duration::from_secs(args.stats_interval_secs),
@@ -2620,6 +3321,8 @@ pub fn rate(count: u64, seconds: f64) -> f64 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ParsedCommand {
     kind: RequestKind,
+    article_id: Option<u64>,
+    message_id: Option<MessageId<'static>>,
 }
 
 type CommandBatch = ArrayVec<ParsedCommand, MAX_SERVER_PIPELINE_DEPTH>;
@@ -2713,9 +3416,22 @@ where
 }
 
 fn parse_command_line(line: &[u8]) -> ParsedCommand {
+    let request = RequestLine::parse(line);
     ParsedCommand {
-        kind: RequestLine::parse(line).kind(),
+        kind: request.kind(),
+        article_id: parse_article_id_arg(request.args()),
+        message_id: request.message_id().and_then(|message_id| {
+            MessageId::from_shared(Arc::<str>::from(message_id.as_str())).ok()
+        }),
     }
+}
+
+fn parse_article_id_arg(args: &[u8]) -> Option<u64> {
+    let arg = std::str::from_utf8(args).ok()?.trim();
+    if arg.is_empty() || arg.bytes().any(|byte| !byte.is_ascii_digit()) {
+        return None;
+    }
+    arg.parse::<u64>().ok()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2890,6 +3606,7 @@ mod tests {
             listen: "127.0.0.1:0".parse().unwrap(),
             body_bytes: 1024,
             article_bytes: 2048,
+            article_dir: None,
             max_connections: 16,
             threads: 1,
             max_pipeline_depth: 8,
@@ -3072,6 +3789,9 @@ mod tests {
             segments: None,
             auth_user: None,
             auth_pass: None,
+            article_ids: None,
+            article_output_dir: None,
+            article_verify_dir: None,
             requests: 0,
             transfer_bytes: 0,
             duration_secs: 0,
@@ -3121,6 +3841,9 @@ mod tests {
             segments: None,
             auth_user: None,
             auth_pass: None,
+            article_ids: None,
+            article_output_dir: None,
+            article_verify_dir: None,
             requests: 0,
             transfer_bytes: 0,
             duration_secs: 0,
@@ -3152,6 +3875,21 @@ mod tests {
         );
         path.push(unique);
         fs::write(&path, contents).unwrap();
+        path
+    }
+
+    fn unique_temp_dir(name: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        let unique = format!(
+            "nntpbench-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        path.push(unique);
+        fs::create_dir_all(&path).unwrap();
         path
     }
 
@@ -3261,6 +3999,8 @@ mod tests {
         let mut writer = FailingWriter;
         let command = ParsedCommand {
             kind: RequestKind::Article,
+            article_id: Some(1),
+            message_id: None,
         };
 
         let err = handle_command(&command, &config, &mut stats, &mut writer, &mut pending)
@@ -4284,6 +5024,156 @@ mod tests {
         assert_eq!(snapshot.article_requests, 1);
         assert_eq!(snapshot.body_requests, 1);
         assert_eq!(snapshot.pipeline_batches, 1);
+    }
+
+    #[tokio::test]
+    async fn client_article_id_mode_writes_220_responses_and_skips_430() {
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let response =
+            b"220 1 <article.1@test> article follows\r\nSubject: one\r\n\r\nbody\r\n.\r\n";
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"201 loopback ready\r\n").await.unwrap();
+
+            let mut scratch = [0_u8; 128];
+            let mut pending = Vec::new();
+            while pending.iter().filter(|byte| **byte == b'\n').count() < 1 {
+                let read = stream.read(&mut scratch).await.unwrap();
+                assert_ne!(read, 0);
+                pending.extend_from_slice(&scratch[..read]);
+            }
+            assert_eq!(&pending[..], b"ARTICLE 1\r\n");
+            pending.clear();
+            stream.write_all(response).await.unwrap();
+
+            while pending.iter().filter(|byte| **byte == b'\n').count() < 1 {
+                let read = stream.read(&mut scratch).await.unwrap();
+                assert_ne!(read, 0);
+                pending.extend_from_slice(&scratch[..read]);
+            }
+            assert_eq!(&pending[..], b"ARTICLE 2\r\n");
+            stream.write_all(ARTICLE_NOT_FOUND_RESPONSE).await.unwrap();
+        });
+
+        let id_file = write_temp_segments("article-ids", "1\n2\n");
+        let output_dir = unique_temp_dir("article-output");
+        let verify_dir = unique_temp_dir("article-verify");
+        let verify_path = article_id_tree_path(&verify_dir, 1);
+        fs::create_dir_all(verify_path.parent().unwrap()).unwrap();
+        fs::write(&verify_path, response).unwrap();
+        let mut args = test_client_args();
+        args.connect = addr;
+        args.article_ids = Some(id_file.clone());
+        args.article_output_dir = Some(output_dir.clone());
+        args.article_verify_dir = Some(verify_dir.clone());
+        args.connections = 1;
+        args.stats_interval_secs = 0;
+
+        run_client(args).await.unwrap();
+        server.await.unwrap();
+
+        let stored = fs::read(article_id_tree_path(&output_dir, 1)).unwrap();
+        assert_eq!(stored, response);
+        assert!(!article_id_tree_path(&output_dir, 2).exists());
+
+        fs::remove_file(id_file).unwrap();
+        fs::remove_dir_all(output_dir).unwrap();
+        fs::remove_dir_all(verify_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn client_article_id_mode_rejects_md5_mismatch_when_verify_file_exists() {
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let response =
+            b"220 1 <article.1@test> article follows\r\nSubject: one\r\n\r\nactual\r\n.\r\n";
+        let expected =
+            b"220 1 <article.1@test> article follows\r\nSubject: one\r\n\r\nexpected\r\n.\r\n";
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"201 loopback ready\r\n").await.unwrap();
+
+            let mut scratch = [0_u8; 128];
+            let mut pending = Vec::new();
+            while pending.iter().filter(|byte| **byte == b'\n').count() < 1 {
+                let read = stream.read(&mut scratch).await.unwrap();
+                assert_ne!(read, 0);
+                pending.extend_from_slice(&scratch[..read]);
+            }
+            assert_eq!(&pending[..], b"ARTICLE 1\r\n");
+            stream.write_all(response).await.unwrap();
+        });
+
+        let id_file = write_temp_segments("article-ids-md5", "1\n");
+        let output_dir = unique_temp_dir("article-output-md5");
+        let verify_dir = unique_temp_dir("article-verify-md5");
+        let verify_path = article_id_tree_path(&verify_dir, 1);
+        fs::create_dir_all(verify_path.parent().unwrap()).unwrap();
+        fs::write(&verify_path, expected).unwrap();
+
+        let mut args = test_client_args();
+        args.connect = addr;
+        args.article_ids = Some(id_file.clone());
+        args.article_output_dir = Some(output_dir.clone());
+        args.article_verify_dir = Some(verify_dir.clone());
+        args.connections = 1;
+        args.stats_interval_secs = 0;
+
+        let err = run_client(args).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("MD5 mismatch"));
+        assert!(!article_id_tree_path(&output_dir, 1).exists());
+        assert_eq!(
+            fs::read(article_id_tree_path(&output_dir.join("failed"), 1)).unwrap(),
+            response
+        );
+        server.await.unwrap();
+
+        fs::remove_file(id_file).unwrap();
+        fs::remove_dir_all(output_dir).unwrap();
+        fs::remove_dir_all(verify_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn client_article_id_file_accepts_message_ids() {
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let response =
+            b"220 1 <abc123@ngPost> article follows\r\nSubject: message id\r\n\r\nbody\r\n.\r\n";
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"201 loopback ready\r\n").await.unwrap();
+
+            let mut scratch = [0_u8; 128];
+            let mut pending = Vec::new();
+            while pending.iter().filter(|byte| **byte == b'\n').count() < 1 {
+                let read = stream.read(&mut scratch).await.unwrap();
+                assert_ne!(read, 0);
+                pending.extend_from_slice(&scratch[..read]);
+            }
+            assert_eq!(&pending[..], b"ARTICLE <abc123@ngPost>\r\n");
+            stream.write_all(response).await.unwrap();
+        });
+
+        let ids = write_temp_segments("message-ids", "abc123@ngPost\n");
+        let output_dir = unique_temp_dir("message-id-output");
+        let mut args = test_client_args();
+        args.connect = addr;
+        args.article_ids = Some(ids.clone());
+        args.article_output_dir = Some(output_dir.clone());
+        args.connections = 1;
+        args.stats_interval_secs = 0;
+
+        run_client(args).await.unwrap();
+        server.await.unwrap();
+
+        let message_id = MessageId::from_borrowed("<abc123@ngPost>").unwrap();
+        let stored = fs::read(message_id_tree_path(&output_dir, &message_id)).unwrap();
+        assert_eq!(stored, response);
+
+        fs::remove_file(ids).unwrap();
+        fs::remove_dir_all(output_dir).unwrap();
     }
 
     #[tokio::test]
@@ -5903,6 +6793,48 @@ mod tests {
         assert_eq!(snapshot.article_requests, 2);
         assert_eq!(snapshot.pipeline_batches, 1);
         assert_eq!(snapshot.bytes_sent, output.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn serve_session_reads_article_responses_from_article_dir() {
+        let article_dir = unique_temp_dir("server-articles");
+        let response =
+            b"220 42 <article.42@test> article follows\r\nSubject: stored\r\n\r\nbody\r\n.\r\n";
+        let path = article_id_tree_path(&article_dir, 42);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, response).unwrap();
+        let message_response =
+            b"220 1 <stored@ngPost> article follows\r\nSubject: message\r\n\r\nbody\r\n.\r\n";
+        let message_id = MessageId::from_borrowed("<stored@ngPost>").unwrap();
+        let message_path = message_id_tree_path(&article_dir, &message_id);
+        fs::create_dir_all(message_path.parent().unwrap()).unwrap();
+        fs::write(&message_path, message_response).unwrap();
+
+        let mut args = test_args();
+        args.article_dir = Some(article_dir.clone());
+        let (output, stats) = run_session_with_input(
+            Arc::new(ServerConfig::from_args(args)),
+            b"ARTICLE 42\r\nARTICLE <stored@ngPost>\r\nARTICLE 43\r\nQUIT\r\n",
+        )
+        .await;
+
+        assert_eq!(
+            output,
+            [
+                GREETING,
+                response,
+                message_response,
+                ARTICLE_NOT_FOUND_RESPONSE,
+                QUIT_RESPONSE
+            ]
+            .concat()
+        );
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.commands, 4);
+        assert_eq!(snapshot.article_requests, 3);
+        assert_eq!(snapshot.bytes_sent, output.len() as u64);
+
+        fs::remove_dir_all(article_dir).unwrap();
     }
 
     #[tokio::test]
