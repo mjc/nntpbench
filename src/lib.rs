@@ -88,7 +88,7 @@ pub use protocol::{
 };
 pub use typed_client::{
     Client, OwnedArticle, OwnedArticleExchange, OwnedExchange, OwnedResponse,
-    TypedClientConnection, TypedClientError, TypedClientOptions, TypedClientResponseMode,
+    TypedClientConnection, TypedClientError, TypedClientOptions,
 };
 
 pub const CRLF: &[u8] = b"\r\n";
@@ -358,6 +358,14 @@ pub struct ClientArgs {
     #[arg(long)]
     pub segments: Option<PathBuf>,
 
+    /// AUTHINFO USER value sent once per connection before workload requests.
+    #[arg(long)]
+    pub auth_user: Option<String>,
+
+    /// AUTHINFO PASS value sent once per connection before workload requests.
+    #[arg(long)]
+    pub auth_pass: Option<String>,
+
     /// Total ARTICLE/BODY commands to complete. Use 0 to disable this limit.
     #[arg(long, default_value_t = 0)]
     pub requests: u64,
@@ -443,6 +451,14 @@ pub struct TypedClientArgs {
     /// Tab-separated segment file. Lines are SIZE<TAB>MSGID; MSGID is normalized into angle brackets.
     #[arg(long)]
     pub segments: Option<PathBuf>,
+
+    /// AUTHINFO USER value sent once per connection before workload requests.
+    #[arg(long)]
+    pub auth_user: Option<String>,
+
+    /// AUTHINFO PASS value sent once per connection before workload requests.
+    #[arg(long)]
+    pub auth_pass: Option<String>,
 
     /// Total typed ARTICLE/BODY requests to complete. Use 0 to disable this limit.
     #[arg(long, default_value_t = 0)]
@@ -748,7 +764,6 @@ pub async fn fetch_typed_response(
             socket_recv_buffer: args.socket_recv_buffer,
             socket_send_buffer: args.socket_send_buffer,
             pipeline_depth: args.pipeline_depth.clamp(1, 4096),
-            response_mode: TypedClientResponseMode::Owned,
         },
     )
     .await?;
@@ -1005,11 +1020,26 @@ fn map_typed_client_error(err: TypedClientError) -> io::Error {
     }
 }
 
+fn validate_client_auth_value(
+    value: Option<String>,
+    name: &'static str,
+) -> io::Result<Option<AuthInfoValue<'static>>> {
+    value
+        .map(|value| {
+            AuthInfoValue::from_owned(value).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, format!("invalid {name} value"))
+            })
+        })
+        .transpose()
+}
+
 #[derive(Debug, Clone)]
 struct TypedClientConfig {
     connect: SocketAddr,
     ports: Box<[u16]>,
     segments: Option<Arc<SegmentSet>>,
+    auth_user: Option<AuthInfoValue<'static>>,
+    auth_pass: Option<AuthInfoValue<'static>>,
     requests: u64,
     transfer_bytes: u64,
     duration: Duration,
@@ -1033,6 +1063,8 @@ impl TypedClientConfig {
             args.connect,
             args.ports.into_boxed_slice(),
             args.segments,
+            args.auth_user,
+            args.auth_pass,
             args.requests,
             args.transfer_bytes,
             args.duration_secs,
@@ -1056,6 +1088,8 @@ impl TypedClientConfig {
             args.connect,
             args.ports.into_boxed_slice(),
             args.segments,
+            args.auth_user,
+            args.auth_pass,
             args.requests,
             args.transfer_bytes,
             args.duration_secs,
@@ -1079,6 +1113,8 @@ impl TypedClientConfig {
         connect: SocketAddr,
         ports: Box<[u16]>,
         segments: Option<PathBuf>,
+        auth_user: Option<String>,
+        auth_pass: Option<String>,
         requests: u64,
         transfer_bytes: u64,
         duration_secs: u64,
@@ -1106,11 +1142,15 @@ impl TypedClientConfig {
             .map(read_segments)
             .transpose()?
             .map(Arc::new);
+        let auth_user = validate_client_auth_value(auth_user, "auth user")?;
+        let auth_pass = validate_client_auth_value(auth_pass, "auth pass")?;
 
         Ok(Self {
             connect,
             ports,
             segments,
+            auth_user,
+            auth_pass,
             requests,
             transfer_bytes,
             duration: Duration::from_secs(duration_secs),
@@ -1142,6 +1182,8 @@ impl TypedClientConfig {
 struct TypedClientSession {
     connect: SocketAddr,
     segments: Option<Arc<SegmentSet>>,
+    auth_user: Option<AuthInfoValue<'static>>,
+    auth_pass: Option<AuthInfoValue<'static>>,
     client_index: usize,
     total_clients: usize,
     requests: u64,
@@ -1160,6 +1202,8 @@ impl TypedClientSession {
         Self {
             connect: config.endpoint_for(global_index),
             segments: config.segments.clone(),
+            auth_user: config.auth_user.clone(),
+            auth_pass: config.auth_pass.clone(),
             client_index: global_index,
             total_clients: config.total_clients,
             requests,
@@ -1184,33 +1228,37 @@ impl TypedClientSession {
     }
 
     async fn run_inner(self, stats: &Stats, stop: &AtomicBool) -> io::Result<()> {
-        let connection = TypedClientConnection::connect_with_options(
+        let mut stream = connect_client_socket(
             self.connect,
-            TypedClientOptions {
-                read_buffer_bytes: self.read_buffer_bytes,
-                nodelay: self.nodelay,
-                socket_recv_buffer: self.socket_recv_buffer,
-                socket_send_buffer: self.socket_send_buffer,
-                pipeline_depth: self.pipeline_depth,
-                response_mode: TypedClientResponseMode::Drained,
-            },
+            self.nodelay,
+            self.socket_recv_buffer,
+            self.socket_send_buffer,
         )
-        .await
-        .map_err(map_typed_client_error)?;
+        .await?;
+        let mut read_buffer = vec![
+            0;
+            self.read_buffer_bytes
+                .max(crate::terminator::TERMINATOR_TAIL_SIZE)
+        ]
+        .into_boxed_slice();
+        read_greeting(&mut stream, &mut read_buffer).await?;
+        let mut response_reader =
+            crate::typed_client::DrainedResponseReader::new(read_buffer.len());
+        self.authenticate(&mut stream, &mut response_reader).await?;
 
-        let mut pending: VecDeque<(u64, crate::typed_client::PendingDrainedResponse)> =
+        let mut pending: VecDeque<(u64, RequestKind)> =
             VecDeque::with_capacity(self.pipeline_depth);
         let mut issued = 0_u64;
 
-        self.fill_typed_pipeline(&connection, &mut pending, &mut issued, stats, stop)
+        self.fill_typed_pipeline(&mut stream, &mut pending, &mut issued, stats, stop)
             .await?;
         if pending.len() > 1 {
             stats.pipeline_batches.fetch_add(1, Ordering::Relaxed);
         }
 
-        while let Some((command_id, pending_response)) = pending.pop_front() {
-            let response = pending_response
-                .receive()
+        while let Some((command_id, kind)) = pending.pop_front() {
+            let response = response_reader
+                .read_response(&mut stream, kind)
                 .await
                 .map_err(map_typed_client_error)?;
 
@@ -1237,7 +1285,7 @@ impl TypedClientSession {
             }
 
             let before = pending.len();
-            self.fill_typed_pipeline(&connection, &mut pending, &mut issued, stats, stop)
+            self.fill_typed_pipeline(&mut stream, &mut pending, &mut issued, stats, stop)
                 .await?;
             if pending.len().saturating_sub(before) > 1 {
                 stats.pipeline_batches.fetch_add(1, Ordering::Relaxed);
@@ -1247,10 +1295,51 @@ impl TypedClientSession {
         Ok(())
     }
 
+    async fn authenticate(
+        &self,
+        stream: &mut TcpStream,
+        response_reader: &mut crate::typed_client::DrainedResponseReader,
+    ) -> io::Result<()> {
+        let mut user_status = None;
+        if let Some(value) = self.auth_user.as_ref() {
+            let response =
+                send_authinfo(stream, response_reader, AuthInfoKind::User, value.clone()).await?;
+            let status = response.status().as_u16();
+            if status != 281 && status != 381 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("AUTHINFO USER rejected with status {status}"),
+                ));
+            }
+            user_status = Some(status);
+        }
+
+        if self.auth_pass.is_none() && user_status == Some(381) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "AUTHINFO USER requires AUTHINFO PASS",
+            ));
+        }
+
+        if let Some(value) = self.auth_pass.as_ref() {
+            let response =
+                send_authinfo(stream, response_reader, AuthInfoKind::Pass, value.clone()).await?;
+            let status = response.status().as_u16();
+            if status != 281 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("AUTHINFO PASS rejected with status {status}"),
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
     async fn fill_typed_pipeline(
         &self,
-        connection: &TypedClientConnection,
-        pending: &mut VecDeque<(u64, crate::typed_client::PendingDrainedResponse)>,
+        stream: &mut TcpStream,
+        pending: &mut VecDeque<(u64, RequestKind)>,
         issued: &mut u64,
         stats: &Stats,
         stop: &AtomicBool,
@@ -1273,16 +1362,29 @@ impl TypedClientSession {
                 self.client_index,
                 self.total_clients,
             )?;
-            let pending_response = connection
-                .queue_request_drained(request)
-                .await
-                .map_err(map_typed_client_error)?;
-            pending.push_back((command_id, pending_response));
+            let kind = request.kind();
+            crate::typed_client::write_request_wire(stream, &request).await?;
+            pending.push_back((command_id, kind));
             *issued = issued.wrapping_add(1);
         }
 
         Ok(())
     }
+}
+
+async fn send_authinfo(
+    stream: &mut TcpStream,
+    response_reader: &mut crate::typed_client::DrainedResponseReader,
+    kind: AuthInfoKind,
+    value: AuthInfoValue<'static>,
+) -> io::Result<crate::typed_client::DrainedResponse> {
+    let request = Request::AuthInfo { kind, value };
+    let request_kind = request.kind();
+    crate::typed_client::write_request_wire(stream, &request).await?;
+    response_reader
+        .read_response(stream, request_kind)
+        .await
+        .map_err(map_typed_client_error)
 }
 
 fn transfer_limit_reached(stats: &Stats, transfer_bytes: u64) -> bool {
@@ -2968,6 +3070,8 @@ mod tests {
             connect: "127.0.0.1:1199".parse().unwrap(),
             ports: Vec::new(),
             segments: None,
+            auth_user: None,
+            auth_pass: None,
             requests: 0,
             transfer_bytes: 0,
             duration_secs: 0,
@@ -3015,6 +3119,8 @@ mod tests {
             connect: "127.0.0.1:1199".parse().unwrap(),
             ports: Vec::new(),
             segments: None,
+            auth_user: None,
+            auth_pass: None,
             requests: 0,
             transfer_bytes: 0,
             duration_secs: 0,
@@ -3463,6 +3569,8 @@ mod tests {
         args.connect = "127.0.0.1:1199".parse().unwrap();
         args.ports = vec![1200, 1201];
         args.segments = Some(path.clone());
+        args.auth_user = Some("bench-user".to_string());
+        args.auth_pass = Some("bench-pass".to_string());
         args.requests = 17;
         args.transfer_bytes = 8192;
         args.duration_secs = 3;
@@ -3501,6 +3609,14 @@ mod tests {
         assert_eq!(config.endpoint_for(1).port(), 1201);
         assert_eq!(config.endpoint_for(2).port(), 1200);
         assert!(config.segments.is_some());
+        assert_eq!(
+            config.auth_user.as_ref().map(AuthInfoValue::as_str),
+            Some("bench-user")
+        );
+        assert_eq!(
+            config.auth_pass.as_ref().map(AuthInfoValue::as_str),
+            Some("bench-pass")
+        );
     }
 
     #[test]
@@ -3526,6 +3642,19 @@ mod tests {
     }
 
     #[test]
+    fn client_config_rejects_invalid_authinfo_values() {
+        let mut args = test_client_args();
+        args.auth_user = Some("bad\ruser".to_string());
+        let err = TypedClientConfig::from_client_args(args).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        let mut args = test_typed_client_args();
+        args.auth_pass = Some("bad\npass".to_string());
+        let err = TypedClientConfig::from_args(args).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
     fn client_session_new_copies_connection_distribution() {
         let path = write_temp_segments("session", "1\tone@test\n22\t<two@test>\n");
         let mut args = test_client_args();
@@ -3534,6 +3663,8 @@ mod tests {
         args.segments = Some(path.clone());
         args.requests = 10;
         args.transfer_bytes = 100;
+        args.auth_user = Some("session-user".to_string());
+        args.auth_pass = Some("session-pass".to_string());
         args.connections = 2;
         args.total_clients = 8;
         args.pipeline_depth = 3;
@@ -3560,6 +3691,14 @@ mod tests {
         assert_eq!(session.socket_recv_buffer, 1024);
         assert_eq!(session.socket_send_buffer, 2048);
         assert!(session.segments.is_some());
+        assert_eq!(
+            session.auth_user.as_ref().map(AuthInfoValue::as_str),
+            Some("session-user")
+        );
+        assert_eq!(
+            session.auth_pass.as_ref().map(AuthInfoValue::as_str),
+            Some("session-pass")
+        );
     }
 
     #[test]
@@ -4069,6 +4208,82 @@ mod tests {
         assert_eq!(snapshot.pipeline_batches, 1);
         assert!(snapshot.bytes_sent > 0);
         assert!(!stop.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn typed_client_session_sends_authinfo_before_workload_requests() {
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"201 loopback ready\r\n").await.unwrap();
+
+            let mut scratch = [0_u8; 128];
+            let mut pending = Vec::new();
+            while pending.iter().filter(|byte| **byte == b'\n').count() < 1 {
+                let read = stream.read(&mut scratch).await.unwrap();
+                assert_ne!(read, 0);
+                pending.extend_from_slice(&scratch[..read]);
+            }
+            assert_eq!(&pending[..], b"AUTHINFO USER bench-user\r\n");
+            pending.clear();
+            stream
+                .write_all(b"381 authentication information required\r\n")
+                .await
+                .unwrap();
+
+            while pending.iter().filter(|byte| **byte == b'\n').count() < 1 {
+                let read = stream.read(&mut scratch).await.unwrap();
+                assert_ne!(read, 0);
+                pending.extend_from_slice(&scratch[..read]);
+            }
+            assert_eq!(&pending[..], b"AUTHINFO PASS bench-pass\r\n");
+            pending.clear();
+            stream
+                .write_all(b"281 authentication accepted\r\n")
+                .await
+                .unwrap();
+
+            while pending.iter().filter(|byte| **byte == b'\n').count() < 2 {
+                let read = stream.read(&mut scratch).await.unwrap();
+                assert_ne!(read, 0);
+                pending.extend_from_slice(&scratch[..read]);
+            }
+            assert_eq!(&pending[..], b"ARTICLE 1\r\nBODY 2\r\n");
+
+            stream
+                .write_all(
+                    b"220 1 <bench.1@nntpbench.local> article follows\r\nSubject: Bench\r\n\r\none\r\n.\r\n",
+                )
+                .await
+                .unwrap();
+            stream
+                .write_all(b"222 1 <bench.2@nntpbench.local> body follows\r\ntwo\r\n.\r\n")
+                .await
+                .unwrap();
+        });
+
+        let mut args = test_client_args();
+        args.connect = addr;
+        args.auth_user = Some("bench-user".to_string());
+        args.auth_pass = Some("bench-pass".to_string());
+        args.requests = 2;
+        args.pipeline_depth = 2;
+        args.command_mix = ClientCommandMix::Alternate;
+        args.read_buffer_bytes = 64;
+        let config = TypedClientConfig::from_client_args(args).unwrap();
+        let session = TypedClientSession::new(&config, 0, 1, 2);
+        let stats = Arc::new(Stats::new());
+        let stop = Arc::new(AtomicBool::new(false));
+
+        session.run(stats.clone(), stop.clone()).await.unwrap();
+        server.await.unwrap();
+
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.commands, 2);
+        assert_eq!(snapshot.article_requests, 1);
+        assert_eq!(snapshot.body_requests, 1);
+        assert_eq!(snapshot.pipeline_batches, 1);
     }
 
     #[tokio::test]

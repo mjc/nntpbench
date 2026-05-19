@@ -8,7 +8,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
-use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -38,13 +38,6 @@ pub struct TypedClientOptions {
     pub socket_recv_buffer: usize,
     pub socket_send_buffer: usize,
     pub pipeline_depth: usize,
-    pub response_mode: TypedClientResponseMode,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TypedClientResponseMode {
-    Owned,
-    Drained,
 }
 
 impl Default for TypedClientOptions {
@@ -55,7 +48,6 @@ impl Default for TypedClientOptions {
             socket_recv_buffer: 0,
             socket_send_buffer: 0,
             pipeline_depth: 64,
-            response_mode: TypedClientResponseMode::Owned,
         }
     }
 }
@@ -884,7 +876,6 @@ impl TypedClientConnection {
         let (inflight_tx, inflight_rx) = mpsc::channel(options.pipeline_depth.max(1));
         let poisoned = Arc::new(Mutex::new(None));
         let read_chunk_bytes = read_buffer.len();
-        let response_mode = options.response_mode;
 
         let writer_task = tokio::spawn(run_writer_task(
             writer,
@@ -896,7 +887,6 @@ impl TypedClientConnection {
         let reader_task = tokio::spawn(run_reader_task(
             reader,
             read_chunk_bytes,
-            response_mode,
             inflight_rx,
             poisoned.clone(),
             writer_abort,
@@ -905,7 +895,6 @@ impl TypedClientConnection {
         Ok(Self {
             inner: Arc::new(ConnectionHandle {
                 request_tx,
-                response_mode,
                 poisoned,
                 writer_task,
                 reader_task,
@@ -1694,11 +1683,6 @@ impl TypedClientConnection {
         &self,
         request: Request<'static>,
     ) -> Result<PendingResponse, TypedClientError> {
-        if self.inner.response_mode != TypedClientResponseMode::Owned {
-            return Err(TypedClientError::Io(io::Error::other(
-                "owned response requested from drained typed connection",
-            )));
-        }
         let (response_tx, response_rx) = oneshot::channel();
         self.inner
             .request_tx
@@ -1715,40 +1699,10 @@ impl TypedClientConnection {
         })
     }
 
-    pub(crate) async fn queue_request_drained(
-        &self,
-        request: Request<'static>,
-    ) -> Result<PendingDrainedResponse, TypedClientError> {
-        if self.inner.response_mode != TypedClientResponseMode::Drained {
-            return Err(TypedClientError::Io(io::Error::other(
-                "drained response requested from owned typed connection",
-            )));
-        }
-        let (response_tx, response_rx) = oneshot::channel();
-        self.inner
-            .request_tx
-            .send(QueuedRequest {
-                request,
-                response_tx,
-            })
-            .await
-            .map_err(|_| TypedClientError::ConnectionClosed)?;
-
-        Ok(PendingDrainedResponse {
-            inner: self.inner.clone(),
-            response_rx,
-        })
-    }
-
     pub(crate) async fn queue_request_exchange(
         &self,
         request: Request<'static>,
     ) -> Result<PendingExchange, TypedClientError> {
-        if self.inner.response_mode != TypedClientResponseMode::Owned {
-            return Err(TypedClientError::Io(io::Error::other(
-                "owned response requested from drained typed connection",
-            )));
-        }
         let (response_tx, response_rx) = oneshot::channel();
         self.inner
             .request_tx
@@ -1784,7 +1738,6 @@ impl Drop for ConnectionHandle {
 #[derive(Debug)]
 struct ConnectionHandle {
     request_tx: mpsc::Sender<QueuedRequest>,
-    response_mode: TypedClientResponseMode,
     poisoned: Arc<Mutex<Option<SharedEngineError>>>,
     writer_task: JoinHandle<()>,
     reader_task: JoinHandle<()>,
@@ -2294,40 +2247,6 @@ impl PendingResponse {
 
         match response.map_err(TypedClientError::from)?.response {
             CompletedResponse::Owned(response) => Ok(response),
-            CompletedResponse::Drained(_) => Err(TypedClientError::Io(io::Error::other(
-                "drained response returned to owned caller",
-            ))),
-        }
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct PendingDrainedResponse {
-    inner: Arc<ConnectionHandle>,
-    response_rx: oneshot::Receiver<Result<CompletedRequest, SharedEngineError>>,
-}
-
-impl PendingDrainedResponse {
-    pub(crate) async fn receive(self) -> Result<DrainedResponse, TypedClientError> {
-        let response = match self.response_rx.await {
-            Ok(response) => response,
-            Err(_) => {
-                return Err(self
-                    .inner
-                    .poisoned
-                    .lock()
-                    .await
-                    .clone()
-                    .map(TypedClientError::from)
-                    .unwrap_or(TypedClientError::ConnectionClosed));
-            }
-        };
-
-        match response.map_err(TypedClientError::from)?.response {
-            CompletedResponse::Drained(response) => Ok(response),
-            CompletedResponse::Owned(_) => Err(TypedClientError::Io(io::Error::other(
-                "owned response returned to drained caller",
-            ))),
         }
     }
 }
@@ -2360,28 +2279,110 @@ impl PendingExchange {
                 request: completed.request,
                 response,
             }),
-            CompletedResponse::Drained(_) => Err(TypedClientError::Io(io::Error::other(
-                "drained response returned to exchange caller",
-            ))),
         }
     }
 }
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DrainedResponse {
+    status: StatusCode,
     bytes_len: usize,
 }
 
 impl DrainedResponse {
+    pub(crate) fn status(&self) -> StatusCode {
+        self.status
+    }
+
     pub(crate) fn bytes_len(&self) -> usize {
         self.bytes_len
+    }
+}
+
+pub(crate) struct DrainedResponseReader {
+    pending_read: Box<[u8; DRAINED_PENDING_READ_BYTES]>,
+    pending_len: usize,
+    pending_start: usize,
+    read_chunk_bytes: usize,
+}
+
+impl DrainedResponseReader {
+    pub(crate) fn new(read_chunk_bytes: usize) -> Self {
+        Self {
+            pending_read: Box::new([0; DRAINED_PENDING_READ_BYTES]),
+            pending_len: 0,
+            pending_start: 0,
+            read_chunk_bytes: read_chunk_bytes.min(DRAINED_PENDING_READ_BYTES),
+        }
+    }
+
+    pub(crate) async fn read_response<R>(
+        &mut self,
+        reader: &mut R,
+        kind: RequestKind,
+    ) -> Result<DrainedResponse, TypedClientError>
+    where
+        R: AsyncRead + Unpin,
+    {
+        let mut decoder = StreamingResponseDecoder::new(kind);
+        let mut bytes_len = 0usize;
+
+        loop {
+            if self.pending_start < self.pending_len {
+                match decoder.push(&self.pending_read[self.pending_start..self.pending_len]) {
+                    Ok(StreamingDecodeProgress::NeedMore { consumed }) => {
+                        bytes_len += consumed;
+                        self.pending_start += consumed;
+                        if self.pending_start == self.pending_len {
+                            self.pending_len = 0;
+                            self.pending_start = 0;
+                        }
+                    }
+                    Ok(StreamingDecodeProgress::Complete { status, consumed }) => {
+                        bytes_len += consumed;
+                        self.pending_start += consumed;
+                        if self.pending_start == self.pending_len {
+                            self.pending_len = 0;
+                            self.pending_start = 0;
+                        }
+
+                        return Ok(DrainedResponse { status, bytes_len });
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+
+            if self.pending_len == self.pending_read.len() {
+                compact_drained_pending_read(
+                    &mut self.pending_read,
+                    &mut self.pending_start,
+                    &mut self.pending_len,
+                );
+                if self.pending_len == self.pending_read.len() {
+                    return Err(TypedClientError::InvalidStatusLine);
+                }
+            }
+
+            let read_len = self
+                .read_chunk_bytes
+                .min(self.pending_read.len() - self.pending_len);
+            let read = reader
+                .read(&mut self.pending_read[self.pending_len..self.pending_len + read_len])
+                .await
+                .map_err(TypedClientError::Io)?;
+
+            if read == 0 {
+                return Err(TypedClientError::UnexpectedEof);
+            }
+
+            self.pending_len += read;
+        }
     }
 }
 
 #[derive(Debug)]
 enum CompletedResponse {
     Owned(OwnedResponse),
-    Drained(DrainedResponse),
 }
 
 #[derive(Debug)]
@@ -2440,7 +2441,10 @@ async fn run_writer_task(
     }
 }
 
-async fn write_request_wire<W>(writer: &mut W, request: &Request<'static>) -> io::Result<()>
+pub(crate) async fn write_request_wire<W>(
+    writer: &mut W,
+    request: &Request<'static>,
+) -> io::Result<()>
 where
     W: AsyncWrite + Unpin,
 {
@@ -2829,42 +2833,13 @@ where
 async fn run_reader_task(
     reader: OwnedReadHalf,
     read_chunk_bytes: usize,
-    response_mode: TypedClientResponseMode,
     inflight_rx: mpsc::Receiver<InFlightRequest>,
     poisoned: Arc<Mutex<Option<SharedEngineError>>>,
     writer_abort: tokio::task::AbortHandle,
 ) {
-    match response_mode {
-        TypedClientResponseMode::Owned => {
-            run_reader_task_owned(
-                reader,
-                read_chunk_bytes,
-                inflight_rx,
-                poisoned,
-                writer_abort,
-            )
-            .await;
-        }
-        TypedClientResponseMode::Drained => {
-            run_reader_task_drained(
-                reader,
-                read_chunk_bytes,
-                inflight_rx,
-                poisoned,
-                writer_abort,
-            )
-            .await;
-        }
-    }
-}
-
-async fn run_reader_task_owned(
-    mut reader: OwnedReadHalf,
-    _read_chunk_bytes: usize,
-    mut inflight_rx: mpsc::Receiver<InFlightRequest>,
-    poisoned: Arc<Mutex<Option<SharedEngineError>>>,
-    writer_abort: tokio::task::AbortHandle,
-) {
+    let mut reader = reader;
+    let _read_chunk_bytes = read_chunk_bytes;
+    let mut inflight_rx = inflight_rx;
     let mut pending_read = BytesMut::with_capacity(OWNED_RESPONSE_PREALLOC_BYTES);
 
     while let Some(inflight_request) = inflight_rx.recv().await {
@@ -2939,116 +2914,6 @@ async fn run_reader_task_owned(
                 poison_reader_engine(&poisoned, &mut inflight_rx, error).await;
                 return;
             }
-        }
-    }
-}
-
-async fn run_reader_task_drained(
-    mut reader: OwnedReadHalf,
-    read_chunk_bytes: usize,
-    mut inflight_rx: mpsc::Receiver<InFlightRequest>,
-    poisoned: Arc<Mutex<Option<SharedEngineError>>>,
-    writer_abort: tokio::task::AbortHandle,
-) {
-    let mut pending_read = Box::new([0; DRAINED_PENDING_READ_BYTES]);
-    let mut pending_len = 0usize;
-    let mut pending_start = 0usize;
-    let read_chunk_bytes = read_chunk_bytes.min(DRAINED_PENDING_READ_BYTES);
-
-    while let Some(inflight_request) = inflight_rx.recv().await {
-        let InFlightRequest {
-            request,
-            kind,
-            response_tx,
-        } = inflight_request;
-        let mut decoder = StreamingResponseDecoder::new(kind);
-        let mut bytes_len = 0usize;
-
-        loop {
-            if pending_start < pending_len {
-                match decoder.push(&pending_read[pending_start..pending_len]) {
-                    Ok(StreamingDecodeProgress::NeedMore { consumed }) => {
-                        bytes_len += consumed;
-                        pending_start += consumed;
-                        if pending_start == pending_len {
-                            pending_len = 0;
-                            pending_start = 0;
-                        }
-                    }
-                    Ok(StreamingDecodeProgress::Complete {
-                        status: _status,
-                        consumed,
-                    }) => {
-                        bytes_len += consumed;
-                        pending_start += consumed;
-                        if pending_start == pending_len {
-                            pending_len = 0;
-                            pending_start = 0;
-                        }
-
-                        let response = CompletedResponse::Drained(DrainedResponse { bytes_len });
-                        let _ = response_tx.send(Ok(CompletedRequest { request, response }));
-                        break;
-                    }
-                    Err(TypedClientError::InvalidStatusLine) => {
-                        let error = SharedEngineError::InvalidStatusLine;
-                        let _ = response_tx.send(Err(error.clone()));
-                        writer_abort.abort();
-                        poison_reader_engine(&poisoned, &mut inflight_rx, error).await;
-                        return;
-                    }
-                    Err(err) => {
-                        let error = shared_engine_error_from_typed(err);
-                        let _ = response_tx.send(Err(error.clone()));
-                        writer_abort.abort();
-                        poison_reader_engine(&poisoned, &mut inflight_rx, error).await;
-                        return;
-                    }
-                }
-            }
-
-            if pending_len == pending_read.len() {
-                compact_drained_pending_read(
-                    &mut pending_read,
-                    &mut pending_start,
-                    &mut pending_len,
-                );
-                if pending_len == pending_read.len() {
-                    let error = SharedEngineError::InvalidStatusLine;
-                    let _ = response_tx.send(Err(error.clone()));
-                    writer_abort.abort();
-                    poison_reader_engine(&poisoned, &mut inflight_rx, error).await;
-                    return;
-                }
-            }
-
-            let read_len = read_chunk_bytes.min(pending_read.len() - pending_len);
-            let read = match reader
-                .read(&mut pending_read[pending_len..pending_len + read_len])
-                .await
-            {
-                Ok(read) => read,
-                Err(err) => {
-                    let error = SharedEngineError::Io {
-                        kind: err.kind(),
-                        message: err.to_string(),
-                    };
-                    let _ = response_tx.send(Err(error.clone()));
-                    writer_abort.abort();
-                    poison_reader_engine(&poisoned, &mut inflight_rx, error).await;
-                    return;
-                }
-            };
-
-            if read == 0 {
-                let error = SharedEngineError::UnexpectedEof;
-                let _ = response_tx.send(Err(error.clone()));
-                writer_abort.abort();
-                poison_reader_engine(&poisoned, &mut inflight_rx, error).await;
-                return;
-            }
-
-            pending_len += read;
         }
     }
 }
