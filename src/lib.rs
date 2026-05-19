@@ -2124,6 +2124,7 @@ fn cpu_seconds_since(start: Option<u64>) -> f64 {
     end.saturating_sub(start) as f64 * PROCESS_CLOCK_TICK.as_secs_f64()
 }
 
+#[cfg(target_os = "linux")]
 #[cfg_attr(coverage_nightly, coverage(off))]
 fn process_rss_kib() -> u64 {
     let Ok(mut file) = fs::File::open("/proc/self/status") else {
@@ -2152,6 +2153,25 @@ fn process_rss_kib() -> u64 {
         }
     }
     rss
+}
+
+#[cfg(target_os = "macos")]
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn process_rss_kib() -> u64 {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+    let result = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+    if result != 0 {
+        return 0;
+    }
+
+    let max_rss_bytes = unsafe { usage.assume_init() }.ru_maxrss;
+    u64::try_from(max_rss_bytes).unwrap_or(0) / 1024
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn process_rss_kib() -> u64 {
+    0
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
