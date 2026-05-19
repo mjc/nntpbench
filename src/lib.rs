@@ -5,6 +5,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 #[cfg(test)]
 use std::cell::Cell;
 use std::collections::VecDeque;
+use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::future::poll_fn;
 use std::io::{self, IoSlice, Read, Write};
@@ -1663,16 +1664,16 @@ impl TypedClientSession {
         {
             let command_id = self.next_id.wrapping_add(*issued);
             let request_index = *issued;
-            let request = typed_request_for_command(
+            let kind = write_typed_workload_request(
+                stream,
                 command_id,
                 request_index,
                 self.command_mix,
                 self.segments.as_deref(),
                 self.client_index,
                 self.total_clients,
-            )?;
-            let kind = request.kind();
-            crate::typed_client::write_request_wire(stream, &request).await?;
+            )
+            .await?;
             pending.push_back((command_id, kind));
             *issued = issued.wrapping_add(1);
         }
@@ -1780,6 +1781,77 @@ fn handle_article_id_response(
 
 fn transfer_limit_reached(stats: &Stats, transfer_bytes: u64) -> bool {
     transfer_bytes != 0 && stats.bytes_sent.load(Ordering::Relaxed) >= transfer_bytes
+}
+
+async fn write_typed_workload_request(
+    stream: &mut TcpStream,
+    command_id: u64,
+    request_index: u64,
+    mix: ClientCommandMix,
+    segments: Option<&SegmentSet>,
+    client_index: usize,
+    total_clients: usize,
+) -> io::Result<RequestKind> {
+    let kind = client_command_kind(command_id, mix);
+    let request_kind = match kind {
+        ClientCommandMix::Article => RequestKind::Article,
+        ClientCommandMix::Body => RequestKind::Body,
+        ClientCommandMix::Alternate => {
+            unreachable!("client_command_kind should normalize Alternate")
+        }
+    };
+
+    if let Some(segments) = segments {
+        let message_id =
+            segment_ref_for_request(segments, client_index, total_clients, request_index);
+        write_typed_message_id_request(stream, kind, message_id).await?;
+        return Ok(request_kind);
+    }
+
+    if (1..=crate::protocol::MAX_ARTICLE_NUMBER).contains(&command_id) {
+        let article_ref = ArticleRef::from_number(command_id)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid article number"))?;
+        write_typed_article_ref_request(stream, kind, &article_ref).await?;
+        return Ok(request_kind);
+    }
+
+    let mut synthetic = arrayvec::ArrayString::<64>::new();
+    write!(&mut synthetic, "<bench.{command_id}@nntpbench.local>")
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid synthetic message-id"))?;
+    let message_id = MessageId::from_borrowed(synthetic.as_str())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid synthetic message-id"))?;
+    write_typed_message_id_request(stream, kind, &message_id).await?;
+    Ok(request_kind)
+}
+
+async fn write_typed_message_id_request(
+    stream: &mut TcpStream,
+    kind: ClientCommandMix,
+    message_id: &MessageId<'_>,
+) -> io::Result<()> {
+    let article_ref = ArticleRef::MessageId(
+        MessageId::from_borrowed(message_id.as_str())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid message-id"))?,
+    );
+    write_typed_article_ref_request(stream, kind, &article_ref).await
+}
+
+async fn write_typed_article_ref_request(
+    stream: &mut TcpStream,
+    kind: ClientCommandMix,
+    article_ref: &ArticleRef<'_>,
+) -> io::Result<()> {
+    match kind {
+        ClientCommandMix::Article => {
+            crate::typed_client::write_article_request_wire(stream, article_ref).await
+        }
+        ClientCommandMix::Body => {
+            crate::typed_client::write_body_request_wire(stream, article_ref).await
+        }
+        ClientCommandMix::Alternate => {
+            unreachable!("client_command_kind should normalize Alternate")
+        }
+    }
 }
 
 fn typed_request_for_command(
@@ -2089,9 +2161,18 @@ fn segment_for_request(
     total_clients: usize,
     request_id: u64,
 ) -> MessageId<'static> {
+    segment_ref_for_request(segments, client_index, total_clients, request_id).clone()
+}
+
+fn segment_ref_for_request(
+    segments: &SegmentSet,
+    client_index: usize,
+    total_clients: usize,
+    request_id: u64,
+) -> &MessageId<'static> {
     let index =
         (client_index + (request_id as usize).wrapping_mul(total_clients)) % segments.ids.len();
-    segments.ids[index].clone()
+    &segments.ids[index]
 }
 
 fn client_command_kind(id: u64, mix: ClientCommandMix) -> ClientCommandMix {
