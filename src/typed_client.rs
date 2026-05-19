@@ -2956,8 +2956,6 @@ async fn run_reader_task_drained(
     let read_chunk_bytes = read_chunk_bytes.min(DRAINED_PENDING_READ_BYTES);
 
     while let Some(inflight_request) = inflight_rx.recv().await {
-        compact_drained_pending_read(&mut pending_read, &mut pending_start, &mut pending_len);
-
         let InFlightRequest {
             request,
             kind,
