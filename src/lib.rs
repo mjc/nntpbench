@@ -7,7 +7,7 @@ use std::cell::Cell;
 use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::future::poll_fn;
-use std::io::{self, IoSlice, Read, Write};
+use std::io::{self, BufRead, IoSlice, Read, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -1953,13 +1953,16 @@ fn request_message_id_for_command(
         ));
     }
 
-    let prefix = match kind {
-        ClientCommandMix::Article | ClientCommandMix::Body => "bench.",
+    match kind {
+        ClientCommandMix::Article | ClientCommandMix::Body => {}
         ClientCommandMix::Alternate => {
             unreachable!("client_command_kind should normalize Alternate")
         }
     };
-    MessageId::from_str_or_wrap(format!("{prefix}{command_id}@nntpbench.local"))
+    let mut message_id = arrayvec::ArrayString::<64>::new();
+    write!(&mut message_id, "<bench.{command_id}@nntpbench.local>")
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid synthetic message-id"))?;
+    MessageId::from_shared(Arc::<str>::from(message_id.as_str()))
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid synthetic message-id"))
 }
 
@@ -1974,34 +1977,32 @@ fn requests_for_connection(total: u64, connections: usize, index: usize) -> u64 
 }
 
 fn read_segments(path: &std::path::Path) -> io::Result<SegmentSet> {
-    let contents = fs::read_to_string(path)?;
+    let file = fs::File::open(path)?;
+    let mut reader = io::BufReader::new(file);
+    let mut line_buf = Vec::with_capacity(512);
     let mut ids = Vec::new();
+    let mut line_index = 0;
 
-    for (line_index, line) in contents.lines().enumerate() {
-        let line = line.trim();
+    loop {
+        line_buf.clear();
+        let read = reader.read_until(b'\n', &mut line_buf)?;
+        if read == 0 {
+            break;
+        }
+        line_index += 1;
+        let line = trim_ascii_line(&line_buf);
         if line.is_empty() {
             continue;
         }
 
-        let (_size, msgid) = line.split_once('\t').ok_or_else(|| {
+        let tab = memchr::memchr(b'\t', line).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!(
-                    "invalid segment line {}: expected SIZE<TAB>MSGID",
-                    line_index + 1
-                ),
+                format!("invalid segment line {line_index}: expected SIZE<TAB>MSGID"),
             )
         })?;
-        let id = normalize_msgid(msgid.trim());
-        let id = std::str::from_utf8(&id).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "segment message-id is not utf-8",
-            )
-        })?;
-        let id = MessageId::from_shared(Arc::<str>::from(id)).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidData, "invalid segment message-id")
-        })?;
+        let msgid = trim_ascii_line(&line[tab + 1..]);
+        let id = shared_message_id_from_bytes(msgid)?;
         ids.push(id);
     }
 
@@ -2017,16 +2018,33 @@ fn read_segments(path: &std::path::Path) -> io::Result<SegmentSet> {
     })
 }
 
-fn normalize_msgid(value: &str) -> Vec<u8> {
+fn shared_message_id_from_bytes(value: &[u8]) -> io::Result<MessageId<'static>> {
+    let value = std::str::from_utf8(value).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "segment message-id is not utf-8",
+        )
+    })?;
     if value.starts_with('<') && value.ends_with('>') {
-        return value.as_bytes().to_vec();
+        return MessageId::from_shared(Arc::<str>::from(value))
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid segment message-id"));
     }
 
-    let mut normalized = Vec::with_capacity(value.len() + 2);
-    normalized.push(b'<');
-    normalized.extend_from_slice(value.as_bytes());
-    normalized.push(b'>');
-    normalized
+    let mut normalized = arrayvec::ArrayString::<512>::new();
+    write!(&mut normalized, "<{value}>")
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "segment message-id too long"))?;
+    MessageId::from_shared(Arc::<str>::from(normalized.as_str()))
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid segment message-id"))
+}
+
+fn trim_ascii_line(mut line: &[u8]) -> &[u8] {
+    while matches!(line.last(), Some(b'\n' | b'\r' | b' ' | b'\t')) {
+        line = &line[..line.len() - 1];
+    }
+    while matches!(line.first(), Some(b' ' | b'\t')) {
+        line = &line[1..];
+    }
+    line
 }
 
 async fn connect_client_socket(
@@ -2083,7 +2101,10 @@ fn optimize_server_socket(stream: &TcpStream, config: &ServerConfig) -> io::Resu
 
 #[cfg_attr(coverage_nightly, coverage(off))]
 fn process_cpu_ticks() -> Option<u64> {
-    let stat = fs::read_to_string("/proc/self/stat").ok()?;
+    let mut file = fs::File::open("/proc/self/stat").ok()?;
+    let mut buffer = [0_u8; 1024];
+    let read = file.read(&mut buffer).ok()?;
+    let stat = std::str::from_utf8(&buffer[..read]).ok()?;
     let rest = stat.rsplit_once(") ")?.1;
     let mut fields = rest.split_whitespace();
     let utime = fields.nth(11)?.parse::<u64>().ok()?;
@@ -2105,7 +2126,14 @@ fn cpu_seconds_since(start: Option<u64>) -> f64 {
 
 #[cfg_attr(coverage_nightly, coverage(off))]
 fn process_rss_kib() -> u64 {
-    let Ok(status) = fs::read_to_string("/proc/self/status") else {
+    let Ok(mut file) = fs::File::open("/proc/self/status") else {
+        return 0;
+    };
+    let mut buffer = [0_u8; 4096];
+    let Ok(read) = file.read(&mut buffer) else {
+        return 0;
+    };
+    let Ok(status) = std::str::from_utf8(&buffer[..read]) else {
         return 0;
     };
 
@@ -2219,7 +2247,11 @@ async fn serve_session_inner(
     let mut reader = BufReader::with_capacity(SERVER_READER_CAPACITY, reader);
     let max_pipeline_depth = config.max_pipeline_depth.min(MAX_SERVER_PIPELINE_DEPTH);
     let mut command_line = [0; MAX_COMMAND_LINE_BYTES];
-    let mut command_batch = CommandBatch::new();
+    let mut command_lines = config
+        .article_dir
+        .as_ref()
+        .map(|_| CommandLineBatch::default());
+    let mut command_batch: Box<CommandBatch> = Box::default();
     let mut pending_write = PendingWrite::new(config.pending_write_bytes);
     let mut article_path = PathBuf::with_capacity(1024);
 
@@ -2229,6 +2261,7 @@ async fn serve_session_inner(
         if !read_command_batch(
             &mut reader,
             &mut command_line,
+            command_lines.as_mut(),
             &mut command_batch,
             max_pipeline_depth,
         )
@@ -2239,6 +2272,7 @@ async fn serve_session_inner(
 
         if process_command_batch(
             &command_batch,
+            command_lines.as_ref(),
             &config,
             session_stats,
             &mut writer,
@@ -2286,6 +2320,7 @@ where
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn process_command_batch<W>(
     command_batch: &CommandBatch,
+    command_lines: Option<&CommandLineBatch>,
     config: &ServerConfig,
     session_stats: &mut SessionStats,
     writer: &mut W,
@@ -2300,6 +2335,7 @@ where
     for command in command_batch {
         if handle_command(
             command,
+            command_lines,
             config,
             session_stats,
             writer,
@@ -2320,6 +2356,7 @@ where
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn handle_command<W>(
     command: &ParsedCommand,
+    command_lines: Option<&CommandLineBatch>,
     config: &ServerConfig,
     session_stats: &mut SessionStats,
     writer: &mut W,
@@ -2335,12 +2372,13 @@ where
         RequestKind::Article => {
             session_stats.article_requests += 1;
             if config.article_dir.is_some() {
+                let message_id = command_lines.and_then(|lines| command_message_id(command, lines));
                 if write_stored_article_response(
                     writer,
                     pending_write,
                     config,
                     command.article_id,
-                    command.message_id.as_ref(),
+                    message_id.as_ref(),
                     session_stats,
                     article_path,
                 )
@@ -3265,15 +3303,47 @@ pub fn rate(count: u64, seconds: f64) -> f64 {
 struct ParsedCommand {
     kind: RequestKind,
     article_id: Option<u64>,
-    message_id: Option<MessageId<'static>>,
+    line_slot: u16,
+    message_id: Option<ParsedMessageId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ParsedMessageId {
+    start: u16,
+    len: u16,
 }
 
 type CommandBatch = ArrayVec<ParsedCommand, MAX_SERVER_PIPELINE_DEPTH>;
+
+struct CommandLineBatch {
+    lines: Box<[[u8; MAX_COMMAND_LINE_BYTES]]>,
+}
+
+impl Default for CommandLineBatch {
+    fn default() -> Self {
+        let mut lines = Vec::with_capacity(MAX_SERVER_PIPELINE_DEPTH);
+        lines.resize_with(MAX_SERVER_PIPELINE_DEPTH, || [0; MAX_COMMAND_LINE_BYTES]);
+        Self {
+            lines: lines.into_boxed_slice(),
+        }
+    }
+}
+
+impl CommandLineBatch {
+    fn copy_line(&mut self, slot: usize, line: &[u8]) {
+        self.lines[slot][..line.len()].copy_from_slice(line);
+    }
+
+    fn line_slice(&self, slot: usize, start: usize, len: usize) -> &[u8] {
+        &self.lines[slot][start..start + len]
+    }
+}
 
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn read_command_batch<R>(
     reader: &mut BufReader<R>,
     command_line: &mut [u8; MAX_COMMAND_LINE_BYTES],
+    mut command_lines: Option<&mut CommandLineBatch>,
     command_batch: &mut CommandBatch,
     max_pipeline_depth: usize,
 ) -> io::Result<bool>
@@ -3284,7 +3354,13 @@ where
     let Some(line_len) = read_crlf_line_into(reader, command_line).await? else {
         return Ok(false);
     };
-    push_command(reader, &command_line[..line_len], command_batch).await?;
+    push_command(
+        reader,
+        &command_line[..line_len],
+        command_lines.as_deref_mut(),
+        command_batch,
+    )
+    .await?;
 
     while command_batch.len() < max_pipeline_depth {
         if find_crlf_line_end(reader.buffer(), 0).is_none() {
@@ -3294,7 +3370,13 @@ where
         let Some(line_len) = read_crlf_line_into(reader, command_line).await? else {
             break;
         };
-        push_command(reader, &command_line[..line_len], command_batch).await?;
+        push_command(
+            reader,
+            &command_line[..line_len],
+            command_lines.as_deref_mut(),
+            command_batch,
+        )
+        .await?;
     }
 
     Ok(true)
@@ -3338,6 +3420,7 @@ where
 async fn push_command<R>(
     reader: &mut BufReader<R>,
     line: &[u8],
+    command_lines: Option<&mut CommandLineBatch>,
     command_batch: &mut CommandBatch,
 ) -> io::Result<()>
 where
@@ -3349,8 +3432,14 @@ where
             "command line missing CRLF terminator",
         ));
     }
-    let command = parse_command_line(line);
+    let line_slot = command_batch.len();
+    let command = parse_command_line(line, line_slot);
     let kind = command.kind;
+    if command.message_id.is_some()
+        && let Some(command_lines) = command_lines
+    {
+        command_lines.copy_line(line_slot, line);
+    }
     if matches!(kind, RequestKind::TakeThis) {
         read_dot_terminated_body(reader).await?;
     }
@@ -3358,15 +3447,47 @@ where
     Ok(())
 }
 
-fn parse_command_line(line: &[u8]) -> ParsedCommand {
+fn parse_command_line(line: &[u8], line_slot: usize) -> ParsedCommand {
     let request = RequestLine::parse(line);
     ParsedCommand {
         kind: request.kind(),
         article_id: parse_article_id_arg(request.args()),
-        message_id: request.message_id().and_then(|message_id| {
-            MessageId::from_shared(Arc::<str>::from(message_id.as_str())).ok()
-        }),
+        line_slot: line_slot.try_into().unwrap_or(u16::MAX),
+        message_id: parsed_message_id_range(line, request.message_id()),
     }
+}
+
+fn parsed_message_id_range(
+    line: &[u8],
+    message_id: Option<MessageId<'_>>,
+) -> Option<ParsedMessageId> {
+    let message_id = message_id?;
+    let message_id_bytes = message_id.as_str().as_bytes();
+    let line_start = line.as_ptr() as usize;
+    let message_start = message_id_bytes.as_ptr() as usize;
+    let start = message_start.checked_sub(line_start)?;
+    if start + message_id_bytes.len() > line.len() {
+        return None;
+    }
+    Some(ParsedMessageId {
+        start: start.try_into().ok()?,
+        len: message_id_bytes.len().try_into().ok()?,
+    })
+}
+
+fn command_message_id<'a>(
+    command: &ParsedCommand,
+    command_lines: &'a CommandLineBatch,
+) -> Option<MessageId<'a>> {
+    let message_id = command.message_id?;
+    let line_slot = usize::from(command.line_slot);
+    let bytes = command_lines.line_slice(
+        line_slot,
+        usize::from(message_id.start),
+        usize::from(message_id.len),
+    );
+    let value = std::str::from_utf8(bytes).ok()?;
+    MessageId::from_borrowed(value).ok()
 }
 
 fn parse_article_id_arg(args: &[u8]) -> Option<u64> {
@@ -3944,11 +4065,14 @@ mod tests {
         let command = ParsedCommand {
             kind: RequestKind::Article,
             article_id: Some(1),
+            line_slot: 0,
             message_id: None,
         };
+        let command_lines = CommandLineBatch::default();
 
         let err = handle_command(
             &command,
+            Some(&command_lines),
             &config,
             &mut stats,
             &mut writer,
@@ -3966,11 +4090,18 @@ mod tests {
         let server = ChunkedRead::new(&[b"ART".as_slice(), b"ICLE 1\r\nBODY 2\r\n".as_slice()]);
         let mut reader = BufReader::with_capacity(32, server);
         let mut command_buf = [0; MAX_COMMAND_LINE_BYTES];
+        let mut command_lines = CommandLineBatch::default();
         let mut command_batch = CommandBatch::new();
         assert!(
-            read_command_batch(&mut reader, &mut command_buf, &mut command_batch, 4)
-                .await
-                .unwrap()
+            read_command_batch(
+                &mut reader,
+                &mut command_buf,
+                Some(&mut command_lines),
+                &mut command_batch,
+                4
+            )
+            .await
+            .unwrap()
         );
         assert_eq!(
             command_batch
@@ -3980,9 +4111,15 @@ mod tests {
             vec![RequestKind::Article, RequestKind::Body]
         );
         assert!(
-            !read_command_batch(&mut reader, &mut command_buf, &mut command_batch, 4)
-                .await
-                .unwrap()
+            !read_command_batch(
+                &mut reader,
+                &mut command_buf,
+                Some(&mut command_lines),
+                &mut command_batch,
+                4
+            )
+            .await
+            .unwrap()
         );
     }
 
@@ -3990,11 +4127,18 @@ mod tests {
     async fn read_command_batch_reports_reader_error() {
         let mut reader = BufReader::with_capacity(32, FailingRead);
         let mut command_buf = [0; MAX_COMMAND_LINE_BYTES];
+        let mut command_lines = CommandLineBatch::default();
         let mut command_batch = CommandBatch::new();
 
-        let err = read_command_batch(&mut reader, &mut command_buf, &mut command_batch, 1)
-            .await
-            .unwrap_err();
+        let err = read_command_batch(
+            &mut reader,
+            &mut command_buf,
+            Some(&mut command_lines),
+            &mut command_batch,
+            1,
+        )
+        .await
+        .unwrap_err();
 
         assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
     }
@@ -4450,8 +4594,6 @@ mod tests {
         let segments = read_segments(&path).unwrap();
         fs::remove_file(path).unwrap();
 
-        assert_eq!(normalize_msgid("bare@test"), b"<bare@test>");
-        assert_eq!(normalize_msgid("<wrapped@test>"), b"<wrapped@test>");
         assert_eq!(
             segment_for_request(&segments, 0, 2, 0).as_str(),
             "<bare@test>"
@@ -6499,12 +6641,19 @@ mod tests {
 
         let mut reader = BufReader::with_capacity(1024, server);
         let mut command_buf = [0; MAX_COMMAND_LINE_BYTES];
+        let mut command_lines = CommandLineBatch::default();
         let mut command_batch = CommandBatch::new();
 
         assert!(
-            read_command_batch(&mut reader, &mut command_buf, &mut command_batch, 8)
-                .await
-                .unwrap()
+            read_command_batch(
+                &mut reader,
+                &mut command_buf,
+                Some(&mut command_lines),
+                &mut command_batch,
+                8
+            )
+            .await
+            .unwrap()
         );
         assert_eq!(
             command_batch
@@ -6522,17 +6671,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_command_batch_preserves_full_length_message_id_without_allocating_per_command() {
+        // RFC 3977 section 3.1 caps command lines at 512 octets including CRLF.
+        // Keep message-id parsing tied to the full command line, not a smaller
+        // internal shortcut.
+        let long_message = format!("<{}@example.test>", "a".repeat(480));
+        let wire = format!("ARTICLE {long_message}\r\n");
+        assert!(wire.len() <= MAX_COMMAND_LINE_BYTES);
+
+        let (mut client, server) = tokio::io::duplex(1024);
+        client.write_all(wire.as_bytes()).await.unwrap();
+
+        let mut reader = BufReader::with_capacity(1024, server);
+        let mut command_buf = [0; MAX_COMMAND_LINE_BYTES];
+        let mut command_lines = CommandLineBatch::default();
+        let mut command_batch = CommandBatch::new();
+
+        assert!(
+            read_command_batch(
+                &mut reader,
+                &mut command_buf,
+                Some(&mut command_lines),
+                &mut command_batch,
+                8
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(
+            command_message_id(&command_batch[0], &command_lines)
+                .unwrap()
+                .as_str(),
+            long_message
+        );
+    }
+
+    #[tokio::test]
     async fn read_command_batch_returns_false_on_clean_eof() {
         let (client, server) = tokio::io::duplex(1024);
         drop(client);
         let mut reader = BufReader::with_capacity(1024, server);
         let mut command_buf = [0; MAX_COMMAND_LINE_BYTES];
+        let mut command_lines = CommandLineBatch::default();
         let mut command_batch = CommandBatch::new();
 
         assert!(
-            !read_command_batch(&mut reader, &mut command_buf, &mut command_batch, 8)
-                .await
-                .unwrap()
+            !read_command_batch(
+                &mut reader,
+                &mut command_buf,
+                Some(&mut command_lines),
+                &mut command_batch,
+                8
+            )
+            .await
+            .unwrap()
         );
         assert!(command_batch.is_empty());
     }
@@ -6544,12 +6736,19 @@ mod tests {
 
         let mut reader = BufReader::with_capacity(1024, server);
         let mut command_buf = [0; MAX_COMMAND_LINE_BYTES];
+        let mut command_lines = CommandLineBatch::default();
         let mut command_batch = CommandBatch::new();
 
         assert!(
-            read_command_batch(&mut reader, &mut command_buf, &mut command_batch, 8)
-                .await
-                .unwrap()
+            read_command_batch(
+                &mut reader,
+                &mut command_buf,
+                Some(&mut command_lines),
+                &mut command_batch,
+                8
+            )
+            .await
+            .unwrap()
         );
         assert_eq!(
             command_batch
@@ -6570,12 +6769,19 @@ mod tests {
 
         let mut reader = BufReader::with_capacity(1024, server);
         let mut command_buf = [0; MAX_COMMAND_LINE_BYTES];
+        let mut command_lines = CommandLineBatch::default();
         let mut command_batch = CommandBatch::new();
 
         assert!(
-            read_command_batch(&mut reader, &mut command_buf, &mut command_batch, 2)
-                .await
-                .unwrap()
+            read_command_batch(
+                &mut reader,
+                &mut command_buf,
+                Some(&mut command_lines),
+                &mut command_batch,
+                2
+            )
+            .await
+            .unwrap()
         );
         assert_eq!(
             command_batch
@@ -6596,12 +6802,19 @@ mod tests {
 
         let mut reader = BufReader::with_capacity(1024, server);
         let mut command_buf = [0; MAX_COMMAND_LINE_BYTES];
+        let mut command_lines = CommandLineBatch::default();
         let mut command_batch = CommandBatch::new();
 
         assert!(
-            read_command_batch(&mut reader, &mut command_buf, &mut command_batch, 2)
-                .await
-                .unwrap()
+            read_command_batch(
+                &mut reader,
+                &mut command_buf,
+                Some(&mut command_lines),
+                &mut command_batch,
+                2
+            )
+            .await
+            .unwrap()
         );
         assert_eq!(
             command_batch
@@ -6612,9 +6825,15 @@ mod tests {
         );
 
         assert!(
-            read_command_batch(&mut reader, &mut command_buf, &mut command_batch, 2)
-                .await
-                .unwrap()
+            read_command_batch(
+                &mut reader,
+                &mut command_buf,
+                Some(&mut command_lines),
+                &mut command_batch,
+                2
+            )
+            .await
+            .unwrap()
         );
         assert_eq!(
             command_batch
@@ -6639,12 +6858,19 @@ mod tests {
 
         let mut reader = BufReader::with_capacity(1024, server);
         let mut command_buf = [0; MAX_COMMAND_LINE_BYTES];
+        let mut command_lines = CommandLineBatch::default();
         let mut command_batch = CommandBatch::new();
 
         assert!(
-            read_command_batch(&mut reader, &mut command_buf, &mut command_batch, 8)
-                .await
-                .unwrap()
+            read_command_batch(
+                &mut reader,
+                &mut command_buf,
+                Some(&mut command_lines),
+                &mut command_batch,
+                8
+            )
+            .await
+            .unwrap()
         );
         assert_eq!(
             command_batch
@@ -6668,12 +6894,19 @@ mod tests {
 
         let mut reader = BufReader::with_capacity(128, server);
         let mut command_buf = [0; MAX_COMMAND_LINE_BYTES];
+        let mut command_lines = CommandLineBatch::default();
         let mut command_batch = CommandBatch::new();
 
         assert!(
-            read_command_batch(&mut reader, &mut command_buf, &mut command_batch, 8)
-                .await
-                .unwrap()
+            read_command_batch(
+                &mut reader,
+                &mut command_buf,
+                Some(&mut command_lines),
+                &mut command_batch,
+                8
+            )
+            .await
+            .unwrap()
         );
         assert_eq!(
             command_batch
@@ -6698,11 +6931,18 @@ mod tests {
 
         let mut reader = BufReader::with_capacity(1024, server);
         let mut command_buf = [0; MAX_COMMAND_LINE_BYTES];
+        let mut command_lines = CommandLineBatch::default();
         let mut command_batch = CommandBatch::new();
 
-        let err = read_command_batch(&mut reader, &mut command_buf, &mut command_batch, 8)
-            .await
-            .unwrap_err();
+        let err = read_command_batch(
+            &mut reader,
+            &mut command_buf,
+            Some(&mut command_lines),
+            &mut command_batch,
+            8,
+        )
+        .await
+        .unwrap_err();
 
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(command_batch.is_empty());
@@ -7568,6 +7808,10 @@ mod tests {
             &article_target,
         )
         .unwrap();
+        let long_message = format!("<{}@example.test>", "a".repeat(480));
+        let long_command = format!("ARTICLE {long_message}\r\n");
+        assert!(long_command.len() <= MAX_COMMAND_LINE_BYTES);
+        let mut command_lines = CommandLineBatch::default();
 
         assert_no_allocations(
             "request parse, scan, serialize, and generated response",
@@ -7612,6 +7856,15 @@ mod tests {
                     &article_target,
                 )
                 .unwrap();
+
+                let command = parse_command_line(long_command.as_bytes(), 0);
+                command_lines.copy_line(0, long_command.as_bytes());
+                assert_eq!(
+                    command_message_id(&command, &command_lines)
+                        .unwrap()
+                        .as_str(),
+                    long_message
+                );
 
                 output.clear();
                 assert!(!process_request_to_buffer(

@@ -1,6 +1,7 @@
+use std::fmt;
 use std::fmt::Write as _;
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, BufRead, Read};
 use std::path::{Path, PathBuf};
 
 use arrayvec::ArrayString;
@@ -33,44 +34,70 @@ pub(crate) fn article_ref_for_download_target(
     }
 }
 
-pub(crate) fn download_target_label(target: &ArticleDownloadTarget) -> String {
-    match target {
-        ArticleDownloadTarget::Number(article_id) => article_id.to_string(),
-        ArticleDownloadTarget::MessageId(message_id) => message_id.as_str().to_string(),
+pub(crate) fn download_target_label(target: &ArticleDownloadTarget) -> DownloadTargetLabel<'_> {
+    DownloadTargetLabel(target)
+}
+
+pub(crate) struct DownloadTargetLabel<'a>(&'a ArticleDownloadTarget);
+
+impl fmt::Display for DownloadTargetLabel<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            ArticleDownloadTarget::Number(article_id) => write!(f, "{article_id}"),
+            ArticleDownloadTarget::MessageId(message_id) => f.write_str(message_id.as_str()),
+        }
     }
 }
 
 pub(crate) fn read_article_targets(path: &Path) -> io::Result<Vec<ArticleDownloadTarget>> {
-    let contents = fs::read_to_string(path)?;
+    let file = fs::File::open(path)?;
+    let mut reader = io::BufReader::new(file);
+    let mut line_buf = Vec::with_capacity(512);
     let mut targets = Vec::new();
+    let mut line_index = 0;
 
-    for (line_index, line) in contents.lines().enumerate() {
-        let line = line.trim();
+    loop {
+        line_buf.clear();
+        let read = reader.read_until(b'\n', &mut line_buf)?;
+        if read == 0 {
+            break;
+        }
+        line_index += 1;
+        let line = trim_ascii_line(&line_buf);
         if line.is_empty() {
             continue;
         }
 
-        if line.bytes().all(|byte| byte.is_ascii_digit()) {
+        if line.iter().all(u8::is_ascii_digit) {
+            let line = std::str::from_utf8(line).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "article number is not utf-8")
+            })?;
             let id = line.parse::<u64>().map_err(|_| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("invalid article number on line {}", line_index + 1),
+                    format!("invalid article number on line {line_index}"),
                 )
             })?;
             if id == 0 || id > MAX_ARTICLE_NUMBER {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("article number out of RFC range on line {}", line_index + 1),
+                    format!("article number out of RFC range on line {line_index}"),
                 ));
             }
             targets.push(ArticleDownloadTarget::Number(id));
             continue;
         }
 
+        let line = std::str::from_utf8(line).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "article message-id is not utf-8",
+            )
+        })?;
         let id = MessageId::from_str_or_wrap(line).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("invalid article message-id on line {}", line_index + 1),
+                format!("invalid article message-id on line {line_index}"),
             )
         })?;
         targets.push(ArticleDownloadTarget::MessageId(id));
@@ -84,6 +111,16 @@ pub(crate) fn read_article_targets(path: &Path) -> io::Result<Vec<ArticleDownloa
     }
 
     Ok(targets)
+}
+
+fn trim_ascii_line(mut line: &[u8]) -> &[u8] {
+    while matches!(line.last(), Some(b'\n' | b'\r' | b' ' | b'\t')) {
+        line = &line[..line.len() - 1];
+    }
+    while matches!(line.first(), Some(b' ' | b'\t')) {
+        line = &line[1..];
+    }
+    line
 }
 
 pub(crate) fn write_article_response_file_into(
@@ -162,9 +199,9 @@ pub(crate) fn verify_article_response_file_into(
         format!(
             "ARTICLE {} MD5 mismatch: expected {} from {}, received {}",
             download_target_label(target),
-            hex_lower(expected.as_slice()),
+            HexLower(expected.as_slice()),
             path.display(),
-            hex_lower(received.as_slice())
+            HexLower(received.as_slice())
         ),
     ))
 }
@@ -251,6 +288,7 @@ pub(crate) fn message_id_tree_path(root: &Path, message_id: &MessageId<'_>) -> P
     root.join("msgid").join(&encoded[..2]).join(encoded)
 }
 
+#[cfg(test)]
 fn hex_lower(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -259,6 +297,19 @@ fn hex_lower(bytes: &[u8]) -> String {
         out.push(HEX[(byte & 0x0f) as usize] as char);
     }
     out
+}
+
+struct HexLower<'a>(&'a [u8]);
+
+impl fmt::Display for HexLower<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        for byte in self.0 {
+            f.write_char(HEX[(byte >> 4) as usize] as char)?;
+            f.write_char(HEX[(byte & 0x0f) as usize] as char)?;
+        }
+        Ok(())
+    }
 }
 
 fn push_hex_lower<const N: usize>(out: &mut ArrayString<N>, bytes: &[u8]) -> io::Result<()> {
