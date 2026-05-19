@@ -231,7 +231,7 @@ mod proptests {
             .prop_map(|ids| SegmentSet {
                 ids: ids
                     .into_iter()
-                    .map(|id| id.into_bytes().into_boxed_slice())
+                    .map(|id| MessageId::from_shared(Arc::<str>::from(id)).unwrap())
                     .collect::<Vec<_>>()
                     .into_boxed_slice(),
             })
@@ -286,8 +286,8 @@ mod proptests {
             prop_assert_eq!(zero_request.message_id().unwrap().as_str(), "<bench.0@nntpbench.local>");
 
             let segmented = typed_request_for_command(17, request_index, mix, Some(&segments), client_index, total_clients).unwrap();
-            let expected = std::str::from_utf8(segment_for_request(&segments, client_index, total_clients, request_index)).unwrap();
-            prop_assert_eq!(segmented.message_id().unwrap().as_str(), expected);
+            let expected = segment_for_request(&segments, client_index, total_clients, request_index);
+            prop_assert_eq!(segmented.message_id().unwrap().as_str(), expected.as_str());
         }
     }
 }
@@ -623,7 +623,7 @@ pub enum TypedRequestKind {
 
 #[derive(Debug)]
 struct SegmentSet {
-    ids: Box<[Box<[u8]>]>,
+    ids: Box<[MessageId<'static>]>,
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -1319,10 +1319,39 @@ fn typed_request_for_command(
         total_clients,
     )?;
     match kind {
-        ClientCommandMix::Article => Request::article(message_id)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid article message-id")),
-        ClientCommandMix::Body => Request::body(message_id)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid body message-id")),
+        ClientCommandMix::Article => Ok(Request::Article {
+            article_ref: ArticleRef::MessageId(message_id),
+        }),
+        ClientCommandMix::Body => Ok(Request::Body {
+            article_ref: ArticleRef::MessageId(message_id),
+        }),
+        ClientCommandMix::Alternate => {
+            unreachable!("client_command_kind should normalize Alternate")
+        }
+    }
+}
+
+#[doc(hidden)]
+pub fn bench_typed_request_for_command(
+    command_id: u64,
+    request_index: u64,
+    mix: ClientCommandMix,
+) -> io::Result<Request<'static>> {
+    typed_request_for_command(command_id, request_index, mix, None, 0, 1)
+}
+
+#[doc(hidden)]
+pub fn bench_typed_segment_request_for_command(
+    segment_message_id: MessageId<'static>,
+    mix: ClientCommandMix,
+) -> io::Result<Request<'static>> {
+    match mix {
+        ClientCommandMix::Article => Ok(Request::Article {
+            article_ref: ArticleRef::MessageId(segment_message_id),
+        }),
+        ClientCommandMix::Body => Ok(Request::Body {
+            article_ref: ArticleRef::MessageId(segment_message_id),
+        }),
         ClientCommandMix::Alternate => {
             unreachable!("client_command_kind should normalize Alternate")
         }
@@ -1336,21 +1365,14 @@ fn request_message_id_for_command(
     segments: Option<&SegmentSet>,
     client_index: usize,
     total_clients: usize,
-) -> io::Result<String> {
+) -> io::Result<MessageId<'static>> {
     if let Some(segments) = segments {
-        let message_id = std::str::from_utf8(segment_for_request(
+        return Ok(segment_for_request(
             segments,
             client_index,
             total_clients,
             request_index,
-        ))
-        .map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "segment message-id is not utf-8",
-            )
-        })?;
-        return Ok(message_id.to_owned());
+        ));
     }
 
     let prefix = match kind {
@@ -1359,7 +1381,8 @@ fn request_message_id_for_command(
             unreachable!("client_command_kind should normalize Alternate")
         }
     };
-    Ok(format!("<{prefix}{command_id}@nntpbench.local>"))
+    MessageId::from_str_or_wrap(format!("{prefix}{command_id}@nntpbench.local"))
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid synthetic message-id"))
 }
 
 fn requests_for_connection(total: u64, connections: usize, index: usize) -> u64 {
@@ -1392,7 +1415,16 @@ fn read_segments(path: &std::path::Path) -> io::Result<SegmentSet> {
             )
         })?;
         let id = normalize_msgid(msgid.trim());
-        ids.push(id.into_boxed_slice());
+        let id = std::str::from_utf8(&id).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "segment message-id is not utf-8",
+            )
+        })?;
+        let id = MessageId::from_shared(Arc::<str>::from(id)).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "invalid segment message-id")
+        })?;
+        ids.push(id);
     }
 
     if ids.is_empty() {
@@ -1563,10 +1595,10 @@ fn segment_for_request(
     client_index: usize,
     total_clients: usize,
     request_id: u64,
-) -> &[u8] {
+) -> MessageId<'static> {
     let index =
         (client_index + (request_id as usize).wrapping_mul(total_clients)) % segments.ids.len();
-    &segments.ids[index]
+    segments.ids[index].clone()
 }
 
 fn client_command_kind(id: u64, mix: ClientCommandMix) -> ClientCommandMix {
@@ -3590,8 +3622,14 @@ mod tests {
 
         assert_eq!(normalize_msgid("bare@test"), b"<bare@test>");
         assert_eq!(normalize_msgid("<wrapped@test>"), b"<wrapped@test>");
-        assert_eq!(segment_for_request(&segments, 0, 2, 0), b"<bare@test>");
-        assert_eq!(segment_for_request(&segments, 1, 2, 0), b"<wrapped@test>");
+        assert_eq!(
+            segment_for_request(&segments, 0, 2, 0).as_str(),
+            "<bare@test>"
+        );
+        assert_eq!(
+            segment_for_request(&segments, 1, 2, 0).as_str(),
+            "<wrapped@test>"
+        );
     }
 
     #[test]
@@ -6425,6 +6463,10 @@ mod tests {
         let config = ServerConfig::from_args(test_args());
         let stats = Stats::new();
         let mut output = FixedWrite::<4096>::new();
+        let segments = SegmentSet {
+            ids: vec![MessageId::from_shared(Arc::<str>::from("<segment@test>")).unwrap()]
+                .into_boxed_slice(),
+        };
 
         assert_no_allocations(
             "request parse, scan, serialize, and generated response",
@@ -6443,6 +6485,20 @@ mod tests {
                 output.clear();
                 Request::body_number(42).unwrap().write_wire_to(&mut output);
                 assert_eq!(output.as_slice(), b"BODY 42\r\n");
+
+                let segment_request = typed_request_for_command(
+                    42,
+                    0,
+                    ClientCommandMix::Article,
+                    Some(&segments),
+                    0,
+                    1,
+                )
+                .unwrap();
+                assert_eq!(
+                    segment_request.message_id().map(MessageId::as_str),
+                    Some("<segment@test>")
+                );
 
                 output.clear();
                 assert!(!process_request_to_buffer(

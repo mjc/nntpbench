@@ -1,8 +1,10 @@
 //! Typed NNTP protocol helpers.
 
 use std::borrow::Cow;
-use std::fmt::Write as FmtWrite;
+use std::fmt::{self, Write as FmtWrite};
+use std::hash::{Hash, Hasher};
 use std::io::Write;
+use std::sync::Arc;
 
 #[cfg(test)]
 use crate::terminator::append_crlf;
@@ -1400,14 +1402,41 @@ mod proptests {
 }
 
 /// Validated NNTP message-id.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct MessageId<'a>(Cow<'a, str>);
+#[derive(Clone)]
+pub struct MessageId<'a>(MessageIdStorage<'a>);
+
+#[derive(Clone)]
+enum MessageIdStorage<'a> {
+    Borrowed(&'a str),
+    Owned(String),
+    Shared(Arc<str>),
+}
+
+impl fmt::Debug for MessageId<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("MessageId").field(&self.as_str()).finish()
+    }
+}
+
+impl PartialEq for MessageId<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl Eq for MessageId<'_> {}
+
+impl Hash for MessageId<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.as_str().hash(state);
+    }
+}
 
 impl<'a> MessageId<'a> {
     /// Construct a borrowed message-id after validation.
     pub fn from_borrowed(value: &'a str) -> Result<Self, InvalidMessageId> {
         validate_message_id(value)?;
-        Ok(Self(Cow::Borrowed(value)))
+        Ok(Self(MessageIdStorage::Borrowed(value)))
     }
 
     /// Construct an owned message-id, auto-wrapping in angle brackets if needed.
@@ -1425,13 +1454,23 @@ impl<'a> MessageId<'a> {
             format!("<{value}>")
         };
         validate_message_id(&wrapped)?;
-        Ok(MessageId(Cow::Owned(wrapped)))
+        Ok(MessageId(MessageIdStorage::Owned(wrapped)))
+    }
+
+    /// Construct a shared owned message-id after validation.
+    pub fn from_shared(value: Arc<str>) -> Result<MessageId<'static>, InvalidMessageId> {
+        validate_message_id(&value)?;
+        Ok(MessageId(MessageIdStorage::Shared(value)))
     }
 
     /// Borrow the validated string.
     #[must_use]
     pub fn as_str(&self) -> &str {
-        &self.0
+        match &self.0 {
+            MessageIdStorage::Borrowed(value) => value,
+            MessageIdStorage::Owned(value) => value,
+            MessageIdStorage::Shared(value) => value,
+        }
     }
 }
 
@@ -1492,7 +1531,7 @@ impl ArticleRef<'static> {
         }
 
         let message_id = MessageId::from_borrowed(value).map_err(|_| InvalidArticleRef)?;
-        Ok(ArticleRef::MessageId(MessageId(Cow::Owned(
+        Ok(ArticleRef::MessageId(MessageId(MessageIdStorage::Owned(
             message_id.as_str().to_owned(),
         ))))
     }

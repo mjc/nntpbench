@@ -38,6 +38,10 @@ harness = false
 name = "response_parsing"
 harness = false
 
+[[bench]]
+name = "typed_client_overheads"
+harness = false
+
 [profile.release]
 debug = false
 strip = true

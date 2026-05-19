@@ -2252,6 +2252,18 @@ enum StreamingDecodeProgress {
     Complete { status: StatusCode, consumed: usize },
 }
 
+#[doc(hidden)]
+pub fn bench_streaming_decode_response(
+    kind: RequestKind,
+    response: &[u8],
+) -> Result<(StatusCode, usize), TypedClientError> {
+    let mut decoder = StreamingResponseDecoder::new(kind);
+    match decoder.push(response)? {
+        StreamingDecodeProgress::Complete { status, consumed } => Ok((status, consumed)),
+        StreamingDecodeProgress::NeedMore { .. } => Err(TypedClientError::UnexpectedEof),
+    }
+}
+
 #[derive(Debug)]
 struct QueuedRequest {
     request: Request<'static>,
@@ -2503,6 +2515,12 @@ where
         Request::ModeReader => write_simple_request_wire(writer, b"MODE READER").await,
         Request::Quit => write_simple_request_wire(writer, b"QUIT").await,
     }
+}
+
+#[doc(hidden)]
+pub async fn bench_write_request_wire_to_sink(request: &Request<'static>) -> io::Result<()> {
+    let mut writer = tokio::io::sink();
+    write_request_wire(&mut writer, request).await
 }
 
 async fn write_article_ref_request_wire<W>(
