@@ -2634,16 +2634,6 @@ where
     write_article_ref_request_wire(writer, b"ARTICLE", article_ref).await
 }
 
-pub(crate) async fn write_body_request_wire<W>(
-    writer: &mut W,
-    article_ref: &ArticleRef<'_>,
-) -> io::Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
-    write_article_ref_request_wire(writer, b"BODY", article_ref).await
-}
-
 pub(crate) async fn write_authinfo_wire<W>(
     writer: &mut W,
     kind: AuthInfoKind,

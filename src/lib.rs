@@ -1549,9 +1549,20 @@ impl TypedClientSession {
         let mut in_flight = 0_usize;
         let mut issued = 0_u64;
         let mut received = 0_u64;
+        let mut request_buffer = Vec::with_capacity(self.pipeline_depth.saturating_mul(32));
 
-        self.fill_typed_pipeline(&mut stream, &mut in_flight, &mut issued, stats, stop)
+        let initial_fill = self
+            .fill_typed_pipeline(
+                &mut stream,
+                &mut request_buffer,
+                in_flight,
+                issued,
+                stats,
+                stop,
+            )
             .await?;
+        in_flight += initial_fill;
+        issued = issued.wrapping_add(initial_fill as u64);
         if in_flight > 1 {
             stats.pipeline_batches.fetch_add(1, Ordering::Relaxed);
         }
@@ -1588,11 +1599,22 @@ impl TypedClientSession {
                 stop.store(true, Ordering::Release);
             }
 
-            let before = in_flight;
-            self.fill_typed_pipeline(&mut stream, &mut in_flight, &mut issued, stats, stop)
-                .await?;
-            if in_flight.saturating_sub(before) > 1 {
-                stats.pipeline_batches.fetch_add(1, Ordering::Relaxed);
+            if in_flight <= self.pipeline_refill_low_water() {
+                let filled = self
+                    .fill_typed_pipeline(
+                        &mut stream,
+                        &mut request_buffer,
+                        in_flight,
+                        issued,
+                        stats,
+                        stop,
+                    )
+                    .await?;
+                in_flight += filled;
+                issued = issued.wrapping_add(filled as u64);
+                if filled > 1 {
+                    stats.pipeline_batches.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
 
@@ -1643,36 +1665,45 @@ impl TypedClientSession {
     async fn fill_typed_pipeline(
         &self,
         stream: &mut TcpStream,
-        in_flight: &mut usize,
-        issued: &mut u64,
+        request_buffer: &mut Vec<u8>,
+        in_flight: usize,
+        issued: u64,
         stats: &Stats,
         stop: &AtomicBool,
-    ) -> io::Result<()> {
+    ) -> io::Result<usize> {
         if stop.load(Ordering::Acquire) {
-            return Ok(());
+            return Ok(0);
         }
 
-        while *in_flight < self.pipeline_depth
-            && (self.requests == 0 || *issued < self.requests)
+        request_buffer.clear();
+        let mut filled = 0usize;
+        while in_flight + filled < self.pipeline_depth
+            && (self.requests == 0 || issued.wrapping_add(filled as u64) < self.requests)
             && !transfer_limit_reached(stats, self.transfer_bytes)
         {
-            let command_id = self.next_id.wrapping_add(*issued);
-            let request_index = *issued;
-            write_typed_workload_request(
-                stream,
+            let request_index = issued.wrapping_add(filled as u64);
+            let command_id = self.next_id.wrapping_add(request_index);
+            append_typed_workload_request(
+                request_buffer,
                 command_id,
                 request_index,
                 self.command_mix,
                 self.segments.as_deref(),
                 self.client_index,
                 self.total_clients,
-            )
-            .await?;
-            *in_flight += 1;
-            *issued = issued.wrapping_add(1);
+            )?;
+            filled += 1;
         }
 
-        Ok(())
+        if filled != 0 {
+            stream.write_all(request_buffer).await?;
+        }
+
+        Ok(filled)
+    }
+
+    fn pipeline_refill_low_water(&self) -> usize {
+        (self.pipeline_depth / 2).max(1)
     }
 }
 
@@ -1779,8 +1810,8 @@ fn transfer_limit_reached(stats: &Stats, transfer_bytes: u64) -> bool {
     transfer_bytes != 0 && stats.bytes_sent.load(Ordering::Relaxed) >= transfer_bytes
 }
 
-async fn write_typed_workload_request(
-    stream: &mut TcpStream,
+fn append_typed_workload_request(
+    buffer: &mut Vec<u8>,
     command_id: u64,
     request_index: u64,
     mix: ClientCommandMix,
@@ -1794,14 +1825,12 @@ async fn write_typed_workload_request(
     if let Some(segments) = segments {
         let message_id =
             segment_ref_for_request(segments, client_index, total_clients, request_index);
-        write_typed_message_id_request(stream, kind, message_id).await?;
+        append_typed_message_id_request(buffer, kind, message_id);
         return Ok(request_kind);
     }
 
     if (1..=crate::protocol::MAX_ARTICLE_NUMBER).contains(&command_id) {
-        let article_ref = ArticleRef::from_number(command_id)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid article number"))?;
-        write_typed_article_ref_request(stream, kind, &article_ref).await?;
+        append_typed_number_request(buffer, kind, command_id)?;
         return Ok(request_kind);
     }
 
@@ -1810,8 +1839,42 @@ async fn write_typed_workload_request(
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid synthetic message-id"))?;
     let message_id = MessageId::from_borrowed(synthetic.as_str())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid synthetic message-id"))?;
-    write_typed_message_id_request(stream, kind, &message_id).await?;
+    append_typed_message_id_request(buffer, kind, &message_id);
     Ok(request_kind)
+}
+
+fn append_typed_number_request(
+    buffer: &mut Vec<u8>,
+    kind: ClientCommandMix,
+    number: u64,
+) -> io::Result<()> {
+    let mut number_buf = arrayvec::ArrayString::<20>::new();
+    write!(&mut number_buf, "{number}")
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid article number"))?;
+    append_typed_request_prefix(buffer, kind);
+    buffer.extend_from_slice(number_buf.as_bytes());
+    buffer.extend_from_slice(crate::CRLF);
+    Ok(())
+}
+
+fn append_typed_message_id_request(
+    buffer: &mut Vec<u8>,
+    kind: ClientCommandMix,
+    message_id: &MessageId<'_>,
+) {
+    append_typed_request_prefix(buffer, kind);
+    buffer.extend_from_slice(message_id.as_str().as_bytes());
+    buffer.extend_from_slice(crate::CRLF);
+}
+
+fn append_typed_request_prefix(buffer: &mut Vec<u8>, kind: ClientCommandMix) {
+    match kind {
+        ClientCommandMix::Article => buffer.extend_from_slice(b"ARTICLE "),
+        ClientCommandMix::Body => buffer.extend_from_slice(b"BODY "),
+        ClientCommandMix::Alternate => {
+            unreachable!("client_command_kind should normalize Alternate")
+        }
+    }
 }
 
 fn request_kind_for_client_command(command_id: u64, mix: ClientCommandMix) -> RequestKind {
@@ -1822,33 +1885,6 @@ fn request_kind_for_normalized_client_command(kind: ClientCommandMix) -> Request
     match kind {
         ClientCommandMix::Article => RequestKind::Article,
         ClientCommandMix::Body => RequestKind::Body,
-        ClientCommandMix::Alternate => {
-            unreachable!("client_command_kind should normalize Alternate")
-        }
-    }
-}
-
-async fn write_typed_message_id_request(
-    stream: &mut TcpStream,
-    kind: ClientCommandMix,
-    message_id: &MessageId<'_>,
-) -> io::Result<()> {
-    let article_ref = ArticleRef::MessageId(message_id.clone());
-    write_typed_article_ref_request(stream, kind, &article_ref).await
-}
-
-async fn write_typed_article_ref_request(
-    stream: &mut TcpStream,
-    kind: ClientCommandMix,
-    article_ref: &ArticleRef<'_>,
-) -> io::Result<()> {
-    match kind {
-        ClientCommandMix::Article => {
-            crate::typed_client::write_article_request_wire(stream, article_ref).await
-        }
-        ClientCommandMix::Body => {
-            crate::typed_client::write_body_request_wire(stream, article_ref).await
-        }
         ClientCommandMix::Alternate => {
             unreachable!("client_command_kind should normalize Alternate")
         }
