@@ -12,7 +12,6 @@ use nntpbench::{
 };
 use std::sync::Arc;
 use tokio::runtime::Builder;
-use tokio::sync::{mpsc, oneshot};
 
 fn main() {
     divan::main();
@@ -161,55 +160,6 @@ mod streaming_decode {
                 black_box(RequestKind::Body),
                 black_box(BODY_RESPONSE),
             ))
-        });
-    }
-}
-
-mod tokio_handoffs {
-    use super::{Bencher, Request, black_box, mpsc, oneshot, runtime};
-
-    #[divan::bench(sample_count = 1000, sample_size = 100)]
-    fn mpsc_request_send_recv(bencher: Bencher) {
-        let rt = runtime();
-        let (tx, mut rx) = mpsc::channel(1024);
-        bencher.bench_local(|| {
-            rt.block_on(async {
-                let request = Request::article_number(black_box(42)).unwrap();
-                tx.send(request).await.unwrap();
-                black_box(rx.recv().await.unwrap());
-            });
-            black_box(())
-        });
-    }
-
-    #[divan::bench(sample_count = 1000, sample_size = 100)]
-    fn oneshot_complete_response(bencher: Bencher) {
-        let rt = runtime();
-        bencher.bench_local(|| {
-            rt.block_on(async {
-                let (tx, rx) = oneshot::channel();
-                tx.send(black_box(786_432usize)).unwrap();
-                black_box(rx.await.unwrap());
-            });
-            black_box(())
-        });
-    }
-
-    #[divan::bench(sample_count = 1000, sample_size = 100)]
-    fn mpsc_then_oneshot_request_response(bencher: Bencher) {
-        let rt = runtime();
-        let (tx, mut rx) = mpsc::channel::<(Request<'static>, oneshot::Sender<usize>)>(1024);
-        bencher.bench_local(|| {
-            rt.block_on(async {
-                let request = Request::article_number(black_box(42)).unwrap();
-                let (response_tx, response_rx) = oneshot::channel();
-                tx.send((request, response_tx)).await.unwrap();
-                let (request, response_tx) = rx.recv().await.unwrap();
-                black_box(request.kind());
-                response_tx.send(black_box(786_432usize)).unwrap();
-                black_box(response_rx.await.unwrap());
-            });
-            black_box(())
         });
     }
 }
