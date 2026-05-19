@@ -1435,29 +1435,34 @@ impl ArticleIdDownloadSession {
         )
         .await?;
 
-        let mut pending = VecDeque::with_capacity(self.pipeline_depth);
         let mut output_path = PathBuf::with_capacity(1024);
         let mut verify_path = PathBuf::with_capacity(1024);
-        let mut next_index = self.client_index;
+        let mut in_flight = 0_usize;
+        let mut next_send_index = self.client_index;
+        let mut next_receive_index = self.client_index;
 
         loop {
             while !stop.load(Ordering::Acquire)
-                && pending.len() < self.pipeline_depth
-                && next_index < self.article_targets.len()
+                && in_flight < self.pipeline_depth
+                && next_send_index < self.article_targets.len()
             {
-                let target = &self.article_targets[next_index];
+                let target = &self.article_targets[next_send_index];
                 let article_ref = article_ref_for_download_target(target)?;
                 crate::typed_client::write_article_request_wire(&mut stream, &article_ref).await?;
-                pending.push_back((next_index, RequestKind::Article));
-                next_index = next_index.saturating_add(self.total_clients);
+                in_flight += 1;
+                next_send_index = next_send_index.saturating_add(self.total_clients);
             }
 
-            let Some((index, kind)) = pending.pop_front() else {
+            if in_flight == 0 {
                 break;
-            };
+            }
+
+            let index = next_receive_index;
+            next_receive_index = next_receive_index.saturating_add(self.total_clients);
+            in_flight -= 1;
             let target = &self.article_targets[index];
             let response = response_reader
-                .read_response_frame(&mut stream, kind)
+                .read_response_frame(&mut stream, RequestKind::Article)
                 .await
                 .map_err(map_typed_client_error)?;
 
