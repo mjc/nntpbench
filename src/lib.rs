@@ -1424,6 +1424,7 @@ impl ArticleIdDownloadSession {
         authenticate_owned_connection(&connection, self.auth_user, self.auth_pass).await?;
 
         let mut pending = VecDeque::with_capacity(self.pipeline_depth);
+        let mut disk_tasks = JoinSet::new();
         let mut next_index = self.client_index;
 
         loop {
@@ -1449,13 +1450,31 @@ impl ArticleIdDownloadSession {
                 .await
                 .map_err(map_typed_client_error)?;
 
-            handle_article_id_response(
-                target,
-                response,
-                &self.output_dir,
-                self.verify_dir.as_deref().map(PathBuf::as_path),
-                stats,
-            )?;
+            stats.commands.fetch_add(1, Ordering::Relaxed);
+            stats.article_requests.fetch_add(1, Ordering::Relaxed);
+            stats
+                .bytes_sent
+                .fetch_add(response.as_bytes().len() as u64, Ordering::Relaxed);
+
+            let target = target.clone();
+            let output_dir = self.output_dir.clone();
+            let verify_dir = self.verify_dir.clone();
+            disk_tasks.spawn_blocking(move || {
+                handle_article_id_response(
+                    &target,
+                    response,
+                    &output_dir,
+                    verify_dir.as_deref().map(PathBuf::as_path),
+                )
+            });
+
+            while disk_tasks.len() >= self.pipeline_depth {
+                join_article_disk_task(&mut disk_tasks).await?;
+            }
+        }
+
+        while !disk_tasks.is_empty() {
+            join_article_disk_task(&mut disk_tasks).await?;
         }
 
         Ok(())
@@ -1765,19 +1784,20 @@ fn write_article_response_file_at(path: &Path, response: &[u8]) -> io::Result<()
     fs::write(path, response)
 }
 
+async fn join_article_disk_task(disk_tasks: &mut JoinSet<io::Result<()>>) -> io::Result<()> {
+    match disk_tasks.join_next().await {
+        Some(Ok(result)) => result,
+        Some(Err(err)) => Err(io::Error::other(err)),
+        None => Ok(()),
+    }
+}
+
 fn handle_article_id_response(
     target: &ArticleDownloadTarget,
     response: OwnedResponse,
     output_dir: &Path,
     verify_dir: Option<&Path>,
-    stats: &Stats,
 ) -> io::Result<()> {
-    stats.commands.fetch_add(1, Ordering::Relaxed);
-    stats.article_requests.fetch_add(1, Ordering::Relaxed);
-    stats
-        .bytes_sent
-        .fetch_add(response.as_bytes().len() as u64, Ordering::Relaxed);
-
     match response.status().as_u16() {
         220 => {
             if let Err(err) = verify_article_response_file(verify_dir, target, response.as_bytes())
