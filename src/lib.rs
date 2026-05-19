@@ -1409,24 +1409,31 @@ impl ArticleIdDownloadSession {
     }
 
     async fn run_inner(self, stats: &Stats, stop: &AtomicBool) -> io::Result<()> {
-        let connection = TypedClientConnection::connect_with_options(
+        let mut stream = connect_client_socket(
             self.connect,
-            TypedClientOptions {
-                read_buffer_bytes: self
-                    .read_buffer_bytes
-                    .max(crate::terminator::TERMINATOR_TAIL_SIZE),
-                nodelay: self.nodelay,
-                socket_recv_buffer: self.socket_recv_buffer,
-                socket_send_buffer: self.socket_send_buffer,
-                pipeline_depth: self.pipeline_depth,
-            },
+            self.nodelay,
+            self.socket_recv_buffer,
+            self.socket_send_buffer,
         )
-        .await
-        .map_err(map_typed_client_error)?;
-        authenticate_owned_connection(&connection, self.auth_user, self.auth_pass).await?;
+        .await?;
+        let mut read_buffer = vec![
+            0;
+            self.read_buffer_bytes
+                .max(crate::terminator::TERMINATOR_TAIL_SIZE)
+        ]
+        .into_boxed_slice();
+        read_greeting(&mut stream, &mut read_buffer).await?;
+        let mut response_reader =
+            crate::typed_client::DrainedResponseReader::new(read_buffer.len());
+        authenticate_client_stream(
+            &mut stream,
+            &mut response_reader,
+            self.auth_user,
+            self.auth_pass,
+        )
+        .await?;
 
         let mut pending = VecDeque::with_capacity(self.pipeline_depth);
-        let mut disk_tasks = JoinSet::new();
         let mut next_index = self.client_index;
 
         loop {
@@ -1435,20 +1442,19 @@ impl ArticleIdDownloadSession {
                 && next_index < self.article_targets.len()
             {
                 let target = &self.article_targets[next_index];
-                let pending_response = connection
-                    .queue_request(request_for_download_target(target)?)
-                    .await
-                    .map_err(map_typed_client_error)?;
-                pending.push_back((next_index, pending_response));
+                let request = request_for_download_target(target)?;
+                let kind = request.kind();
+                crate::typed_client::write_request_wire(&mut stream, &request).await?;
+                pending.push_back((next_index, kind));
                 next_index = next_index.saturating_add(self.total_clients);
             }
 
-            let Some((index, pending_response)) = pending.pop_front() else {
+            let Some((index, kind)) = pending.pop_front() else {
                 break;
             };
             let target = &self.article_targets[index];
-            let response = pending_response
-                .receive()
+            let response = response_reader
+                .read_response_frame(&mut stream, kind)
                 .await
                 .map_err(map_typed_client_error)?;
 
@@ -1458,25 +1464,13 @@ impl ArticleIdDownloadSession {
                 .bytes_sent
                 .fetch_add(response.as_bytes().len() as u64, Ordering::Relaxed);
 
-            let target = target.clone();
-            let output_dir = self.output_dir.clone();
-            let verify_dir = self.verify_dir.clone();
-            disk_tasks.spawn_blocking(move || {
-                handle_article_id_response(
-                    &target,
-                    response,
-                    &output_dir,
-                    verify_dir.as_deref().map(PathBuf::as_path),
-                )
-            });
-
-            while disk_tasks.len() >= self.pipeline_depth {
-                join_article_disk_task(&mut disk_tasks).await?;
-            }
-        }
-
-        while !disk_tasks.is_empty() {
-            join_article_disk_task(&mut disk_tasks).await?;
+            handle_article_id_response(
+                target,
+                response.status(),
+                response.as_bytes(),
+                &self.output_dir,
+                self.verify_dir.as_deref().map(PathBuf::as_path),
+            )?;
         }
 
         Ok(())
@@ -1692,20 +1686,15 @@ async fn send_authinfo(
         .map_err(map_typed_client_error)
 }
 
-async fn authenticate_owned_connection(
-    connection: &TypedClientConnection,
+async fn authenticate_client_stream(
+    stream: &mut TcpStream,
+    response_reader: &mut crate::typed_client::DrainedResponseReader,
     auth_user: Option<AuthInfoValue<'static>>,
     auth_pass: Option<AuthInfoValue<'static>>,
 ) -> io::Result<()> {
     let mut user_status = None;
     if let Some(value) = auth_user {
-        let response = connection
-            .execute(Request::AuthInfo {
-                kind: AuthInfoKind::User,
-                value,
-            })
-            .await
-            .map_err(map_typed_client_error)?;
+        let response = send_authinfo(stream, response_reader, AuthInfoKind::User, value).await?;
         let status = response.status().as_u16();
         if status != 281 && status != 381 {
             return Err(io::Error::new(
@@ -1724,13 +1713,7 @@ async fn authenticate_owned_connection(
     }
 
     if let Some(value) = auth_pass {
-        let response = connection
-            .execute(Request::AuthInfo {
-                kind: AuthInfoKind::Pass,
-                value,
-            })
-            .await
-            .map_err(map_typed_client_error)?;
+        let response = send_authinfo(stream, response_reader, AuthInfoKind::Pass, value).await?;
         let status = response.status().as_u16();
         if status != 281 {
             return Err(io::Error::new(
@@ -1743,30 +1726,19 @@ async fn authenticate_owned_connection(
     Ok(())
 }
 
-async fn join_article_disk_task(disk_tasks: &mut JoinSet<io::Result<()>>) -> io::Result<()> {
-    match disk_tasks.join_next().await {
-        Some(Ok(result)) => result,
-        Some(Err(err)) => Err(io::Error::other(err)),
-        None => Ok(()),
-    }
-}
-
 fn handle_article_id_response(
     target: &ArticleDownloadTarget,
-    response: OwnedResponse,
+    status: StatusCode,
+    response: &[u8],
     output_dir: &Path,
     verify_dir: Option<&Path>,
 ) -> io::Result<()> {
-    match response.status().as_u16() {
+    match status.as_u16() {
         220 => {
-            if let Err(err) = verify_article_response_file(verify_dir, target, response.as_bytes())
-            {
+            if let Err(err) = verify_article_response_file(verify_dir, target, response) {
                 if err.kind() == io::ErrorKind::InvalidData {
-                    let failed_path = write_failed_article_response_file(
-                        output_dir,
-                        target,
-                        response.as_bytes(),
-                    )?;
+                    let failed_path =
+                        write_failed_article_response_file(output_dir, target, response)?;
                     eprintln!(
                         "ARTICLE {} verification failed; saved received response to {}",
                         download_target_label(target),
@@ -1775,7 +1747,7 @@ fn handle_article_id_response(
                 }
                 return Err(err);
             }
-            write_article_response_file(output_dir, target, response.as_bytes())
+            write_article_response_file(output_dir, target, response)
         }
         430 => Ok(()),
         status => Err(io::Error::new(

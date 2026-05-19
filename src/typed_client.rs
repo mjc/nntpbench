@@ -2299,6 +2299,22 @@ impl DrainedResponse {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct DrainedResponseFrame<'a> {
+    status: StatusCode,
+    bytes: &'a [u8],
+}
+
+impl<'a> DrainedResponseFrame<'a> {
+    pub(crate) fn status(&self) -> StatusCode {
+        self.status
+    }
+
+    pub(crate) fn as_bytes(&self) -> &'a [u8] {
+        self.bytes
+    }
+}
+
 pub(crate) struct DrainedResponseReader {
     pending_read: Box<[u8; DRAINED_PENDING_READ_BYTES]>,
     pending_len: usize,
@@ -2361,6 +2377,66 @@ impl DrainedResponseReader {
                 if self.pending_len == self.pending_read.len() {
                     return Err(TypedClientError::InvalidStatusLine);
                 }
+            }
+
+            let read_len = self
+                .read_chunk_bytes
+                .min(self.pending_read.len() - self.pending_len);
+            let read = reader
+                .read(&mut self.pending_read[self.pending_len..self.pending_len + read_len])
+                .await
+                .map_err(TypedClientError::Io)?;
+
+            if read == 0 {
+                return Err(TypedClientError::UnexpectedEof);
+            }
+
+            self.pending_len += read;
+        }
+    }
+
+    pub(crate) async fn read_response_frame<R>(
+        &mut self,
+        reader: &mut R,
+        kind: RequestKind,
+    ) -> Result<DrainedResponseFrame<'_>, TypedClientError>
+    where
+        R: AsyncRead + Unpin,
+    {
+        let mut frame_start = self.pending_start;
+
+        loop {
+            if frame_start < self.pending_len {
+                match ResponseDecoder::new(kind)
+                    .push(&self.pending_read[frame_start..self.pending_len])
+                {
+                    Ok(DecodeProgress::NeedMore) => {}
+                    Ok(DecodeProgress::Complete { status, consumed }) => {
+                        let frame_end = frame_start + consumed;
+                        self.pending_start = frame_end;
+                        if self.pending_start == self.pending_len {
+                            self.pending_len = 0;
+                            self.pending_start = 0;
+                        }
+                        return Ok(DrainedResponseFrame {
+                            status,
+                            bytes: &self.pending_read[frame_start..frame_end],
+                        });
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+
+            if self.pending_len == self.pending_read.len() {
+                if frame_start == 0 {
+                    return Err(TypedClientError::InvalidStatusLine);
+                }
+                let frame_len = self.pending_len - frame_start;
+                self.pending_read
+                    .copy_within(frame_start..self.pending_len, 0);
+                self.pending_start = 0;
+                self.pending_len = frame_len;
+                frame_start = 0;
             }
 
             let read_len = self
