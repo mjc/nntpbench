@@ -4,7 +4,6 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 #[cfg(test)]
 use std::cell::Cell;
-use std::collections::VecDeque;
 use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::future::poll_fn;
@@ -84,7 +83,7 @@ pub mod typed_client;
 
 use article_store::{
     ArticleDownloadTarget, ArticleStoreKey, article_ref_for_download_target, download_target_label,
-    open_article_response, read_article_targets, verify_article_response_file_into,
+    open_article_response_into, read_article_targets, verify_article_response_file_into,
     write_article_response_file_into, write_failed_article_response_file_into,
 };
 #[cfg(test)]
@@ -1556,21 +1555,25 @@ impl TypedClientSession {
             crate::typed_client::DrainedResponseReader::new(read_buffer.len());
         self.authenticate(&mut stream, &mut response_reader).await?;
 
-        let mut pending: VecDeque<(u64, RequestKind)> =
-            VecDeque::with_capacity(self.pipeline_depth);
+        let mut in_flight = 0_usize;
         let mut issued = 0_u64;
+        let mut received = 0_u64;
 
-        self.fill_typed_pipeline(&mut stream, &mut pending, &mut issued, stats, stop)
+        self.fill_typed_pipeline(&mut stream, &mut in_flight, &mut issued, stats, stop)
             .await?;
-        if pending.len() > 1 {
+        if in_flight > 1 {
             stats.pipeline_batches.fetch_add(1, Ordering::Relaxed);
         }
 
-        while let Some((command_id, kind)) = pending.pop_front() {
+        while in_flight > 0 {
+            let command_id = self.next_id.wrapping_add(received);
+            let kind = request_kind_for_client_command(command_id, self.command_mix);
             let response = response_reader
                 .read_response(&mut stream, kind)
                 .await
                 .map_err(map_typed_client_error)?;
+            in_flight -= 1;
+            received = received.wrapping_add(1);
 
             stats
                 .bytes_sent
@@ -1594,10 +1597,10 @@ impl TypedClientSession {
                 stop.store(true, Ordering::Release);
             }
 
-            let before = pending.len();
-            self.fill_typed_pipeline(&mut stream, &mut pending, &mut issued, stats, stop)
+            let before = in_flight;
+            self.fill_typed_pipeline(&mut stream, &mut in_flight, &mut issued, stats, stop)
                 .await?;
-            if pending.len().saturating_sub(before) > 1 {
+            if in_flight.saturating_sub(before) > 1 {
                 stats.pipeline_batches.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -1613,7 +1616,7 @@ impl TypedClientSession {
         let mut user_status = None;
         if let Some(value) = self.auth_user.as_ref() {
             let response =
-                send_authinfo(stream, response_reader, AuthInfoKind::User, value.clone()).await?;
+                send_authinfo(stream, response_reader, AuthInfoKind::User, value).await?;
             let status = response.status().as_u16();
             if status != 281 && status != 381 {
                 return Err(io::Error::new(
@@ -1633,7 +1636,7 @@ impl TypedClientSession {
 
         if let Some(value) = self.auth_pass.as_ref() {
             let response =
-                send_authinfo(stream, response_reader, AuthInfoKind::Pass, value.clone()).await?;
+                send_authinfo(stream, response_reader, AuthInfoKind::Pass, value).await?;
             let status = response.status().as_u16();
             if status != 281 {
                 return Err(io::Error::new(
@@ -1649,7 +1652,7 @@ impl TypedClientSession {
     async fn fill_typed_pipeline(
         &self,
         stream: &mut TcpStream,
-        pending: &mut VecDeque<(u64, RequestKind)>,
+        in_flight: &mut usize,
         issued: &mut u64,
         stats: &Stats,
         stop: &AtomicBool,
@@ -1658,13 +1661,13 @@ impl TypedClientSession {
             return Ok(());
         }
 
-        while pending.len() < self.pipeline_depth
+        while *in_flight < self.pipeline_depth
             && (self.requests == 0 || *issued < self.requests)
             && !transfer_limit_reached(stats, self.transfer_bytes)
         {
             let command_id = self.next_id.wrapping_add(*issued);
             let request_index = *issued;
-            let kind = write_typed_workload_request(
+            write_typed_workload_request(
                 stream,
                 command_id,
                 request_index,
@@ -1674,7 +1677,7 @@ impl TypedClientSession {
                 self.total_clients,
             )
             .await?;
-            pending.push_back((command_id, kind));
+            *in_flight += 1;
             *issued = issued.wrapping_add(1);
         }
 
@@ -1686,11 +1689,13 @@ async fn send_authinfo(
     stream: &mut TcpStream,
     response_reader: &mut crate::typed_client::DrainedResponseReader,
     kind: AuthInfoKind,
-    value: AuthInfoValue<'static>,
+    value: &AuthInfoValue<'_>,
 ) -> io::Result<crate::typed_client::DrainedResponse> {
-    let request = Request::AuthInfo { kind, value };
-    let request_kind = request.kind();
-    crate::typed_client::write_request_wire(stream, &request).await?;
+    let request_kind = match kind {
+        AuthInfoKind::User => RequestKind::AuthInfoUser,
+        AuthInfoKind::Pass => RequestKind::AuthInfoPass,
+    };
+    crate::typed_client::write_authinfo_wire(stream, kind, value).await?;
     response_reader
         .read_response(stream, request_kind)
         .await
@@ -1704,7 +1709,7 @@ async fn authenticate_client_stream(
     auth_pass: Option<AuthInfoValue<'static>>,
 ) -> io::Result<()> {
     let mut user_status = None;
-    if let Some(value) = auth_user {
+    if let Some(value) = auth_user.as_ref() {
         let response = send_authinfo(stream, response_reader, AuthInfoKind::User, value).await?;
         let status = response.status().as_u16();
         if status != 281 && status != 381 {
@@ -1723,7 +1728,7 @@ async fn authenticate_client_stream(
         ));
     }
 
-    if let Some(value) = auth_pass {
+    if let Some(value) = auth_pass.as_ref() {
         let response = send_authinfo(stream, response_reader, AuthInfoKind::Pass, value).await?;
         let status = response.status().as_u16();
         if status != 281 {
@@ -1793,13 +1798,7 @@ async fn write_typed_workload_request(
     total_clients: usize,
 ) -> io::Result<RequestKind> {
     let kind = client_command_kind(command_id, mix);
-    let request_kind = match kind {
-        ClientCommandMix::Article => RequestKind::Article,
-        ClientCommandMix::Body => RequestKind::Body,
-        ClientCommandMix::Alternate => {
-            unreachable!("client_command_kind should normalize Alternate")
-        }
-    };
+    let request_kind = request_kind_for_normalized_client_command(kind);
 
     if let Some(segments) = segments {
         let message_id =
@@ -1822,6 +1821,20 @@ async fn write_typed_workload_request(
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid synthetic message-id"))?;
     write_typed_message_id_request(stream, kind, &message_id).await?;
     Ok(request_kind)
+}
+
+fn request_kind_for_client_command(command_id: u64, mix: ClientCommandMix) -> RequestKind {
+    request_kind_for_normalized_client_command(client_command_kind(command_id, mix))
+}
+
+fn request_kind_for_normalized_client_command(kind: ClientCommandMix) -> RequestKind {
+    match kind {
+        ClientCommandMix::Article => RequestKind::Article,
+        ClientCommandMix::Body => RequestKind::Body,
+        ClientCommandMix::Alternate => {
+            unreachable!("client_command_kind should normalize Alternate")
+        }
+    }
 }
 
 async fn write_typed_message_id_request(
@@ -2208,6 +2221,7 @@ async fn serve_session_inner(
     let mut command_line = [0; MAX_COMMAND_LINE_BYTES];
     let mut command_batch = CommandBatch::new();
     let mut pending_write = PendingWrite::new(config.pending_write_bytes);
+    let mut article_path = PathBuf::with_capacity(1024);
 
     send_greeting(&mut writer, &config, session_stats).await?;
 
@@ -2229,6 +2243,7 @@ async fn serve_session_inner(
             session_stats,
             &mut writer,
             &mut pending_write,
+            &mut article_path,
         )
         .await?
         .should_close()
@@ -2275,6 +2290,7 @@ async fn process_command_batch<W>(
     session_stats: &mut SessionStats,
     writer: &mut W,
     pending_write: &mut PendingWrite,
+    article_path: &mut PathBuf,
 ) -> io::Result<BatchOutcome>
 where
     W: AsyncWrite + Unpin,
@@ -2282,7 +2298,16 @@ where
     session_stats.pipeline_batches += u64::from(command_batch.len() > 1);
 
     for command in command_batch {
-        if handle_command(command, config, session_stats, writer, pending_write).await? {
+        if handle_command(
+            command,
+            config,
+            session_stats,
+            writer,
+            pending_write,
+            article_path,
+        )
+        .await?
+        {
             flush_session_writer(writer, pending_write, config).await?;
             return Ok(BatchOutcome::Close);
         }
@@ -2299,6 +2324,7 @@ async fn handle_command<W>(
     session_stats: &mut SessionStats,
     writer: &mut W,
     pending_write: &mut PendingWrite,
+    article_path: &mut PathBuf,
 ) -> io::Result<bool>
 where
     W: AsyncWrite + Unpin,
@@ -2316,6 +2342,7 @@ where
                     command.article_id,
                     command.message_id.as_ref(),
                     session_stats,
+                    article_path,
                 )
                 .await?
                 {
@@ -2865,17 +2892,23 @@ fn open_stored_article_response(
     config: &ServerConfig,
     article_id: Option<u64>,
     message_id: Option<&MessageId<'_>>,
+    article_path: &mut PathBuf,
 ) -> io::Result<Option<fs::File>> {
     let Some(root) = config.article_dir.as_ref() else {
         return Ok(None);
     };
     if let Some(article_id) = article_id
-        && let Some(file) = open_article_response(root, ArticleStoreKey::Number(article_id))?
+        && let Some(file) =
+            open_article_response_into(root, ArticleStoreKey::Number(article_id), article_path)?
     {
         return Ok(Some(file));
     }
     if let Some(message_id) = message_id {
-        return open_article_response(root, ArticleStoreKey::MessageId(message_id));
+        return open_article_response_into(
+            root,
+            ArticleStoreKey::MessageId(message_id),
+            article_path,
+        );
     }
     Ok(None)
 }
@@ -2887,11 +2920,13 @@ async fn write_stored_article_response<W>(
     article_id: Option<u64>,
     message_id: Option<&MessageId<'_>>,
     session_stats: &mut SessionStats,
+    article_path: &mut PathBuf,
 ) -> io::Result<bool>
 where
     W: AsyncWrite + Unpin,
 {
-    let Some(file) = open_stored_article_response(config, article_id, message_id)? else {
+    let Some(file) = open_stored_article_response(config, article_id, message_id, article_path)?
+    else {
         return Ok(false);
     };
 
@@ -2960,7 +2995,10 @@ fn write_stored_article_response_to<W>(
 where
     W: Write,
 {
-    let Some(file) = open_stored_article_response(config, article_id, message_id)? else {
+    let mut article_path = PathBuf::with_capacity(1024);
+    let Some(file) =
+        open_stored_article_response(config, article_id, message_id, &mut article_path)?
+    else {
         return Ok(false);
     };
     write_file_response_to(output, file, stats)?;
@@ -3901,6 +3939,7 @@ mod tests {
         let config = ServerConfig::from_args(args);
         let mut stats = SessionStats::default();
         let mut pending = PendingWrite::new(DEFAULT_PENDING_WRITE_BYTES);
+        let mut article_path = PathBuf::new();
         let mut writer = FailingWriter;
         let command = ParsedCommand {
             kind: RequestKind::Article,
@@ -3908,9 +3947,16 @@ mod tests {
             message_id: None,
         };
 
-        let err = handle_command(&command, &config, &mut stats, &mut writer, &mut pending)
-            .await
-            .unwrap_err();
+        let err = handle_command(
+            &command,
+            &config,
+            &mut stats,
+            &mut writer,
+            &mut pending,
+            &mut article_path,
+        )
+        .await
+        .unwrap_err();
 
         assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
     }

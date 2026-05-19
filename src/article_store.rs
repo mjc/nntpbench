@@ -113,18 +113,21 @@ fn write_article_response_file_at(path: &Path, response: &[u8]) -> io::Result<()
     fs::write(path, response)
 }
 
-pub(crate) fn open_article_response(
+pub(crate) fn open_article_response_into(
     root: &Path,
     key: ArticleStoreKey<'_>,
+    path: &mut PathBuf,
 ) -> io::Result<Option<fs::File>> {
-    let path = match key {
-        ArticleStoreKey::Number(article_id) => article_id_tree_path(root, article_id),
-        ArticleStoreKey::MessageId(message_id) => message_id_tree_path(root, message_id),
-    };
+    path.clear();
+    path.push(root);
+    match key {
+        ArticleStoreKey::Number(article_id) => push_article_id_tree_path(path, article_id)?,
+        ArticleStoreKey::MessageId(message_id) => push_message_id_tree_path(path, message_id)?,
+    }
     open_optional_file(path)
 }
 
-fn open_optional_file(path: PathBuf) -> io::Result<Option<fs::File>> {
+fn open_optional_file(path: impl AsRef<Path>) -> io::Result<Option<fs::File>> {
     match fs::File::open(path) {
         Ok(file) => Ok(Some(file)),
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -235,12 +238,14 @@ fn push_message_id_tree_path(path: &mut PathBuf, message_id: &MessageId<'_>) -> 
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn article_id_tree_path(root: &Path, article_id: u64) -> PathBuf {
     root.join(format!("{:03}", article_id / 1_000_000))
         .join(format!("{:03}", (article_id / 1_000) % 1_000))
         .join(article_id.to_string())
 }
 
+#[cfg(test)]
 pub(crate) fn message_id_tree_path(root: &Path, message_id: &MessageId<'_>) -> PathBuf {
     let encoded = hex_lower(message_id.as_str().as_bytes());
     root.join("msgid").join(&encoded[..2]).join(encoded)

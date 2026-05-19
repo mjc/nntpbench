@@ -2617,6 +2617,17 @@ where
     write_article_ref_request_wire(writer, b"BODY", article_ref).await
 }
 
+pub(crate) async fn write_authinfo_wire<W>(
+    writer: &mut W,
+    kind: AuthInfoKind,
+    value: &AuthInfoValue<'_>,
+) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    write_authinfo_request_wire(writer, kind, value.as_str()).await
+}
+
 #[doc(hidden)]
 pub async fn bench_write_request_wire_to_sink(request: &Request<'static>) -> io::Result<()> {
     let mut writer = tokio::io::sink();
@@ -2951,11 +2962,11 @@ async fn run_reader_task(
                 match decoder.push(&pending_read) {
                     Ok(DecodeProgress::NeedMore) => {}
                     Ok(DecodeProgress::Complete { status, consumed }) => {
-                        let bytes = Bytes::copy_from_slice(&pending_read[..consumed]);
-                        let pending_len = pending_read.len();
-                        let leftover_len = pending_len - consumed;
-                        pending_read.copy_within(consumed..pending_len, 0);
-                        pending_read.truncate(leftover_len);
+                        let bytes = pending_read.split_to(consumed).freeze();
+                        if pending_read.capacity() < OWNED_RESPONSE_PREALLOC_BYTES {
+                            pending_read
+                                .reserve(OWNED_RESPONSE_PREALLOC_BYTES - pending_read.capacity());
+                        }
                         let response = CompletedResponse::Owned(OwnedResponse {
                             kind,
                             status,
@@ -2982,6 +2993,10 @@ async fn run_reader_task(
             }
 
             if pending_read.capacity() == pending_read.len() {
+                if pending_read.is_empty() {
+                    pending_read.reserve(OWNED_RESPONSE_PREALLOC_BYTES);
+                    continue;
+                }
                 let error = SharedEngineError::InvalidStatusLine;
                 let _ = response_tx.send(Err(error.clone()));
                 writer_abort.abort();
