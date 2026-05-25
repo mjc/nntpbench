@@ -7,8 +7,8 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use bytes::{Bytes, BytesMut};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use bytes::{BufMut, Bytes, BytesMut};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -2340,7 +2340,7 @@ impl DrainedResponseReader {
             pending_read: Vec::with_capacity(DRAINED_PENDING_READ_BYTES),
             pending_len: 0,
             pending_start: 0,
-            read_chunk_bytes: read_chunk_bytes.clamp(1, DRAINED_PENDING_READ_BYTES),
+            read_chunk_bytes: read_chunk_bytes.max(1),
         }
     }
 
@@ -2395,7 +2395,7 @@ impl DrainedResponseReader {
                     &mut self.pending_len,
                 );
                 if self.pending_len == self.pending_read.capacity() {
-                    return Err(TypedClientError::InvalidStatusLine);
+                    reserve_next_read_capacity(&mut self.pending_read, self.read_chunk_bytes);
                 }
             }
 
@@ -2455,15 +2455,16 @@ impl DrainedResponseReader {
 
             if self.pending_len == self.pending_read.capacity() {
                 if frame_start == 0 {
-                    return Err(TypedClientError::InvalidStatusLine);
+                    reserve_next_read_capacity(&mut self.pending_read, self.read_chunk_bytes);
+                } else {
+                    let frame_len = self.pending_len - frame_start;
+                    self.pending_read
+                        .copy_within(frame_start..self.pending_len, 0);
+                    self.pending_read.truncate(frame_len);
+                    self.pending_start = 0;
+                    self.pending_len = frame_len;
+                    frame_start = 0;
                 }
-                let frame_len = self.pending_len - frame_start;
-                self.pending_read
-                    .copy_within(frame_start..self.pending_len, 0);
-                self.pending_read.truncate(frame_len);
-                self.pending_start = 0;
-                self.pending_len = frame_len;
-                frame_start = 0;
             }
 
             let read = read_into_pending(
@@ -2962,7 +2963,7 @@ async fn run_reader_task(
     writer_abort: tokio::task::AbortHandle,
 ) {
     let mut reader = reader;
-    let _read_chunk_bytes = read_chunk_bytes;
+    let read_chunk_bytes = read_chunk_bytes.max(1);
     let mut inflight_rx = inflight_rx;
     let mut pending_read = BytesMut::with_capacity(OWNED_RESPONSE_PREALLOC_BYTES);
 
@@ -3012,35 +3013,22 @@ async fn run_reader_task(
                 }
             }
 
-            if pending_read.is_empty() && pending_read.capacity() < OWNED_RESPONSE_PREALLOC_BYTES {
-                pending_read.reserve(OWNED_RESPONSE_PREALLOC_BYTES - pending_read.capacity());
-            }
-
-            if pending_read.capacity() == pending_read.len() {
-                if pending_read.is_empty() {
-                    pending_read.reserve(OWNED_RESPONSE_PREALLOC_BYTES);
-                    continue;
-                }
-                let error = SharedEngineError::InvalidStatusLine;
-                let _ = response_tx.send(Err(error.clone()));
-                writer_abort.abort();
-                poison_reader_engine(&poisoned, &mut inflight_rx, error).await;
-                return;
-            }
-
-            let read = match reader.read_buf(&mut pending_read).await {
-                Ok(read) => read,
-                Err(err) => {
-                    let error = SharedEngineError::Io {
-                        kind: err.kind(),
-                        message: err.to_string(),
-                    };
-                    let _ = response_tx.send(Err(error.clone()));
-                    writer_abort.abort();
-                    poison_reader_engine(&poisoned, &mut inflight_rx, error).await;
-                    return;
-                }
-            };
+            let read =
+                match read_into_pending_bytes(&mut reader, &mut pending_read, read_chunk_bytes)
+                    .await
+                {
+                    Ok(read) => read,
+                    Err(err) => {
+                        let error = SharedEngineError::Io {
+                            kind: err.kind(),
+                            message: err.to_string(),
+                        };
+                        let _ = response_tx.send(Err(error.clone()));
+                        writer_abort.abort();
+                        poison_reader_engine(&poisoned, &mut inflight_rx, error).await;
+                        return;
+                    }
+                };
 
             if read == 0 {
                 let error = SharedEngineError::UnexpectedEof;
@@ -3051,6 +3039,10 @@ async fn run_reader_task(
             }
         }
     }
+}
+
+fn reserve_next_read_capacity(pending_read: &mut Vec<u8>, read_chunk_bytes: usize) {
+    pending_read.reserve(read_chunk_bytes.max(1));
 }
 
 async fn read_into_pending<R>(
@@ -3078,6 +3070,35 @@ where
             std::task::Poll::Ready(Err(err)) => {
                 std::task::Poll::Ready(Err(TypedClientError::Io(err)))
             }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    })
+    .await
+}
+
+async fn read_into_pending_bytes<R>(
+    reader: &mut R,
+    pending_read: &mut BytesMut,
+    read_chunk_bytes: usize,
+) -> io::Result<usize>
+where
+    R: AsyncRead + Unpin,
+{
+    let read_len = read_chunk_bytes.max(1);
+    pending_read.reserve(read_len);
+    poll_fn(|cx| {
+        let spare = pending_read.spare_capacity_mut();
+        let mut read_buf = ReadBuf::uninit(&mut spare[..read_len]);
+        match Pin::new(&mut *reader).poll_read(cx, &mut read_buf) {
+            std::task::Poll::Ready(Ok(())) => {
+                let read = read_buf.filled().len();
+                // `poll_read` initialized exactly `read` bytes in the spare capacity.
+                unsafe {
+                    pending_read.advance_mut(read);
+                }
+                std::task::Poll::Ready(Ok(read))
+            }
+            std::task::Poll::Ready(Err(err)) => std::task::Poll::Ready(Err(err)),
             std::task::Poll::Pending => std::task::Poll::Pending,
         }
     })
@@ -3175,6 +3196,43 @@ mod tests {
     use super::*;
     use proptest::collection::vec;
     use proptest::prelude::*;
+    use std::task::{Context, Poll};
+    use tokio::io::AsyncReadExt;
+
+    struct ProbeReader {
+        data: Vec<u8>,
+        offset: usize,
+        max_requested: usize,
+    }
+
+    impl ProbeReader {
+        fn new(data: &[u8]) -> Self {
+            Self {
+                data: data.to_vec(),
+                offset: 0,
+                max_requested: 0,
+            }
+        }
+    }
+
+    impl AsyncRead for ProbeReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            self.max_requested = self.max_requested.max(buf.remaining());
+            let available = self.data.len() - self.offset;
+            let to_copy = available.min(buf.remaining());
+            if to_copy != 0 {
+                let start = self.offset;
+                let end = start + to_copy;
+                buf.put_slice(&self.data[start..end]);
+                self.offset = end;
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
 
     fn dangerous_wire_bytes() -> impl Strategy<Value = u8> {
         prop_oneof![
@@ -4111,6 +4169,58 @@ mod tests {
 
         assert_eq!(&pending_read[..pending_len], b"1234");
         assert_eq!(pending_start, 0);
+    }
+
+    #[tokio::test]
+    async fn owned_pending_read_honors_chunk_size_and_grows_past_prealloc() {
+        let mut reader = ProbeReader::new(b"abcdef");
+        let mut pending_read = BytesMut::with_capacity(OWNED_RESPONSE_PREALLOC_BYTES);
+
+        let read = read_into_pending_bytes(&mut reader, &mut pending_read, 3)
+            .await
+            .unwrap();
+        assert_eq!(read, 3);
+        assert_eq!(reader.max_requested, 3);
+        assert_eq!(&pending_read[..], b"abc");
+
+        pending_read.resize(OWNED_RESPONSE_PREALLOC_BYTES, b'x');
+        let mut reader = ProbeReader::new(b"z");
+        let read = read_into_pending_bytes(&mut reader, &mut pending_read, 1)
+            .await
+            .unwrap();
+        assert_eq!(read, 1);
+        assert_eq!(pending_read.len(), OWNED_RESPONSE_PREALLOC_BYTES + 1);
+        assert_eq!(pending_read[OWNED_RESPONSE_PREALLOC_BYTES], b'z');
+    }
+
+    #[tokio::test]
+    async fn drained_response_frame_grows_past_initial_pending_capacity() {
+        let (mut writer, mut reader) = tokio::io::duplex(64 * 1024);
+        let response_len = DRAINED_PENDING_READ_BYTES + 1024;
+        let server = tokio::spawn(async move {
+            writer
+                .write_all(b"222 1 <large@test> body follows\r\n")
+                .await
+                .unwrap();
+            let chunk = vec![b'x'; 64 * 1024];
+            let mut remaining = response_len;
+            while remaining != 0 {
+                let write_len = remaining.min(chunk.len());
+                writer.write_all(&chunk[..write_len]).await.unwrap();
+                remaining -= write_len;
+            }
+            writer.write_all(b"\r\n.\r\n").await.unwrap();
+        });
+
+        let mut response_reader = DrainedResponseReader::new(32 * 1024);
+        let frame = response_reader
+            .read_response_frame(&mut reader, RequestKind::Body)
+            .await
+            .unwrap();
+
+        assert_eq!(frame.status().as_u16(), 222);
+        assert!(frame.as_bytes().len() > DRAINED_PENDING_READ_BYTES);
+        server.await.unwrap();
     }
 
     #[tokio::test]

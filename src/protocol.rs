@@ -3239,10 +3239,17 @@ impl<'a> RequestLine<'a> {
                 args: &[],
             };
         };
-        let split = memchr::memchr(b' ', line).unwrap_or(line.len());
+        let split = line
+            .iter()
+            .position(|byte| byte.is_ascii_whitespace())
+            .unwrap_or(line.len());
         let verb = &line[..split];
         let args = if split < line.len() {
-            &line[split + 1..]
+            let args_start = line[split..]
+                .iter()
+                .position(|byte| !byte.is_ascii_whitespace())
+                .map_or(line.len(), |relative| split + relative);
+            &line[args_start..]
         } else {
             &[]
         };
@@ -3437,7 +3444,9 @@ fn classify_request_kind(verb: &[u8], args: &[u8]) -> RequestKind {
         CommandKind::AuthInfo => {
             classify_subcommand(args, AUTHINFO_SUBCOMMANDS, RequestKind::AuthInfo)
         }
-        CommandKind::Mode if eq_ignore_ascii_case_const(args, b"READER") => RequestKind::ModeReader,
+        CommandKind::Mode if eq_ignore_ascii_case_const(trim_ascii_whitespace(args), b"READER") => {
+            RequestKind::ModeReader
+        }
         CommandKind::Mode => RequestKind::Unknown,
     }
 }
@@ -3459,6 +3468,18 @@ fn classify_subcommand(
         .iter()
         .find_map(|(wire, kind)| eq_ignore_ascii_case_const(subcommand, wire).then_some(*kind))
         .unwrap_or(default)
+}
+
+fn trim_ascii_whitespace(value: &[u8]) -> &[u8] {
+    let start = value
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(value.len());
+    let end = value
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .map_or(start, |index| index + 1);
+    &value[start..end]
 }
 
 const fn eq_ignore_ascii_case_const(left: &[u8], right: &[u8]) -> bool {
@@ -3916,6 +3937,18 @@ mod tests {
             RequestLine::parse(b"MODE READER\r\n").kind(),
             RequestKind::ModeReader
         );
+        assert_eq!(
+            RequestLine::parse(b"GROUP\talt.test\r\n").kind(),
+            RequestKind::Group
+        );
+        assert_eq!(
+            RequestLine::parse(b"MODE\tREADER\r\n").kind(),
+            RequestKind::ModeReader
+        );
+        assert_eq!(
+            RequestLine::parse(b"MODE  READER\r\n").kind(),
+            RequestKind::ModeReader
+        );
         assert_eq!(RequestLine::parse(b"QUIT\r\n").kind(), RequestKind::Quit);
         assert_eq!(RequestLine::parse(b"HEAD 1\r\n").kind(), RequestKind::Head);
         assert_eq!(
@@ -3966,7 +3999,11 @@ mod tests {
             (b"DATE".as_slice(), RequestKind::Date),
             (b"HELP".as_slice(), RequestKind::Help),
             (b"CAPABILITIES".as_slice(), RequestKind::Capabilities),
+            (b"GROUP\talt.test".as_slice(), RequestKind::Group),
+            (b"LIST\tACTIVE".as_slice(), RequestKind::ListActive),
             (b"MODE READER".as_slice(), RequestKind::ModeReader),
+            (b"MODE\tREADER".as_slice(), RequestKind::ModeReader),
+            (b"MODE  READER".as_slice(), RequestKind::ModeReader),
             (b"QUIT".as_slice(), RequestKind::Quit),
             (b"OVER 1-10".as_slice(), RequestKind::Over),
             (b"XOVER 1-10".as_slice(), RequestKind::Xover),
@@ -4069,6 +4106,16 @@ mod tests {
                 b"HEAD 9\r\n".as_slice(),
                 b"HEAD".as_slice(),
                 b"9".as_slice(),
+            ),
+            (
+                b"GROUP\talt.test\r\n".as_slice(),
+                b"GROUP".as_slice(),
+                b"alt.test".as_slice(),
+            ),
+            (
+                b"MODE  READER\r\n".as_slice(),
+                b"MODE".as_slice(),
+                b"READER".as_slice(),
             ),
             (
                 b"STAT <stat@test>\r\n".as_slice(),

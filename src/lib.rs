@@ -1647,7 +1647,7 @@ impl TypedClientSession {
             ));
         }
 
-        if let Some(value) = self.auth_pass.as_ref() {
+        if let (Some(381), Some(value)) = (user_status, self.auth_pass.as_ref()) {
             let response =
                 send_authinfo(stream, response_reader, AuthInfoKind::Pass, value).await?;
             let status = response.status().as_u16();
@@ -1750,7 +1750,7 @@ async fn authenticate_client_stream(
         ));
     }
 
-    if let Some(value) = auth_pass.as_ref() {
+    if let (Some(381), Some(value)) = (user_status, auth_pass.as_ref()) {
         let response = send_authinfo(stream, response_reader, AuthInfoKind::Pass, value).await?;
         let status = response.status().as_u16();
         if status != 281 {
@@ -5076,6 +5076,90 @@ mod tests {
         assert_eq!(snapshot.article_requests, 1);
         assert_eq!(snapshot.body_requests, 1);
         assert_eq!(snapshot.pipeline_batches, 1);
+    }
+
+    #[tokio::test]
+    async fn typed_client_session_skips_authinfo_pass_after_user_success() {
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"201 loopback ready\r\n").await.unwrap();
+            let mut reader = BufReader::new(stream);
+
+            let mut line = Vec::new();
+            reader.read_until(b'\n', &mut line).await.unwrap();
+            assert_eq!(line, b"AUTHINFO USER bench-user\r\n");
+            reader
+                .get_mut()
+                .write_all(b"281 authentication accepted\r\n")
+                .await
+                .unwrap();
+
+            line.clear();
+            reader.read_until(b'\n', &mut line).await.unwrap();
+            assert_eq!(line, b"ARTICLE 1\r\n");
+            reader
+                .get_mut()
+                .write_all(
+                    b"220 1 <bench.1@nntpbench.local> article follows\r\nSubject: Bench\r\n\r\none\r\n.\r\n",
+                )
+                .await
+                .unwrap();
+        });
+
+        let mut args = test_client_args();
+        args.connect = addr;
+        args.auth_user = Some("bench-user".to_string());
+        args.auth_pass = Some("bench-pass".to_string());
+        args.requests = 1;
+        args.pipeline_depth = 1;
+        args.command_mix = ClientCommandMix::Article;
+        let config = TypedClientConfig::from_client_args(args).unwrap();
+        let session = TypedClientSession::new(&config, 0, 1, 1);
+        let stats = Arc::new(Stats::new());
+        let stop = Arc::new(AtomicBool::new(false));
+
+        session.run(stats, stop).await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn download_authentication_skips_authinfo_pass_after_user_success() {
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+
+            let mut line = Vec::new();
+            reader.read_until(b'\n', &mut line).await.unwrap();
+            assert_eq!(line, b"AUTHINFO USER bench-user\r\n");
+            reader
+                .get_mut()
+                .write_all(b"281 authentication accepted\r\n")
+                .await
+                .unwrap();
+
+            line.clear();
+            reader.read_until(b'\n', &mut line).await.unwrap();
+            assert_eq!(line, b"ARTICLE 1\r\n");
+        });
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let mut response_reader =
+            crate::typed_client::DrainedResponseReader::new(CLIENT_READER_CAPACITY);
+        authenticate_client_stream(
+            &mut stream,
+            &mut response_reader,
+            Some(AuthInfoValue::from_borrowed("bench-user").unwrap()),
+            Some(AuthInfoValue::from_borrowed("bench-pass").unwrap()),
+        )
+        .await
+        .unwrap();
+        stream.write_all(b"ARTICLE 1\r\n").await.unwrap();
+
+        server.await.unwrap();
     }
 
     #[tokio::test]
