@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR"
+TARGET_DIR="${CARGO_TARGET_DIR:-$PROJECT_DIR/target}"
 
 BENCH_NAME="typed_client_roundtrip"
 BENCH_ARGS=("$@")
@@ -35,7 +36,7 @@ echo "Building $BENCH_NAME..."
 RUSTFLAGS="-C target-cpu=native -C force-frame-pointers=yes" \
     cargo bench --bench "$BENCH_NAME" --no-run
 
-mapfile -t bench_bins < <(find "$PROJECT_DIR/target" -path "*/deps/${BENCH_NAME}-*" -type f -executable)
+mapfile -t bench_bins < <(find "$TARGET_DIR" -path "*/deps/${BENCH_NAME}-*" -type f -executable)
 if [[ "${#bench_bins[@]}" -eq 0 ]]; then
     echo "Error: could not locate built bench binary for $BENCH_NAME"
     exit 1

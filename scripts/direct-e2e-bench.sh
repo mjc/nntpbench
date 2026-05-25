@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR"
+TARGET_DIR="${CARGO_TARGET_DIR:-$PROJECT_DIR/target}"
 
 LISTEN="${LISTEN:-127.0.0.1:21211}"
 BODY_BYTES="${BODY_BYTES:-786432}"
@@ -33,6 +34,7 @@ CLIENT_SOCKET_SEND_BUFFER="${CLIENT_SOCKET_SEND_BUFFER:-${SOCKET_SEND_BUFFER:-$D
 if [[ "${BUILD:-1}" != "0" ]]; then
     cargo build --release --bin nntpbench
 fi
+mkdir -p "$TARGET_DIR"
 
 cleanup() {
     if [[ -n "${SERVER_PID:-}" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
@@ -45,8 +47,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-SERVER_LOG="$(mktemp "$PROJECT_DIR/target/direct-e2e-server.XXXXXX.log")"
-./target/release/nntpbench server \
+SERVER_LOG="$(mktemp "$TARGET_DIR/direct-e2e-server.XXXXXX.log")"
+"$TARGET_DIR/release/nntpbench" server \
     --listen "$LISTEN" \
     --body-bytes "$BODY_BYTES" \
     --article-bytes "$ARTICLE_BYTES" \
@@ -70,7 +72,7 @@ grep -m1 "server listening" "$SERVER_LOG"
 for run in $(seq 1 "$RUNS"); do
     printf 'run=%s body_bytes=%s article_bytes=%s pending_write_bytes=%s command_mix=%s\n' \
         "$run" "$BODY_BYTES" "$ARTICLE_BYTES" "$PENDING_WRITE_BYTES" "$COMMAND_MIX"
-    ./target/release/nntpbench client \
+    "$TARGET_DIR/release/nntpbench" client \
         --connect "$LISTEN" \
         --transfer-bytes "$TRANSFER_BYTES" \
         --connections "$CONNECTIONS" \

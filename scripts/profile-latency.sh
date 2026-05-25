@@ -17,15 +17,18 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR"
 
 PLATFORM="$(uname -s)"
-if [ $# -gt 0 ]; then
-    MODE="$1"
-    shift
-else
-    case "$PLATFORM" in
-        Darwin) MODE="sample" ;;
-        *) MODE="strace" ;;
-    esac
-fi
+case "${1:-}" in
+    -h|--help|strace|offcpu|sample|dtrace)
+        MODE="$1"
+        shift
+        ;;
+    *)
+        case "$PLATFORM" in
+            Darwin) MODE="sample" ;;
+            *) MODE="strace" ;;
+        esac
+        ;;
+esac
 
 TARGET="server"
 if [ $# -gt 0 ]; then
@@ -156,7 +159,7 @@ run_macos_dtrace() {
     DTRACE_PID=$!
     sleep "$seconds"
     kill -INT "$DTRACE_PID" 2>/dev/null || true
-    wait "$DTRACE_PID" 2>/dev/null || true
+    wait "$DTRACE_PID" 2>/dev/null
     DTRACE_STATUS=$?
     if kill -0 "$APP_PID" 2>/dev/null; then
         kill -INT "$APP_PID" 2>/dev/null || true
@@ -183,10 +186,6 @@ case "$PLATFORM:$MODE" in
     ;;
 
   Linux:strace)
-    echo 0 | sudo tee /proc/sys/kernel/kptr_restrict > /dev/null
-    echo -1 | sudo tee /proc/sys/kernel/perf_event_paranoid > /dev/null
-    sudo chmod -R a+rx /sys/kernel/tracing 2>/dev/null || true
-    sudo chmod -R a+rx /sys/kernel/debug/tracing 2>/dev/null || true
     build_profile_binary
 
     echo "Recording syscall latency with strace..."
