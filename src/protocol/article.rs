@@ -651,6 +651,25 @@ mod proptests {
         }
 
         #[test]
+        fn article_parse_rejects_article_family_status_tokens_that_are_not_exactly_three_digits(
+            status in prop_oneof![Just("22"), Just("220x"), Just("2200")],
+            message_id in message_id_strategy(),
+            article_number in 0_u32..=999_999,
+        ) {
+            // RFC 3977 section 3.1 defines the initial response line as a three-digit
+            // status code followed by a space. Article-family parsers must not accept
+            // adjacent bytes as part of the status token, even when the first three bytes
+            // happen to be a known article status:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-3.1
+            let frame = format!("{status} {article_number} {message_id}\r\n.\r\n");
+
+            prop_assert_eq!(
+                Article::parse(frame.as_bytes()).unwrap_err(),
+                ArticleParseError::InvalidStatusPrefix
+            );
+        }
+
+        #[test]
         fn headers_parse_rejects_leading_folds_and_missing_colons(
             name in header_name_strategy(),
             value in header_value_strategy(),
@@ -1311,7 +1330,10 @@ fn parse_status_code(buf: &[u8]) -> Result<u16, ArticleParseError> {
 fn parse_first_line(
     line: &[u8],
 ) -> Result<(MessageId<'_>, Option<ArticleNumber>), ArticleParseError> {
-    let first_space = memchr::memchr(b' ', line).ok_or(ArticleParseError::InvalidMessageId)?;
+    let first_space = memchr::memchr(b' ', line).ok_or(ArticleParseError::InvalidStatusPrefix)?;
+    if first_space != 3 {
+        return Err(ArticleParseError::InvalidStatusPrefix);
+    }
     let second_space =
         memchr::memchr(b' ', &line[first_space + 1..]).map(|pos| first_space + 1 + pos);
 
