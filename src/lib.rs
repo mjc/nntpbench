@@ -1,38 +1,164 @@
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
+#[cfg(test)]
+use std::alloc::{GlobalAlloc, Layout, System};
+#[cfg(test)]
+use std::cell::Cell;
+use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::future::poll_fn;
-use std::io::{self, IoSlice};
+use std::io::{self, BufRead, IoSlice, Read, Write};
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use arrayvec::ArrayVec;
-use clap::{Parser, ValueEnum};
+use clap::{ArgAction, Parser, ValueEnum};
 use socket2::{Domain, Protocol, SockRef, Socket, Type};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{
+    AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
+};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio::time;
 
-pub mod tail_buffer;
+use crate::terminator::{
+    BoundedResponseLineStatus, DOT_TERMINATOR, ResponseLineStatus, append_dot_terminator,
+    detect_bounded_response_line_end, detect_response_line_end_from, find_crlf_line_end,
+    find_dot_terminated_block_end, strip_complete_crlf_line,
+};
+#[cfg(test)]
+use crate::terminator::{strip_dot_terminator_suffix, target_before_dot_terminator};
+
+#[cfg(test)]
+#[global_allocator]
+static TEST_ALLOCATOR: CountingAllocator = CountingAllocator;
+
+#[cfg(test)]
+struct CountingAllocator;
+
+#[cfg(test)]
+static TEST_ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+thread_local! {
+    static COUNT_TEST_ALLOCATIONS: Cell<bool> = const { Cell::new(false) };
+}
+
+#[cfg(test)]
+unsafe impl GlobalAlloc for CountingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        COUNT_TEST_ALLOCATIONS.with(|enabled| {
+            if enabled.get() {
+                TEST_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        unsafe { System.alloc(layout) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe { System.dealloc(ptr, layout) };
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        COUNT_TEST_ALLOCATIONS.with(|enabled| {
+            if enabled.get() {
+                TEST_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        unsafe { System.realloc(ptr, layout, new_size) }
+    }
+}
+
+mod article_store;
+pub mod protocol;
+pub mod terminator;
+pub mod typed_client;
+
+use article_store::{
+    ArticleDownloadTarget, ArticleStoreKey, article_ref_for_download_target, download_target_label,
+    open_article_response_into, read_article_targets, verify_article_response_file_into,
+    write_article_response_file_into, write_failed_article_response_file_into,
+};
+#[cfg(test)]
+use article_store::{
+    article_download_target_path_into, article_id_tree_path, message_id_tree_path,
+};
+
+pub use protocol::{
+    Article, ArticleNumber, ArticleParseError, ArticleRef, ArticleSelector, ArticleTransfer,
+    AuthInfoKind, AuthInfoValue, GroupName, HeaderIter, HeaderName, Headers, ListGroupRange,
+    ListKind, MessageId, NntpDate, NntpTime, Request, RequestKind, RequestLine, StatusCode,
+    Wildmat,
+};
+pub use typed_client::{
+    Client, OwnedArticle, OwnedArticleExchange, OwnedExchange, OwnedResponse,
+    TypedClientConnection, TypedClientError, TypedClientOptions,
+};
 
 pub const CRLF: &[u8] = b"\r\n";
 pub const TERMINATOR: &[u8] = b"\r\n.\r\n";
 pub const GREETING: &[u8] = b"201 nntpbench mock server ready\r\n";
 pub const MODE_READER_RESPONSE: &[u8] = b"201 posting not permitted\r\n";
 pub const DATE_RESPONSE: &[u8] = b"111 20260515120000\r\n";
-const MAX_COMMAND_LINE_BYTES: usize = 1024;
+pub const LIST_RESPONSE: &[u8] =
+    b"215 list of newsgroups follows\r\ncomp.lang.rust 0000000001 0000000001 y\r\n.\r\n";
+pub const LIST_ACTIVE_TIMES_RESPONSE: &[u8] =
+    b"215 information follows\r\ncomp.lang.rust 1715904000 admin@nntpbench.local\r\nalt.test 1715907600 admin@nntpbench.local\r\n.\r\n";
+pub const LIST_NEWSGROUPS_RESPONSE: &[u8] =
+    b"215 information follows\r\ncomp.lang.rust The Rust programming language\r\nalt.test Synthetic benchmark group\r\n.\r\n";
+pub const LIST_OVERVIEW_FMT_RESPONSE: &[u8] =
+    b"215 Order of fields in overview database\r\nSubject:\r\nFrom:\r\nDate:\r\nMessage-ID:\r\nReferences:\r\n:bytes\r\n:lines\r\n.\r\n";
+pub const LIST_HEADERS_RESPONSE: &[u8] =
+    b"215 headers supported\r\n:bytes\r\n:lines\r\nSubject\r\nFrom\r\nDate\r\nMessage-ID\r\nReferences\r\n.\r\n";
+pub const LIST_DISTRIB_PATS_RESPONSE: &[u8] =
+    b"215 distribution patterns\r\nworld:* world\r\nlocal:*.local local\r\n.\r\n";
+pub const GROUP_RESPONSE: &[u8] = b"211 3 1 3 alt.test\r\n";
+pub const LISTGROUP_RESPONSE: &[u8] = b"211 3 1 3 alt.test\r\n1\r\n2\r\n3\r\n.\r\n";
+pub const LAST_RESPONSE: &[u8] =
+    b"223 1 <prev@alt.test> article retrieved - request text separately\r\n";
+pub const NEXT_RESPONSE: &[u8] =
+    b"223 2 <next@alt.test> article retrieved - request text separately\r\n";
+pub const NEWGROUPS_RESPONSE: &[u8] =
+    b"231 list of new newsgroups follows\r\ncomp.lang.rust 0000000003 0000000001 y\r\nalt.test 0000000003 0000000001 y\r\n.\r\n";
+pub const NEWNEWS_RESPONSE: &[u8] =
+    b"230 list of new articles follows\r\n<one@alt.test>\r\n<two@alt.test>\r\n.\r\n";
+pub const POST_RESPONSE: &[u8] = b"340 send article to be posted\r\n";
+pub const IHAVE_RESPONSE: &[u8] = b"335 send article to be transferred\r\n";
+pub const CHECK_RESPONSE: &[u8] = b"238 send article to be transferred\r\n";
+pub const TAKETHIS_RESPONSE: &[u8] = b"239 article transferred ok\r\n";
+pub const AUTHINFO_USER_RESPONSE: &[u8] = b"381 more authentication information required\r\n";
+pub const AUTHINFO_RESPONSE: &[u8] = b"281 authentication accepted\r\n";
+pub const STARTTLS_RESPONSE: &[u8] = b"382 continue with TLS negotiation\r\n";
+pub const OVER_RESPONSE: &[u8] = b"224 Overview information follows\r\n1\tSubject one\tone@example.com\tFri, 16 May 2026 12:00:00 +0000\t<one@example.com>\t\t123\t4\r\n.\r\n";
+pub const XOVER_RESPONSE: &[u8] = b"224 Overview information follows\r\n2\tSubject two\ttwo@example.com\tFri, 16 May 2026 12:00:01 +0000\t<two@example.com>\t<ref@example.com>\t456\t8\r\n.\r\n";
+pub const HDR_RESPONSE: &[u8] =
+    b"225 headers follow\r\n1 Subject: example one\r\n2 Subject: example two\r\n.\r\n";
+pub const XHDR_RESPONSE: &[u8] =
+    b"225 headers follow\r\n1 <one@example>\r\n2 <two@example>\r\n.\r\n";
+pub const HEAD_RESPONSE: &[u8] = b"221 1 <article.1@nntpbench.local> article retrieved\r\nPath: nntpbench.local!mock\r\nFrom: Bench User <bench@nntpbench.local>\r\nNewsgroups: alt.binaries.bench\r\nSubject: nntpbench synthetic article\r\nMessage-ID: <article.1@nntpbench.local>\r\nDate: Fri, 15 May 2026 00:00:00 +0000\r\n.\r\n";
+pub const STAT_RESPONSE: &[u8] = b"223 1 <article.1@nntpbench.local> article retrieved\r\n";
+pub const HELP_RESPONSE: &[u8] =
+    b"100 help text follows\r\nLIST\r\nCAPABILITIES\r\nDATE\r\nMODE-READER\r\nQUIT\r\n.\r\n";
+pub const QUIT_RESPONSE: &[u8] = b"205 closing connection\r\n";
+pub const ARTICLE_NOT_FOUND_RESPONSE: &[u8] = b"430 no article with that number\r\n";
+const BODY_RESPONSE_PREFIX: &[u8] = b"222 1 <article.1@nntpbench.local> body follows\r\n";
+const ARTICLE_RESPONSE_PREFIX: &[u8] = b"220 1 <article.1@nntpbench.local> article follows\r\nPath: nntpbench.local!mock\r\nFrom: Bench User <bench@nntpbench.local>\r\nNewsgroups: alt.binaries.bench\r\nSubject: nntpbench synthetic article\r\nMessage-ID: <article.1@nntpbench.local>\r\nDate: Fri, 15 May 2026 00:00:00 +0000\r\n\r\n";
+const MAX_COMMAND_LINE_BYTES: usize = protocol::MAX_INITIAL_RESPONSE_LINE_BYTES;
 const MAX_SERVER_PIPELINE_DEPTH: usize = 1024;
 const SERVER_READER_CAPACITY: usize = 256 * 1024;
 const CLIENT_READER_CAPACITY: usize = 256 * 1024;
-const MAX_PENDING_WRITE_BYTES: usize = 64 * 1024;
-const MAX_CLIENT_COMMAND_BYTES: usize = 64;
+const DEFAULT_PENDING_WRITE_BYTES: usize = 800 * 1024;
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 const HIGH_THROUGHPUT_SOCKET_BUFFER: usize = 16 * 1024 * 1024;
+#[cfg(target_os = "macos")]
+const DEFAULT_SOCKET_BUFFER: usize = 1024 * 1024;
+#[cfg(not(target_os = "macos"))]
+const DEFAULT_SOCKET_BUFFER: usize = HIGH_THROUGHPUT_SOCKET_BUFFER;
 const PROCESS_CLOCK_TICK: Duration = Duration::from_millis(10);
 const TCP_LINGER_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(target_os = "linux")]
@@ -53,6 +179,10 @@ pub struct ServerArgs {
     /// Approximate full article bytes returned for ARTICLE, including headers.
     #[arg(long, default_value_t = 68 * 1024)]
     pub article_bytes: usize,
+
+    /// Directory tree containing complete ARTICLE response frames keyed by ARTICLE selector.
+    #[arg(long)]
+    pub article_dir: Option<PathBuf>,
 
     /// Maximum concurrent accepted sessions.
     #[arg(long, default_value_t = 4096)]
@@ -79,11 +209,11 @@ pub struct ServerArgs {
     pub nodelay: bool,
 
     /// Socket receive buffer size for accepted sockets. Use 0 to leave the OS default.
-    #[arg(long, default_value_t = HIGH_THROUGHPUT_SOCKET_BUFFER)]
+    #[arg(long, default_value_t = DEFAULT_SOCKET_BUFFER)]
     pub socket_recv_buffer: usize,
 
     /// Socket send buffer size for accepted sockets. Use 0 to leave the OS default.
-    #[arg(long, default_value_t = HIGH_THROUGHPUT_SOCKET_BUFFER)]
+    #[arg(long, default_value_t = DEFAULT_SOCKET_BUFFER)]
     pub socket_send_buffer: usize,
 
     /// Print benchmark statistics at this interval. Use 0 to disable periodic output.
@@ -93,6 +223,92 @@ pub struct ServerArgs {
     /// Flush after each response.
     #[arg(long, default_value_t = false)]
     pub flush: bool,
+
+    /// Per-session pending write buffer used to coalesce small generated response chunks.
+    #[arg(long, default_value_t = DEFAULT_PENDING_WRITE_BYTES)]
+    pub pending_write_bytes: usize,
+}
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::collection::vec;
+    use proptest::prelude::*;
+    use proptest::string::string_regex;
+
+    fn message_id_strategy() -> BoxedStrategy<String> {
+        (
+            string_regex("[A-Za-z0-9][A-Za-z0-9._-]{0,7}").unwrap(),
+            string_regex("[A-Za-z0-9][A-Za-z0-9._-]{0,7}").unwrap(),
+        )
+            .prop_map(|(local, domain)| format!("<{local}@{domain}.test>"))
+            .boxed()
+    }
+
+    fn segment_set_strategy() -> BoxedStrategy<SegmentSet> {
+        vec(message_id_strategy(), 1..=4)
+            .prop_map(|ids| SegmentSet {
+                ids: ids
+                    .into_iter()
+                    .map(|id| MessageId::from_shared(Arc::<str>::from(id)).unwrap())
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            })
+            .boxed()
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(48))]
+
+        #[test]
+        fn typed_request_for_command_uses_numeric_selectors_for_nonzero_synthetic_ids(
+            command_id in 1_u64..=10_000,
+            mix in prop_oneof![
+                Just(ClientCommandMix::Article),
+                Just(ClientCommandMix::Body),
+                Just(ClientCommandMix::Alternate),
+            ],
+        ) {
+            let request = typed_request_for_command(command_id, 0, mix, None, 0, 1).unwrap();
+            let expected_kind = client_command_kind(command_id, mix);
+
+            match expected_kind {
+                ClientCommandMix::Article => {
+                    prop_assert_eq!(request.kind(), RequestKind::Article);
+                    prop_assert_eq!(request.article_ref(), Some(&ArticleRef::Number(command_id)));
+                }
+                ClientCommandMix::Body => {
+                    prop_assert_eq!(request.kind(), RequestKind::Body);
+                    prop_assert_eq!(request.article_ref(), Some(&ArticleRef::Number(command_id)));
+                }
+                ClientCommandMix::Alternate => {
+                    unreachable!("client_command_kind should normalize Alternate")
+                }
+            }
+            prop_assert!(request.message_id().is_none());
+        }
+
+        #[test]
+        fn typed_request_for_command_uses_message_ids_for_zero_and_segment_inputs(
+            mix in prop_oneof![
+                Just(ClientCommandMix::Article),
+                Just(ClientCommandMix::Body),
+                Just(ClientCommandMix::Alternate),
+            ],
+            request_index in 0_u64..32,
+            client_index in 0_usize..4,
+            total_clients in 1_usize..4,
+            segments in segment_set_strategy(),
+        ) {
+            let zero_request = typed_request_for_command(0, request_index, mix, None, client_index, total_clients).unwrap();
+            prop_assert!(zero_request.message_id().is_some());
+            prop_assert_eq!(zero_request.message_id().unwrap().as_str(), "<bench.0@nntpbench.local>");
+
+            let segmented = typed_request_for_command(17, request_index, mix, Some(&segments), client_index, total_clients).unwrap();
+            let expected = segment_for_request(&segments, client_index, total_clients, request_index);
+            prop_assert_eq!(segmented.message_id().unwrap().as_str(), expected.as_str());
+        }
+    }
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -161,6 +377,26 @@ pub struct ClientArgs {
     #[arg(long)]
     pub segments: Option<PathBuf>,
 
+    /// AUTHINFO USER value sent once per connection before workload requests.
+    #[arg(long)]
+    pub auth_user: Option<String>,
+
+    /// AUTHINFO PASS value sent once per connection before workload requests.
+    #[arg(long)]
+    pub auth_pass: Option<String>,
+
+    /// File containing ARTICLE numbers or message-IDs to fetch, one per line.
+    #[arg(long)]
+    pub article_ids: Option<PathBuf>,
+
+    /// Directory tree where fetched ARTICLE responses are stored by ARTICLE selector.
+    #[arg(long)]
+    pub article_output_dir: Option<PathBuf>,
+
+    /// Directory tree containing expected ARTICLE response frames to verify with MD5 when present.
+    #[arg(long)]
+    pub article_verify_dir: Option<PathBuf>,
+
     /// Total ARTICLE/BODY commands to complete. Use 0 to disable this limit.
     #[arg(long, default_value_t = 0)]
     pub requests: u64,
@@ -210,11 +446,11 @@ pub struct ClientArgs {
     pub nodelay: bool,
 
     /// Socket receive buffer size in bytes. Use 0 to leave the OS default.
-    #[arg(long, default_value_t = HIGH_THROUGHPUT_SOCKET_BUFFER)]
+    #[arg(long, default_value_t = DEFAULT_SOCKET_BUFFER)]
     pub socket_recv_buffer: usize,
 
     /// Socket send buffer size in bytes. Use 0 to leave the OS default.
-    #[arg(long, default_value_t = HIGH_THROUGHPUT_SOCKET_BUFFER)]
+    #[arg(long, default_value_t = DEFAULT_SOCKET_BUFFER)]
     pub socket_send_buffer: usize,
 
     /// Print final machine-readable CSV: requests,bytes,elapsed_s,cpu_s,rss_kib.
@@ -233,15 +469,240 @@ pub enum ClientCommandMix {
     Alternate,
 }
 
+#[derive(Debug, Parser, Clone)]
+pub struct TypedClientArgs {
+    /// Address to connect to.
+    #[arg(long, default_value = "127.0.0.1:1199")]
+    pub connect: SocketAddr,
+
+    /// Comma-separated target ports. When set, clients rotate across these ports on the connect host.
+    #[arg(long, value_delimiter = ',')]
+    pub ports: Vec<u16>,
+
+    /// Tab-separated segment file. Lines are SIZE<TAB>MSGID; MSGID is normalized into angle brackets.
+    #[arg(long)]
+    pub segments: Option<PathBuf>,
+
+    /// AUTHINFO USER value sent once per connection before workload requests.
+    #[arg(long)]
+    pub auth_user: Option<String>,
+
+    /// AUTHINFO PASS value sent once per connection before workload requests.
+    #[arg(long)]
+    pub auth_pass: Option<String>,
+
+    /// File containing ARTICLE numbers or message-IDs to fetch, one per line.
+    #[arg(long)]
+    pub article_ids: Option<PathBuf>,
+
+    /// Directory tree where fetched ARTICLE responses are stored by ARTICLE selector.
+    #[arg(long)]
+    pub article_output_dir: Option<PathBuf>,
+
+    /// Directory tree containing expected ARTICLE response frames to verify with MD5 when present.
+    #[arg(long)]
+    pub article_verify_dir: Option<PathBuf>,
+
+    /// Total typed ARTICLE/BODY requests to complete. Use 0 to disable this limit.
+    #[arg(long, default_value_t = 0)]
+    pub requests: u64,
+
+    /// Received response bytes to complete. Use 0 to disable this limit.
+    #[arg(long, default_value_t = 0)]
+    pub transfer_bytes: u64,
+
+    /// Seconds to run. Use 0 to disable this limit.
+    #[arg(long, default_value_t = 0)]
+    pub duration_secs: u64,
+
+    /// Concurrent TCP connections.
+    #[arg(long, default_value_t = 1)]
+    pub connections: usize,
+
+    /// Offset used when this process owns a shard of the total client set.
+    #[arg(long, default_value_t = 0)]
+    pub client_offset: usize,
+
+    /// Total clients across all cooperating client processes. Use 0 to mean --connections.
+    #[arg(long, default_value_t = 0)]
+    pub total_clients: usize,
+
+    /// Tokio runtime worker threads. Use 1 for the current-thread runtime.
+    #[arg(long, default_value_t = 1)]
+    pub threads: usize,
+
+    /// Maximum in-flight typed requests allowed on each connection.
+    #[arg(long, default_value_t = 64)]
+    pub pipeline_depth: usize,
+
+    /// Command mix generated by each connection.
+    #[arg(long, value_enum, default_value_t = ClientCommandMix::Alternate)]
+    pub command_mix: ClientCommandMix,
+
+    /// First numeric article id used for per-request accounting.
+    #[arg(long, default_value_t = 1)]
+    pub start_id: u64,
+
+    /// Per-connection read buffer size.
+    #[arg(long, default_value_t = CLIENT_READER_CAPACITY)]
+    pub read_buffer_bytes: usize,
+
+    /// Set TCP_NODELAY on client sockets.
+    #[arg(long, default_value_t = true)]
+    pub nodelay: bool,
+
+    /// Socket receive buffer size in bytes. Use 0 to leave the OS default.
+    #[arg(long, default_value_t = DEFAULT_SOCKET_BUFFER)]
+    pub socket_recv_buffer: usize,
+
+    /// Socket send buffer size in bytes. Use 0 to leave the OS default.
+    #[arg(long, default_value_t = DEFAULT_SOCKET_BUFFER)]
+    pub socket_send_buffer: usize,
+
+    /// Print final machine-readable CSV: requests,bytes,elapsed_s,cpu_s,rss_kib.
+    #[arg(long, default_value_t = false)]
+    pub csv: bool,
+
+    /// Print benchmark statistics at this interval. Use 0 to disable periodic output.
+    #[arg(long, default_value_t = 1)]
+    pub stats_interval_secs: u64,
+}
+
+#[derive(Debug, Parser, Clone)]
+pub struct TypedFetchArgs {
+    /// Address to connect to.
+    #[arg(long, default_value = "127.0.0.1:1199")]
+    pub connect: SocketAddr,
+
+    /// Request kind to send.
+    #[arg(long, value_enum)]
+    pub request: TypedRequestKind,
+
+    /// Message-ID to request for ARTICLE/BODY/HEAD/STAT. Bare IDs are wrapped in angle brackets.
+    #[arg(long)]
+    pub message_id: Option<String>,
+
+    /// Article body for TAKETHIS requests.
+    #[arg(long)]
+    pub article_body: Option<String>,
+
+    /// AUTHINFO value for AUTHINFO USER/PASS requests.
+    #[arg(long)]
+    pub auth_value: Option<String>,
+
+    /// Header name for HDR/XHDR requests.
+    #[arg(long)]
+    pub header: Option<String>,
+
+    /// Group name for GROUP/LISTGROUP requests.
+    #[arg(long)]
+    pub group: Option<String>,
+
+    /// Wildmat pattern for NEWNEWS and LIST ACTIVE/ACTIVE.TIMES/NEWSGROUPS requests.
+    #[arg(long)]
+    pub wildmat: Option<String>,
+
+    /// NNTP date for NEWGROUPS/NEWNEWS, in YYMMDD or YYYYMMDD form.
+    #[arg(long)]
+    pub date: Option<String>,
+
+    /// NNTP time for NEWGROUPS/NEWNEWS, in HHMMSS form.
+    #[arg(long)]
+    pub time: Option<String>,
+
+    /// Treat NEWGROUPS/NEWNEWS timestamps as UTC.
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    pub gmt: bool,
+
+    /// Article selector for OVER/XOVER/HDR/XHDR requests, such as 1, 1-10, or <message@id>.
+    #[arg(long)]
+    pub selector: Option<String>,
+
+    /// Tokio runtime worker threads. Use 1 for the current-thread runtime.
+    #[arg(long, default_value_t = 1)]
+    pub threads: usize,
+
+    /// Per-connection read buffer size.
+    #[arg(long, default_value_t = CLIENT_READER_CAPACITY)]
+    pub read_buffer_bytes: usize,
+
+    /// Maximum in-flight typed requests allowed on the connection.
+    #[arg(long, default_value_t = 64)]
+    pub pipeline_depth: usize,
+
+    /// Set TCP_NODELAY on client sockets.
+    #[arg(long, default_value_t = true)]
+    pub nodelay: bool,
+
+    /// Socket receive buffer size in bytes. Use 0 to leave the OS default.
+    #[arg(long, default_value_t = DEFAULT_SOCKET_BUFFER)]
+    pub socket_recv_buffer: usize,
+
+    /// Socket send buffer size in bytes. Use 0 to leave the OS default.
+    #[arg(long, default_value_t = DEFAULT_SOCKET_BUFFER)]
+    pub socket_send_buffer: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum TypedRequestKind {
+    Article,
+    Body,
+    Head,
+    Stat,
+    ListActive,
+    ListActiveTimes,
+    ListNewsgroups,
+    ListOverviewFmt,
+    ListHeaders,
+    ListDistribPats,
+    Group,
+    Listgroup,
+    Last,
+    Next,
+    Newgroups,
+    Newnews,
+    Post,
+    Ihave,
+    Check,
+    Takethis,
+    AuthinfoUser,
+    AuthinfoPass,
+    Starttls,
+    Over,
+    Xover,
+    Hdr,
+    Xhdr,
+    List,
+    Help,
+    Capabilities,
+    Date,
+    ModeReader,
+    Quit,
+}
+
 #[derive(Debug)]
 struct SegmentSet {
-    ids: Box<[Box<[u8]>]>,
-    max_id_len: usize,
+    ids: Box<[MessageId<'static>]>,
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
 pub async fn run_client(args: ClientArgs) -> io::Result<()> {
-    let config = ClientConfig::from_args(args)?;
+    let config = TypedClientConfig::from_client_args(args)?;
+    run_typed_workload(config).await
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+pub async fn run_typed_client(args: TypedClientArgs) -> io::Result<()> {
+    let config = TypedClientConfig::from_args(args)?;
+    run_typed_workload(config).await
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn run_typed_workload(config: TypedClientConfig) -> io::Result<()> {
+    if config.article_targets.is_some() {
+        return run_article_id_download_workload(config).await;
+    }
+
     let start_cpu_ticks = process_cpu_ticks();
     let started = Instant::now();
     let stats = Arc::new(Stats::new());
@@ -289,7 +750,7 @@ pub async fn run_client(args: ClientArgs) -> io::Result<()> {
     for connection_index in 0..config.connections {
         let global_index = config.client_offset + connection_index;
         let requests = requests_for_connection(config.requests, config.total_clients, global_index);
-        let session = ClientSession::new(&config, global_index, next_start_id, requests);
+        let session = TypedClientSession::new(&config, global_index, next_start_id, requests);
         next_start_id = next_start_id.wrapping_add(requests);
         let stats = stats.clone();
         let stop = stop.clone();
@@ -330,11 +791,402 @@ pub async fn run_client(args: ClientArgs) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn run_article_id_download_workload(config: TypedClientConfig) -> io::Result<()> {
+    let start_cpu_ticks = process_cpu_ticks();
+    let started = Instant::now();
+    let stats = Arc::new(Stats::new());
+    let stop = Arc::new(AtomicBool::new(false));
+    let article_targets = config
+        .article_targets
+        .clone()
+        .expect("article id workload requires targets");
+    let output_dir = config
+        .article_output_dir
+        .clone()
+        .expect("article id workload requires output dir");
+
+    eprintln!(
+        "nntpbench client connecting to {} article_targets={} output_dir={} connections={} total_clients={} client_offset={}",
+        config.connect,
+        article_targets.len(),
+        output_dir.display(),
+        config.connections,
+        config.total_clients,
+        config.client_offset
+    );
+
+    if config.stats_interval != Duration::ZERO {
+        tokio::spawn(report_stats(stats.clone(), config.stats_interval));
+    }
+
+    tokio::spawn({
+        let stop = stop.clone();
+        async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                stop.store(true, Ordering::Release);
+            }
+        }
+    });
+
+    if config.duration != Duration::ZERO {
+        tokio::spawn({
+            let stop = stop.clone();
+            let duration = config.duration;
+            async move {
+                time::sleep(duration).await;
+                stop.store(true, Ordering::Release);
+            }
+        });
+    }
+
+    let mut sessions = JoinSet::new();
+    for connection_index in 0..config.connections {
+        let global_index = config.client_offset + connection_index;
+        let session = ArticleIdDownloadSession::new(
+            &config,
+            global_index,
+            article_targets.clone(),
+            output_dir.clone(),
+        );
+        let stats = stats.clone();
+        let stop = stop.clone();
+        sessions.spawn(async move { session.run(stats, stop).await });
+    }
+
+    while let Some(result) = sessions.join_next().await {
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                stats.errors.fetch_add(1, Ordering::Relaxed);
+                stop.store(true, Ordering::Release);
+                sessions.abort_all();
+                return Err(err);
+            }
+            Err(err) => {
+                stats.errors.fetch_add(1, Ordering::Relaxed);
+                stop.store(true, Ordering::Release);
+                sessions.abort_all();
+                return Err(io::Error::other(err));
+            }
+        }
+    }
+
+    if config.csv {
+        let snapshot = stats.snapshot();
+        println!(
+            "{},{},{:.9},{:.9},{}",
+            snapshot.commands,
+            snapshot.bytes_sent,
+            started.elapsed().as_secs_f64(),
+            cpu_seconds_since(start_cpu_ticks),
+            process_rss_kib()
+        );
+    } else {
+        stats.print_snapshot("final");
+    }
+    Ok(())
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+pub async fn run_typed_fetch(args: TypedFetchArgs) -> io::Result<()> {
+    let response = fetch_typed_response(&args)
+        .await
+        .map_err(map_typed_client_error)?;
+    io::stdout().write_all(response.as_bytes())
+}
+
+pub async fn fetch_typed_response(
+    args: &TypedFetchArgs,
+) -> Result<OwnedResponse, TypedClientError> {
+    let request = typed_fetch_request(args)?;
+    let connection = TypedClientConnection::connect_with_options(
+        args.connect,
+        TypedClientOptions {
+            read_buffer_bytes: args.read_buffer_bytes.max(terminator::TERMINATOR_TAIL_SIZE),
+            nodelay: args.nodelay,
+            socket_recv_buffer: args.socket_recv_buffer,
+            socket_send_buffer: args.socket_send_buffer,
+            pipeline_depth: args.pipeline_depth.clamp(1, 4096),
+        },
+    )
+    .await?;
+
+    connection.execute(request).await
+}
+
+fn typed_fetch_request(args: &TypedFetchArgs) -> Result<Request<'static>, TypedClientError> {
+    match args.request {
+        TypedRequestKind::Article => typed_fetch_article_request(
+            args,
+            |message_id| Request::article(message_id),
+            |selector| Request::article_selector(selector),
+            Request::article_current,
+        ),
+        TypedRequestKind::Body => typed_fetch_article_request(
+            args,
+            |message_id| Request::body(message_id),
+            |selector| Request::body_selector(selector),
+            Request::body_current,
+        ),
+        TypedRequestKind::Head => typed_fetch_article_request(
+            args,
+            |message_id| Request::head(message_id),
+            |selector| Request::head_selector(selector),
+            Request::head_current,
+        ),
+        TypedRequestKind::Stat => typed_fetch_article_request(
+            args,
+            |message_id| Request::stat(message_id),
+            |selector| Request::stat_selector(selector),
+            Request::stat_current,
+        ),
+        TypedRequestKind::ListActive => match args.wildmat.as_deref() {
+            Some(wildmat) => {
+                Request::list_active_wildmat(wildmat).map_err(|_| TypedClientError::InvalidWildmat)
+            }
+            None => Ok(Request::list_active()),
+        },
+        TypedRequestKind::ListActiveTimes => match args.wildmat.as_deref() {
+            Some(wildmat) => Request::list_active_times_wildmat(wildmat)
+                .map_err(|_| TypedClientError::InvalidWildmat),
+            None => Ok(Request::list_active_times()),
+        },
+        TypedRequestKind::ListNewsgroups => match args.wildmat.as_deref() {
+            Some(wildmat) => Request::list_newsgroups_wildmat(wildmat)
+                .map_err(|_| TypedClientError::InvalidWildmat),
+            None => Ok(Request::list_newsgroups()),
+        },
+        TypedRequestKind::ListOverviewFmt => Ok(Request::list_overview_fmt()),
+        TypedRequestKind::ListHeaders => Ok(Request::list_headers()),
+        TypedRequestKind::ListDistribPats => Ok(Request::list_distrib_pats()),
+        TypedRequestKind::Group => typed_fetch_group_request(args, |group| Request::group(group)),
+        TypedRequestKind::Listgroup => typed_fetch_listgroup_request(args),
+        TypedRequestKind::Last => Ok(Request::last()),
+        TypedRequestKind::Next => Ok(Request::next()),
+        TypedRequestKind::Newgroups => typed_fetch_newgroups_request(args),
+        TypedRequestKind::Newnews => typed_fetch_newnews_request(args),
+        TypedRequestKind::Post => Ok(Request::post()),
+        TypedRequestKind::Ihave => {
+            typed_fetch_message_id_request(args, |message_id| Request::ihave(message_id))
+        }
+        TypedRequestKind::Check => {
+            typed_fetch_message_id_request(args, |message_id| Request::check(message_id))
+        }
+        TypedRequestKind::Takethis => typed_fetch_takethis_request(args),
+        TypedRequestKind::AuthinfoUser => {
+            typed_fetch_authinfo_request(args, |value| Request::authinfo_user(value))
+        }
+        TypedRequestKind::AuthinfoPass => {
+            typed_fetch_authinfo_request(args, |value| Request::authinfo_pass(value))
+        }
+        TypedRequestKind::Starttls => Ok(Request::starttls()),
+        TypedRequestKind::Over => {
+            typed_fetch_selector_request(args, |selector| Request::over(selector))
+        }
+        TypedRequestKind::Xover => {
+            typed_fetch_selector_request(args, |selector| Request::xover(selector))
+        }
+        TypedRequestKind::Hdr => {
+            typed_fetch_header_request(args, |header, selector| Request::hdr(header, selector))
+        }
+        TypedRequestKind::Xhdr => {
+            typed_fetch_header_request(args, |header, selector| Request::xhdr(header, selector))
+        }
+        TypedRequestKind::List => Ok(Request::list()),
+        TypedRequestKind::Help => Ok(Request::help()),
+        TypedRequestKind::Capabilities => Ok(Request::capabilities()),
+        TypedRequestKind::Date => Ok(Request::date()),
+        TypedRequestKind::ModeReader => Ok(Request::mode_reader()),
+        TypedRequestKind::Quit => Ok(Request::quit()),
+    }
+}
+
+fn typed_fetch_message_id_request<F>(
+    args: &TypedFetchArgs,
+    build: F,
+) -> Result<Request<'static>, TypedClientError>
+where
+    F: FnOnce(&str) -> Result<Request<'static>, protocol::InvalidMessageId>,
+{
+    let message_id = args
+        .message_id
+        .as_deref()
+        .ok_or(TypedClientError::MissingMessageId)?;
+    build(message_id).map_err(|_| TypedClientError::InvalidMessageId)
+}
+
+fn typed_fetch_article_request<F, G, H>(
+    args: &TypedFetchArgs,
+    build_message_id: F,
+    build_selector: G,
+    build_current: H,
+) -> Result<Request<'static>, TypedClientError>
+where
+    F: FnOnce(&str) -> Result<Request<'static>, protocol::InvalidMessageId>,
+    G: FnOnce(&str) -> Result<Request<'static>, protocol::InvalidArticleRef>,
+    H: FnOnce() -> Request<'static>,
+{
+    if let Some(message_id) = args.message_id.as_deref() {
+        return build_message_id(message_id).map_err(|_| TypedClientError::InvalidMessageId);
+    }
+
+    if let Some(selector) = args.selector.as_deref() {
+        return build_selector(selector).map_err(|_| TypedClientError::InvalidArticleSelector);
+    }
+
+    Ok(build_current())
+}
+
+fn typed_fetch_header_request<F>(
+    args: &TypedFetchArgs,
+    build: F,
+) -> Result<Request<'static>, TypedClientError>
+where
+    F: FnOnce(&str, &str) -> Result<Request<'static>, crate::protocol::InvalidHeaderQuery>,
+{
+    let header = args
+        .header
+        .as_deref()
+        .ok_or(TypedClientError::MissingHeaderName)?;
+    let selector = args
+        .selector
+        .as_deref()
+        .ok_or(TypedClientError::MissingArticleSelector)?;
+    build(header, selector).map_err(TypedClientError::from)
+}
+
+fn typed_fetch_group_request<F>(
+    args: &TypedFetchArgs,
+    build: F,
+) -> Result<Request<'static>, TypedClientError>
+where
+    F: FnOnce(&str) -> Result<Request<'static>, crate::protocol::InvalidGroupName>,
+{
+    let group = args
+        .group
+        .as_deref()
+        .ok_or(TypedClientError::MissingGroupName)?;
+    build(group).map_err(|_| TypedClientError::InvalidGroupName)
+}
+
+fn typed_fetch_listgroup_request(
+    args: &TypedFetchArgs,
+) -> Result<Request<'static>, TypedClientError> {
+    match (args.group.as_deref(), args.selector.as_deref()) {
+        (Some(group), Some(range)) => {
+            Request::listgroup_group_range(group, range).map_err(TypedClientError::from)
+        }
+        (Some(group), None) => {
+            Request::listgroup(group).map_err(|_| TypedClientError::InvalidGroupName)
+        }
+        (None, Some(range)) => {
+            Request::listgroup_range(range).map_err(|_| TypedClientError::InvalidListGroupRange)
+        }
+        (None, None) => Ok(Request::listgroup_current()),
+    }
+}
+
+fn typed_fetch_newgroups_request(
+    args: &TypedFetchArgs,
+) -> Result<Request<'static>, TypedClientError> {
+    let date = args.date.as_deref().ok_or(TypedClientError::MissingDate)?;
+    let time = args.time.as_deref().ok_or(TypedClientError::MissingTime)?;
+    Request::newgroups(date, time, args.gmt).map_err(TypedClientError::from)
+}
+
+fn typed_fetch_newnews_request(
+    args: &TypedFetchArgs,
+) -> Result<Request<'static>, TypedClientError> {
+    let wildmat = args
+        .wildmat
+        .as_deref()
+        .ok_or(TypedClientError::MissingWildmat)?;
+    let date = args.date.as_deref().ok_or(TypedClientError::MissingDate)?;
+    let time = args.time.as_deref().ok_or(TypedClientError::MissingTime)?;
+    Request::newnews(wildmat, date, time, args.gmt).map_err(TypedClientError::from)
+}
+
+fn typed_fetch_selector_request<F>(
+    args: &TypedFetchArgs,
+    build: F,
+) -> Result<Request<'static>, TypedClientError>
+where
+    F: FnOnce(&str) -> Result<Request<'static>, crate::protocol::InvalidArticleSelector>,
+{
+    let selector = args
+        .selector
+        .as_deref()
+        .ok_or(TypedClientError::MissingArticleSelector)?;
+    build(selector).map_err(|_| TypedClientError::InvalidArticleSelector)
+}
+
+fn typed_fetch_authinfo_request<F>(
+    args: &TypedFetchArgs,
+    build: F,
+) -> Result<Request<'static>, TypedClientError>
+where
+    F: FnOnce(&str) -> Result<Request<'static>, crate::protocol::InvalidAuthInfoValue>,
+{
+    let value = args
+        .auth_value
+        .as_deref()
+        .ok_or(TypedClientError::MissingAuthInfoValue)?;
+    build(value).map_err(TypedClientError::from)
+}
+
+fn typed_fetch_takethis_request(
+    args: &TypedFetchArgs,
+) -> Result<Request<'static>, TypedClientError> {
+    let message_id = args
+        .message_id
+        .as_deref()
+        .ok_or(TypedClientError::MissingMessageId)?;
+    let article = args
+        .article_body
+        .as_deref()
+        .ok_or(TypedClientError::MissingArticleBody)?;
+    Request::takethis(message_id, article.as_bytes())
+        .map_err(|_| TypedClientError::InvalidMessageId)
+}
+
+fn map_typed_client_error(err: TypedClientError) -> io::Error {
+    match err {
+        TypedClientError::Io(err) => err,
+        TypedClientError::UnexpectedEof => io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "server closed before completing response",
+        ),
+        TypedClientError::ConnectionClosed => {
+            io::Error::new(io::ErrorKind::BrokenPipe, "connection engine closed")
+        }
+        other => io::Error::new(io::ErrorKind::InvalidData, other),
+    }
+}
+
+fn validate_client_auth_value(
+    value: Option<String>,
+    name: &'static str,
+) -> io::Result<Option<AuthInfoValue<'static>>> {
+    value
+        .map(|value| {
+            AuthInfoValue::from_owned(value).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, format!("invalid {name} value"))
+            })
+        })
+        .transpose()
+}
+
 #[derive(Debug, Clone)]
-struct ClientConfig {
+struct TypedClientConfig {
     connect: SocketAddr,
     ports: Box<[u16]>,
     segments: Option<Arc<SegmentSet>>,
+    auth_user: Option<AuthInfoValue<'static>>,
+    auth_pass: Option<AuthInfoValue<'static>>,
+    article_targets: Option<Arc<[ArticleDownloadTarget]>>,
+    article_output_dir: Option<Arc<PathBuf>>,
+    article_verify_dir: Option<Arc<PathBuf>>,
     requests: u64,
     transfer_bytes: u64,
     duration: Duration,
@@ -352,44 +1204,153 @@ struct ClientConfig {
     stats_interval: Duration,
 }
 
-impl ClientConfig {
-    fn from_args(args: ClientArgs) -> io::Result<Self> {
-        let connections = args.connections.max(1);
-        let total_clients = if args.total_clients == 0 {
+impl TypedClientConfig {
+    fn from_client_args(args: ClientArgs) -> io::Result<Self> {
+        Self::build(
+            args.connect,
+            args.ports.into_boxed_slice(),
+            args.segments,
+            args.auth_user,
+            args.auth_pass,
+            args.article_ids,
+            args.article_output_dir,
+            args.article_verify_dir,
+            args.requests,
+            args.transfer_bytes,
+            args.duration_secs,
+            args.connections,
+            args.client_offset,
+            args.total_clients,
+            args.pipeline_depth,
+            args.command_mix,
+            args.start_id,
+            args.read_buffer_bytes,
+            args.nodelay,
+            args.socket_recv_buffer,
+            args.socket_send_buffer,
+            args.csv,
+            args.stats_interval_secs,
+        )
+    }
+
+    fn from_args(args: TypedClientArgs) -> io::Result<Self> {
+        Self::build(
+            args.connect,
+            args.ports.into_boxed_slice(),
+            args.segments,
+            args.auth_user,
+            args.auth_pass,
+            args.article_ids,
+            args.article_output_dir,
+            args.article_verify_dir,
+            args.requests,
+            args.transfer_bytes,
+            args.duration_secs,
+            args.connections,
+            args.client_offset,
+            args.total_clients,
+            args.pipeline_depth,
+            args.command_mix,
+            args.start_id,
+            args.read_buffer_bytes,
+            args.nodelay,
+            args.socket_recv_buffer,
+            args.socket_send_buffer,
+            args.csv,
+            args.stats_interval_secs,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        connect: SocketAddr,
+        ports: Box<[u16]>,
+        segments: Option<PathBuf>,
+        auth_user: Option<String>,
+        auth_pass: Option<String>,
+        article_ids: Option<PathBuf>,
+        article_output_dir: Option<PathBuf>,
+        article_verify_dir: Option<PathBuf>,
+        requests: u64,
+        transfer_bytes: u64,
+        duration_secs: u64,
+        connections: usize,
+        client_offset: usize,
+        total_clients: usize,
+        pipeline_depth: usize,
+        command_mix: ClientCommandMix,
+        start_id: u64,
+        read_buffer_bytes: usize,
+        nodelay: bool,
+        socket_recv_buffer: usize,
+        socket_send_buffer: usize,
+        csv: bool,
+        stats_interval_secs: u64,
+    ) -> io::Result<Self> {
+        let connections = connections.max(1);
+        let total_clients = if total_clients == 0 {
             connections
         } else {
-            args.total_clients
+            total_clients
         };
-        let pipeline_depth = args.pipeline_depth.clamp(1, 4096);
-        let read_buffer_bytes = args
-            .read_buffer_bytes
-            .max(tail_buffer::TERMINATOR_TAIL_SIZE);
-        let segments = args
-            .segments
+        let segments = segments
             .as_deref()
             .map(read_segments)
             .transpose()?
             .map(Arc::new);
+        let auth_user = validate_client_auth_value(auth_user, "auth user")?;
+        let auth_pass = validate_client_auth_value(auth_pass, "auth pass")?;
+        let article_targets = if let Some(path) = article_ids.as_deref() {
+            Some(Arc::from(read_article_targets(path)?.into_boxed_slice()))
+        } else {
+            None
+        };
+        if article_targets.is_some() && article_output_dir.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--article-output-dir is required with --article-ids",
+            ));
+        }
+        if article_targets.is_none() && article_output_dir.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--article-ids is required with --article-output-dir",
+            ));
+        }
+        if article_targets.is_none() && article_verify_dir.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--article-ids is required with --article-verify-dir",
+            ));
+        }
+        if let Some(output_dir) = article_output_dir.as_ref() {
+            fs::create_dir_all(output_dir)?;
+        }
 
         Ok(Self {
-            connect: args.connect,
-            ports: args.ports.into_boxed_slice(),
+            connect,
+            ports,
             segments,
-            requests: args.requests,
-            transfer_bytes: args.transfer_bytes,
-            duration: Duration::from_secs(args.duration_secs),
+            auth_user,
+            auth_pass,
+            article_targets,
+            article_output_dir: article_output_dir.map(Arc::new),
+            article_verify_dir: article_verify_dir.map(Arc::new),
+            requests,
+            transfer_bytes,
+            duration: Duration::from_secs(duration_secs),
             connections,
-            client_offset: args.client_offset,
+            client_offset,
             total_clients,
-            pipeline_depth,
-            command_mix: args.command_mix,
-            start_id: args.start_id,
-            read_buffer_bytes,
-            nodelay: args.nodelay,
-            socket_recv_buffer: args.socket_recv_buffer,
-            socket_send_buffer: args.socket_send_buffer,
-            csv: args.csv,
-            stats_interval: Duration::from_secs(args.stats_interval_secs),
+            pipeline_depth: pipeline_depth.clamp(1, 4096),
+            command_mix,
+            start_id,
+            read_buffer_bytes: read_buffer_bytes.max(terminator::TERMINATOR_TAIL_SIZE),
+            nodelay,
+            socket_recv_buffer,
+            socket_send_buffer,
+            csv,
+            stats_interval: Duration::from_secs(stats_interval_secs),
         })
     }
 
@@ -400,61 +1361,50 @@ impl ClientConfig {
         }
         connect
     }
-
-    fn command_capacity(&self) -> usize {
-        let max_command = self
-            .segments
-            .as_ref()
-            .map_or(MAX_CLIENT_COMMAND_BYTES, |segments| {
-                b"ARTICLE "
-                    .len()
-                    .max(b"BODY ".len())
-                    .saturating_add(segments.max_id_len)
-                    .saturating_add(CRLF.len())
-            });
-        self.pipeline_depth.saturating_mul(max_command)
-    }
 }
 
 #[derive(Debug)]
-struct ClientSession {
+struct ArticleIdDownloadSession {
     connect: SocketAddr,
-    segments: Option<Arc<SegmentSet>>,
+    auth_user: Option<AuthInfoValue<'static>>,
+    auth_pass: Option<AuthInfoValue<'static>>,
+    article_targets: Arc<[ArticleDownloadTarget]>,
+    output_dir: Arc<PathBuf>,
+    verify_dir: Option<Arc<PathBuf>>,
     client_index: usize,
     total_clients: usize,
-    requests: u64,
-    transfer_bytes: u64,
-    next_id: u64,
-    pipeline_depth: usize,
-    command_mix: ClientCommandMix,
     read_buffer_bytes: usize,
-    command_buffer_bytes: usize,
+    pipeline_depth: usize,
     nodelay: bool,
     socket_recv_buffer: usize,
     socket_send_buffer: usize,
 }
 
-impl ClientSession {
-    fn new(config: &ClientConfig, global_index: usize, start_id: u64, requests: u64) -> Self {
+impl ArticleIdDownloadSession {
+    fn new(
+        config: &TypedClientConfig,
+        global_index: usize,
+        article_targets: Arc<[ArticleDownloadTarget]>,
+        output_dir: Arc<PathBuf>,
+    ) -> Self {
         Self {
             connect: config.endpoint_for(global_index),
-            segments: config.segments.clone(),
+            auth_user: config.auth_user.clone(),
+            auth_pass: config.auth_pass.clone(),
+            article_targets,
+            output_dir,
+            verify_dir: config.article_verify_dir.clone(),
             client_index: global_index,
             total_clients: config.total_clients,
-            requests,
-            transfer_bytes: config.transfer_bytes,
-            next_id: start_id,
-            pipeline_depth: config.pipeline_depth,
-            command_mix: config.command_mix,
             read_buffer_bytes: config.read_buffer_bytes,
-            command_buffer_bytes: config.command_capacity(),
+            pipeline_depth: config.pipeline_depth,
             nodelay: config.nodelay,
             socket_recv_buffer: config.socket_recv_buffer,
             socket_send_buffer: config.socket_send_buffer,
         }
     }
 
-    async fn run(mut self, stats: Arc<Stats>, stop: Arc<AtomicBool>) -> io::Result<()> {
+    async fn run(self, stats: Arc<Stats>, stop: Arc<AtomicBool>) -> io::Result<()> {
         stats.accepted_connections.fetch_add(1, Ordering::Relaxed);
         stats.active_connections.fetch_add(1, Ordering::Relaxed);
 
@@ -463,7 +1413,7 @@ impl ClientSession {
         result
     }
 
-    async fn run_inner(&mut self, stats: &Stats, stop: &AtomicBool) -> io::Result<()> {
+    async fn run_inner(self, stats: &Stats, stop: &AtomicBool) -> io::Result<()> {
         let mut stream = connect_client_socket(
             self.connect,
             self.nodelay,
@@ -471,154 +1421,573 @@ impl ClientSession {
             self.socket_send_buffer,
         )
         .await?;
-        #[cfg(not(coverage_nightly))]
-        self.optimize_stream(&stream)?;
-        #[cfg(coverage_nightly)]
-        let _ = self.optimize_stream(&stream);
+        read_greeting(&mut stream).await?;
+        let mut response_reader =
+            crate::typed_client::DrainedResponseReader::new(self.read_buffer_bytes);
+        authenticate_client_stream(
+            &mut stream,
+            &mut response_reader,
+            self.auth_user,
+            self.auth_pass,
+        )
+        .await?;
 
-        let mut read_buffer = vec![0; self.read_buffer_bytes].into_boxed_slice();
-        read_greeting(&mut stream, &mut read_buffer).await?;
-
-        let mut write_buffer = vec![0; self.command_buffer_bytes].into_boxed_slice();
-        let mut scanner = MultilineScanner::default();
-        let start_id = self.next_id;
-        let mut issued = 0_u64;
-        let mut completed = 0_u64;
+        let mut output_path = PathBuf::with_capacity(1024);
+        let mut verify_path = PathBuf::with_capacity(1024);
         let mut in_flight = 0_usize;
-        let (mut reader, mut writer) = stream.split();
+        let mut next_send_index = self.client_index;
+        let mut next_receive_index = self.client_index;
 
-        while in_flight < self.pipeline_depth
-            && (self.requests == 0 || issued < self.requests)
-            && !transfer_limit_reached(stats, self.transfer_bytes)
-        {
-            let count = self.next_issue_count(issued, in_flight);
-            if count == 0 {
+        loop {
+            while !stop.load(Ordering::Acquire)
+                && in_flight < self.pipeline_depth
+                && next_send_index < self.article_targets.len()
+            {
+                let target = &self.article_targets[next_send_index];
+                let article_ref = article_ref_for_download_target(target)?;
+                crate::typed_client::write_article_request_wire(&mut stream, &article_ref).await?;
+                in_flight += 1;
+                next_send_index = next_send_index.saturating_add(self.total_clients);
+            }
+
+            if in_flight == 0 {
                 break;
             }
-            self.write_command_batch(&mut writer, &mut write_buffer, issued, count)
-                .await?;
+
+            let index = next_receive_index;
+            next_receive_index = next_receive_index.saturating_add(self.total_clients);
+            in_flight -= 1;
+            let target = &self.article_targets[index];
+            let response = response_reader
+                .read_response_frame(&mut stream, RequestKind::Article)
+                .await
+                .map_err(map_typed_client_error)?;
+
+            stats.commands.fetch_add(1, Ordering::Relaxed);
+            stats.article_requests.fetch_add(1, Ordering::Relaxed);
             stats
-                .pipeline_batches
-                .fetch_add(u64::from(count > 1), Ordering::Relaxed);
-            issued = issued.wrapping_add(count as u64);
-            in_flight += count;
+                .bytes_sent
+                .fetch_add(response.as_bytes().len() as u64, Ordering::Relaxed);
+
+            handle_article_id_response(
+                target,
+                response.status(),
+                response.as_bytes(),
+                &self.output_dir,
+                self.verify_dir.as_deref().map(PathBuf::as_path),
+                &mut output_path,
+                &mut verify_path,
+            )?;
         }
 
-        while in_flight != 0 && !stop.load(Ordering::Acquire) {
-            let read = reader.read(&mut read_buffer).await?;
-            if read == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "server closed during multiline response",
-                ));
-            }
-
-            let previous_bytes = stats.bytes_sent.fetch_add(read as u64, Ordering::Relaxed);
-            if self.transfer_bytes != 0
-                && previous_bytes.saturating_add(read as u64) >= self.transfer_bytes
-            {
-                stop.store(true, Ordering::Release);
-            }
-
-            let responses = scanner.count_terminators(&read_buffer[..read]);
-            if responses > in_flight {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "server returned more multiline responses than outstanding requests",
-                ));
-            }
-
-            if responses != 0 {
-                let completed_before = completed;
-                let responses = responses as u64;
-                completed = completed.wrapping_add(responses);
-                in_flight -= responses as usize;
-
-                let command_id = start_id.wrapping_add(completed_before);
-                let (articles, bodies) =
-                    count_client_commands(command_id, responses, self.command_mix);
-                stats.commands.fetch_add(responses, Ordering::Relaxed);
-                stats
-                    .article_requests
-                    .fetch_add(articles, Ordering::Relaxed);
-                stats.body_requests.fetch_add(bodies, Ordering::Relaxed);
-            }
-
-            while !stop.load(Ordering::Acquire)
-                && in_flight <= self.pipeline_low_watermark()
-                && in_flight < self.pipeline_depth
-                && (self.requests == 0 || issued < self.requests)
-                && !transfer_limit_reached(stats, self.transfer_bytes)
-            {
-                let count = self.next_issue_count(issued, in_flight);
-                if count == 0 {
-                    break;
-                }
-                self.write_command_batch(&mut writer, &mut write_buffer, issued, count)
-                    .await?;
-                stats
-                    .pipeline_batches
-                    .fetch_add(u64::from(count > 1), Ordering::Relaxed);
-                issued = issued.wrapping_add(count as u64);
-                in_flight += count;
-            }
-        }
-
-        self.next_id = start_id.wrapping_add(issued);
         Ok(())
     }
+}
 
-    fn next_issue_count(&self, issued: u64, in_flight: usize) -> usize {
-        let available = self.pipeline_depth - in_flight;
-        if self.requests == 0 {
-            available
-        } else {
-            self.requests.saturating_sub(issued).min(available as u64) as usize
+#[derive(Debug)]
+struct TypedClientSession {
+    connect: SocketAddr,
+    segments: Option<Arc<SegmentSet>>,
+    auth_user: Option<AuthInfoValue<'static>>,
+    auth_pass: Option<AuthInfoValue<'static>>,
+    client_index: usize,
+    total_clients: usize,
+    requests: u64,
+    transfer_bytes: u64,
+    next_id: u64,
+    pipeline_depth: usize,
+    command_mix: ClientCommandMix,
+    read_buffer_bytes: usize,
+    nodelay: bool,
+    socket_recv_buffer: usize,
+    socket_send_buffer: usize,
+}
+
+impl TypedClientSession {
+    fn new(config: &TypedClientConfig, global_index: usize, start_id: u64, requests: u64) -> Self {
+        Self {
+            connect: config.endpoint_for(global_index),
+            segments: config.segments.clone(),
+            auth_user: config.auth_user.clone(),
+            auth_pass: config.auth_pass.clone(),
+            client_index: global_index,
+            total_clients: config.total_clients,
+            requests,
+            transfer_bytes: config.transfer_bytes,
+            next_id: start_id,
+            pipeline_depth: config.pipeline_depth,
+            command_mix: config.command_mix,
+            read_buffer_bytes: config.read_buffer_bytes,
+            nodelay: config.nodelay,
+            socket_recv_buffer: config.socket_recv_buffer,
+            socket_send_buffer: config.socket_send_buffer,
         }
     }
 
-    fn pipeline_low_watermark(&self) -> usize {
-        self.pipeline_depth / 2
+    async fn run(self, stats: Arc<Stats>, stop: Arc<AtomicBool>) -> io::Result<()> {
+        stats.accepted_connections.fetch_add(1, Ordering::Relaxed);
+        stats.active_connections.fetch_add(1, Ordering::Relaxed);
+
+        let result = self.run_inner(&stats, &stop).await;
+        stats.active_connections.fetch_sub(1, Ordering::Relaxed);
+        result
     }
 
-    async fn write_command_batch<W>(
-        &self,
-        writer: &mut W,
-        write_buffer: &mut [u8],
-        issued: u64,
-        count: usize,
-    ) -> io::Result<()>
-    where
-        W: AsyncWrite + Unpin,
-    {
-        let written = fill_client_command_batch(
-            write_buffer,
-            CommandBatchSpec {
-                start_command_id: self.next_id.wrapping_add(issued),
-                start_request_index: issued,
-                count,
-                mix: self.command_mix,
-                segments: self.segments.as_deref(),
-                client_index: self.client_index,
-                total_clients: self.total_clients,
-            },
-        );
-        writer.write_all(&write_buffer[..written]).await
-    }
-
-    #[cfg_attr(coverage_nightly, coverage(off))]
-    fn optimize_stream(&self, stream: &TcpStream) -> io::Result<()> {
-        optimize_client_socket(
-            stream,
+    async fn run_inner(self, stats: &Stats, stop: &AtomicBool) -> io::Result<()> {
+        let mut stream = connect_client_socket(
+            self.connect,
             self.nodelay,
             self.socket_recv_buffer,
             self.socket_send_buffer,
         )
+        .await?;
+        read_greeting(&mut stream).await?;
+        let mut response_reader =
+            crate::typed_client::DrainedResponseReader::new(self.read_buffer_bytes);
+        self.authenticate(&mut stream, &mut response_reader).await?;
+
+        let mut in_flight = 0_usize;
+        let mut issued = 0_u64;
+        let mut received = 0_u64;
+        let mut request_buffer = Vec::with_capacity(self.pipeline_depth.saturating_mul(32));
+
+        let initial_fill = self
+            .fill_typed_pipeline(
+                &mut stream,
+                &mut request_buffer,
+                in_flight,
+                issued,
+                stats,
+                stop,
+            )
+            .await?;
+        in_flight += initial_fill;
+        issued = issued.wrapping_add(initial_fill as u64);
+        if in_flight > 1 {
+            stats.pipeline_batches.fetch_add(1, Ordering::Relaxed);
+        }
+
+        while in_flight > 0 {
+            let command_id = self.next_id.wrapping_add(received);
+            let kind = request_kind_for_client_command(command_id, self.command_mix);
+            let response = response_reader
+                .read_response(&mut stream, kind)
+                .await
+                .map_err(map_typed_client_error)?;
+            in_flight -= 1;
+            received = received.wrapping_add(1);
+
+            stats
+                .bytes_sent
+                .fetch_add(response.bytes_len() as u64, Ordering::Relaxed);
+            stats.commands.fetch_add(1, Ordering::Relaxed);
+            match client_command_kind(command_id, self.command_mix) {
+                ClientCommandMix::Article => {
+                    stats.article_requests.fetch_add(1, Ordering::Relaxed);
+                }
+                ClientCommandMix::Body => {
+                    stats.body_requests.fetch_add(1, Ordering::Relaxed);
+                }
+                ClientCommandMix::Alternate => {
+                    unreachable!("client_command_kind should normalize Alternate")
+                }
+            }
+
+            if self.transfer_bytes != 0
+                && stats.bytes_sent.load(Ordering::Relaxed) >= self.transfer_bytes
+            {
+                stop.store(true, Ordering::Release);
+            }
+
+            if in_flight <= self.pipeline_refill_low_water() {
+                let filled = self
+                    .fill_typed_pipeline(
+                        &mut stream,
+                        &mut request_buffer,
+                        in_flight,
+                        issued,
+                        stats,
+                        stop,
+                    )
+                    .await?;
+                in_flight += filled;
+                issued = issued.wrapping_add(filled as u64);
+                if filled > 1 {
+                    stats.pipeline_batches.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn authenticate(
+        &self,
+        stream: &mut TcpStream,
+        response_reader: &mut crate::typed_client::DrainedResponseReader,
+    ) -> io::Result<()> {
+        let mut user_status = None;
+        if let Some(value) = self.auth_user.as_ref() {
+            let response =
+                send_authinfo(stream, response_reader, AuthInfoKind::User, value).await?;
+            let status = response.status().as_u16();
+            if status != 281 && status != 381 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("AUTHINFO USER rejected with status {status}"),
+                ));
+            }
+            user_status = Some(status);
+        }
+
+        if self.auth_pass.is_none() && user_status == Some(381) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "AUTHINFO USER requires AUTHINFO PASS",
+            ));
+        }
+
+        if let (Some(381), Some(value)) = (user_status, self.auth_pass.as_ref()) {
+            let response =
+                send_authinfo(stream, response_reader, AuthInfoKind::Pass, value).await?;
+            let status = response.status().as_u16();
+            if status != 281 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("AUTHINFO PASS rejected with status {status}"),
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn fill_typed_pipeline(
+        &self,
+        stream: &mut TcpStream,
+        request_buffer: &mut Vec<u8>,
+        in_flight: usize,
+        issued: u64,
+        stats: &Stats,
+        stop: &AtomicBool,
+    ) -> io::Result<usize> {
+        if stop.load(Ordering::Acquire) {
+            return Ok(0);
+        }
+
+        request_buffer.clear();
+        let mut filled = 0usize;
+        while in_flight + filled < self.pipeline_depth
+            && (self.requests == 0 || issued.wrapping_add(filled as u64) < self.requests)
+            && !transfer_limit_reached(stats, self.transfer_bytes)
+        {
+            let request_index = issued.wrapping_add(filled as u64);
+            let command_id = self.next_id.wrapping_add(request_index);
+            append_typed_workload_request(
+                request_buffer,
+                command_id,
+                request_index,
+                self.command_mix,
+                self.segments.as_deref(),
+                self.client_index,
+                self.total_clients,
+            )?;
+            filled += 1;
+        }
+
+        if filled != 0 {
+            stream.write_all(request_buffer).await?;
+        }
+
+        Ok(filled)
+    }
+
+    fn pipeline_refill_low_water(&self) -> usize {
+        (self.pipeline_depth / 2).max(1)
+    }
+}
+
+async fn send_authinfo(
+    stream: &mut TcpStream,
+    response_reader: &mut crate::typed_client::DrainedResponseReader,
+    kind: AuthInfoKind,
+    value: &AuthInfoValue<'_>,
+) -> io::Result<crate::typed_client::DrainedResponse> {
+    let request_kind = match kind {
+        AuthInfoKind::User => RequestKind::AuthInfoUser,
+        AuthInfoKind::Pass => RequestKind::AuthInfoPass,
+    };
+    crate::typed_client::write_authinfo_wire(stream, kind, value).await?;
+    response_reader
+        .read_response(stream, request_kind)
+        .await
+        .map_err(map_typed_client_error)
+}
+
+async fn authenticate_client_stream(
+    stream: &mut TcpStream,
+    response_reader: &mut crate::typed_client::DrainedResponseReader,
+    auth_user: Option<AuthInfoValue<'static>>,
+    auth_pass: Option<AuthInfoValue<'static>>,
+) -> io::Result<()> {
+    let mut user_status = None;
+    if let Some(value) = auth_user.as_ref() {
+        let response = send_authinfo(stream, response_reader, AuthInfoKind::User, value).await?;
+        let status = response.status().as_u16();
+        if status != 281 && status != 381 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("AUTHINFO USER rejected with status {status}"),
+            ));
+        }
+        user_status = Some(status);
+    }
+
+    if auth_pass.is_none() && user_status == Some(381) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "AUTHINFO USER requires AUTHINFO PASS",
+        ));
+    }
+
+    if let (Some(381), Some(value)) = (user_status, auth_pass.as_ref()) {
+        let response = send_authinfo(stream, response_reader, AuthInfoKind::Pass, value).await?;
+        let status = response.status().as_u16();
+        if status != 281 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("AUTHINFO PASS rejected with status {status}"),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn handle_article_id_response(
+    target: &ArticleDownloadTarget,
+    status: StatusCode,
+    response: &[u8],
+    output_dir: &Path,
+    verify_dir: Option<&Path>,
+    output_path: &mut PathBuf,
+    verify_path: &mut PathBuf,
+) -> io::Result<()> {
+    match status.as_u16() {
+        220 => {
+            if let Err(err) =
+                verify_article_response_file_into(verify_dir, target, response, verify_path)
+            {
+                if err.kind() == io::ErrorKind::InvalidData {
+                    write_failed_article_response_file_into(
+                        output_dir,
+                        target,
+                        response,
+                        output_path,
+                    )?;
+                    eprintln!(
+                        "ARTICLE {} verification failed; saved received response to {}",
+                        download_target_label(target),
+                        output_path.display()
+                    );
+                }
+                return Err(err);
+            }
+            write_article_response_file_into(output_dir, target, response, output_path)
+        }
+        430 => Ok(()),
+        status => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "ARTICLE {} returned unexpected status {status}",
+                download_target_label(target)
+            ),
+        )),
     }
 }
 
 fn transfer_limit_reached(stats: &Stats, transfer_bytes: u64) -> bool {
     transfer_bytes != 0 && stats.bytes_sent.load(Ordering::Relaxed) >= transfer_bytes
+}
+
+fn append_typed_workload_request(
+    buffer: &mut Vec<u8>,
+    command_id: u64,
+    request_index: u64,
+    mix: ClientCommandMix,
+    segments: Option<&SegmentSet>,
+    client_index: usize,
+    total_clients: usize,
+) -> io::Result<RequestKind> {
+    let kind = client_command_kind(command_id, mix);
+    let request_kind = request_kind_for_normalized_client_command(kind);
+
+    if let Some(segments) = segments {
+        let message_id =
+            segment_ref_for_request(segments, client_index, total_clients, request_index);
+        append_typed_message_id_request(buffer, kind, message_id);
+        return Ok(request_kind);
+    }
+
+    if (1..=crate::protocol::MAX_ARTICLE_NUMBER).contains(&command_id) {
+        append_typed_number_request(buffer, kind, command_id)?;
+        return Ok(request_kind);
+    }
+
+    let mut synthetic = arrayvec::ArrayString::<64>::new();
+    write!(&mut synthetic, "<bench.{command_id}@nntpbench.local>")
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid synthetic message-id"))?;
+    let message_id = MessageId::from_borrowed(synthetic.as_str())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid synthetic message-id"))?;
+    append_typed_message_id_request(buffer, kind, &message_id);
+    Ok(request_kind)
+}
+
+fn append_typed_number_request(
+    buffer: &mut Vec<u8>,
+    kind: ClientCommandMix,
+    number: u64,
+) -> io::Result<()> {
+    let mut number_buf = arrayvec::ArrayString::<20>::new();
+    write!(&mut number_buf, "{number}")
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid article number"))?;
+    append_typed_request_prefix(buffer, kind);
+    buffer.extend_from_slice(number_buf.as_bytes());
+    buffer.extend_from_slice(crate::CRLF);
+    Ok(())
+}
+
+fn append_typed_message_id_request(
+    buffer: &mut Vec<u8>,
+    kind: ClientCommandMix,
+    message_id: &MessageId<'_>,
+) {
+    append_typed_request_prefix(buffer, kind);
+    buffer.extend_from_slice(message_id.as_str().as_bytes());
+    buffer.extend_from_slice(crate::CRLF);
+}
+
+fn append_typed_request_prefix(buffer: &mut Vec<u8>, kind: ClientCommandMix) {
+    match kind {
+        ClientCommandMix::Article => buffer.extend_from_slice(b"ARTICLE "),
+        ClientCommandMix::Body => buffer.extend_from_slice(b"BODY "),
+        ClientCommandMix::Alternate => {
+            unreachable!("client_command_kind should normalize Alternate")
+        }
+    }
+}
+
+fn request_kind_for_client_command(command_id: u64, mix: ClientCommandMix) -> RequestKind {
+    request_kind_for_normalized_client_command(client_command_kind(command_id, mix))
+}
+
+fn request_kind_for_normalized_client_command(kind: ClientCommandMix) -> RequestKind {
+    match kind {
+        ClientCommandMix::Article => RequestKind::Article,
+        ClientCommandMix::Body => RequestKind::Body,
+        ClientCommandMix::Alternate => {
+            unreachable!("client_command_kind should normalize Alternate")
+        }
+    }
+}
+
+fn typed_request_for_command(
+    command_id: u64,
+    request_index: u64,
+    mix: ClientCommandMix,
+    segments: Option<&SegmentSet>,
+    client_index: usize,
+    total_clients: usize,
+) -> io::Result<Request<'static>> {
+    let kind = client_command_kind(command_id, mix);
+    if segments.is_none() && (1..=crate::protocol::MAX_ARTICLE_NUMBER).contains(&command_id) {
+        return match kind {
+            ClientCommandMix::Article => Request::article_number(command_id)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid article number")),
+            ClientCommandMix::Body => Request::body_number(command_id)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid body number")),
+            ClientCommandMix::Alternate => {
+                unreachable!("client_command_kind should normalize Alternate")
+            }
+        };
+    }
+
+    let message_id = request_message_id_for_command(
+        kind,
+        command_id,
+        request_index,
+        segments,
+        client_index,
+        total_clients,
+    )?;
+    match kind {
+        ClientCommandMix::Article => Ok(Request::Article {
+            article_ref: ArticleRef::MessageId(message_id),
+        }),
+        ClientCommandMix::Body => Ok(Request::Body {
+            article_ref: ArticleRef::MessageId(message_id),
+        }),
+        ClientCommandMix::Alternate => {
+            unreachable!("client_command_kind should normalize Alternate")
+        }
+    }
+}
+
+#[doc(hidden)]
+pub fn bench_typed_request_for_command(
+    command_id: u64,
+    request_index: u64,
+    mix: ClientCommandMix,
+) -> io::Result<Request<'static>> {
+    typed_request_for_command(command_id, request_index, mix, None, 0, 1)
+}
+
+#[doc(hidden)]
+pub fn bench_typed_segment_request_for_command(
+    segment_message_id: MessageId<'static>,
+    mix: ClientCommandMix,
+) -> io::Result<Request<'static>> {
+    match mix {
+        ClientCommandMix::Article => Ok(Request::Article {
+            article_ref: ArticleRef::MessageId(segment_message_id),
+        }),
+        ClientCommandMix::Body => Ok(Request::Body {
+            article_ref: ArticleRef::MessageId(segment_message_id),
+        }),
+        ClientCommandMix::Alternate => {
+            unreachable!("client_command_kind should normalize Alternate")
+        }
+    }
+}
+
+fn request_message_id_for_command(
+    kind: ClientCommandMix,
+    command_id: u64,
+    request_index: u64,
+    segments: Option<&SegmentSet>,
+    client_index: usize,
+    total_clients: usize,
+) -> io::Result<MessageId<'static>> {
+    if let Some(segments) = segments {
+        return Ok(segment_for_request(
+            segments,
+            client_index,
+            total_clients,
+            request_index,
+        ));
+    }
+
+    match kind {
+        ClientCommandMix::Article | ClientCommandMix::Body => {}
+        ClientCommandMix::Alternate => {
+            unreachable!("client_command_kind should normalize Alternate")
+        }
+    };
+    let mut message_id = arrayvec::ArrayString::<64>::new();
+    write!(&mut message_id, "<bench.{command_id}@nntpbench.local>")
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid synthetic message-id"))?;
+    MessageId::from_shared(Arc::<str>::from(message_id.as_str()))
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid synthetic message-id"))
 }
 
 fn requests_for_connection(total: u64, connections: usize, index: usize) -> u64 {
@@ -632,28 +2001,33 @@ fn requests_for_connection(total: u64, connections: usize, index: usize) -> u64 
 }
 
 fn read_segments(path: &std::path::Path) -> io::Result<SegmentSet> {
-    let contents = fs::read_to_string(path)?;
+    let file = fs::File::open(path)?;
+    let mut reader = io::BufReader::new(file);
+    let mut line_buf = Vec::with_capacity(512);
     let mut ids = Vec::new();
-    let mut max_id_len = 0;
+    let mut line_index = 0;
 
-    for (line_index, line) in contents.lines().enumerate() {
-        let line = line.trim();
+    loop {
+        line_buf.clear();
+        let read = reader.read_until(b'\n', &mut line_buf)?;
+        if read == 0 {
+            break;
+        }
+        line_index += 1;
+        let line = trim_ascii_line(&line_buf);
         if line.is_empty() {
             continue;
         }
 
-        let (_size, msgid) = line.split_once('\t').ok_or_else(|| {
+        let tab = memchr::memchr(b'\t', line).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!(
-                    "invalid segment line {}: expected SIZE<TAB>MSGID",
-                    line_index + 1
-                ),
+                format!("invalid segment line {line_index}: expected SIZE<TAB>MSGID"),
             )
         })?;
-        let id = normalize_msgid(msgid.trim());
-        max_id_len = max_id_len.max(id.len());
-        ids.push(id.into_boxed_slice());
+        let msgid = trim_ascii_line(&line[tab + 1..]);
+        let id = shared_message_id_from_bytes(msgid)?;
+        ids.push(id);
     }
 
     if ids.is_empty() {
@@ -665,46 +2039,36 @@ fn read_segments(path: &std::path::Path) -> io::Result<SegmentSet> {
 
     Ok(SegmentSet {
         ids: ids.into_boxed_slice(),
-        max_id_len,
     })
 }
 
-fn normalize_msgid(value: &str) -> Vec<u8> {
+fn shared_message_id_from_bytes(value: &[u8]) -> io::Result<MessageId<'static>> {
+    let value = std::str::from_utf8(value).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "segment message-id is not utf-8",
+        )
+    })?;
     if value.starts_with('<') && value.ends_with('>') {
-        return value.as_bytes().to_vec();
+        return MessageId::from_shared(Arc::<str>::from(value))
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid segment message-id"));
     }
 
-    let mut normalized = Vec::with_capacity(value.len() + 2);
-    normalized.push(b'<');
-    normalized.extend_from_slice(value.as_bytes());
-    normalized.push(b'>');
-    normalized
+    let mut normalized = arrayvec::ArrayString::<512>::new();
+    write!(&mut normalized, "<{value}>")
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "segment message-id too long"))?;
+    MessageId::from_shared(Arc::<str>::from(normalized.as_str()))
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid segment message-id"))
 }
 
-#[cfg_attr(coverage_nightly, coverage(off))]
-fn optimize_client_socket(
-    stream: &TcpStream,
-    nodelay: bool,
-    recv_buffer: usize,
-    send_buffer: usize,
-) -> io::Result<()> {
-    stream.set_nodelay(nodelay)?;
-    let socket = socket2::SockRef::from(stream);
-    if recv_buffer != 0 {
-        socket.set_recv_buffer_size(recv_buffer)?;
+fn trim_ascii_line(mut line: &[u8]) -> &[u8] {
+    while matches!(line.last(), Some(b'\n' | b'\r' | b' ' | b'\t')) {
+        line = &line[..line.len() - 1];
     }
-    if send_buffer != 0 {
-        socket.set_send_buffer_size(send_buffer)?;
+    while matches!(line.first(), Some(b' ' | b'\t')) {
+        line = &line[1..];
     }
-    socket.set_linger(Some(TCP_LINGER_TIMEOUT))?;
-
-    #[cfg(target_os = "linux")]
-    {
-        let _ = socket.set_tcp_user_timeout(Some(TCP_USER_TIMEOUT));
-        let _ = socket.set_tos_v4(TOS_THROUGHPUT);
-    }
-
-    Ok(())
+    line
 }
 
 async fn connect_client_socket(
@@ -761,7 +2125,10 @@ fn optimize_server_socket(stream: &TcpStream, config: &ServerConfig) -> io::Resu
 
 #[cfg_attr(coverage_nightly, coverage(off))]
 fn process_cpu_ticks() -> Option<u64> {
-    let stat = fs::read_to_string("/proc/self/stat").ok()?;
+    let mut file = fs::File::open("/proc/self/stat").ok()?;
+    let mut buffer = [0_u8; 1024];
+    let read = file.read(&mut buffer).ok()?;
+    let stat = std::str::from_utf8(&buffer[..read]).ok()?;
     let rest = stat.rsplit_once(") ")?.1;
     let mut fields = rest.split_whitespace();
     let utime = fields.nth(11)?.parse::<u64>().ok()?;
@@ -781,9 +2148,17 @@ fn cpu_seconds_since(start: Option<u64>) -> f64 {
     end.saturating_sub(start) as f64 * PROCESS_CLOCK_TICK.as_secs_f64()
 }
 
+#[cfg(target_os = "linux")]
 #[cfg_attr(coverage_nightly, coverage(off))]
 fn process_rss_kib() -> u64 {
-    let Ok(status) = fs::read_to_string("/proc/self/status") else {
+    let Ok(mut file) = fs::File::open("/proc/self/status") else {
+        return 0;
+    };
+    let mut buffer = [0_u8; 4096];
+    let Ok(read) = file.read(&mut buffer) else {
+        return 0;
+    };
+    let Ok(status) = std::str::from_utf8(&buffer[..read]) else {
         return 0;
     };
 
@@ -804,8 +2179,28 @@ fn process_rss_kib() -> u64 {
     rss
 }
 
+#[cfg(target_os = "macos")]
 #[cfg_attr(coverage_nightly, coverage(off))]
-async fn read_greeting(stream: &mut TcpStream, buffer: &mut [u8]) -> io::Result<()> {
+fn process_rss_kib() -> u64 {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+    let result = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+    if result != 0 {
+        return 0;
+    }
+
+    let max_rss_bytes = unsafe { usage.assume_init() }.ru_maxrss;
+    u64::try_from(max_rss_bytes).unwrap_or(0) / 1024
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn process_rss_kib() -> u64 {
+    0
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn read_greeting(stream: &mut TcpStream) -> io::Result<()> {
+    let mut buffer = [0_u8; protocol::MAX_INITIAL_RESPONSE_LINE_BYTES];
     let mut total = 0;
     loop {
         if total == buffer.len() {
@@ -823,74 +2218,27 @@ async fn read_greeting(stream: &mut TcpStream, buffer: &mut [u8]) -> io::Result<
             ));
         }
 
-        let end = total + read;
-        if memchr::memchr(b'\n', &buffer[total..end]).is_some() {
-            return Ok(());
+        total += read;
+        match detect_bounded_response_line_end(
+            &buffer[..total],
+            protocol::MAX_INITIAL_RESPONSE_LINE_BYTES,
+        ) {
+            BoundedResponseLineStatus::CompleteAt(_) => return Ok(()),
+            BoundedResponseLineStatus::NeedMore => {}
+            BoundedResponseLineStatus::Invalid => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "server greeting missing CRLF terminator",
+                ));
+            }
+            BoundedResponseLineStatus::TooLong => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "server greeting exceeded RFC response-line limit",
+                ));
+            }
         }
-        total = end;
     }
-}
-
-#[derive(Clone, Copy)]
-struct CommandBatchSpec<'a> {
-    start_command_id: u64,
-    start_request_index: u64,
-    count: usize,
-    mix: ClientCommandMix,
-    segments: Option<&'a SegmentSet>,
-    client_index: usize,
-    total_clients: usize,
-}
-
-fn fill_client_command_batch(output: &mut [u8], spec: CommandBatchSpec<'_>) -> usize {
-    let mut written = 0;
-    for offset in 0..spec.count {
-        let id = spec.start_command_id.wrapping_add(offset as u64);
-        let request_index = spec.start_request_index.wrapping_add(offset as u64);
-        let kind = client_command_kind(id, spec.mix);
-        written += if let Some(segments) = spec.segments {
-            let segment = segment_for_request(
-                segments,
-                spec.client_index,
-                spec.total_clients,
-                request_index,
-            );
-            write_segment_command(&mut output[written..], kind, segment)
-        } else {
-            write_synthetic_command(&mut output[written..], kind, id)
-        };
-    }
-    written
-}
-
-fn write_synthetic_command(output: &mut [u8], kind: ClientCommandMix, id: u64) -> usize {
-    let prefix: &[u8] = match kind {
-        ClientCommandMix::Article | ClientCommandMix::Alternate => b"ARTICLE <bench.",
-        ClientCommandMix::Body => b"BODY <bench.",
-    };
-    let suffix = b"@nntpbench.local>\r\n";
-
-    let mut written = 0;
-    output[..prefix.len()].copy_from_slice(prefix);
-    written += prefix.len();
-    written += write_u64_ascii(&mut output[written..], id);
-    output[written..written + suffix.len()].copy_from_slice(suffix);
-    written + suffix.len()
-}
-
-fn write_segment_command(output: &mut [u8], kind: ClientCommandMix, segment: &[u8]) -> usize {
-    let prefix: &[u8] = match kind {
-        ClientCommandMix::Article | ClientCommandMix::Alternate => b"ARTICLE ",
-        ClientCommandMix::Body => b"BODY ",
-    };
-
-    let mut written = 0;
-    output[..prefix.len()].copy_from_slice(prefix);
-    written += prefix.len();
-    output[written..written + segment.len()].copy_from_slice(segment);
-    written += segment.len();
-    output[written..written + CRLF.len()].copy_from_slice(CRLF);
-    written + CRLF.len()
 }
 
 fn segment_for_request(
@@ -898,29 +2246,19 @@ fn segment_for_request(
     client_index: usize,
     total_clients: usize,
     request_id: u64,
-) -> &[u8] {
+) -> MessageId<'static> {
+    segment_ref_for_request(segments, client_index, total_clients, request_id).clone()
+}
+
+fn segment_ref_for_request(
+    segments: &SegmentSet,
+    client_index: usize,
+    total_clients: usize,
+    request_id: u64,
+) -> &MessageId<'static> {
     let index =
         (client_index + (request_id as usize).wrapping_mul(total_clients)) % segments.ids.len();
     &segments.ids[index]
-}
-
-fn write_u64_ascii(output: &mut [u8], value: u64) -> usize {
-    let mut digits = [0_u8; 20];
-    let mut cursor = digits.len();
-    let mut value = value;
-
-    loop {
-        cursor -= 1;
-        digits[cursor] = b'0' + (value % 10) as u8;
-        value /= 10;
-        if value == 0 {
-            break;
-        }
-    }
-
-    let len = digits.len() - cursor;
-    output[..len].copy_from_slice(&digits[cursor..]);
-    len
 }
 
 fn client_command_kind(id: u64, mix: ClientCommandMix) -> ClientCommandMix {
@@ -929,74 +2267,6 @@ fn client_command_kind(id: u64, mix: ClientCommandMix) -> ClientCommandMix {
         ClientCommandMix::Alternate => ClientCommandMix::Article,
         command => command,
     }
-}
-
-fn count_client_commands(start_id: u64, count: u64, mix: ClientCommandMix) -> (u64, u64) {
-    match mix {
-        ClientCommandMix::Article => (count, 0),
-        ClientCommandMix::Body => (0, count),
-        ClientCommandMix::Alternate => {
-            let odd_ids =
-                count / 2 + u64::from(!count.is_multiple_of(2) && !start_id.is_multiple_of(2));
-            (odd_ids, count - odd_ids)
-        }
-    }
-}
-
-#[derive(Debug, Default)]
-struct MultilineScanner {
-    tail: tail_buffer::TailBuffer,
-}
-
-impl MultilineScanner {
-    fn count_terminators(&mut self, input: &[u8]) -> usize {
-        if input.is_empty() {
-            return 0;
-        }
-
-        let mut count = 0;
-        let mut last_end = 0;
-        if let Some(end) = self.tail.find_spanning_terminator(input) {
-            count += 1;
-            last_end = end;
-        }
-
-        let (chunk_count, chunk_last_end) = count_in_chunk_terminators(&input[last_end..]);
-        if chunk_count != 0 {
-            count += chunk_count;
-            last_end += chunk_last_end;
-        }
-
-        if count == 0 {
-            self.tail.update(input);
-        } else {
-            self.tail = tail_buffer::TailBuffer::default();
-            if last_end < input.len() {
-                self.tail.update(&input[last_end..]);
-            }
-        }
-        count
-    }
-}
-
-fn count_in_chunk_terminators(input: &[u8]) -> (usize, usize) {
-    let mut count = 0;
-    let mut last_end = 0;
-
-    for dot in memchr::memchr_iter(b'.', input) {
-        if dot >= 2
-            && dot + 2 < input.len()
-            && input[dot - 2] == b'\r'
-            && input[dot - 1] == b'\n'
-            && input[dot + 1] == b'\r'
-            && input[dot + 2] == b'\n'
-        {
-            count += 1;
-            last_end = dot + TERMINATOR.len() - 2;
-        }
-    }
-
-    (count, last_end)
 }
 
 pub async fn serve_session(
@@ -1021,23 +2291,22 @@ async fn serve_session_inner(
     let (reader, mut writer) = stream.split();
     let mut reader = BufReader::with_capacity(SERVER_READER_CAPACITY, reader);
     let max_pipeline_depth = config.max_pipeline_depth.min(MAX_SERVER_PIPELINE_DEPTH);
-    let mut command_buf = Vec::with_capacity(MAX_COMMAND_LINE_BYTES);
-    let mut command_batch = CommandBatch::new();
-    let mut pending_write = PendingWrite::new();
+    let mut command_line = [0; MAX_COMMAND_LINE_BYTES];
+    let mut command_lines = config
+        .article_dir
+        .as_ref()
+        .map(|_| CommandLineBatch::default());
+    let mut command_batch: Box<CommandBatch> = Box::default();
+    let mut pending_write = PendingWrite::new(config.pending_write_bytes);
+    let mut article_path = PathBuf::with_capacity(1024);
 
-    writer.write_all(GREETING).await?;
-    session_stats.bytes_sent += GREETING.len() as u64;
-    if config.flush {
-        #[cfg(not(coverage_nightly))]
-        writer.flush().await?;
-        #[cfg(coverage_nightly)]
-        let _ = writer.flush().await;
-    }
+    send_greeting(&mut writer, &config, session_stats).await?;
 
     loop {
         if !read_command_batch(
             &mut reader,
-            &mut command_buf,
+            &mut command_line,
+            command_lines.as_mut(),
             &mut command_batch,
             max_pipeline_depth,
         )
@@ -1046,64 +2315,131 @@ async fn serve_session_inner(
             break;
         }
 
-        session_stats.pipeline_batches += u64::from(command_batch.len() > 1);
-        for command in &command_batch {
-            let should_close = handle_command(
-                command,
-                &config,
-                session_stats,
-                &mut writer,
-                &mut pending_write,
-            )
-            .await?;
-            if should_close {
-                flush_pending(&mut writer, &mut pending_write).await?;
-                if config.flush {
-                    #[cfg(not(coverage_nightly))]
-                    writer.flush().await?;
-                    #[cfg(coverage_nightly)]
-                    let _ = writer.flush().await;
-                }
-                return Ok(());
-            }
-        }
-
-        flush_pending(&mut writer, &mut pending_write).await?;
-        if config.flush {
-            #[cfg(not(coverage_nightly))]
-            writer.flush().await?;
-            #[cfg(coverage_nightly)]
-            let _ = writer.flush().await;
+        if process_command_batch(
+            &command_batch,
+            command_lines.as_ref(),
+            &config,
+            session_stats,
+            &mut writer,
+            &mut pending_write,
+            &mut article_path,
+        )
+        .await?
+        .should_close()
+        {
+            return Ok(());
         }
     }
 
-    flush_pending(&mut writer, &mut pending_write).await?;
-    if config.flush {
-        #[cfg(not(coverage_nightly))]
-        writer.flush().await?;
-        #[cfg(coverage_nightly)]
-        let _ = writer.flush().await;
-    }
+    flush_session_writer(&mut writer, &mut pending_write, &config).await?;
 
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BatchOutcome {
+    Continue,
+    Close,
+}
+
+impl BatchOutcome {
+    const fn should_close(self) -> bool {
+        matches!(self, Self::Close)
+    }
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn send_greeting<W>(
+    writer: &mut W,
+    config: &ServerConfig,
+    session_stats: &mut SessionStats,
+) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    writer.write_all(GREETING).await?;
+    session_stats.bytes_sent += GREETING.len() as u64;
+    flush_writer_if_needed(writer, config.flush).await
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn process_command_batch<W>(
+    command_batch: &CommandBatch,
+    command_lines: Option<&CommandLineBatch>,
+    config: &ServerConfig,
+    session_stats: &mut SessionStats,
+    writer: &mut W,
+    pending_write: &mut PendingWrite,
+    article_path: &mut PathBuf,
+) -> io::Result<BatchOutcome>
+where
+    W: AsyncWrite + Unpin,
+{
+    session_stats.pipeline_batches += u64::from(command_batch.len() > 1);
+
+    for command in command_batch {
+        if handle_command(
+            command,
+            command_lines,
+            config,
+            session_stats,
+            writer,
+            pending_write,
+            article_path,
+        )
+        .await?
+        {
+            flush_session_writer(writer, pending_write, config).await?;
+            return Ok(BatchOutcome::Close);
+        }
+    }
+
+    flush_session_writer(writer, pending_write, config).await?;
+    Ok(BatchOutcome::Continue)
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn handle_command<W>(
     command: &ParsedCommand,
+    command_lines: Option<&CommandLineBatch>,
     config: &ServerConfig,
     session_stats: &mut SessionStats,
     writer: &mut W,
     pending_write: &mut PendingWrite,
+    article_path: &mut PathBuf,
 ) -> io::Result<bool>
 where
     W: AsyncWrite + Unpin,
 {
     session_stats.commands += 1;
 
-    match command {
-        ParsedCommand::Article => {
+    match command.kind {
+        RequestKind::Article => {
             session_stats.article_requests += 1;
+            if config.article_dir.is_some() {
+                let message_id = command_lines.and_then(|lines| command_message_id(command, lines));
+                if write_stored_article_response(
+                    writer,
+                    pending_write,
+                    config,
+                    command.article_id,
+                    message_id.as_ref(),
+                    session_stats,
+                    article_path,
+                )
+                .await?
+                {
+                    return Ok(false);
+                }
+                write_response(
+                    writer,
+                    pending_write,
+                    ARTICLE_NOT_FOUND_RESPONSE,
+                    session_stats,
+                )
+                .await?;
+                return Ok(false);
+            }
             write_response(
                 writer,
                 pending_write,
@@ -1113,12 +2449,146 @@ where
             .await?;
             Ok(false)
         }
-        ParsedCommand::Body => {
+        RequestKind::Head => {
+            session_stats.article_requests += 1;
+            write_response(writer, pending_write, config.head_response(), session_stats).await?;
+            Ok(false)
+        }
+        RequestKind::Stat => {
+            session_stats.article_requests += 1;
+            write_response(writer, pending_write, config.stat_response(), session_stats).await?;
+            Ok(false)
+        }
+        RequestKind::Body => {
             session_stats.body_requests += 1;
             write_response(writer, pending_write, config.body_response(), session_stats).await?;
             Ok(false)
         }
-        ParsedCommand::Capabilities => {
+        RequestKind::List => {
+            write_response(writer, pending_write, LIST_RESPONSE, session_stats).await?;
+            Ok(false)
+        }
+        RequestKind::ListActive => {
+            write_response(writer, pending_write, LIST_RESPONSE, session_stats).await?;
+            Ok(false)
+        }
+        RequestKind::ListActiveTimes => {
+            write_response(
+                writer,
+                pending_write,
+                LIST_ACTIVE_TIMES_RESPONSE,
+                session_stats,
+            )
+            .await?;
+            Ok(false)
+        }
+        RequestKind::ListNewsgroups => {
+            write_response(
+                writer,
+                pending_write,
+                LIST_NEWSGROUPS_RESPONSE,
+                session_stats,
+            )
+            .await?;
+            Ok(false)
+        }
+        RequestKind::ListOverviewFmt => {
+            write_response(
+                writer,
+                pending_write,
+                LIST_OVERVIEW_FMT_RESPONSE,
+                session_stats,
+            )
+            .await?;
+            Ok(false)
+        }
+        RequestKind::ListHeaders => {
+            write_response(writer, pending_write, LIST_HEADERS_RESPONSE, session_stats).await?;
+            Ok(false)
+        }
+        RequestKind::ListDistribPats => {
+            write_response(
+                writer,
+                pending_write,
+                LIST_DISTRIB_PATS_RESPONSE,
+                session_stats,
+            )
+            .await?;
+            Ok(false)
+        }
+        RequestKind::Group => {
+            write_response(writer, pending_write, GROUP_RESPONSE, session_stats).await?;
+            Ok(false)
+        }
+        RequestKind::ListGroup => {
+            write_response(writer, pending_write, LISTGROUP_RESPONSE, session_stats).await?;
+            Ok(false)
+        }
+        RequestKind::Last => {
+            write_response(writer, pending_write, LAST_RESPONSE, session_stats).await?;
+            Ok(false)
+        }
+        RequestKind::Next => {
+            write_response(writer, pending_write, NEXT_RESPONSE, session_stats).await?;
+            Ok(false)
+        }
+        RequestKind::NewGroups => {
+            write_response(writer, pending_write, NEWGROUPS_RESPONSE, session_stats).await?;
+            Ok(false)
+        }
+        RequestKind::NewNews => {
+            write_response(writer, pending_write, NEWNEWS_RESPONSE, session_stats).await?;
+            Ok(false)
+        }
+        RequestKind::Post => {
+            write_response(writer, pending_write, POST_RESPONSE, session_stats).await?;
+            Ok(false)
+        }
+        RequestKind::Ihave => {
+            write_response(writer, pending_write, IHAVE_RESPONSE, session_stats).await?;
+            Ok(false)
+        }
+        RequestKind::Check => {
+            write_response(writer, pending_write, CHECK_RESPONSE, session_stats).await?;
+            Ok(false)
+        }
+        RequestKind::TakeThis => {
+            write_response(writer, pending_write, TAKETHIS_RESPONSE, session_stats).await?;
+            Ok(false)
+        }
+        RequestKind::AuthInfoUser => {
+            write_response(writer, pending_write, AUTHINFO_USER_RESPONSE, session_stats).await?;
+            Ok(false)
+        }
+        RequestKind::AuthInfoPass => {
+            write_response(writer, pending_write, AUTHINFO_RESPONSE, session_stats).await?;
+            Ok(false)
+        }
+        RequestKind::AuthInfo => {
+            write_response(writer, pending_write, AUTHINFO_RESPONSE, session_stats).await?;
+            Ok(false)
+        }
+        RequestKind::StartTls => {
+            write_response(writer, pending_write, STARTTLS_RESPONSE, session_stats).await?;
+            Ok(false)
+        }
+        RequestKind::Over => {
+            write_response(writer, pending_write, OVER_RESPONSE, session_stats).await?;
+            Ok(false)
+        }
+        RequestKind::Xover => {
+            write_response(writer, pending_write, XOVER_RESPONSE, session_stats).await?;
+            Ok(false)
+        }
+        RequestKind::Hdr => {
+            write_response(writer, pending_write, HDR_RESPONSE, session_stats).await?;
+            Ok(false)
+        }
+        RequestKind::Xhdr => {
+            write_response(writer, pending_write, XHDR_RESPONSE, session_stats).await?;
+            Ok(false)
+        }
+        RequestKind::Capabilities => {
             write_response(
                 writer,
                 pending_write,
@@ -1128,25 +2598,23 @@ where
             .await?;
             Ok(false)
         }
-        ParsedCommand::Date => {
+        RequestKind::Help => {
+            write_response(writer, pending_write, HELP_RESPONSE, session_stats).await?;
+            Ok(false)
+        }
+        RequestKind::Date => {
             write_response(writer, pending_write, DATE_RESPONSE, session_stats).await?;
             Ok(false)
         }
-        ParsedCommand::ModeReader => {
+        RequestKind::ModeReader => {
             write_response(writer, pending_write, MODE_READER_RESPONSE, session_stats).await?;
             Ok(false)
         }
-        ParsedCommand::Quit => {
-            write_response(
-                writer,
-                pending_write,
-                b"205 closing connection\r\n",
-                session_stats,
-            )
-            .await?;
+        RequestKind::Quit => {
+            write_response(writer, pending_write, QUIT_RESPONSE, session_stats).await?;
             Ok(true)
         }
-        ParsedCommand::Unknown => {
+        _ => {
             write_response(
                 writer,
                 pending_write,
@@ -1160,15 +2628,70 @@ where
 }
 
 struct PendingWrite {
-    buf: Box<[u8; MAX_PENDING_WRITE_BYTES]>,
+    buf: Box<[u8]>,
     len: usize,
+}
+
+struct GeneratedResponse<'a> {
+    prefix: &'a [u8],
+    target_bytes: usize,
+}
+
+impl<'a> GeneratedResponse<'a> {
+    const fn new(prefix: &'a [u8], target_bytes: usize) -> Self {
+        Self {
+            prefix,
+            target_bytes,
+        }
+    }
+}
+
+fn build_generated_response(prefix: &[u8], target_bytes: usize) -> Box<[u8]> {
+    let response = GeneratedResponse::new(prefix, target_bytes);
+    let mut buffer = Vec::with_capacity(response.total_len());
+    buffer.extend_from_slice(response.prefix);
+
+    if response.prefix.len() < response.target_bytes {
+        append_repeated_payload_at_least(
+            &mut buffer,
+            BODY_LINE,
+            response.target_bytes - response.prefix.len(),
+        );
+    }
+
+    append_dot_terminator(&mut buffer);
+    buffer.into_boxed_slice()
+}
+
+fn append_repeated_payload_at_least(buffer: &mut Vec<u8>, line: &[u8], min_bytes: usize) {
+    if line.is_empty() {
+        return;
+    }
+
+    let copies = min_bytes.div_ceil(line.len());
+    buffer.reserve(copies * line.len());
+    for _ in 0..copies {
+        buffer.extend_from_slice(line);
+    }
+}
+
+impl GeneratedResponse<'_> {
+    fn total_len(&self) -> usize {
+        let payload_bytes = if self.prefix.len() < self.target_bytes {
+            let missing = self.target_bytes - self.prefix.len();
+            missing.div_ceil(BODY_LINE.len()) * BODY_LINE.len()
+        } else {
+            0
+        };
+        self.prefix.len() + payload_bytes + DOT_TERMINATOR.len()
+    }
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
 impl PendingWrite {
-    fn new() -> Self {
+    fn new(capacity: usize) -> Self {
         Self {
-            buf: Box::new([0; MAX_PENDING_WRITE_BYTES]),
+            buf: vec![0; capacity.max(1)].into_boxed_slice(),
             len: 0,
         }
     }
@@ -1241,51 +2764,133 @@ where
     Ok(())
 }
 
-pub fn process_command_to_buffer(
-    command: ParsedCommand,
+pub fn process_request_to_buffer<W>(
+    request: RequestLine<'_>,
     config: &ServerConfig,
     stats: &Stats,
-    output: &mut Vec<u8>,
-) -> bool {
+    output: &mut W,
+) -> bool
+where
+    W: Write,
+{
     stats.commands.fetch_add(1, Ordering::Relaxed);
 
-    let response = match command {
-        ParsedCommand::Article => {
+    let response = match request.kind() {
+        RequestKind::Article => {
             stats.article_requests.fetch_add(1, Ordering::Relaxed);
-            config.article_response()
+            if config.article_dir.is_some() {
+                if write_stored_article_response_to(
+                    output,
+                    config,
+                    parse_article_id_arg(request.args()),
+                    request.message_id().as_ref(),
+                    stats,
+                )
+                .expect("response write failed")
+                {
+                    return false;
+                }
+                stats
+                    .bytes_sent
+                    .fetch_add(ARTICLE_NOT_FOUND_RESPONSE.len() as u64, Ordering::Relaxed);
+                output
+                    .write_all(ARTICLE_NOT_FOUND_RESPONSE)
+                    .expect("response write failed");
+                return false;
+            }
+            stats
+                .bytes_sent
+                .fetch_add(config.article_response().len() as u64, Ordering::Relaxed);
+            output
+                .write_all(config.article_response())
+                .expect("response write failed");
+            return false;
         }
-        ParsedCommand::Body => {
+        RequestKind::Head => {
+            stats.article_requests.fetch_add(1, Ordering::Relaxed);
+            config.head_response()
+        }
+        RequestKind::Stat => {
+            stats.article_requests.fetch_add(1, Ordering::Relaxed);
+            config.stat_response()
+        }
+        RequestKind::Body => {
             stats.body_requests.fetch_add(1, Ordering::Relaxed);
-            config.body_response()
+            stats
+                .bytes_sent
+                .fetch_add(config.body_response().len() as u64, Ordering::Relaxed);
+            output
+                .write_all(config.body_response())
+                .expect("response write failed");
+            return false;
         }
-        ParsedCommand::Capabilities => b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n",
-        ParsedCommand::Date => DATE_RESPONSE,
-        ParsedCommand::ModeReader => MODE_READER_RESPONSE,
-        ParsedCommand::Quit => b"205 closing connection\r\n",
-        ParsedCommand::Unknown => b"500 unknown command\r\n",
+        RequestKind::List | RequestKind::ListActive => LIST_RESPONSE,
+        RequestKind::ListActiveTimes => LIST_ACTIVE_TIMES_RESPONSE,
+        RequestKind::ListNewsgroups => LIST_NEWSGROUPS_RESPONSE,
+        RequestKind::ListOverviewFmt => LIST_OVERVIEW_FMT_RESPONSE,
+        RequestKind::ListHeaders => LIST_HEADERS_RESPONSE,
+        RequestKind::ListDistribPats => LIST_DISTRIB_PATS_RESPONSE,
+        RequestKind::Group => GROUP_RESPONSE,
+        RequestKind::ListGroup => LISTGROUP_RESPONSE,
+        RequestKind::Last => LAST_RESPONSE,
+        RequestKind::Next => NEXT_RESPONSE,
+        RequestKind::NewGroups => NEWGROUPS_RESPONSE,
+        RequestKind::NewNews => NEWNEWS_RESPONSE,
+        RequestKind::Post => POST_RESPONSE,
+        RequestKind::Ihave => IHAVE_RESPONSE,
+        RequestKind::Check => CHECK_RESPONSE,
+        RequestKind::TakeThis => TAKETHIS_RESPONSE,
+        RequestKind::AuthInfoUser => AUTHINFO_USER_RESPONSE,
+        RequestKind::AuthInfoPass => AUTHINFO_RESPONSE,
+        RequestKind::AuthInfo => AUTHINFO_RESPONSE,
+        RequestKind::StartTls => STARTTLS_RESPONSE,
+        RequestKind::Over => OVER_RESPONSE,
+        RequestKind::Xover => XOVER_RESPONSE,
+        RequestKind::Hdr => HDR_RESPONSE,
+        RequestKind::Xhdr => XHDR_RESPONSE,
+        RequestKind::Capabilities => b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n",
+        RequestKind::Help => HELP_RESPONSE,
+        RequestKind::Date => DATE_RESPONSE,
+        RequestKind::ModeReader => MODE_READER_RESPONSE,
+        RequestKind::Quit => QUIT_RESPONSE,
+        _ => b"500 unknown command\r\n",
     };
 
     stats
         .bytes_sent
         .fetch_add(response.len() as u64, Ordering::Relaxed);
-    output.extend_from_slice(response);
-    matches!(command, ParsedCommand::Quit)
+    output.write_all(response).expect("response write failed");
+    matches!(request.kind(), RequestKind::Quit)
 }
 
-pub fn parse_command_batch_bytes(
+pub fn for_each_request_line_in_batch<F>(
     input: &[u8],
     max_pipeline_depth: usize,
-    command_batch: &mut Vec<ParsedCommand>,
-) -> usize {
-    command_batch.clear();
+    mut visit: F,
+) -> usize
+where
+    F: FnMut(RequestLine<'_>),
+{
     let mut start = 0;
+    let mut count = 0;
 
-    while command_batch.len() < max_pipeline_depth {
-        let Some(relative_lf) = memchr::memchr(b'\n', &input[start..]) else {
-            break;
+    while count < max_pipeline_depth {
+        let end = match detect_response_line_end_from(input, start) {
+            ResponseLineStatus::CompleteAt(end) => end,
+            ResponseLineStatus::NeedMore | ResponseLineStatus::Invalid => break,
         };
-        let end = start + relative_lf + 1;
-        command_batch.push(CommandLine::parse(trim_line_slice(&input[start..end])));
+        let request = RequestLine::parse(&input[start..end]);
+        if matches!(request.kind(), RequestKind::TakeThis) {
+            let Some(body_end) = find_dot_terminated_block_end(input, end) else {
+                break;
+            };
+            visit(request);
+            count += 1;
+            start = body_end;
+            continue;
+        }
+        visit(request);
+        count += 1;
         start = end;
     }
 
@@ -1312,6 +2917,107 @@ where
     pending_write.write_with_response(writer, response).await
 }
 
+fn open_stored_article_response(
+    config: &ServerConfig,
+    article_id: Option<u64>,
+    message_id: Option<&MessageId<'_>>,
+    article_path: &mut PathBuf,
+) -> io::Result<Option<fs::File>> {
+    let Some(root) = config.article_dir.as_ref() else {
+        return Ok(None);
+    };
+    if let Some(article_id) = article_id
+        && let Some(file) =
+            open_article_response_into(root, ArticleStoreKey::Number(article_id), article_path)?
+    {
+        return Ok(Some(file));
+    }
+    if let Some(message_id) = message_id {
+        return open_article_response_into(
+            root,
+            ArticleStoreKey::MessageId(message_id),
+            article_path,
+        );
+    }
+    Ok(None)
+}
+
+async fn write_stored_article_response<W>(
+    writer: &mut W,
+    pending_write: &mut PendingWrite,
+    config: &ServerConfig,
+    article_id: Option<u64>,
+    message_id: Option<&MessageId<'_>>,
+    session_stats: &mut SessionStats,
+    article_path: &mut PathBuf,
+) -> io::Result<bool>
+where
+    W: AsyncWrite + Unpin,
+{
+    let Some(file) = open_stored_article_response(config, article_id, message_id, article_path)?
+    else {
+        return Ok(false);
+    };
+
+    pending_write.flush(writer).await?;
+    write_file_response_to_async(writer, file, session_stats).await?;
+    Ok(true)
+}
+
+async fn write_file_response_to_async<W>(
+    writer: &mut W,
+    mut file: fs::File,
+    session_stats: &mut SessionStats,
+) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(());
+        }
+        writer.write_all(&buffer[..read]).await?;
+        session_stats.bytes_sent += read as u64;
+    }
+}
+
+fn write_stored_article_response_to<W>(
+    output: &mut W,
+    config: &ServerConfig,
+    article_id: Option<u64>,
+    message_id: Option<&MessageId<'_>>,
+    stats: &Stats,
+) -> io::Result<bool>
+where
+    W: Write,
+{
+    let mut article_path = PathBuf::with_capacity(1024);
+    let Some(file) =
+        open_stored_article_response(config, article_id, message_id, &mut article_path)?
+    else {
+        return Ok(false);
+    };
+    write_file_response_to(output, file, stats)?;
+    Ok(true)
+}
+
+fn write_file_response_to<W>(output: &mut W, mut file: fs::File, stats: &Stats) -> io::Result<()>
+where
+    W: Write,
+{
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(());
+        }
+        output.write_all(&buffer[..read])?;
+        stats.bytes_sent.fetch_add(read as u64, Ordering::Relaxed);
+    }
+}
+
 async fn flush_pending<W>(writer: &mut W, pending_write: &mut PendingWrite) -> io::Result<()>
 where
     W: AsyncWrite + Unpin,
@@ -1319,47 +3025,87 @@ where
     pending_write.flush(writer).await
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn flush_session_writer<W>(
+    writer: &mut W,
+    pending_write: &mut PendingWrite,
+    config: &ServerConfig,
+) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    flush_pending(writer, pending_write).await?;
+    flush_writer_if_needed(writer, config.flush).await
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn flush_writer_if_needed<W>(writer: &mut W, flush: bool) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    if flush {
+        #[cfg(not(coverage_nightly))]
+        writer.flush().await?;
+        #[cfg(coverage_nightly)]
+        let _ = writer.flush().await;
+    }
+
+    Ok(())
+}
+
 #[derive(Debug)]
 pub struct ServerConfig {
     pub body_bytes: usize,
     pub article_bytes: usize,
+    body_response: Box<[u8]>,
+    article_response: Box<[u8]>,
+    pub article_dir: Option<Arc<PathBuf>>,
     pub max_connections: usize,
     pub max_pipeline_depth: usize,
     pub stats_interval: Duration,
     pub flush: bool,
+    pub pending_write_bytes: usize,
     pub nodelay: bool,
     pub socket_recv_buffer: usize,
     pub socket_send_buffer: usize,
-    body: Box<[u8]>,
-    article: Box<[u8]>,
 }
 
 impl ServerConfig {
     pub fn from_args(args: ServerArgs) -> Self {
-        let body = generate_body(args.body_bytes);
-        let article = generate_article(args.article_bytes, &body);
-
+        let body_response = build_generated_response(BODY_RESPONSE_PREFIX, args.body_bytes);
+        let article_response =
+            build_generated_response(ARTICLE_RESPONSE_PREFIX, args.article_bytes);
         Self {
             body_bytes: args.body_bytes,
             article_bytes: args.article_bytes,
+            body_response,
+            article_response,
+            article_dir: args.article_dir.map(Arc::new),
             max_connections: args.max_connections,
             max_pipeline_depth: args.max_pipeline_depth.clamp(1, 1024),
             stats_interval: Duration::from_secs(args.stats_interval_secs),
             flush: args.flush,
+            pending_write_bytes: args.pending_write_bytes.max(1),
             nodelay: args.nodelay,
             socket_recv_buffer: args.socket_recv_buffer,
             socket_send_buffer: args.socket_send_buffer,
-            body,
-            article,
         }
     }
 
-    pub fn article_response(&self) -> &[u8] {
-        &self.article
+    pub fn head_response(&self) -> &[u8] {
+        HEAD_RESPONSE
+    }
+
+    pub fn stat_response(&self) -> &[u8] {
+        STAT_RESPONSE
     }
 
     pub fn body_response(&self) -> &[u8] {
-        &self.body
+        &self.body_response
+    }
+
+    pub fn article_response(&self) -> &[u8] {
+        &self.article_response
     }
 }
 
@@ -1528,47 +3274,51 @@ pub fn rate(count: u64, seconds: f64) -> f64 {
     count as f64 / seconds
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedCommand {
+    kind: RequestKind,
+    article_id: Option<u64>,
+    line_slot: u16,
+    message_id: Option<ParsedMessageId>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ParsedCommand {
-    Article,
-    Body,
-    Capabilities,
-    Date,
-    ModeReader,
-    Quit,
-    Unknown,
+struct ParsedMessageId {
+    start: u16,
+    len: u16,
 }
 
 type CommandBatch = ArrayVec<ParsedCommand, MAX_SERVER_PIPELINE_DEPTH>;
 
-pub struct CommandLine;
+struct CommandLineBatch {
+    lines: Box<[[u8; MAX_COMMAND_LINE_BYTES]]>,
+}
 
-impl CommandLine {
-    pub fn parse(line: &[u8]) -> ParsedCommand {
-        let (verb, arg) = split_once_space(line).map_or((line, &[][..]), |(verb, arg)| (verb, arg));
-
-        if verb_eq(verb, b"ARTICLE") {
-            ParsedCommand::Article
-        } else if verb_eq(verb, b"BODY") {
-            ParsedCommand::Body
-        } else if verb_eq(verb, b"CAPABILITIES") {
-            ParsedCommand::Capabilities
-        } else if verb_eq(verb, b"DATE") {
-            ParsedCommand::Date
-        } else if verb_eq(verb, b"MODE") && verb_eq(arg, b"READER") {
-            ParsedCommand::ModeReader
-        } else if verb_eq(verb, b"QUIT") {
-            ParsedCommand::Quit
-        } else {
-            ParsedCommand::Unknown
+impl Default for CommandLineBatch {
+    fn default() -> Self {
+        let mut lines = Vec::with_capacity(MAX_SERVER_PIPELINE_DEPTH);
+        lines.resize_with(MAX_SERVER_PIPELINE_DEPTH, || [0; MAX_COMMAND_LINE_BYTES]);
+        Self {
+            lines: lines.into_boxed_slice(),
         }
+    }
+}
+
+impl CommandLineBatch {
+    fn copy_line(&mut self, slot: usize, line: &[u8]) {
+        self.lines[slot][..line.len()].copy_from_slice(line);
+    }
+
+    fn line_slice(&self, slot: usize, start: usize, len: usize) -> &[u8] {
+        &self.lines[slot][start..start + len]
     }
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn read_command_batch<R>(
     reader: &mut BufReader<R>,
-    command_buf: &mut Vec<u8>,
+    command_line: &mut [u8; MAX_COMMAND_LINE_BYTES],
+    mut command_lines: Option<&mut CommandLineBatch>,
     command_batch: &mut CommandBatch,
     max_pipeline_depth: usize,
 ) -> io::Result<bool>
@@ -1576,62 +3326,238 @@ where
     R: tokio::io::AsyncRead + Unpin,
 {
     command_batch.clear();
-    command_buf.clear();
-    let read = reader.read_until(b'\n', command_buf).await?;
-    if read == 0 {
+    let Some(line_len) = read_crlf_line_into(reader, command_line).await? else {
         return Ok(false);
-    }
-    push_command(command_buf, command_batch);
+    };
+    push_command(
+        reader,
+        &command_line[..line_len],
+        command_lines.as_deref_mut(),
+        command_batch,
+    )
+    .await?;
 
     while command_batch.len() < max_pipeline_depth {
-        if memchr::memchr(b'\n', reader.buffer()).is_none() {
+        if find_crlf_line_end(reader.buffer(), 0).is_none() {
             break;
         }
 
-        command_buf.clear();
-        reader.read_until(b'\n', command_buf).await?;
-        push_command(command_buf, command_batch);
+        let Some(line_len) = read_crlf_line_into(reader, command_line).await? else {
+            break;
+        };
+        push_command(
+            reader,
+            &command_line[..line_len],
+            command_lines.as_deref_mut(),
+            command_batch,
+        )
+        .await?;
     }
 
     Ok(true)
 }
 
-fn push_command(command_buf: &mut Vec<u8>, command_batch: &mut CommandBatch) {
-    command_batch.push(parse_command_buf(command_buf));
-}
+async fn read_crlf_line_into<R>(reader: &mut R, line: &mut [u8]) -> io::Result<Option<usize>>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let mut len = 0;
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            if len == 0 {
+                return Ok(None);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "truncated line",
+            ));
+        }
 
-fn parse_command_buf(command_buf: &mut Vec<u8>) -> ParsedCommand {
-    trim_command_line(command_buf);
-    CommandLine::parse(command_buf)
-}
+        let take = memchr::memchr(b'\n', available).map_or(available.len(), |index| index + 1);
+        if len + take > line.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "line exceeds fixed read buffer",
+            ));
+        }
 
-fn split_once_space(line: &[u8]) -> Option<(&[u8], &[u8])> {
-    let pos = memchr::memchr(b' ', line)?;
-    let verb = &line[..pos];
-    let arg = line[pos + 1..].trim_ascii();
-    Some((verb, arg))
-}
+        line[len..len + take].copy_from_slice(&available[..take]);
+        reader.consume(take);
+        len += take;
 
-fn verb_eq(actual: &[u8], expected_upper: &[u8]) -> bool {
-    actual.len() == expected_upper.len()
-        && actual
-            .iter()
-            .zip(expected_upper)
-            .all(|(left, right)| left.to_ascii_uppercase() == *right)
-}
-
-fn trim_command_line(line: &mut Vec<u8>) {
-    while matches!(line.last(), Some(b'\r' | b'\n')) {
-        line.pop();
+        if line[..len].ends_with(b"\n") {
+            return Ok(Some(len));
+        }
     }
 }
 
-fn trim_line_slice(line: &[u8]) -> &[u8] {
-    line.strip_suffix(b"\r\n")
-        .or_else(|| line.strip_suffix(b"\n"))
-        .unwrap_or(line)
+async fn push_command<R>(
+    reader: &mut BufReader<R>,
+    line: &[u8],
+    command_lines: Option<&mut CommandLineBatch>,
+    command_batch: &mut CommandBatch,
+) -> io::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    if strip_complete_crlf_line(line).is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "command line missing CRLF terminator",
+        ));
+    }
+    let line_slot = command_batch.len();
+    let command = parse_command_line(line, line_slot);
+    let kind = command.kind;
+    if command.message_id.is_some()
+        && let Some(command_lines) = command_lines
+    {
+        command_lines.copy_line(line_slot, line);
+    }
+    if matches!(kind, RequestKind::TakeThis) {
+        read_dot_terminated_body(reader).await?;
+    }
+    command_batch.push(command);
+    Ok(())
 }
 
+fn parse_command_line(line: &[u8], line_slot: usize) -> ParsedCommand {
+    let request = RequestLine::parse(line);
+    ParsedCommand {
+        kind: request.kind(),
+        article_id: parse_article_id_arg(request.args()),
+        line_slot: line_slot.try_into().unwrap_or(u16::MAX),
+        message_id: parsed_message_id_range(line, request.message_id()),
+    }
+}
+
+fn parsed_message_id_range(
+    line: &[u8],
+    message_id: Option<MessageId<'_>>,
+) -> Option<ParsedMessageId> {
+    let message_id = message_id?;
+    let message_id_bytes = message_id.as_str().as_bytes();
+    let line_start = line.as_ptr() as usize;
+    let message_start = message_id_bytes.as_ptr() as usize;
+    let start = message_start.checked_sub(line_start)?;
+    if start + message_id_bytes.len() > line.len() {
+        return None;
+    }
+    Some(ParsedMessageId {
+        start: start.try_into().ok()?,
+        len: message_id_bytes.len().try_into().ok()?,
+    })
+}
+
+fn command_message_id<'a>(
+    command: &ParsedCommand,
+    command_lines: &'a CommandLineBatch,
+) -> Option<MessageId<'a>> {
+    let message_id = command.message_id?;
+    let line_slot = usize::from(command.line_slot);
+    let bytes = command_lines.line_slice(
+        line_slot,
+        usize::from(message_id.start),
+        usize::from(message_id.len),
+    );
+    let value = std::str::from_utf8(bytes).ok()?;
+    MessageId::from_borrowed(value).ok()
+}
+
+fn parse_article_id_arg(args: &[u8]) -> Option<u64> {
+    let arg = std::str::from_utf8(args).ok()?.trim();
+    if arg.is_empty() || arg.bytes().any(|byte| !byte.is_ascii_digit()) {
+        return None;
+    }
+    arg.parse::<u64>().ok()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TakeThisBodyState {
+    LineStart,
+    LineStartDot,
+    LineStartDotCr,
+    Line,
+    LineCr,
+}
+
+async fn read_dot_terminated_body<R>(reader: &mut BufReader<R>) -> io::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut state = TakeThisBodyState::LineStart;
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "truncated TAKETHIS body",
+            ));
+        }
+
+        let mut consumed = 0;
+        for &byte in available {
+            consumed += 1;
+            state = match (state, byte) {
+                (TakeThisBodyState::LineStart, b'.') => TakeThisBodyState::LineStartDot,
+                (TakeThisBodyState::LineStart, b'\r') => TakeThisBodyState::LineCr,
+                (TakeThisBodyState::LineStart, b'\n') => {
+                    reader.consume(consumed);
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "TAKETHIS body line missing CRLF terminator",
+                    ));
+                }
+                (TakeThisBodyState::LineStart, _) => TakeThisBodyState::Line,
+
+                (TakeThisBodyState::LineStartDot, b'\r') => TakeThisBodyState::LineStartDotCr,
+                (TakeThisBodyState::LineStartDot, b'\n') => {
+                    reader.consume(consumed);
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "TAKETHIS body line missing CRLF terminator",
+                    ));
+                }
+                (TakeThisBodyState::LineStartDot, _) => TakeThisBodyState::Line,
+
+                (TakeThisBodyState::LineStartDotCr, b'\n') => {
+                    reader.consume(consumed);
+                    return Ok(());
+                }
+                (TakeThisBodyState::LineStartDotCr, _) => {
+                    reader.consume(consumed);
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "TAKETHIS body line missing CRLF terminator",
+                    ));
+                }
+
+                (TakeThisBodyState::Line, b'\r') => TakeThisBodyState::LineCr,
+                (TakeThisBodyState::Line, b'\n') => {
+                    reader.consume(consumed);
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "TAKETHIS body line missing CRLF terminator",
+                    ));
+                }
+                (TakeThisBodyState::Line, _) => TakeThisBodyState::Line,
+
+                (TakeThisBodyState::LineCr, b'\n') => TakeThisBodyState::LineStart,
+                (TakeThisBodyState::LineCr, _) => {
+                    reader.consume(consumed);
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "TAKETHIS body line missing CRLF terminator",
+                    ));
+                }
+            };
+        }
+        reader.consume(consumed);
+    }
+}
+
+#[cfg(test)]
 pub fn generate_article(target_bytes: usize, body: &[u8]) -> Box<[u8]> {
     let mut response = Vec::with_capacity(target_bytes.max(256) + TERMINATOR.len());
     response.extend_from_slice(b"220 1 <article.1@nntpbench.local> article follows\r\n");
@@ -1641,12 +3567,13 @@ pub fn generate_article(target_bytes: usize, body: &[u8]) -> Box<[u8]> {
     response.extend_from_slice(b"Subject: nntpbench synthetic article\r\n");
     response.extend_from_slice(b"Message-ID: <article.1@nntpbench.local>\r\n");
     response.extend_from_slice(b"Date: Fri, 15 May 2026 00:00:00 +0000\r\n");
-    response.extend_from_slice(b"\r\n");
+    crate::terminator::append_crlf(&mut response);
     append_repeated_payload(&mut response, body_payload(body), target_bytes);
     ensure_terminated(&mut response);
     response.into_boxed_slice()
 }
 
+#[cfg(test)]
 pub fn generate_body(target_bytes: usize) -> Box<[u8]> {
     let mut response = Vec::with_capacity(target_bytes.max(128) + TERMINATOR.len());
     response.extend_from_slice(b"222 1 <article.1@nntpbench.local> body follows\r\n");
@@ -1655,18 +3582,19 @@ pub fn generate_body(target_bytes: usize) -> Box<[u8]> {
     response.into_boxed_slice()
 }
 
+#[cfg(test)]
 fn body_payload(body: &[u8]) -> &[u8] {
-    let header_end = memchr::memmem::find(body, CRLF).map_or(0, |idx| idx + CRLF.len());
-    body[header_end..]
-        .strip_suffix(b".\r\n")
-        .unwrap_or(&body[header_end..])
+    let header_end = find_crlf_line_end(body, 0).unwrap_or(0);
+    let payload = &body[header_end..];
+    strip_dot_terminator_suffix(payload).unwrap_or(payload)
 }
 
 const BODY_LINE: &[u8] =
     b"This is synthetic NNTP article payload for throughput and latency benchmarking\r\n";
 
+#[cfg(test)]
 fn append_repeated_payload(response: &mut Vec<u8>, line: &[u8], target_bytes: usize) {
-    let target_before_dot_line = target_bytes.saturating_sub(b".\r\n".len());
+    let target_before_dot_line = target_before_dot_terminator(target_bytes);
     while response.len() + line.len() <= target_before_dot_line {
         response.extend_from_slice(line);
     }
@@ -1677,26 +3605,47 @@ fn append_repeated_payload(response: &mut Vec<u8>, line: &[u8], target_bytes: us
     }
 }
 
+#[cfg(test)]
 fn ensure_terminated(response: &mut Vec<u8>) {
-    if !response.ends_with(CRLF) {
-        response.extend_from_slice(CRLF);
-    }
-    response.extend_from_slice(b".\r\n");
+    append_dot_terminator(response);
 }
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+    use proptest::collection::vec;
+    use proptest::prelude::*;
     use std::pin::Pin;
     use std::task::{Context, Poll};
     use tokio::io::AsyncReadExt;
+
+    fn dangerous_takethis_body_bytes() -> impl Strategy<Value = u8> {
+        prop_oneof![
+            Just(b'\r'),
+            Just(b'\n'),
+            Just(b'.'),
+            Just(b' '),
+            b'0'..=b'9',
+            b'a'..=b'z',
+        ]
+    }
+
+    fn remove_rfc_dot_terminators(buffer: &mut [u8]) {
+        while let Some(start) = buffer
+            .windows(TERMINATOR.len())
+            .position(|window| window == TERMINATOR)
+        {
+            buffer[start + 2] = b'x';
+        }
+    }
 
     fn test_args() -> ServerArgs {
         ServerArgs {
             listen: "127.0.0.1:0".parse().unwrap(),
             body_bytes: 1024,
             article_bytes: 2048,
+            article_dir: None,
             max_connections: 16,
             threads: 1,
             max_pipeline_depth: 8,
@@ -1707,6 +3656,7 @@ mod tests {
             socket_send_buffer: HIGH_THROUGHPUT_SOCKET_BUFFER,
             stats_interval_secs: 0,
             flush: false,
+            pending_write_bytes: DEFAULT_PENDING_WRITE_BYTES,
         }
     }
 
@@ -1714,11 +3664,225 @@ mod tests {
         Arc::new(ServerConfig::from_args(test_args()))
     }
 
+    struct AllocationCountGuard;
+
+    impl AllocationCountGuard {
+        fn start() -> Self {
+            COUNT_TEST_ALLOCATIONS.with(|enabled| enabled.set(false));
+            TEST_ALLOCATIONS.store(0, Ordering::Relaxed);
+            COUNT_TEST_ALLOCATIONS.with(|enabled| enabled.set(true));
+            Self
+        }
+
+        fn finish(self, label: &str) {
+            COUNT_TEST_ALLOCATIONS.with(|enabled| enabled.set(false));
+            let allocations = TEST_ALLOCATIONS.load(Ordering::Relaxed);
+            assert_eq!(allocations, 0, "{label} allocated {allocations} times");
+        }
+    }
+
+    impl Drop for AllocationCountGuard {
+        fn drop(&mut self) {
+            COUNT_TEST_ALLOCATIONS.with(|enabled| enabled.set(false));
+        }
+    }
+
+    fn assert_no_allocations(label: &str, run: impl FnOnce()) {
+        let guard = AllocationCountGuard::start();
+        run();
+        guard.finish(label);
+    }
+
+    fn client_command_mix_strategy() -> impl Strategy<Value = ClientCommandMix> {
+        prop_oneof![
+            Just(ClientCommandMix::Article),
+            Just(ClientCommandMix::Body),
+            Just(ClientCommandMix::Alternate),
+        ]
+    }
+
+    fn expected_client_command_counts(
+        start_id: u64,
+        requests: u64,
+        mix: ClientCommandMix,
+    ) -> (u64, u64) {
+        let mut articles = 0;
+        let mut bodies = 0;
+        for offset in 0..requests {
+            match client_command_kind(start_id.wrapping_add(offset), mix) {
+                ClientCommandMix::Article => articles += 1,
+                ClientCommandMix::Body => bodies += 1,
+                ClientCommandMix::Alternate => {
+                    unreachable!("client_command_kind should normalize Alternate")
+                }
+            }
+        }
+        (articles, bodies)
+    }
+
+    fn direct_e2e_proptest_config(cases: u32) -> ProptestConfig {
+        ProptestConfig {
+            cases,
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_direct_client_server_case(
+        body_bytes: usize,
+        article_bytes: usize,
+        max_pipeline_depth: usize,
+        requests: u64,
+        transfer_bytes: u64,
+        pipeline_depth: usize,
+        mix: ClientCommandMix,
+        start_id: u64,
+        read_buffer_bytes: usize,
+    ) -> io::Result<(Snapshot, Snapshot)> {
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let mut server_args = test_args();
+        server_args.body_bytes = body_bytes;
+        server_args.article_bytes = article_bytes;
+        server_args.max_pipeline_depth = max_pipeline_depth;
+        let server_config = Arc::new(ServerConfig::from_args(server_args));
+        let server_stats = Arc::new(Stats::new());
+
+        let server_task = tokio::spawn({
+            let server_config = server_config.clone();
+            let server_stats = server_stats.clone();
+            async move {
+                let (stream, peer_addr) = listener.accept().await.unwrap();
+                serve_session(stream, peer_addr, server_config, server_stats).await
+            }
+        });
+
+        let mut client_args = test_client_args();
+        client_args.connect = addr;
+        client_args.requests = requests;
+        client_args.transfer_bytes = transfer_bytes;
+        client_args.pipeline_depth = pipeline_depth;
+        client_args.command_mix = mix;
+        client_args.start_id = start_id;
+        client_args.read_buffer_bytes = read_buffer_bytes;
+        client_args.socket_recv_buffer = 0;
+        client_args.socket_send_buffer = 0;
+        let client_config = TypedClientConfig::from_client_args(client_args)?;
+        let client_session = TypedClientSession::new(&client_config, 0, start_id, requests);
+        let client_stats = Arc::new(Stats::new());
+        let stop = Arc::new(AtomicBool::new(false));
+
+        client_session.run(client_stats.clone(), stop).await?;
+        server_task.await.unwrap()?;
+
+        Ok((client_stats.snapshot(), server_stats.snapshot()))
+    }
+
+    struct FixedWrite<const N: usize> {
+        data: [u8; N],
+        len: usize,
+    }
+
+    impl<const N: usize> FixedWrite<N> {
+        const fn new() -> Self {
+            Self {
+                data: [0; N],
+                len: 0,
+            }
+        }
+
+        fn clear(&mut self) {
+            self.len = 0;
+        }
+
+        fn as_slice(&self) -> &[u8] {
+            &self.data[..self.len]
+        }
+    }
+
+    impl<const N: usize> Write for FixedWrite<N> {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.len + buf.len() > self.data.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "fixed test sink overflow",
+                ));
+            }
+            let end = self.len + buf.len();
+            self.data[self.len..end].copy_from_slice(buf);
+            self.len = end;
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
     fn test_client_args() -> ClientArgs {
         ClientArgs {
             connect: "127.0.0.1:1199".parse().unwrap(),
             ports: Vec::new(),
             segments: None,
+            auth_user: None,
+            auth_pass: None,
+            article_ids: None,
+            article_output_dir: None,
+            article_verify_dir: None,
+            requests: 0,
+            transfer_bytes: 0,
+            duration_secs: 0,
+            connections: 1,
+            client_offset: 0,
+            total_clients: 0,
+            threads: 1,
+            pipeline_depth: 64,
+            command_mix: ClientCommandMix::Alternate,
+            start_id: 1,
+            read_buffer_bytes: CLIENT_READER_CAPACITY,
+            nodelay: true,
+            socket_recv_buffer: HIGH_THROUGHPUT_SOCKET_BUFFER,
+            socket_send_buffer: HIGH_THROUGHPUT_SOCKET_BUFFER,
+            csv: false,
+            stats_interval_secs: 0,
+        }
+    }
+
+    fn test_typed_fetch_args() -> TypedFetchArgs {
+        TypedFetchArgs {
+            connect: "127.0.0.1:1199".parse().unwrap(),
+            request: TypedRequestKind::Article,
+            message_id: Some("bench@test".to_string()),
+            article_body: None,
+            auth_value: None,
+            header: None,
+            group: None,
+            wildmat: None,
+            date: None,
+            time: None,
+            gmt: true,
+            selector: None,
+            threads: 1,
+            read_buffer_bytes: CLIENT_READER_CAPACITY,
+            pipeline_depth: 64,
+            nodelay: true,
+            socket_recv_buffer: HIGH_THROUGHPUT_SOCKET_BUFFER,
+            socket_send_buffer: HIGH_THROUGHPUT_SOCKET_BUFFER,
+        }
+    }
+
+    fn test_typed_client_args() -> TypedClientArgs {
+        TypedClientArgs {
+            connect: "127.0.0.1:1199".parse().unwrap(),
+            ports: Vec::new(),
+            segments: None,
+            auth_user: None,
+            auth_pass: None,
+            article_ids: None,
+            article_output_dir: None,
+            article_verify_dir: None,
             requests: 0,
             transfer_bytes: 0,
             duration_secs: 0,
@@ -1750,6 +3914,21 @@ mod tests {
         );
         path.push(unique);
         fs::write(&path, contents).unwrap();
+        path
+    }
+
+    fn unique_temp_dir(name: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        let unique = format!(
+            "nntpbench-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        path.push(unique);
+        fs::create_dir_all(&path).unwrap();
         path
     }
 
@@ -1786,15 +3965,15 @@ mod tests {
     #[tokio::test]
     async fn pending_write_flushes_when_full_and_writes_oversized_directly() {
         let mut sink = tokio::io::sink();
-        let mut pending = PendingWrite::new();
-        let first = [b'a'; 40 * 1024];
-        let second = [b'b'; 40 * 1024];
+        let mut pending = PendingWrite::new(DEFAULT_PENDING_WRITE_BYTES);
+        let first = vec![b'a'; DEFAULT_PENDING_WRITE_BYTES - 16];
+        let second = vec![b'b'; 32];
         pending.push(&mut sink, &first).await.unwrap();
         assert_eq!(pending.len, first.len());
         pending.push(&mut sink, &second).await.unwrap();
         assert_eq!(pending.len, second.len());
 
-        let huge = [b'c'; MAX_PENDING_WRITE_BYTES + 1];
+        let huge = vec![b'c'; DEFAULT_PENDING_WRITE_BYTES + 1];
         pending.push(&mut sink, &huge).await.unwrap();
         assert_eq!(pending.len, 0);
     }
@@ -1802,7 +3981,7 @@ mod tests {
     #[tokio::test]
     async fn pending_write_handles_pending_writer() {
         let mut writer = PendingOnceWriter::default();
-        let mut pending = PendingWrite::new();
+        let mut pending = PendingWrite::new(DEFAULT_PENDING_WRITE_BYTES);
 
         pending
             .push(&mut writer, b"CAPABILITIES\r\n")
@@ -1819,7 +3998,7 @@ mod tests {
     #[tokio::test]
     async fn pending_write_vectors_pending_prefix_with_large_response() {
         let mut writer = VectoredWriter::default();
-        let mut pending = PendingWrite::new();
+        let mut pending = PendingWrite::new(DEFAULT_PENDING_WRITE_BYTES);
 
         pending.push(&mut writer, DATE_RESPONSE).await.unwrap();
         pending
@@ -1839,18 +4018,28 @@ mod tests {
     #[tokio::test]
     async fn handle_command_reports_large_response_write_error() {
         let mut args = test_args();
-        args.article_bytes = 8192;
+        args.article_bytes = DEFAULT_PENDING_WRITE_BYTES + BODY_LINE.len();
         let config = ServerConfig::from_args(args);
         let mut stats = SessionStats::default();
-        let mut pending = PendingWrite::new();
+        let mut pending = PendingWrite::new(DEFAULT_PENDING_WRITE_BYTES);
+        let mut article_path = PathBuf::new();
         let mut writer = FailingWriter;
+        let command = ParsedCommand {
+            kind: RequestKind::Article,
+            article_id: Some(1),
+            line_slot: 0,
+            message_id: None,
+        };
+        let command_lines = CommandLineBatch::default();
 
         let err = handle_command(
-            &ParsedCommand::Article,
+            &command,
+            Some(&command_lines),
             &config,
             &mut stats,
             &mut writer,
             &mut pending,
+            &mut article_path,
         )
         .await
         .unwrap_err();
@@ -1862,33 +4051,56 @@ mod tests {
     async fn fixed_command_reader_handles_split_line_and_closed_sender() {
         let server = ChunkedRead::new(&[b"ART".as_slice(), b"ICLE 1\r\nBODY 2\r\n".as_slice()]);
         let mut reader = BufReader::with_capacity(32, server);
-        let mut command_buf = Vec::with_capacity(MAX_COMMAND_LINE_BYTES);
+        let mut command_buf = [0; MAX_COMMAND_LINE_BYTES];
+        let mut command_lines = CommandLineBatch::default();
         let mut command_batch = CommandBatch::new();
         assert!(
-            read_command_batch(&mut reader, &mut command_buf, &mut command_batch, 4)
-                .await
-                .unwrap()
+            read_command_batch(
+                &mut reader,
+                &mut command_buf,
+                Some(&mut command_lines),
+                &mut command_batch,
+                4
+            )
+            .await
+            .unwrap()
         );
         assert_eq!(
-            command_batch.as_slice(),
-            &[ParsedCommand::Article, ParsedCommand::Body]
+            command_batch
+                .iter()
+                .map(|command| command.kind)
+                .collect::<Vec<_>>(),
+            vec![RequestKind::Article, RequestKind::Body]
         );
         assert!(
-            !read_command_batch(&mut reader, &mut command_buf, &mut command_batch, 4)
-                .await
-                .unwrap()
+            !read_command_batch(
+                &mut reader,
+                &mut command_buf,
+                Some(&mut command_lines),
+                &mut command_batch,
+                4
+            )
+            .await
+            .unwrap()
         );
     }
 
     #[tokio::test]
     async fn read_command_batch_reports_reader_error() {
         let mut reader = BufReader::with_capacity(32, FailingRead);
-        let mut command_buf = Vec::new();
+        let mut command_buf = [0; MAX_COMMAND_LINE_BYTES];
+        let mut command_lines = CommandLineBatch::default();
         let mut command_batch = CommandBatch::new();
 
-        let err = read_command_batch(&mut reader, &mut command_buf, &mut command_batch, 1)
-            .await
-            .unwrap_err();
+        let err = read_command_batch(
+            &mut reader,
+            &mut command_buf,
+            Some(&mut command_lines),
+            &mut command_batch,
+            1,
+        )
+        .await
+        .unwrap_err();
 
         assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
     }
@@ -2032,52 +4244,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_supported_commands_case_insensitively() {
-        assert_eq!(CommandLine::parse(b"ARTICLE <x@y>"), ParsedCommand::Article);
-        assert_eq!(CommandLine::parse(b"ARTICLE"), ParsedCommand::Article);
-        assert_eq!(CommandLine::parse(b"body 123"), ParsedCommand::Body);
-        assert_eq!(CommandLine::parse(b"BoDy"), ParsedCommand::Body);
-        assert_eq!(
-            CommandLine::parse(b"CAPABILITIES"),
-            ParsedCommand::Capabilities
-        );
-        assert_eq!(
-            CommandLine::parse(b"capabilities"),
-            ParsedCommand::Capabilities
-        );
-        assert_eq!(CommandLine::parse(b"DATE"), ParsedCommand::Date);
-        assert_eq!(CommandLine::parse(b"date"), ParsedCommand::Date);
-        assert_eq!(
-            CommandLine::parse(b"MODE READER"),
-            ParsedCommand::ModeReader
-        );
-        assert_eq!(
-            CommandLine::parse(b"mode reader"),
-            ParsedCommand::ModeReader
-        );
-        assert_eq!(CommandLine::parse(b"QUIT"), ParsedCommand::Quit);
-        assert_eq!(CommandLine::parse(b"quit"), ParsedCommand::Quit);
-        assert_eq!(CommandLine::parse(b"HEAD 1"), ParsedCommand::Unknown);
-        assert_eq!(CommandLine::parse(b"ARTICLEZ 1"), ParsedCommand::Unknown);
-        assert_eq!(CommandLine::parse(b"MODE TRANSIT"), ParsedCommand::Unknown);
-    }
-
-    #[test]
-    fn trims_crlf_command_lines() {
-        let mut line = b"ARTICLE 1\r\n".to_vec();
-        trim_command_line(&mut line);
-        assert_eq!(line, b"ARTICLE 1");
-
-        let mut bare_lf = b"BODY 1\n".to_vec();
-        trim_command_line(&mut bare_lf);
-        assert_eq!(bare_lf, b"BODY 1");
-
-        let mut unchanged = b"QUIT".to_vec();
-        trim_command_line(&mut unchanged);
-        assert_eq!(unchanged, b"QUIT");
-    }
-
-    #[test]
     fn generated_responses_are_multiline_terminated() {
         let body = generate_body(1024);
         let article = generate_article(2048, &body);
@@ -2101,7 +4267,7 @@ mod tests {
 
         let article = generate_article(8192, &body);
         let header_end = memchr::memmem::find(&article, b"\r\n\r\n").unwrap() + b"\r\n\r\n".len();
-        let article_content = article[header_end..].strip_suffix(b".\r\n").unwrap();
+        let article_content = strip_dot_terminator_suffix(&article[header_end..]).unwrap();
         assert!(!article_content.contains(&b'.'));
     }
 
@@ -2151,8 +4317,8 @@ mod tests {
         low.max_pipeline_depth = 0;
         let config = ServerConfig::from_args(low);
         assert_eq!(config.max_pipeline_depth, 1);
-        assert!(config.body_response().starts_with(b"222 "));
-        assert!(config.article_response().starts_with(b"220 "));
+        assert_eq!(config.body_bytes, 1024);
+        assert_eq!(config.article_bytes, 2048);
 
         let mut high = test_args();
         high.max_pipeline_depth = 4096;
@@ -2200,6 +4366,8 @@ mod tests {
         args.connect = "127.0.0.1:1199".parse().unwrap();
         args.ports = vec![1200, 1201];
         args.segments = Some(path.clone());
+        args.auth_user = Some("bench-user".to_string());
+        args.auth_pass = Some("bench-pass".to_string());
         args.requests = 17;
         args.transfer_bytes = 8192;
         args.duration_secs = 3;
@@ -2216,7 +4384,7 @@ mod tests {
         args.csv = true;
         args.stats_interval_secs = 2;
 
-        let config = ClientConfig::from_args(args).unwrap();
+        let config = TypedClientConfig::from_client_args(args).unwrap();
         fs::remove_file(path).unwrap();
 
         assert_eq!(config.requests, 17);
@@ -2228,7 +4396,7 @@ mod tests {
         assert_eq!(config.pipeline_depth, 1);
         assert_eq!(config.command_mix, ClientCommandMix::Body);
         assert_eq!(config.start_id, 99);
-        assert_eq!(config.read_buffer_bytes, tail_buffer::TERMINATOR_TAIL_SIZE);
+        assert_eq!(config.read_buffer_bytes, terminator::TERMINATOR_TAIL_SIZE);
         assert!(!config.nodelay);
         assert_eq!(config.socket_recv_buffer, 4096);
         assert_eq!(config.socket_send_buffer, 8192);
@@ -2237,7 +4405,15 @@ mod tests {
         assert_eq!(config.endpoint_for(0).port(), 1200);
         assert_eq!(config.endpoint_for(1).port(), 1201);
         assert_eq!(config.endpoint_for(2).port(), 1200);
-        assert!(config.command_capacity() >= b"BODY <wrapped@test>\r\n".len());
+        assert!(config.segments.is_some());
+        assert_eq!(
+            config.auth_user.as_ref().map(AuthInfoValue::as_str),
+            Some("bench-user")
+        );
+        assert_eq!(
+            config.auth_pass.as_ref().map(AuthInfoValue::as_str),
+            Some("bench-pass")
+        );
     }
 
     #[test]
@@ -2245,21 +4421,34 @@ mod tests {
         let invalid = write_temp_segments("invalid", "missing-tab\n");
         let mut args = test_client_args();
         args.segments = Some(invalid.clone());
-        let err = ClientConfig::from_args(args).unwrap_err();
+        let err = TypedClientConfig::from_client_args(args).unwrap_err();
         fs::remove_file(invalid).unwrap();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
 
         let empty = write_temp_segments("empty", "\n\n");
         let mut args = test_client_args();
         args.segments = Some(empty.clone());
-        let err = ClientConfig::from_args(args).unwrap_err();
+        let err = TypedClientConfig::from_client_args(args).unwrap_err();
         fs::remove_file(empty).unwrap();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
 
         let mut args = test_client_args();
         args.segments = Some(std::env::temp_dir().join("nntpbench-missing-segments"));
-        let err = ClientConfig::from_args(args).unwrap_err();
+        let err = TypedClientConfig::from_client_args(args).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn client_config_rejects_invalid_authinfo_values() {
+        let mut args = test_client_args();
+        args.auth_user = Some("bad\ruser".to_string());
+        let err = TypedClientConfig::from_client_args(args).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        let mut args = test_typed_client_args();
+        args.auth_pass = Some("bad\npass".to_string());
+        let err = TypedClientConfig::from_args(args).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]
@@ -2271,6 +4460,8 @@ mod tests {
         args.segments = Some(path.clone());
         args.requests = 10;
         args.transfer_bytes = 100;
+        args.auth_user = Some("session-user".to_string());
+        args.auth_pass = Some("session-pass".to_string());
         args.connections = 2;
         args.total_clients = 8;
         args.pipeline_depth = 3;
@@ -2280,9 +4471,9 @@ mod tests {
         args.socket_recv_buffer = 1024;
         args.socket_send_buffer = 2048;
 
-        let config = ClientConfig::from_args(args).unwrap();
+        let config = TypedClientConfig::from_client_args(args).unwrap();
         fs::remove_file(path).unwrap();
-        let session = ClientSession::new(&config, 3, 55, 7);
+        let session = TypedClientSession::new(&config, 3, 55, 7);
 
         assert_eq!(session.connect.port(), 1301);
         assert_eq!(session.client_index, 3);
@@ -2293,11 +4484,56 @@ mod tests {
         assert_eq!(session.pipeline_depth, 3);
         assert_eq!(session.command_mix, ClientCommandMix::Article);
         assert_eq!(session.read_buffer_bytes, 64);
-        assert!(session.command_buffer_bytes >= b"ARTICLE <two@test>\r\n".len() * 3);
         assert!(!session.nodelay);
         assert_eq!(session.socket_recv_buffer, 1024);
         assert_eq!(session.socket_send_buffer, 2048);
         assert!(session.segments.is_some());
+        assert_eq!(
+            session.auth_user.as_ref().map(AuthInfoValue::as_str),
+            Some("session-user")
+        );
+        assert_eq!(
+            session.auth_pass.as_ref().map(AuthInfoValue::as_str),
+            Some("session-pass")
+        );
+    }
+
+    #[test]
+    fn typed_client_config_from_args_clamps_and_copies_fields() {
+        let mut args = test_typed_client_args();
+        args.requests = 17;
+        args.transfer_bytes = 8192;
+        args.duration_secs = 3;
+        args.connections = 0;
+        args.client_offset = 4;
+        args.total_clients = 0;
+        args.pipeline_depth = 0;
+        args.command_mix = ClientCommandMix::Body;
+        args.start_id = 99;
+        args.read_buffer_bytes = 1;
+        args.nodelay = false;
+        args.socket_recv_buffer = 4096;
+        args.socket_send_buffer = 8192;
+        args.csv = true;
+        args.stats_interval_secs = 2;
+
+        let config = TypedClientConfig::from_args(args).unwrap();
+
+        assert_eq!(config.requests, 17);
+        assert_eq!(config.transfer_bytes, 8192);
+        assert_eq!(config.duration, Duration::from_secs(3));
+        assert_eq!(config.connections, 1);
+        assert_eq!(config.client_offset, 4);
+        assert_eq!(config.total_clients, 1);
+        assert_eq!(config.pipeline_depth, 1);
+        assert_eq!(config.command_mix, ClientCommandMix::Body);
+        assert_eq!(config.start_id, 99);
+        assert_eq!(config.read_buffer_bytes, terminator::TERMINATOR_TAIL_SIZE);
+        assert!(!config.nodelay);
+        assert_eq!(config.socket_recv_buffer, 4096);
+        assert_eq!(config.socket_send_buffer, 8192);
+        assert!(config.csv);
+        assert_eq!(config.stats_interval, Duration::from_secs(2));
     }
 
     #[test]
@@ -2320,11 +4556,83 @@ mod tests {
         let segments = read_segments(&path).unwrap();
         fs::remove_file(path).unwrap();
 
-        assert_eq!(normalize_msgid("bare@test"), b"<bare@test>");
-        assert_eq!(normalize_msgid("<wrapped@test>"), b"<wrapped@test>");
-        assert_eq!(segments.max_id_len, b"<wrapped@test>".len());
-        assert_eq!(segment_for_request(&segments, 0, 2, 0), b"<bare@test>");
-        assert_eq!(segment_for_request(&segments, 1, 2, 0), b"<wrapped@test>");
+        assert_eq!(
+            segment_for_request(&segments, 0, 2, 0).as_str(),
+            "<bare@test>"
+        );
+        assert_eq!(
+            segment_for_request(&segments, 1, 2, 0).as_str(),
+            "<wrapped@test>"
+        );
+    }
+
+    #[test]
+    fn typed_request_for_command_prefers_numeric_refs_without_segments() {
+        let article =
+            typed_request_for_command(42, 0, ClientCommandMix::Article, None, 0, 1).unwrap();
+        let body = typed_request_for_command(7, 0, ClientCommandMix::Body, None, 0, 1).unwrap();
+        let alternate_article =
+            typed_request_for_command(1, 0, ClientCommandMix::Alternate, None, 0, 1).unwrap();
+        let alternate_body =
+            typed_request_for_command(2, 0, ClientCommandMix::Alternate, None, 0, 1).unwrap();
+
+        assert_eq!(article.kind(), RequestKind::Article);
+        assert_eq!(article.article_ref(), Some(&ArticleRef::Number(42)));
+        assert!(article.message_id().is_none());
+        assert_eq!(body.kind(), RequestKind::Body);
+        assert_eq!(body.article_ref(), Some(&ArticleRef::Number(7)));
+        assert!(body.message_id().is_none());
+        assert_eq!(alternate_article.kind(), RequestKind::Article);
+        assert_eq!(
+            alternate_article.article_ref(),
+            Some(&ArticleRef::Number(1))
+        );
+        assert!(alternate_article.message_id().is_none());
+        assert_eq!(alternate_body.kind(), RequestKind::Body);
+        assert_eq!(alternate_body.article_ref(), Some(&ArticleRef::Number(2)));
+        assert!(alternate_body.message_id().is_none());
+    }
+
+    #[test]
+    fn typed_request_for_command_keeps_message_ids_for_segments_and_zero_id() {
+        let path = write_temp_segments("typed-request", "1\tsegment@test\n2\tbody@test\n");
+        let segments = read_segments(&path).unwrap();
+        fs::remove_file(path).unwrap();
+
+        let segmented =
+            typed_request_for_command(11, 0, ClientCommandMix::Article, Some(&segments), 0, 1)
+                .unwrap();
+        let segmented_body =
+            typed_request_for_command(12, 1, ClientCommandMix::Body, Some(&segments), 0, 1)
+                .unwrap();
+        let zero_article =
+            typed_request_for_command(0, 0, ClientCommandMix::Article, None, 0, 1).unwrap();
+        let zero_body =
+            typed_request_for_command(0, 0, ClientCommandMix::Body, None, 0, 1).unwrap();
+        let zero_alternate =
+            typed_request_for_command(0, 0, ClientCommandMix::Alternate, None, 0, 1).unwrap();
+
+        assert_eq!(
+            segmented.message_id().map(MessageId::as_str),
+            Some("<segment@test>")
+        );
+        assert_eq!(
+            segmented_body.message_id().map(MessageId::as_str),
+            Some("<body@test>")
+        );
+        assert_eq!(
+            zero_article.message_id().map(MessageId::as_str),
+            Some("<bench.0@nntpbench.local>")
+        );
+        assert_eq!(
+            zero_body.message_id().map(MessageId::as_str),
+            Some("<bench.0@nntpbench.local>")
+        );
+        assert_eq!(zero_alternate.kind(), RequestKind::Body);
+        assert_eq!(
+            zero_alternate.message_id().map(MessageId::as_str),
+            Some("<bench.0@nntpbench.local>")
+        );
     }
 
     #[test]
@@ -2333,16 +4641,6 @@ mod tests {
         let start = process_cpu_ticks();
         assert!(cpu_seconds_since(start) >= 0.0);
         assert!(process_rss_kib() > 0);
-    }
-
-    #[test]
-    fn write_u64_ascii_handles_zero_and_large_values() {
-        let mut output = [0_u8; 20];
-        let written = write_u64_ascii(&mut output, 0);
-        assert_eq!(&output[..written], b"0");
-
-        let written = write_u64_ascii(&mut output, u64::MAX);
-        assert_eq!(&output[..written], b"18446744073709551615");
     }
 
     #[tokio::test]
@@ -2363,20 +4661,6 @@ mod tests {
     #[tokio::test]
     async fn bind_listener_selects_ipv6_domain() {
         let _ = bind_listener("[::1]:0".parse().unwrap(), 16, false);
-    }
-
-    #[tokio::test]
-    async fn optimize_client_socket_accepts_explicit_buffers() {
-        let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
-        let addr = listener.local_addr().unwrap();
-        let client = TcpStream::connect(addr);
-        let accepted = listener.accept();
-        let (client, accepted) = tokio::join!(client, accepted);
-        let client = client.unwrap();
-        let (_server, _) = accepted.unwrap();
-
-        optimize_client_socket(&client, true, 4096, 4096).unwrap();
-        optimize_client_socket(&client, false, 0, 0).unwrap();
     }
 
     #[test]
@@ -2423,8 +4707,7 @@ mod tests {
             drop(stream);
         });
         let mut client = TcpStream::connect(addr).await.unwrap();
-        let mut buffer = [0_u8; 16];
-        let err = read_greeting(&mut client, &mut buffer).await.unwrap_err();
+        let err = read_greeting(&mut client).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
         server.await.unwrap();
 
@@ -2432,13 +4715,55 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            stream.write_all(b"201 no newline yet").await.unwrap();
+            let greeting = vec![b'x'; protocol::MAX_INITIAL_RESPONSE_LINE_BYTES + 1];
+            stream.write_all(&greeting).await.unwrap();
         });
         let mut client = TcpStream::connect(addr).await.unwrap();
-        let mut buffer = [0_u8; 8];
-        let err = read_greeting(&mut client, &mut buffer).await.unwrap_err();
+        let err = read_greeting(&mut client).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_greeting_accepts_exact_rfc_initial_line_limit() {
+        // RFC 3977 section 3.1 permits a response initial line of exactly
+        // 512 octets, including the terminating CRLF.
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut greeting = Vec::from(b"201 ".as_slice());
+            greeting.resize(protocol::MAX_INITIAL_RESPONSE_LINE_BYTES - 2, b'x');
+            greeting.extend_from_slice(b"\r\n");
+            stream.write_all(&greeting).await.unwrap();
+        });
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        read_greeting(&mut client).await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_greeting_rejects_malformed_crlf_recovery() {
+        // RFC 3977 section 3.1 defines response lines as CRLF-terminated. A greeting
+        // with bare LF, bare CR, or malformed CR before a later CRLF must fail at the
+        // malformed byte instead of resynchronizing:
+        // https://www.rfc-editor.org/rfc/rfc3977#section-3.1
+        for greeting in [
+            b"201 nntpbench mock server ready\n".as_slice(),
+            b"201 nntpbench mock server ready\r later\r\n".as_slice(),
+            b"201 nntpbench mock server ready\r\r\n".as_slice(),
+        ] {
+            let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                stream.write_all(greeting).await.unwrap();
+            });
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            let err = read_greeting(&mut client).await.unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{greeting:?}");
+            server.await.unwrap();
+        }
     }
 
     #[tokio::test]
@@ -2457,8 +4782,7 @@ mod tests {
                 assert_ne!(read, 0);
                 pending.extend_from_slice(&scratch[..read]);
 
-                while let Some(line_end) = memchr::memchr(b'\n', &pending) {
-                    let line_len = line_end + 1;
+                while let Some(line_len) = find_crlf_line_end(&pending, 0) {
                     let response: &[u8] = if pending[..line_len].starts_with(b"ARTICLE ") {
                         b"220 1 article follows\r\nbody\r\n.\r\n"
                     } else {
@@ -2477,8 +4801,8 @@ mod tests {
         args.pipeline_depth = 2;
         args.command_mix = ClientCommandMix::Alternate;
         args.read_buffer_bytes = 64;
-        let config = ClientConfig::from_args(args).unwrap();
-        let session = ClientSession::new(&config, 0, 1, 2);
+        let config = TypedClientConfig::from_client_args(args).unwrap();
+        let session = TypedClientSession::new(&config, 0, 1, 2);
         let stats = Arc::new(Stats::new());
         let stop = Arc::new(AtomicBool::new(false));
 
@@ -2494,6 +4818,639 @@ mod tests {
         assert_eq!(snapshot.pipeline_batches, 1);
         assert!(snapshot.bytes_sent > 0);
         assert!(!stop.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn direct_client_server_request_limited_roundtrips_match_generated_e2e_shapes() {
+        let mut runner = proptest::test_runner::TestRunner::new(direct_e2e_proptest_config(16));
+        let strategy = (
+            128_usize..=4096,
+            256_usize..=8192,
+            1_usize..=8,
+            1_u64..=16,
+            1_usize..=8,
+            client_command_mix_strategy(),
+            0_u64..=4,
+            64_usize..=256,
+        );
+
+        runner
+            .run(
+                &strategy,
+                |(
+                    body_bytes,
+                    article_bytes,
+                    max_pipeline_depth,
+                    requests,
+                    pipeline_depth,
+                    mix,
+                    start_id,
+                    read_buffer_bytes,
+                )| {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    let (client, server) = runtime
+                        .block_on(run_direct_client_server_case(
+                            body_bytes,
+                            article_bytes,
+                            max_pipeline_depth,
+                            requests,
+                            0,
+                            pipeline_depth,
+                            mix,
+                            start_id,
+                            read_buffer_bytes,
+                        ))
+                        .unwrap();
+
+                    let (expected_articles, expected_bodies) =
+                        expected_client_command_counts(start_id, requests, mix);
+                    prop_assert_eq!(client.accepted_connections, 1);
+                    prop_assert_eq!(client.active_connections, 0);
+                    prop_assert_eq!(client.commands, requests);
+                    prop_assert_eq!(client.article_requests, expected_articles);
+                    prop_assert_eq!(client.body_requests, expected_bodies);
+                    prop_assert_eq!(server.commands, requests);
+                    prop_assert_eq!(server.article_requests, expected_articles);
+                    prop_assert_eq!(server.body_requests, expected_bodies);
+                    prop_assert_eq!(server.errors, 0);
+                    prop_assert!(client.bytes_sent > 0);
+                    prop_assert!(server.bytes_sent >= client.bytes_sent);
+                    if requests > 1 && pipeline_depth > 1 {
+                        prop_assert!(client.pipeline_batches > 0);
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn direct_client_server_transfer_limited_roundtrips_cross_generated_byte_targets() {
+        let mut runner = proptest::test_runner::TestRunner::new(direct_e2e_proptest_config(12));
+        let strategy = (
+            128_usize..=4096,
+            256_usize..=8192,
+            1_usize..=8,
+            1_u64..=16_384,
+            1_usize..=6,
+            client_command_mix_strategy(),
+            0_u64..=4,
+            64_usize..=256,
+        );
+
+        runner
+            .run(
+                &strategy,
+                |(
+                    body_bytes,
+                    article_bytes,
+                    max_pipeline_depth,
+                    transfer_bytes,
+                    pipeline_depth,
+                    mix,
+                    start_id,
+                    read_buffer_bytes,
+                )| {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    let (client, server) = runtime
+                        .block_on(run_direct_client_server_case(
+                            body_bytes,
+                            article_bytes,
+                            max_pipeline_depth,
+                            0,
+                            transfer_bytes,
+                            pipeline_depth,
+                            mix,
+                            start_id,
+                            read_buffer_bytes,
+                        ))
+                        .unwrap();
+
+                    prop_assert_eq!(client.accepted_connections, 1);
+                    prop_assert_eq!(client.active_connections, 0);
+                    prop_assert!(client.commands >= 1);
+                    prop_assert!(client.bytes_sent >= transfer_bytes);
+                    prop_assert_eq!(server.commands, client.commands);
+                    prop_assert_eq!(server.article_requests, client.article_requests);
+                    prop_assert_eq!(server.body_requests, client.body_requests);
+                    prop_assert_eq!(server.errors, 0);
+                    prop_assert!(server.bytes_sent >= client.bytes_sent);
+                    Ok(())
+                },
+            )
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn typed_client_session_runs_pipelined_requests_against_loopback_server() {
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"201 loopback ready\r\n").await.unwrap();
+
+            let mut scratch = [0_u8; 128];
+            let mut pending = Vec::new();
+            while pending.iter().filter(|byte| **byte == b'\n').count() < 2 {
+                let read = stream.read(&mut scratch).await.unwrap();
+                assert_ne!(read, 0);
+                pending.extend_from_slice(&scratch[..read]);
+            }
+
+            assert_eq!(&pending[..], b"ARTICLE 1\r\nBODY 2\r\n");
+
+            stream
+                .write_all(
+                    b"220 1 <bench.1@nntpbench.local> article follows\r\nSubject: Bench\r\n\r\none\r\n.\r\n",
+                )
+                .await
+                .unwrap();
+            stream
+                .write_all(b"222 1 <bench.2@nntpbench.local> body follows\r\ntwo\r\n.\r\n")
+                .await
+                .unwrap();
+        });
+
+        let mut args = test_typed_client_args();
+        args.connect = addr;
+        args.requests = 2;
+        args.pipeline_depth = 2;
+        args.command_mix = ClientCommandMix::Alternate;
+        args.read_buffer_bytes = 64;
+        let config = TypedClientConfig::from_args(args).unwrap();
+        let session = TypedClientSession::new(&config, 0, 1, 2);
+        let stats = Arc::new(Stats::new());
+        let stop = Arc::new(AtomicBool::new(false));
+
+        session.run(stats.clone(), stop.clone()).await.unwrap();
+        server.await.unwrap();
+
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.accepted_connections, 1);
+        assert_eq!(snapshot.active_connections, 0);
+        assert_eq!(snapshot.commands, 2);
+        assert_eq!(snapshot.article_requests, 1);
+        assert_eq!(snapshot.body_requests, 1);
+        assert_eq!(snapshot.pipeline_batches, 1);
+        assert!(snapshot.bytes_sent > 0);
+        assert!(!stop.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn typed_client_session_sends_authinfo_before_workload_requests() {
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"201 loopback ready\r\n").await.unwrap();
+
+            let mut scratch = [0_u8; 128];
+            let mut pending = Vec::new();
+            while pending.iter().filter(|byte| **byte == b'\n').count() < 1 {
+                let read = stream.read(&mut scratch).await.unwrap();
+                assert_ne!(read, 0);
+                pending.extend_from_slice(&scratch[..read]);
+            }
+            assert_eq!(&pending[..], b"AUTHINFO USER bench-user\r\n");
+            pending.clear();
+            stream
+                .write_all(b"381 authentication information required\r\n")
+                .await
+                .unwrap();
+
+            while pending.iter().filter(|byte| **byte == b'\n').count() < 1 {
+                let read = stream.read(&mut scratch).await.unwrap();
+                assert_ne!(read, 0);
+                pending.extend_from_slice(&scratch[..read]);
+            }
+            assert_eq!(&pending[..], b"AUTHINFO PASS bench-pass\r\n");
+            pending.clear();
+            stream
+                .write_all(b"281 authentication accepted\r\n")
+                .await
+                .unwrap();
+
+            while pending.iter().filter(|byte| **byte == b'\n').count() < 2 {
+                let read = stream.read(&mut scratch).await.unwrap();
+                assert_ne!(read, 0);
+                pending.extend_from_slice(&scratch[..read]);
+            }
+            assert_eq!(&pending[..], b"ARTICLE 1\r\nBODY 2\r\n");
+
+            stream
+                .write_all(
+                    b"220 1 <bench.1@nntpbench.local> article follows\r\nSubject: Bench\r\n\r\none\r\n.\r\n",
+                )
+                .await
+                .unwrap();
+            stream
+                .write_all(b"222 1 <bench.2@nntpbench.local> body follows\r\ntwo\r\n.\r\n")
+                .await
+                .unwrap();
+        });
+
+        let mut args = test_client_args();
+        args.connect = addr;
+        args.auth_user = Some("bench-user".to_string());
+        args.auth_pass = Some("bench-pass".to_string());
+        args.requests = 2;
+        args.pipeline_depth = 2;
+        args.command_mix = ClientCommandMix::Alternate;
+        args.read_buffer_bytes = 64;
+        let config = TypedClientConfig::from_client_args(args).unwrap();
+        let session = TypedClientSession::new(&config, 0, 1, 2);
+        let stats = Arc::new(Stats::new());
+        let stop = Arc::new(AtomicBool::new(false));
+
+        session.run(stats.clone(), stop.clone()).await.unwrap();
+        server.await.unwrap();
+
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.commands, 2);
+        assert_eq!(snapshot.article_requests, 1);
+        assert_eq!(snapshot.body_requests, 1);
+        assert_eq!(snapshot.pipeline_batches, 1);
+    }
+
+    #[tokio::test]
+    async fn typed_client_session_skips_authinfo_pass_after_user_success() {
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"201 loopback ready\r\n").await.unwrap();
+            let mut reader = BufReader::new(stream);
+
+            let mut line = Vec::new();
+            reader.read_until(b'\n', &mut line).await.unwrap();
+            assert_eq!(line, b"AUTHINFO USER bench-user\r\n");
+            reader
+                .get_mut()
+                .write_all(b"281 authentication accepted\r\n")
+                .await
+                .unwrap();
+
+            line.clear();
+            reader.read_until(b'\n', &mut line).await.unwrap();
+            assert_eq!(line, b"ARTICLE 1\r\n");
+            reader
+                .get_mut()
+                .write_all(
+                    b"220 1 <bench.1@nntpbench.local> article follows\r\nSubject: Bench\r\n\r\none\r\n.\r\n",
+                )
+                .await
+                .unwrap();
+        });
+
+        let mut args = test_client_args();
+        args.connect = addr;
+        args.auth_user = Some("bench-user".to_string());
+        args.auth_pass = Some("bench-pass".to_string());
+        args.requests = 1;
+        args.pipeline_depth = 1;
+        args.command_mix = ClientCommandMix::Article;
+        let config = TypedClientConfig::from_client_args(args).unwrap();
+        let session = TypedClientSession::new(&config, 0, 1, 1);
+        let stats = Arc::new(Stats::new());
+        let stop = Arc::new(AtomicBool::new(false));
+
+        session.run(stats, stop).await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn download_authentication_skips_authinfo_pass_after_user_success() {
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+
+            let mut line = Vec::new();
+            reader.read_until(b'\n', &mut line).await.unwrap();
+            assert_eq!(line, b"AUTHINFO USER bench-user\r\n");
+            reader
+                .get_mut()
+                .write_all(b"281 authentication accepted\r\n")
+                .await
+                .unwrap();
+
+            line.clear();
+            reader.read_until(b'\n', &mut line).await.unwrap();
+            assert_eq!(line, b"ARTICLE 1\r\n");
+        });
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let mut response_reader =
+            crate::typed_client::DrainedResponseReader::new(CLIENT_READER_CAPACITY);
+        authenticate_client_stream(
+            &mut stream,
+            &mut response_reader,
+            Some(AuthInfoValue::from_borrowed("bench-user").unwrap()),
+            Some(AuthInfoValue::from_borrowed("bench-pass").unwrap()),
+        )
+        .await
+        .unwrap();
+        stream.write_all(b"ARTICLE 1\r\n").await.unwrap();
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn client_article_id_mode_writes_220_responses_and_skips_430() {
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let response =
+            b"220 1 <article.1@test> article follows\r\nSubject: one\r\n\r\nbody\r\n.\r\n";
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"201 loopback ready\r\n").await.unwrap();
+
+            let mut scratch = [0_u8; 128];
+            let mut pending = Vec::new();
+            while pending.iter().filter(|byte| **byte == b'\n').count() < 2 {
+                let read = stream.read(&mut scratch).await.unwrap();
+                assert_ne!(read, 0);
+                pending.extend_from_slice(&scratch[..read]);
+            }
+            assert_eq!(&pending[..], b"ARTICLE 1\r\nARTICLE 2\r\n");
+            stream.write_all(response).await.unwrap();
+            stream.write_all(ARTICLE_NOT_FOUND_RESPONSE).await.unwrap();
+        });
+
+        let id_file = write_temp_segments("article-ids", "1\n2\n");
+        let output_dir = unique_temp_dir("article-output");
+        let verify_dir = unique_temp_dir("article-verify");
+        let verify_path = article_id_tree_path(&verify_dir, 1);
+        fs::create_dir_all(verify_path.parent().unwrap()).unwrap();
+        fs::write(&verify_path, response).unwrap();
+        let mut args = test_client_args();
+        args.connect = addr;
+        args.article_ids = Some(id_file.clone());
+        args.article_output_dir = Some(output_dir.clone());
+        args.article_verify_dir = Some(verify_dir.clone());
+        args.connections = 1;
+        args.pipeline_depth = 2;
+        args.stats_interval_secs = 0;
+
+        run_client(args).await.unwrap();
+        server.await.unwrap();
+
+        let stored = fs::read(article_id_tree_path(&output_dir, 1)).unwrap();
+        assert_eq!(stored, response);
+        assert!(!article_id_tree_path(&output_dir, 2).exists());
+
+        fs::remove_file(id_file).unwrap();
+        fs::remove_dir_all(output_dir).unwrap();
+        fs::remove_dir_all(verify_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn client_article_id_mode_rejects_md5_mismatch_when_verify_file_exists() {
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let response =
+            b"220 1 <article.1@test> article follows\r\nSubject: one\r\n\r\nactual\r\n.\r\n";
+        let expected =
+            b"220 1 <article.1@test> article follows\r\nSubject: one\r\n\r\nexpected\r\n.\r\n";
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"201 loopback ready\r\n").await.unwrap();
+
+            let mut scratch = [0_u8; 128];
+            let mut pending = Vec::new();
+            while pending.iter().filter(|byte| **byte == b'\n').count() < 1 {
+                let read = stream.read(&mut scratch).await.unwrap();
+                assert_ne!(read, 0);
+                pending.extend_from_slice(&scratch[..read]);
+            }
+            assert_eq!(&pending[..], b"ARTICLE 1\r\n");
+            stream.write_all(response).await.unwrap();
+        });
+
+        let id_file = write_temp_segments("article-ids-md5", "1\n");
+        let output_dir = unique_temp_dir("article-output-md5");
+        let verify_dir = unique_temp_dir("article-verify-md5");
+        let verify_path = article_id_tree_path(&verify_dir, 1);
+        fs::create_dir_all(verify_path.parent().unwrap()).unwrap();
+        fs::write(&verify_path, expected).unwrap();
+
+        let mut args = test_client_args();
+        args.connect = addr;
+        args.article_ids = Some(id_file.clone());
+        args.article_output_dir = Some(output_dir.clone());
+        args.article_verify_dir = Some(verify_dir.clone());
+        args.connections = 1;
+        args.stats_interval_secs = 0;
+
+        let err = run_client(args).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("MD5 mismatch"));
+        assert!(!article_id_tree_path(&output_dir, 1).exists());
+        assert_eq!(
+            fs::read(article_id_tree_path(&output_dir.join("failed"), 1)).unwrap(),
+            response
+        );
+        server.await.unwrap();
+
+        fs::remove_file(id_file).unwrap();
+        fs::remove_dir_all(output_dir).unwrap();
+        fs::remove_dir_all(verify_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn client_article_id_file_accepts_message_ids() {
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let response =
+            b"220 1 <abc123@ngPost> article follows\r\nSubject: message id\r\n\r\nbody\r\n.\r\n";
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"201 loopback ready\r\n").await.unwrap();
+
+            let mut scratch = [0_u8; 128];
+            let mut pending = Vec::new();
+            while pending.iter().filter(|byte| **byte == b'\n').count() < 1 {
+                let read = stream.read(&mut scratch).await.unwrap();
+                assert_ne!(read, 0);
+                pending.extend_from_slice(&scratch[..read]);
+            }
+            assert_eq!(&pending[..], b"ARTICLE <abc123@ngPost>\r\n");
+            stream.write_all(response).await.unwrap();
+        });
+
+        let ids = write_temp_segments("message-ids", "abc123@ngPost\n");
+        let output_dir = unique_temp_dir("message-id-output");
+        let mut args = test_client_args();
+        args.connect = addr;
+        args.article_ids = Some(ids.clone());
+        args.article_output_dir = Some(output_dir.clone());
+        args.connections = 1;
+        args.stats_interval_secs = 0;
+
+        run_client(args).await.unwrap();
+        server.await.unwrap();
+
+        let message_id = MessageId::from_borrowed("<abc123@ngPost>").unwrap();
+        let stored = fs::read(message_id_tree_path(&output_dir, &message_id)).unwrap();
+        assert_eq!(stored, response);
+
+        fs::remove_file(ids).unwrap();
+        fs::remove_dir_all(output_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn typed_client_session_uses_segment_message_ids_on_wire() {
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"201 loopback ready\r\n").await.unwrap();
+
+            let mut scratch = [0_u8; 128];
+            let mut pending = Vec::new();
+            while pending.iter().filter(|byte| **byte == b'\n').count() < 2 {
+                let read = stream.read(&mut scratch).await.unwrap();
+                assert_ne!(read, 0);
+                pending.extend_from_slice(&scratch[..read]);
+            }
+
+            assert_eq!(
+                &pending[..],
+                b"ARTICLE <segment-1@test>\r\nBODY <segment-2@test>\r\n"
+            );
+
+            stream
+                .write_all(
+                    b"220 1 <segment-1@test> article follows\r\nSubject: Bench\r\n\r\none\r\n.\r\n",
+                )
+                .await
+                .unwrap();
+            stream
+                .write_all(b"222 1 <segment-2@test> body follows\r\ntwo\r\n.\r\n")
+                .await
+                .unwrap();
+        });
+
+        let path = write_temp_segments(
+            "typed-session-wire",
+            "1\tsegment-1@test\n2\tsegment-2@test\n",
+        );
+        let mut args = test_typed_client_args();
+        args.connect = addr;
+        args.requests = 2;
+        args.pipeline_depth = 2;
+        args.command_mix = ClientCommandMix::Alternate;
+        args.read_buffer_bytes = 64;
+        args.segments = Some(path.clone());
+        let config = TypedClientConfig::from_args(args).unwrap();
+        fs::remove_file(path).unwrap();
+        let session = TypedClientSession::new(&config, 0, 1, 2);
+        let stats = Arc::new(Stats::new());
+        let stop = Arc::new(AtomicBool::new(false));
+
+        session.run(stats.clone(), stop.clone()).await.unwrap();
+        server.await.unwrap();
+
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.commands, 2);
+        assert_eq!(snapshot.article_requests, 1);
+        assert_eq!(snapshot.body_requests, 1);
+        assert_eq!(snapshot.pipeline_batches, 1);
+    }
+
+    #[tokio::test]
+    async fn typed_client_session_zero_start_id_falls_back_per_request() {
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"201 loopback ready\r\n").await.unwrap();
+
+            let mut scratch = [0_u8; 128];
+            let mut pending = Vec::new();
+            while pending.iter().filter(|byte| **byte == b'\n').count() < 2 {
+                let read = stream.read(&mut scratch).await.unwrap();
+                assert_ne!(read, 0);
+                pending.extend_from_slice(&scratch[..read]);
+            }
+
+            assert_eq!(
+                &pending[..],
+                b"BODY <bench.0@nntpbench.local>\r\nARTICLE 1\r\n"
+            );
+
+            stream
+                .write_all(b"222 0 <bench.0@nntpbench.local> body follows\r\nzero\r\n.\r\n")
+                .await
+                .unwrap();
+            stream
+                .write_all(
+                    b"220 1 <bench.1@nntpbench.local> article follows\r\nSubject: Bench\r\n\r\none\r\n.\r\n",
+                )
+                .await
+                .unwrap();
+        });
+
+        let mut args = test_typed_client_args();
+        args.connect = addr;
+        args.requests = 2;
+        args.pipeline_depth = 2;
+        args.command_mix = ClientCommandMix::Alternate;
+        args.start_id = 0;
+        args.read_buffer_bytes = 64;
+        let config = TypedClientConfig::from_args(args).unwrap();
+        let session = TypedClientSession::new(&config, 0, 0, 2);
+        let stats = Arc::new(Stats::new());
+        let stop = Arc::new(AtomicBool::new(false));
+
+        session.run(stats.clone(), stop.clone()).await.unwrap();
+        server.await.unwrap();
+
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.commands, 2);
+        assert_eq!(snapshot.article_requests, 1);
+        assert_eq!(snapshot.body_requests, 1);
+        assert_eq!(snapshot.pipeline_batches, 1);
+    }
+
+    #[test]
+    fn typed_request_for_command_uses_message_id_after_numeric_article_range() {
+        let request = typed_request_for_command(
+            i32::MAX as u64 + 1,
+            0,
+            ClientCommandMix::Article,
+            None,
+            0,
+            1,
+        )
+        .unwrap();
+
+        match request {
+            Request::Article { article_ref } => assert_eq!(
+                article_ref.message_id().map(MessageId::as_str),
+                Some("<bench.2147483648@nntpbench.local>")
+            ),
+            other => panic!("expected message-id ARTICLE fallback, got {other:?}"),
+        }
+
+        let request =
+            typed_request_for_command(i32::MAX as u64 + 2, 0, ClientCommandMix::Body, None, 0, 1)
+                .unwrap();
+
+        match request {
+            Request::Body { article_ref } => assert_eq!(
+                article_ref.message_id().map(MessageId::as_str),
+                Some("<bench.2147483649@nntpbench.local>")
+            ),
+            other => panic!("expected message-id BODY fallback, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -2543,8 +5500,8 @@ mod tests {
         args.pipeline_depth = 2;
         args.command_mix = ClientCommandMix::Alternate;
         args.read_buffer_bytes = 64;
-        let config = ClientConfig::from_args(args).unwrap();
-        let session = ClientSession::new(&config, 0, 1, 3);
+        let config = TypedClientConfig::from_client_args(args).unwrap();
+        let session = TypedClientSession::new(&config, 0, 1, 3);
         let stats = Arc::new(Stats::new());
         let stop = Arc::new(AtomicBool::new(false));
 
@@ -2567,8 +5524,8 @@ mod tests {
         args.connect = addr;
         args.requests = 1;
         args.pipeline_depth = 1;
-        let config = ClientConfig::from_args(args).unwrap();
-        let session = ClientSession::new(&config, 0, 1, 1);
+        let config = TypedClientConfig::from_client_args(args).unwrap();
+        let session = TypedClientSession::new(&config, 0, 1, 1);
         let stats = Arc::new(Stats::new());
         let stop = Arc::new(AtomicBool::new(false));
 
@@ -2602,8 +5559,8 @@ mod tests {
         args.pipeline_depth = 1;
         args.command_mix = ClientCommandMix::Body;
         args.read_buffer_bytes = 64;
-        let config = ClientConfig::from_args(args).unwrap();
-        let session = ClientSession::new(&config, 0, 1, 0);
+        let config = TypedClientConfig::from_client_args(args).unwrap();
+        let session = TypedClientSession::new(&config, 0, 1, 0);
         let stats = Arc::new(Stats::new());
         let stop = Arc::new(AtomicBool::new(false));
 
@@ -2631,8 +5588,8 @@ mod tests {
         args.requests = 1;
         args.pipeline_depth = 1;
         args.read_buffer_bytes = 64;
-        let config = ClientConfig::from_args(args).unwrap();
-        let session = ClientSession::new(&config, 0, 1, 1);
+        let config = TypedClientConfig::from_client_args(args).unwrap();
+        let session = TypedClientSession::new(&config, 0, 1, 1);
         let stats = Arc::new(Stats::new());
         let stop = Arc::new(AtomicBool::new(false));
 
@@ -2663,8 +5620,8 @@ mod tests {
         args.requests = 1;
         args.pipeline_depth = 1;
         args.read_buffer_bytes = 64;
-        let config = ClientConfig::from_args(args).unwrap();
-        let session = ClientSession::new(&config, 0, 1, 1);
+        let config = TypedClientConfig::from_client_args(args).unwrap();
+        let session = TypedClientSession::new(&config, 0, 1, 1);
         let stats = Arc::new(Stats::new());
         let stop = Arc::new(AtomicBool::new(false));
 
@@ -2689,8 +5646,8 @@ mod tests {
         args.requests = 1;
         args.pipeline_depth = 1;
         args.read_buffer_bytes = 64;
-        let config = ClientConfig::from_args(args).unwrap();
-        let session = ClientSession::new(&config, 0, 1, 1);
+        let config = TypedClientConfig::from_client_args(args).unwrap();
+        let session = TypedClientSession::new(&config, 0, 1, 1);
         let stats = Arc::new(Stats::new());
         let stop = Arc::new(AtomicBool::new(false));
 
@@ -2718,8 +5675,8 @@ mod tests {
         args.requests = 1;
         args.pipeline_depth = 1;
         args.read_buffer_bytes = 64;
-        let config = ClientConfig::from_args(args).unwrap();
-        let session = ClientSession::new(&config, 0, 1, 1);
+        let config = TypedClientConfig::from_client_args(args).unwrap();
+        let session = TypedClientSession::new(&config, 0, 1, 1);
         let stats = Arc::new(Stats::new());
         let stop = Arc::new(AtomicBool::new(false));
 
@@ -2731,6 +5688,993 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fetch_typed_response_uses_typed_connection_path() {
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"201 fetch ready\r\n").await.unwrap();
+
+            let mut request = [0_u8; 128];
+            let read = stream.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"BODY <typed-fetch@test>\r\n");
+
+            stream
+                .write_all(b"222 1 <typed-fetch@test> body follows\r\nbody payload\r\n.\r\n")
+                .await
+                .unwrap();
+        });
+
+        let mut args = test_typed_fetch_args();
+        args.connect = addr;
+        args.request = TypedRequestKind::Body;
+        args.message_id = Some("typed-fetch@test".to_string());
+        args.read_buffer_bytes = 64;
+
+        let response = fetch_typed_response(&args).await.unwrap();
+        let article = response.parse_article().unwrap();
+
+        assert_eq!(response.kind(), RequestKind::Body);
+        assert_eq!(response.status().as_u16(), 222);
+        assert_eq!(article.message_id.as_str(), "<typed-fetch@test>");
+        assert_eq!(article.body, Some(&b"body payload\r\n"[..]));
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fetch_typed_response_supports_head_and_stat_requests() {
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut head_stream, _) = listener.accept().await.unwrap();
+            head_stream.write_all(b"201 fetch ready\r\n").await.unwrap();
+
+            let mut first = [0_u8; 128];
+            let read = head_stream.read(&mut first).await.unwrap();
+            assert_eq!(&first[..read], b"HEAD <typed-head@test>\r\n");
+            head_stream
+                .write_all(b"221 1 <typed-head@test> article retrieved\r\nSubject: Head\r\n.\r\n")
+                .await
+                .unwrap();
+
+            let (mut stat_stream, _) = listener.accept().await.unwrap();
+            stat_stream.write_all(b"201 fetch ready\r\n").await.unwrap();
+
+            let mut second = [0_u8; 128];
+            let read = stat_stream.read(&mut second).await.unwrap();
+            assert_eq!(&second[..read], b"STAT <typed-stat@test>\r\n");
+            stat_stream
+                .write_all(b"223 1 <typed-stat@test> article retrieved\r\n")
+                .await
+                .unwrap();
+        });
+
+        let mut head_args = test_typed_fetch_args();
+        head_args.connect = addr;
+        head_args.request = TypedRequestKind::Head;
+        head_args.message_id = Some("typed-head@test".to_string());
+        let head = fetch_typed_response(&head_args).await.unwrap();
+        assert_eq!(head.kind(), RequestKind::Head);
+        assert_eq!(head.status().as_u16(), 221);
+
+        let mut stat_args = test_typed_fetch_args();
+        stat_args.connect = addr;
+        stat_args.request = TypedRequestKind::Stat;
+        stat_args.message_id = Some("typed-stat@test".to_string());
+        let stat = fetch_typed_response(&stat_args).await.unwrap();
+        assert_eq!(stat.kind(), RequestKind::Stat);
+        assert_eq!(stat.status().as_u16(), 223);
+        assert_eq!(
+            stat.parse_article().unwrap().message_id.as_str(),
+            "<typed-stat@test>"
+        );
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn serve_session_supports_head_and_stat_requests() {
+        let config = test_config();
+        let (output, stats) = run_session_with_input(
+            config,
+            b"HEAD <typed-head@test>\r\nSTAT <typed-stat@test>\r\n",
+        )
+        .await;
+
+        assert_eq!(output, [GREETING, HEAD_RESPONSE, STAT_RESPONSE].concat());
+
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.commands, 2);
+        assert_eq!(snapshot.article_requests, 2);
+        assert_eq!(snapshot.body_requests, 0);
+    }
+
+    #[tokio::test]
+    async fn serve_session_supports_list_subcommand_requests() {
+        let config = test_config();
+        let (output, stats) = run_session_with_input(
+            config,
+            b"LIST ACTIVE\r\nLIST ACTIVE.TIMES\r\nLIST ACTIVE.TIMES comp.lang.*\r\nLIST NEWSGROUPS\r\nLIST NEWSGROUPS comp.lang.*\r\nLIST OVERVIEW.FMT\r\nLIST HEADERS\r\nLIST DISTRIB.PATS\r\n",
+        )
+        .await;
+
+        assert_eq!(
+            output,
+            [
+                GREETING,
+                LIST_RESPONSE,
+                LIST_ACTIVE_TIMES_RESPONSE,
+                LIST_ACTIVE_TIMES_RESPONSE,
+                LIST_NEWSGROUPS_RESPONSE,
+                LIST_NEWSGROUPS_RESPONSE,
+                LIST_OVERVIEW_FMT_RESPONSE,
+                LIST_HEADERS_RESPONSE,
+                LIST_DISTRIB_PATS_RESPONSE,
+            ]
+            .concat()
+        );
+
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.commands, 8);
+        assert_eq!(snapshot.article_requests, 0);
+        assert_eq!(snapshot.body_requests, 0);
+    }
+
+    #[tokio::test]
+    async fn fetch_typed_response_rejects_invalid_message_id() {
+        let mut args = test_typed_fetch_args();
+        args.message_id = Some("<bad id>".to_string());
+
+        let err = fetch_typed_response(&args).await.unwrap_err();
+        assert!(matches!(err, TypedClientError::InvalidMessageId));
+    }
+
+    #[tokio::test]
+    async fn fetch_typed_response_clamps_pipeline_depth_for_typed_engine() {
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"201 fetch ready\r\n").await.unwrap();
+
+            let mut request = [0_u8; 128];
+            let read = stream.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"ARTICLE <clamp@test>\r\n");
+
+            stream
+                .write_all(
+                    b"220 1 <clamp@test> article follows\r\nSubject: Clamp\r\n\r\nbody\r\n.\r\n",
+                )
+                .await
+                .unwrap();
+        });
+
+        let mut args = test_typed_fetch_args();
+        args.connect = addr;
+        args.message_id = Some("clamp@test".to_string());
+        args.pipeline_depth = 0;
+
+        let response = fetch_typed_response(&args).await.unwrap();
+        assert_eq!(response.status().as_u16(), 220);
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fetch_typed_response_supports_general_request_kinds_without_message_id() {
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            first.write_all(b"201 fetch ready\r\n").await.unwrap();
+
+            let mut request = [0_u8; 128];
+            let read = first.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"LIST\r\n");
+            first.write_all(LIST_RESPONSE).await.unwrap();
+
+            let (mut second, _) = listener.accept().await.unwrap();
+            second.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = second.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"HELP\r\n");
+            second.write_all(HELP_RESPONSE).await.unwrap();
+
+            let (mut third, _) = listener.accept().await.unwrap();
+            third.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = third.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"CAPABILITIES\r\n");
+            third
+                .write_all(b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n")
+                .await
+                .unwrap();
+
+            let (mut fourth, _) = listener.accept().await.unwrap();
+            fourth.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = fourth.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"DATE\r\n");
+            fourth.write_all(b"111 20260515120000\r\n").await.unwrap();
+
+            let (mut fifth, _) = listener.accept().await.unwrap();
+            fifth.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = fifth.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"MODE READER\r\n");
+            fifth
+                .write_all(b"201 posting not permitted\r\n")
+                .await
+                .unwrap();
+
+            let (mut sixth, _) = listener.accept().await.unwrap();
+            sixth.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = sixth.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"QUIT\r\n");
+            sixth.write_all(QUIT_RESPONSE).await.unwrap();
+        });
+
+        let mut list_args = test_typed_fetch_args();
+        list_args.connect = addr;
+        list_args.request = TypedRequestKind::List;
+        list_args.message_id = None;
+        let list = fetch_typed_response(&list_args).await.unwrap();
+        assert_eq!(list.kind(), RequestKind::List);
+        assert_eq!(list.status().as_u16(), 215);
+
+        let mut help_args = test_typed_fetch_args();
+        help_args.connect = addr;
+        help_args.request = TypedRequestKind::Help;
+        help_args.message_id = None;
+        let help = fetch_typed_response(&help_args).await.unwrap();
+        assert_eq!(help.kind(), RequestKind::Help);
+        assert_eq!(help.status().as_u16(), 100);
+
+        let mut capabilities_args = test_typed_fetch_args();
+        capabilities_args.connect = addr;
+        capabilities_args.request = TypedRequestKind::Capabilities;
+        capabilities_args.message_id = None;
+        let capabilities = fetch_typed_response(&capabilities_args).await.unwrap();
+        assert_eq!(capabilities.kind(), RequestKind::Capabilities);
+        assert_eq!(capabilities.status().as_u16(), 101);
+
+        let mut date_args = test_typed_fetch_args();
+        date_args.connect = addr;
+        date_args.request = TypedRequestKind::Date;
+        date_args.message_id = None;
+        let date = fetch_typed_response(&date_args).await.unwrap();
+        assert_eq!(date.kind(), RequestKind::Date);
+        assert_eq!(date.status().as_u16(), 111);
+
+        let mut mode_reader_args = test_typed_fetch_args();
+        mode_reader_args.connect = addr;
+        mode_reader_args.request = TypedRequestKind::ModeReader;
+        mode_reader_args.message_id = None;
+        let mode_reader = fetch_typed_response(&mode_reader_args).await.unwrap();
+        assert_eq!(mode_reader.kind(), RequestKind::ModeReader);
+        assert_eq!(mode_reader.status().as_u16(), 201);
+
+        let mut quit_args = test_typed_fetch_args();
+        quit_args.connect = addr;
+        quit_args.request = TypedRequestKind::Quit;
+        quit_args.message_id = None;
+        let quit = fetch_typed_response(&quit_args).await.unwrap();
+        assert_eq!(quit.kind(), RequestKind::Quit);
+        assert_eq!(quit.status().as_u16(), 205);
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fetch_typed_response_supports_list_subcommand_request_kinds() {
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            first.write_all(b"201 fetch ready\r\n").await.unwrap();
+
+            let mut request = [0_u8; 128];
+            let read = first.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"LIST ACTIVE\r\n");
+            first.write_all(LIST_RESPONSE).await.unwrap();
+
+            let (mut second, _) = listener.accept().await.unwrap();
+            second.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = second.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"LIST ACTIVE.TIMES\r\n");
+            second.write_all(LIST_ACTIVE_TIMES_RESPONSE).await.unwrap();
+
+            let (mut third, _) = listener.accept().await.unwrap();
+            third.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = third.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"LIST ACTIVE.TIMES comp.lang.*\r\n");
+            third.write_all(LIST_ACTIVE_TIMES_RESPONSE).await.unwrap();
+
+            let (mut fourth, _) = listener.accept().await.unwrap();
+            fourth.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = fourth.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"LIST NEWSGROUPS\r\n");
+            fourth.write_all(LIST_NEWSGROUPS_RESPONSE).await.unwrap();
+
+            let (mut fifth, _) = listener.accept().await.unwrap();
+            fifth.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = fifth.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"LIST NEWSGROUPS comp.lang.*\r\n");
+            fifth.write_all(LIST_NEWSGROUPS_RESPONSE).await.unwrap();
+
+            let (mut sixth, _) = listener.accept().await.unwrap();
+            sixth.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = sixth.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"LIST OVERVIEW.FMT\r\n");
+            sixth.write_all(LIST_OVERVIEW_FMT_RESPONSE).await.unwrap();
+
+            let (mut seventh, _) = listener.accept().await.unwrap();
+            seventh.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = seventh.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"LIST HEADERS\r\n");
+            seventh.write_all(LIST_HEADERS_RESPONSE).await.unwrap();
+
+            let (mut eighth, _) = listener.accept().await.unwrap();
+            eighth.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = eighth.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"LIST DISTRIB.PATS\r\n");
+            eighth.write_all(LIST_DISTRIB_PATS_RESPONSE).await.unwrap();
+        });
+
+        let mut list_active_args = test_typed_fetch_args();
+        list_active_args.connect = addr;
+        list_active_args.request = TypedRequestKind::ListActive;
+        list_active_args.message_id = None;
+        let list_active = fetch_typed_response(&list_active_args).await.unwrap();
+        assert_eq!(list_active.kind(), RequestKind::ListActive);
+        assert_eq!(list_active.status().as_u16(), 215);
+
+        let mut list_active_times_args = test_typed_fetch_args();
+        list_active_times_args.connect = addr;
+        list_active_times_args.request = TypedRequestKind::ListActiveTimes;
+        list_active_times_args.message_id = None;
+        let list_active_times = fetch_typed_response(&list_active_times_args).await.unwrap();
+        assert_eq!(list_active_times.kind(), RequestKind::ListActiveTimes);
+        assert_eq!(list_active_times.status().as_u16(), 215);
+
+        let mut list_active_times_wildmat_args = test_typed_fetch_args();
+        list_active_times_wildmat_args.connect = addr;
+        list_active_times_wildmat_args.request = TypedRequestKind::ListActiveTimes;
+        list_active_times_wildmat_args.message_id = None;
+        list_active_times_wildmat_args.wildmat = Some("comp.lang.*".to_string());
+        let list_active_times_wildmat = fetch_typed_response(&list_active_times_wildmat_args)
+            .await
+            .unwrap();
+        assert_eq!(
+            list_active_times_wildmat.kind(),
+            RequestKind::ListActiveTimes
+        );
+        assert_eq!(list_active_times_wildmat.status().as_u16(), 215);
+
+        let mut list_newsgroups_args = test_typed_fetch_args();
+        list_newsgroups_args.connect = addr;
+        list_newsgroups_args.request = TypedRequestKind::ListNewsgroups;
+        list_newsgroups_args.message_id = None;
+        let list_newsgroups = fetch_typed_response(&list_newsgroups_args).await.unwrap();
+        assert_eq!(list_newsgroups.kind(), RequestKind::ListNewsgroups);
+        assert_eq!(list_newsgroups.status().as_u16(), 215);
+
+        let mut list_newsgroups_wildmat_args = test_typed_fetch_args();
+        list_newsgroups_wildmat_args.connect = addr;
+        list_newsgroups_wildmat_args.request = TypedRequestKind::ListNewsgroups;
+        list_newsgroups_wildmat_args.message_id = None;
+        list_newsgroups_wildmat_args.wildmat = Some("comp.lang.*".to_string());
+        let list_newsgroups_wildmat = fetch_typed_response(&list_newsgroups_wildmat_args)
+            .await
+            .unwrap();
+        assert_eq!(list_newsgroups_wildmat.kind(), RequestKind::ListNewsgroups);
+        assert_eq!(list_newsgroups_wildmat.status().as_u16(), 215);
+
+        let mut list_overview_fmt_args = test_typed_fetch_args();
+        list_overview_fmt_args.connect = addr;
+        list_overview_fmt_args.request = TypedRequestKind::ListOverviewFmt;
+        list_overview_fmt_args.message_id = None;
+        let list_overview_fmt = fetch_typed_response(&list_overview_fmt_args).await.unwrap();
+        assert_eq!(list_overview_fmt.kind(), RequestKind::ListOverviewFmt);
+        assert_eq!(list_overview_fmt.status().as_u16(), 215);
+
+        let mut list_headers_args = test_typed_fetch_args();
+        list_headers_args.connect = addr;
+        list_headers_args.request = TypedRequestKind::ListHeaders;
+        list_headers_args.message_id = None;
+        let list_headers = fetch_typed_response(&list_headers_args).await.unwrap();
+        assert_eq!(list_headers.kind(), RequestKind::ListHeaders);
+        assert_eq!(list_headers.status().as_u16(), 215);
+
+        let mut list_distrib_pats_args = test_typed_fetch_args();
+        list_distrib_pats_args.connect = addr;
+        list_distrib_pats_args.request = TypedRequestKind::ListDistribPats;
+        list_distrib_pats_args.message_id = None;
+        let list_distrib_pats = fetch_typed_response(&list_distrib_pats_args).await.unwrap();
+        assert_eq!(list_distrib_pats.kind(), RequestKind::ListDistribPats);
+        assert_eq!(list_distrib_pats.status().as_u16(), 215);
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fetch_typed_response_supports_header_query_request_kinds() {
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            first.write_all(b"201 fetch ready\r\n").await.unwrap();
+
+            let mut request = [0_u8; 128];
+            let read = first.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"HDR Subject 1-10\r\n");
+            first.write_all(HDR_RESPONSE).await.unwrap();
+
+            let (mut second, _) = listener.accept().await.unwrap();
+            second.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = second.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"HDR Message-ID <headers@test>\r\n");
+            second.write_all(HDR_RESPONSE).await.unwrap();
+
+            let (mut third, _) = listener.accept().await.unwrap();
+            third.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = third.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"XHDR Subject 1-10\r\n");
+            third.write_all(XHDR_RESPONSE).await.unwrap();
+
+            let (mut fourth, _) = listener.accept().await.unwrap();
+            fourth.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = fourth.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"XHDR Message-ID <headers@test>\r\n");
+            fourth.write_all(XHDR_RESPONSE).await.unwrap();
+        });
+
+        let mut hdr_range_args = test_typed_fetch_args();
+        hdr_range_args.connect = addr;
+        hdr_range_args.request = TypedRequestKind::Hdr;
+        hdr_range_args.message_id = None;
+        hdr_range_args.header = Some("Subject".to_string());
+        hdr_range_args.selector = Some("1-10".to_string());
+        let hdr_range = fetch_typed_response(&hdr_range_args).await.unwrap();
+        assert_eq!(hdr_range.kind(), RequestKind::Hdr);
+        assert_eq!(hdr_range.status().as_u16(), 225);
+
+        let mut hdr_message_id_args = test_typed_fetch_args();
+        hdr_message_id_args.connect = addr;
+        hdr_message_id_args.request = TypedRequestKind::Hdr;
+        hdr_message_id_args.message_id = None;
+        hdr_message_id_args.header = Some("Message-ID".to_string());
+        hdr_message_id_args.selector = Some("<headers@test>".to_string());
+        let hdr_message_id = fetch_typed_response(&hdr_message_id_args).await.unwrap();
+        assert_eq!(hdr_message_id.kind(), RequestKind::Hdr);
+        assert_eq!(hdr_message_id.status().as_u16(), 225);
+
+        let mut xhdr_range_args = test_typed_fetch_args();
+        xhdr_range_args.connect = addr;
+        xhdr_range_args.request = TypedRequestKind::Xhdr;
+        xhdr_range_args.message_id = None;
+        xhdr_range_args.header = Some("Subject".to_string());
+        xhdr_range_args.selector = Some("1-10".to_string());
+        let xhdr_range = fetch_typed_response(&xhdr_range_args).await.unwrap();
+        assert_eq!(xhdr_range.kind(), RequestKind::Xhdr);
+        assert_eq!(xhdr_range.status().as_u16(), 225);
+
+        let mut xhdr_message_id_args = test_typed_fetch_args();
+        xhdr_message_id_args.connect = addr;
+        xhdr_message_id_args.request = TypedRequestKind::Xhdr;
+        xhdr_message_id_args.message_id = None;
+        xhdr_message_id_args.header = Some("Message-ID".to_string());
+        xhdr_message_id_args.selector = Some("<headers@test>".to_string());
+        let xhdr_message_id = fetch_typed_response(&xhdr_message_id_args).await.unwrap();
+        assert_eq!(xhdr_message_id.kind(), RequestKind::Xhdr);
+        assert_eq!(xhdr_message_id.status().as_u16(), 225);
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fetch_typed_response_supports_overview_request_kinds() {
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            first.write_all(b"201 fetch ready\r\n").await.unwrap();
+
+            let mut request = [0_u8; 128];
+            let read = first.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"OVER 1-10\r\n");
+            first.write_all(OVER_RESPONSE).await.unwrap();
+
+            let (mut second, _) = listener.accept().await.unwrap();
+            second.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = second.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"OVER <overview@test>\r\n");
+            second.write_all(OVER_RESPONSE).await.unwrap();
+
+            let (mut third, _) = listener.accept().await.unwrap();
+            third.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = third.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"XOVER 1-10\r\n");
+            third.write_all(XOVER_RESPONSE).await.unwrap();
+
+            let (mut fourth, _) = listener.accept().await.unwrap();
+            fourth.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = fourth.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"XOVER <overview@test>\r\n");
+            fourth.write_all(XOVER_RESPONSE).await.unwrap();
+        });
+
+        let mut over_range_args = test_typed_fetch_args();
+        over_range_args.connect = addr;
+        over_range_args.request = TypedRequestKind::Over;
+        over_range_args.message_id = None;
+        over_range_args.selector = Some("1-10".to_string());
+        let over_range = fetch_typed_response(&over_range_args).await.unwrap();
+        assert_eq!(over_range.kind(), RequestKind::Over);
+        assert_eq!(over_range.status().as_u16(), 224);
+
+        let mut over_message_id_args = test_typed_fetch_args();
+        over_message_id_args.connect = addr;
+        over_message_id_args.request = TypedRequestKind::Over;
+        over_message_id_args.message_id = None;
+        over_message_id_args.selector = Some("<overview@test>".to_string());
+        let over_message_id = fetch_typed_response(&over_message_id_args).await.unwrap();
+        assert_eq!(over_message_id.kind(), RequestKind::Over);
+        assert_eq!(over_message_id.status().as_u16(), 224);
+
+        let mut xover_range_args = test_typed_fetch_args();
+        xover_range_args.connect = addr;
+        xover_range_args.request = TypedRequestKind::Xover;
+        xover_range_args.message_id = None;
+        xover_range_args.selector = Some("1-10".to_string());
+        let xover_range = fetch_typed_response(&xover_range_args).await.unwrap();
+        assert_eq!(xover_range.kind(), RequestKind::Xover);
+        assert_eq!(xover_range.status().as_u16(), 224);
+
+        let mut xover_message_id_args = test_typed_fetch_args();
+        xover_message_id_args.connect = addr;
+        xover_message_id_args.request = TypedRequestKind::Xover;
+        xover_message_id_args.message_id = None;
+        xover_message_id_args.selector = Some("<overview@test>".to_string());
+        let xover_message_id = fetch_typed_response(&xover_message_id_args).await.unwrap();
+        assert_eq!(xover_message_id.kind(), RequestKind::Xover);
+        assert_eq!(xover_message_id.status().as_u16(), 224);
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fetch_typed_response_supports_group_navigation_and_discovery_request_kinds() {
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            first.write_all(b"201 fetch ready\r\n").await.unwrap();
+
+            let mut request = [0_u8; 128];
+            let read = first.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"GROUP alt.test\r\n");
+            first.write_all(GROUP_RESPONSE).await.unwrap();
+
+            let (mut second, _) = listener.accept().await.unwrap();
+            second.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = second.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"LISTGROUP\r\n");
+            second.write_all(LISTGROUP_RESPONSE).await.unwrap();
+
+            let (mut third, _) = listener.accept().await.unwrap();
+            third.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = third.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"LISTGROUP 1-\r\n");
+            third.write_all(LISTGROUP_RESPONSE).await.unwrap();
+
+            let (mut fourth, _) = listener.accept().await.unwrap();
+            fourth.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = fourth.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"LISTGROUP alt.test 1-10\r\n");
+            fourth.write_all(LISTGROUP_RESPONSE).await.unwrap();
+
+            let (mut fifth, _) = listener.accept().await.unwrap();
+            fifth.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = fifth.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"LAST\r\n");
+            fifth.write_all(LAST_RESPONSE).await.unwrap();
+
+            let (mut sixth, _) = listener.accept().await.unwrap();
+            sixth.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = sixth.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"NEXT\r\n");
+            sixth.write_all(NEXT_RESPONSE).await.unwrap();
+
+            let (mut seventh, _) = listener.accept().await.unwrap();
+            seventh.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = seventh.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"NEWGROUPS 20260101 000000 GMT\r\n");
+            seventh.write_all(NEWGROUPS_RESPONSE).await.unwrap();
+
+            let (mut eighth, _) = listener.accept().await.unwrap();
+            eighth.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = eighth.read(&mut request).await.unwrap();
+            assert_eq!(
+                &request[..read],
+                b"NEWNEWS comp.lang.*,alt.test 20260101 000000\r\n"
+            );
+            eighth.write_all(NEWNEWS_RESPONSE).await.unwrap();
+        });
+
+        let mut group_args = test_typed_fetch_args();
+        group_args.connect = addr;
+        group_args.request = TypedRequestKind::Group;
+        group_args.message_id = None;
+        group_args.group = Some("alt.test".to_string());
+        let group = fetch_typed_response(&group_args).await.unwrap();
+        assert_eq!(group.kind(), RequestKind::Group);
+        assert_eq!(group.status().as_u16(), 211);
+
+        let mut listgroup_args = test_typed_fetch_args();
+        listgroup_args.connect = addr;
+        listgroup_args.request = TypedRequestKind::Listgroup;
+        listgroup_args.message_id = None;
+        listgroup_args.group = None;
+        let listgroup = fetch_typed_response(&listgroup_args).await.unwrap();
+        assert_eq!(listgroup.kind(), RequestKind::ListGroup);
+        assert_eq!(listgroup.status().as_u16(), 211);
+
+        let mut listgroup_range_args = test_typed_fetch_args();
+        listgroup_range_args.connect = addr;
+        listgroup_range_args.request = TypedRequestKind::Listgroup;
+        listgroup_range_args.message_id = None;
+        listgroup_range_args.group = None;
+        listgroup_range_args.selector = Some("1-".to_string());
+        let listgroup_range = fetch_typed_response(&listgroup_range_args).await.unwrap();
+        assert_eq!(listgroup_range.kind(), RequestKind::ListGroup);
+        assert_eq!(listgroup_range.status().as_u16(), 211);
+
+        let mut listgroup_group_args = test_typed_fetch_args();
+        listgroup_group_args.connect = addr;
+        listgroup_group_args.request = TypedRequestKind::Listgroup;
+        listgroup_group_args.message_id = None;
+        listgroup_group_args.group = Some("alt.test".to_string());
+        listgroup_group_args.selector = Some("1-10".to_string());
+        let listgroup_group = fetch_typed_response(&listgroup_group_args).await.unwrap();
+        assert_eq!(listgroup_group.kind(), RequestKind::ListGroup);
+        assert_eq!(listgroup_group.status().as_u16(), 211);
+
+        let mut last_args = test_typed_fetch_args();
+        last_args.connect = addr;
+        last_args.request = TypedRequestKind::Last;
+        last_args.message_id = None;
+        let last = fetch_typed_response(&last_args).await.unwrap();
+        assert_eq!(last.kind(), RequestKind::Last);
+        assert_eq!(last.status().as_u16(), 223);
+
+        let mut next_args = test_typed_fetch_args();
+        next_args.connect = addr;
+        next_args.request = TypedRequestKind::Next;
+        next_args.message_id = None;
+        let next = fetch_typed_response(&next_args).await.unwrap();
+        assert_eq!(next.kind(), RequestKind::Next);
+        assert_eq!(next.status().as_u16(), 223);
+
+        let mut newgroups_args = test_typed_fetch_args();
+        newgroups_args.connect = addr;
+        newgroups_args.request = TypedRequestKind::Newgroups;
+        newgroups_args.message_id = None;
+        newgroups_args.date = Some("20260101".to_string());
+        newgroups_args.time = Some("000000".to_string());
+        let newgroups = fetch_typed_response(&newgroups_args).await.unwrap();
+        assert_eq!(newgroups.kind(), RequestKind::NewGroups);
+        assert_eq!(newgroups.status().as_u16(), 231);
+
+        let mut newnews_args = test_typed_fetch_args();
+        newnews_args.connect = addr;
+        newnews_args.request = TypedRequestKind::Newnews;
+        newnews_args.message_id = None;
+        newnews_args.wildmat = Some("comp.lang.*,alt.test".to_string());
+        newnews_args.date = Some("20260101".to_string());
+        newnews_args.time = Some("000000".to_string());
+        newnews_args.gmt = false;
+        let newnews = fetch_typed_response(&newnews_args).await.unwrap();
+        assert_eq!(newnews.kind(), RequestKind::NewNews);
+        assert_eq!(newnews.status().as_u16(), 230);
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fetch_typed_response_supports_remaining_rfc_request_kinds() {
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            first.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let mut request = [0_u8; 256];
+            let read = first.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"POST\r\n");
+            first.write_all(POST_RESPONSE).await.unwrap();
+
+            let (mut second, _) = listener.accept().await.unwrap();
+            second.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = second.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"IHAVE <ihave@test>\r\n");
+            second.write_all(IHAVE_RESPONSE).await.unwrap();
+
+            let (mut third, _) = listener.accept().await.unwrap();
+            third.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = third.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"CHECK <check@test>\r\n");
+            third.write_all(CHECK_RESPONSE).await.unwrap();
+
+            let (mut fourth, _) = listener.accept().await.unwrap();
+            fourth.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = fourth.read(&mut request).await.unwrap();
+            assert_eq!(
+                &request[..read],
+                b"TAKETHIS <take@test>\r\nSubject: Taken\r\n\r\n..dot line\r\npayload\r\n.\r\n"
+            );
+            fourth.write_all(TAKETHIS_RESPONSE).await.unwrap();
+
+            let (mut fifth, _) = listener.accept().await.unwrap();
+            fifth.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = fifth.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"AUTHINFO USER bench user\r\n");
+            fifth.write_all(AUTHINFO_RESPONSE).await.unwrap();
+
+            let (mut sixth, _) = listener.accept().await.unwrap();
+            sixth.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = sixth.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"AUTHINFO PASS bench pass\r\n");
+            sixth.write_all(AUTHINFO_RESPONSE).await.unwrap();
+
+            let (mut seventh, _) = listener.accept().await.unwrap();
+            seventh.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = seventh.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"STARTTLS\r\n");
+            seventh.write_all(STARTTLS_RESPONSE).await.unwrap();
+        });
+
+        let mut post_args = test_typed_fetch_args();
+        post_args.connect = addr;
+        post_args.request = TypedRequestKind::Post;
+        post_args.message_id = None;
+        let post = fetch_typed_response(&post_args).await.unwrap();
+        assert_eq!(post.kind(), RequestKind::Post);
+        assert_eq!(post.status().as_u16(), 340);
+
+        let mut ihave_args = test_typed_fetch_args();
+        ihave_args.connect = addr;
+        ihave_args.request = TypedRequestKind::Ihave;
+        ihave_args.message_id = Some("ihave@test".to_string());
+        let ihave = fetch_typed_response(&ihave_args).await.unwrap();
+        assert_eq!(ihave.kind(), RequestKind::Ihave);
+        assert_eq!(ihave.status().as_u16(), 335);
+
+        let mut check_args = test_typed_fetch_args();
+        check_args.connect = addr;
+        check_args.request = TypedRequestKind::Check;
+        check_args.message_id = Some("check@test".to_string());
+        let check = fetch_typed_response(&check_args).await.unwrap();
+        assert_eq!(check.kind(), RequestKind::Check);
+        assert_eq!(check.status().as_u16(), 238);
+
+        let mut takethis_args = test_typed_fetch_args();
+        takethis_args.connect = addr;
+        takethis_args.request = TypedRequestKind::Takethis;
+        takethis_args.message_id = Some("take@test".to_string());
+        takethis_args.article_body = Some("Subject: Taken\r\n\r\n.dot line\r\npayload".to_string());
+        let takethis = fetch_typed_response(&takethis_args).await.unwrap();
+        assert_eq!(takethis.kind(), RequestKind::TakeThis);
+        assert_eq!(takethis.status().as_u16(), 239);
+
+        let mut auth_user_args = test_typed_fetch_args();
+        auth_user_args.connect = addr;
+        auth_user_args.request = TypedRequestKind::AuthinfoUser;
+        auth_user_args.message_id = None;
+        auth_user_args.auth_value = Some("bench user".to_string());
+        let auth_user = fetch_typed_response(&auth_user_args).await.unwrap();
+        assert_eq!(auth_user.kind(), RequestKind::AuthInfoUser);
+        assert_eq!(auth_user.status().as_u16(), 281);
+
+        let mut auth_pass_args = test_typed_fetch_args();
+        auth_pass_args.connect = addr;
+        auth_pass_args.request = TypedRequestKind::AuthinfoPass;
+        auth_pass_args.message_id = None;
+        auth_pass_args.auth_value = Some("bench pass".to_string());
+        let auth_pass = fetch_typed_response(&auth_pass_args).await.unwrap();
+        assert_eq!(auth_pass.kind(), RequestKind::AuthInfoPass);
+        assert_eq!(auth_pass.status().as_u16(), 281);
+
+        let mut starttls_args = test_typed_fetch_args();
+        starttls_args.connect = addr;
+        starttls_args.request = TypedRequestKind::Starttls;
+        starttls_args.message_id = None;
+        let starttls = fetch_typed_response(&starttls_args).await.unwrap();
+        assert_eq!(starttls.kind(), RequestKind::StartTls);
+        assert_eq!(starttls.status().as_u16(), 382);
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fetch_typed_response_rejects_missing_message_id_for_message_id_only_requests() {
+        let mut args = test_typed_fetch_args();
+        args.request = TypedRequestKind::Ihave;
+        args.message_id = None;
+        assert!(matches!(
+            fetch_typed_response(&args).await.unwrap_err(),
+            TypedClientError::MissingMessageId
+        ));
+    }
+
+    #[tokio::test]
+    async fn fetch_typed_response_rejects_range_selector_for_article_style_requests() {
+        let mut args = test_typed_fetch_args();
+        args.message_id = None;
+        args.selector = Some("1-10".to_string());
+
+        assert!(matches!(
+            fetch_typed_response(&args).await.unwrap_err(),
+            TypedClientError::InvalidArticleSelector
+        ));
+    }
+
+    #[tokio::test]
+    async fn fetch_typed_response_supports_article_request_current_and_numeric_selector() {
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            first.write_all(b"201 fetch ready\r\n").await.unwrap();
+
+            let mut request = [0_u8; 128];
+            let read = first.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"ARTICLE\r\n");
+            first
+                .write_all(
+                    b"220 1 <article.1@nntpbench.local> article follows\r\nSubject: Current\r\n\r\nbody\r\n.\r\n",
+                )
+                .await
+                .unwrap();
+
+            let (mut second, _) = listener.accept().await.unwrap();
+            second.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = second.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"BODY 42\r\n");
+            second
+                .write_all(b"222 42 <article.42@nntpbench.local> body follows\r\nbody\r\n.\r\n")
+                .await
+                .unwrap();
+        });
+
+        let mut current_args = test_typed_fetch_args();
+        current_args.connect = addr;
+        current_args.message_id = None;
+        current_args.selector = None;
+        let current = fetch_typed_response(&current_args).await.unwrap();
+        assert_eq!(current.kind(), RequestKind::Article);
+        assert_eq!(current.status().as_u16(), 220);
+
+        let mut numeric_args = test_typed_fetch_args();
+        numeric_args.connect = addr;
+        numeric_args.request = TypedRequestKind::Body;
+        numeric_args.message_id = None;
+        numeric_args.selector = Some("42".to_string());
+        let numeric = fetch_typed_response(&numeric_args).await.unwrap();
+        assert_eq!(numeric.kind(), RequestKind::Body);
+        assert_eq!(numeric.status().as_u16(), 222);
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fetch_typed_response_rejects_missing_header_query_arguments() {
+        let mut args = test_typed_fetch_args();
+        args.request = TypedRequestKind::Hdr;
+        args.message_id = None;
+        args.header = None;
+        args.selector = Some("1-10".to_string());
+        assert!(matches!(
+            fetch_typed_response(&args).await.unwrap_err(),
+            TypedClientError::MissingHeaderName
+        ));
+
+        args.header = Some("Subject".to_string());
+        args.selector = None;
+        assert!(matches!(
+            fetch_typed_response(&args).await.unwrap_err(),
+            TypedClientError::MissingArticleSelector
+        ));
+    }
+
+    #[tokio::test]
+    async fn fetch_typed_response_rejects_missing_overview_selector() {
+        let mut args = test_typed_fetch_args();
+        args.request = TypedRequestKind::Over;
+        args.message_id = None;
+        args.selector = None;
+
+        assert!(matches!(
+            fetch_typed_response(&args).await.unwrap_err(),
+            TypedClientError::MissingArticleSelector
+        ));
+    }
+
+    #[tokio::test]
+    async fn fetch_typed_response_rejects_missing_group_argument() {
+        let mut args = test_typed_fetch_args();
+        args.request = TypedRequestKind::Group;
+        args.message_id = None;
+        args.group = None;
+
+        assert!(matches!(
+            fetch_typed_response(&args).await.unwrap_err(),
+            TypedClientError::MissingGroupName
+        ));
+    }
+
+    #[tokio::test]
+    async fn fetch_typed_response_rejects_invalid_listgroup_range() {
+        let mut args = test_typed_fetch_args();
+        args.request = TypedRequestKind::Listgroup;
+        args.message_id = None;
+        args.group = Some("alt.test".to_string());
+        args.selector = Some("-10".to_string());
+
+        assert!(matches!(
+            fetch_typed_response(&args).await.unwrap_err(),
+            TypedClientError::InvalidListGroupRange
+        ));
+    }
+
+    #[tokio::test]
+    async fn fetch_typed_response_rejects_missing_discovery_arguments() {
+        let mut newgroups_args = test_typed_fetch_args();
+        newgroups_args.request = TypedRequestKind::Newgroups;
+        newgroups_args.message_id = None;
+        newgroups_args.date = None;
+        newgroups_args.time = Some("000000".to_string());
+        assert!(matches!(
+            fetch_typed_response(&newgroups_args).await.unwrap_err(),
+            TypedClientError::MissingDate
+        ));
+
+        newgroups_args.date = Some("20260101".to_string());
+        newgroups_args.time = None;
+        assert!(matches!(
+            fetch_typed_response(&newgroups_args).await.unwrap_err(),
+            TypedClientError::MissingTime
+        ));
+
+        let mut newnews_args = test_typed_fetch_args();
+        newnews_args.request = TypedRequestKind::Newnews;
+        newnews_args.message_id = None;
+        newnews_args.wildmat = None;
+        newnews_args.date = Some("20260101".to_string());
+        newnews_args.time = Some("000000".to_string());
+        assert!(matches!(
+            fetch_typed_response(&newnews_args).await.unwrap_err(),
+            TypedClientError::MissingWildmat
+        ));
+    }
+
+    #[tokio::test]
+    async fn fetch_typed_response_rejects_missing_remaining_rfc_arguments() {
+        let mut takethis_args = test_typed_fetch_args();
+        takethis_args.request = TypedRequestKind::Takethis;
+        takethis_args.article_body = None;
+        assert!(matches!(
+            fetch_typed_response(&takethis_args).await.unwrap_err(),
+            TypedClientError::MissingArticleBody
+        ));
+
+        let mut auth_args = test_typed_fetch_args();
+        auth_args.request = TypedRequestKind::AuthinfoUser;
+        auth_args.message_id = None;
+        auth_args.auth_value = None;
+        assert!(matches!(
+            fetch_typed_response(&auth_args).await.unwrap_err(),
+            TypedClientError::MissingAuthInfoValue
+        ));
+    }
+
+    #[tokio::test]
     async fn reads_pipelined_commands_in_fifo_order() {
         let (mut client, server) = tokio::io::duplex(1024);
         client
@@ -2739,23 +6683,69 @@ mod tests {
             .unwrap();
 
         let mut reader = BufReader::with_capacity(1024, server);
-        let mut command_buf = Vec::with_capacity(1024);
+        let mut command_buf = [0; MAX_COMMAND_LINE_BYTES];
+        let mut command_lines = CommandLineBatch::default();
         let mut command_batch = CommandBatch::new();
 
         assert!(
-            read_command_batch(&mut reader, &mut command_buf, &mut command_batch, 8)
-                .await
-                .unwrap()
+            read_command_batch(
+                &mut reader,
+                &mut command_buf,
+                Some(&mut command_lines),
+                &mut command_batch,
+                8
+            )
+            .await
+            .unwrap()
         );
         assert_eq!(
-            command_batch.as_slice(),
-            &[
-                ParsedCommand::Article,
-                ParsedCommand::Body,
-                ParsedCommand::Date,
-                ParsedCommand::ModeReader,
-                ParsedCommand::Quit
+            command_batch
+                .iter()
+                .map(|command| command.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                RequestKind::Article,
+                RequestKind::Body,
+                RequestKind::Date,
+                RequestKind::ModeReader,
+                RequestKind::Quit
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn read_command_batch_preserves_full_length_message_id_without_allocating_per_command() {
+        // RFC 3977 section 3.1 caps command lines at 512 octets including CRLF.
+        // Keep message-id parsing tied to the full command line, not a smaller
+        // internal shortcut.
+        let long_message = format!("<{}@example.test>", "a".repeat(480));
+        let wire = format!("ARTICLE {long_message}\r\n");
+        assert!(wire.len() <= MAX_COMMAND_LINE_BYTES);
+
+        let (mut client, server) = tokio::io::duplex(1024);
+        client.write_all(wire.as_bytes()).await.unwrap();
+
+        let mut reader = BufReader::with_capacity(1024, server);
+        let mut command_buf = [0; MAX_COMMAND_LINE_BYTES];
+        let mut command_lines = CommandLineBatch::default();
+        let mut command_batch = CommandBatch::new();
+
+        assert!(
+            read_command_batch(
+                &mut reader,
+                &mut command_buf,
+                Some(&mut command_lines),
+                &mut command_batch,
+                8
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(
+            command_message_id(&command_batch[0], &command_lines)
+                .unwrap()
+                .as_str(),
+            long_message
         );
     }
 
@@ -2764,13 +6754,20 @@ mod tests {
         let (client, server) = tokio::io::duplex(1024);
         drop(client);
         let mut reader = BufReader::with_capacity(1024, server);
-        let mut command_buf = Vec::with_capacity(1024);
+        let mut command_buf = [0; MAX_COMMAND_LINE_BYTES];
+        let mut command_lines = CommandLineBatch::default();
         let mut command_batch = CommandBatch::new();
 
         assert!(
-            !read_command_batch(&mut reader, &mut command_buf, &mut command_batch, 8)
-                .await
-                .unwrap()
+            !read_command_batch(
+                &mut reader,
+                &mut command_buf,
+                Some(&mut command_lines),
+                &mut command_batch,
+                8
+            )
+            .await
+            .unwrap()
         );
         assert!(command_batch.is_empty());
     }
@@ -2781,15 +6778,28 @@ mod tests {
         client.write_all(b"ARTICLE 1\r\nBODY 2").await.unwrap();
 
         let mut reader = BufReader::with_capacity(1024, server);
-        let mut command_buf = Vec::with_capacity(1024);
+        let mut command_buf = [0; MAX_COMMAND_LINE_BYTES];
+        let mut command_lines = CommandLineBatch::default();
         let mut command_batch = CommandBatch::new();
 
         assert!(
-            read_command_batch(&mut reader, &mut command_buf, &mut command_batch, 8)
-                .await
-                .unwrap()
+            read_command_batch(
+                &mut reader,
+                &mut command_buf,
+                Some(&mut command_lines),
+                &mut command_batch,
+                8
+            )
+            .await
+            .unwrap()
         );
-        assert_eq!(command_batch.as_slice(), &[ParsedCommand::Article]);
+        assert_eq!(
+            command_batch
+                .iter()
+                .map(|command| command.kind)
+                .collect::<Vec<_>>(),
+            vec![RequestKind::Article]
+        );
     }
 
     #[tokio::test]
@@ -2801,17 +6811,27 @@ mod tests {
             .unwrap();
 
         let mut reader = BufReader::with_capacity(1024, server);
-        let mut command_buf = Vec::with_capacity(1024);
+        let mut command_buf = [0; MAX_COMMAND_LINE_BYTES];
+        let mut command_lines = CommandLineBatch::default();
         let mut command_batch = CommandBatch::new();
 
         assert!(
-            read_command_batch(&mut reader, &mut command_buf, &mut command_batch, 2)
-                .await
-                .unwrap()
+            read_command_batch(
+                &mut reader,
+                &mut command_buf,
+                Some(&mut command_lines),
+                &mut command_batch,
+                2
+            )
+            .await
+            .unwrap()
         );
         assert_eq!(
-            command_batch.as_slice(),
-            &[ParsedCommand::Article, ParsedCommand::Body]
+            command_batch
+                .iter()
+                .map(|command| command.kind)
+                .collect::<Vec<_>>(),
+            vec![RequestKind::Article, RequestKind::Body]
         );
     }
 
@@ -2824,25 +6844,151 @@ mod tests {
             .unwrap();
 
         let mut reader = BufReader::with_capacity(1024, server);
-        let mut command_buf = Vec::with_capacity(1024);
+        let mut command_buf = [0; MAX_COMMAND_LINE_BYTES];
+        let mut command_lines = CommandLineBatch::default();
         let mut command_batch = CommandBatch::new();
 
         assert!(
-            read_command_batch(&mut reader, &mut command_buf, &mut command_batch, 2)
-                .await
-                .unwrap()
+            read_command_batch(
+                &mut reader,
+                &mut command_buf,
+                Some(&mut command_lines),
+                &mut command_batch,
+                2
+            )
+            .await
+            .unwrap()
         );
         assert_eq!(
-            command_batch.as_slice(),
-            &[ParsedCommand::Article, ParsedCommand::Body]
+            command_batch
+                .iter()
+                .map(|command| command.kind)
+                .collect::<Vec<_>>(),
+            vec![RequestKind::Article, RequestKind::Body]
         );
 
         assert!(
-            read_command_batch(&mut reader, &mut command_buf, &mut command_batch, 2)
-                .await
-                .unwrap()
+            read_command_batch(
+                &mut reader,
+                &mut command_buf,
+                Some(&mut command_lines),
+                &mut command_batch,
+                2
+            )
+            .await
+            .unwrap()
         );
-        assert_eq!(command_batch.as_slice(), &[ParsedCommand::Quit]);
+        assert_eq!(
+            command_batch
+                .iter()
+                .map(|command| command.kind)
+                .collect::<Vec<_>>(),
+            vec![RequestKind::Quit]
+        );
+    }
+
+    #[tokio::test]
+    async fn read_command_batch_consumes_takethis_payload_as_one_command() {
+        // RFC 3977 section 3.1.1 uses "." CRLF as the multiline block terminator.
+        // A complete TAKETHIS command body must be consumed as part of the TAKETHIS command
+        // so the following command is parsed only after the terminating dot line:
+        // https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1
+        let (mut client, server) = tokio::io::duplex(1024);
+        client
+            .write_all(b"TAKETHIS <take@test>\r\nHeader: value\r\n\r\nbody\r\n.\r\nQUIT\r\n")
+            .await
+            .unwrap();
+
+        let mut reader = BufReader::with_capacity(1024, server);
+        let mut command_buf = [0; MAX_COMMAND_LINE_BYTES];
+        let mut command_lines = CommandLineBatch::default();
+        let mut command_batch = CommandBatch::new();
+
+        assert!(
+            read_command_batch(
+                &mut reader,
+                &mut command_buf,
+                Some(&mut command_lines),
+                &mut command_batch,
+                8
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(
+            command_batch
+                .iter()
+                .map(|command| command.kind)
+                .collect::<Vec<_>>(),
+            vec![RequestKind::TakeThis, RequestKind::Quit]
+        );
+    }
+
+    #[tokio::test]
+    async fn read_command_batch_accepts_long_takethis_body_lines() {
+        // RFC 3977 section 3.1 limits command lines, but section 3.1.1
+        // multiline data blocks are terminated by "." CRLF rather than a
+        // 512-octet command-line bound.
+        let (mut client, server) = tokio::io::duplex(2048);
+        let mut wire = b"TAKETHIS <take@test>\r\nHeader: value\r\n".to_vec();
+        wire.extend(std::iter::repeat_n(b'x', MAX_COMMAND_LINE_BYTES + 128));
+        wire.extend_from_slice(b"\r\n.\r\nQUIT\r\n");
+        client.write_all(&wire).await.unwrap();
+
+        let mut reader = BufReader::with_capacity(128, server);
+        let mut command_buf = [0; MAX_COMMAND_LINE_BYTES];
+        let mut command_lines = CommandLineBatch::default();
+        let mut command_batch = CommandBatch::new();
+
+        assert!(
+            read_command_batch(
+                &mut reader,
+                &mut command_buf,
+                Some(&mut command_lines),
+                &mut command_batch,
+                8
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(
+            command_batch
+                .iter()
+                .map(|command| command.kind)
+                .collect::<Vec<_>>(),
+            vec![RequestKind::TakeThis, RequestKind::Quit]
+        );
+    }
+
+    #[tokio::test]
+    async fn read_command_batch_rejects_lf_only_takethis_terminator() {
+        // RFC 3977 section 3.1.1 requires the TAKETHIS data block terminator to be
+        // "." CRLF. A bare-LF "." line must not end the body or expose the next command:
+        // https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1
+        let (mut client, server) = tokio::io::duplex(1024);
+        client
+            .write_all(b"TAKETHIS <take@test>\r\nHeader: value\r\n\r\nbody\n.\nQUIT\r\n")
+            .await
+            .unwrap();
+        drop(client);
+
+        let mut reader = BufReader::with_capacity(1024, server);
+        let mut command_buf = [0; MAX_COMMAND_LINE_BYTES];
+        let mut command_lines = CommandLineBatch::default();
+        let mut command_batch = CommandBatch::new();
+
+        let err = read_command_batch(
+            &mut reader,
+            &mut command_buf,
+            Some(&mut command_lines),
+            &mut command_batch,
+            8,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(command_batch.is_empty());
     }
 
     #[tokio::test]
@@ -2859,21 +7005,63 @@ mod tests {
         let caps = text.find("101 Capability").unwrap();
         let date = text.find("111 20260515120000").unwrap();
         let mode = text.find("201 posting not permitted").unwrap();
-        let unknown = text.find("500 unknown").unwrap();
+        let head = text.find("221 1 <article.1@nntpbench.local>").unwrap();
         let quit = text.find("205 closing").unwrap();
         assert!(body < article);
         assert!(article < caps);
         assert!(caps < date);
         assert!(date < mode);
-        assert!(mode < unknown);
-        assert!(unknown < quit);
+        assert!(mode < head);
+        assert!(head < quit);
 
         let snapshot = stats.snapshot();
         assert_eq!(snapshot.commands, 7);
         assert_eq!(snapshot.body_requests, 1);
-        assert_eq!(snapshot.article_requests, 1);
+        assert_eq!(snapshot.article_requests, 2);
         assert_eq!(snapshot.pipeline_batches, 1);
         assert_eq!(snapshot.bytes_sent, output.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn serve_session_reads_article_responses_from_article_dir() {
+        let article_dir = unique_temp_dir("server-articles");
+        let response =
+            b"220 42 <article.42@test> article follows\r\nSubject: stored\r\n\r\nbody\r\n.\r\n";
+        let path = article_id_tree_path(&article_dir, 42);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, response).unwrap();
+        let message_response =
+            b"220 1 <stored@ngPost> article follows\r\nSubject: message\r\n\r\nbody\r\n.\r\n";
+        let message_id = MessageId::from_borrowed("<stored@ngPost>").unwrap();
+        let message_path = message_id_tree_path(&article_dir, &message_id);
+        fs::create_dir_all(message_path.parent().unwrap()).unwrap();
+        fs::write(&message_path, message_response).unwrap();
+
+        let mut args = test_args();
+        args.article_dir = Some(article_dir.clone());
+        let (output, stats) = run_session_with_input(
+            Arc::new(ServerConfig::from_args(args)),
+            b"ARTICLE 42\r\nARTICLE <stored@ngPost>\r\nARTICLE 43\r\nQUIT\r\n",
+        )
+        .await;
+
+        assert_eq!(
+            output,
+            [
+                GREETING,
+                response,
+                message_response,
+                ARTICLE_NOT_FOUND_RESPONSE,
+                QUIT_RESPONSE
+            ]
+            .concat()
+        );
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.commands, 4);
+        assert_eq!(snapshot.article_requests, 3);
+        assert_eq!(snapshot.bytes_sent, output.len() as u64);
+
+        fs::remove_dir_all(article_dir).unwrap();
     }
 
     #[tokio::test]
@@ -2892,6 +7080,105 @@ mod tests {
             .concat()
         );
         assert_eq!(stats.snapshot().commands, 3);
+    }
+
+    #[tokio::test]
+    async fn serve_session_supports_help_and_quit_commands() {
+        let (output, stats) =
+            run_session_with_input(test_config(), b"LIST\r\nHELP\r\nQUIT\r\n").await;
+
+        assert_eq!(
+            output,
+            [GREETING, LIST_RESPONSE, HELP_RESPONSE, QUIT_RESPONSE].concat()
+        );
+        assert_eq!(stats.snapshot().commands, 3);
+    }
+
+    #[tokio::test]
+    async fn serve_session_supports_overview_commands() {
+        let (output, stats) = run_session_with_input(
+            test_config(),
+            b"OVER 1-10\r\nOVER <overview@test>\r\nXOVER 1-10\r\nXOVER <overview@test>\r\n",
+        )
+        .await;
+
+        assert_eq!(
+            output,
+            [
+                GREETING,
+                OVER_RESPONSE,
+                OVER_RESPONSE,
+                XOVER_RESPONSE,
+                XOVER_RESPONSE
+            ]
+            .concat()
+        );
+        assert_eq!(stats.snapshot().commands, 4);
+    }
+
+    #[tokio::test]
+    async fn serve_session_supports_group_navigation_commands() {
+        let (output, stats) = run_session_with_input(
+            test_config(),
+            b"GROUP alt.test\r\nLISTGROUP\r\nLISTGROUP alt.test\r\nLISTGROUP 1-\r\nLISTGROUP alt.test 1-10\r\nLAST\r\nNEXT\r\n",
+        )
+        .await;
+
+        assert_eq!(
+            output,
+            [
+                GREETING,
+                GROUP_RESPONSE,
+                LISTGROUP_RESPONSE,
+                LISTGROUP_RESPONSE,
+                LISTGROUP_RESPONSE,
+                LISTGROUP_RESPONSE,
+                LAST_RESPONSE,
+                NEXT_RESPONSE,
+            ]
+            .concat()
+        );
+        assert_eq!(stats.snapshot().commands, 7);
+    }
+
+    #[tokio::test]
+    async fn serve_session_supports_discovery_commands() {
+        let (output, stats) = run_session_with_input(
+            test_config(),
+            b"NEWGROUPS 20260101 000000 GMT\r\nNEWNEWS comp.lang.* 20260101 000000\r\n",
+        )
+        .await;
+
+        assert_eq!(
+            output,
+            [GREETING, NEWGROUPS_RESPONSE, NEWNEWS_RESPONSE].concat()
+        );
+        assert_eq!(stats.snapshot().commands, 2);
+    }
+
+    #[tokio::test]
+    async fn serve_session_supports_remaining_rfc_commands() {
+        let (output, stats) = run_session_with_input(
+            test_config(),
+            b"POST\r\nIHAVE <ihave@test>\r\nCHECK <check@test>\r\nTAKETHIS <take@test>\r\nHeader: value\r\n\r\nbody\r\n.\r\nAUTHINFO USER bench\r\nAUTHINFO PASS bench\r\nSTARTTLS\r\n",
+        )
+        .await;
+
+        assert_eq!(
+            output,
+            [
+                GREETING,
+                POST_RESPONSE,
+                IHAVE_RESPONSE,
+                CHECK_RESPONSE,
+                TAKETHIS_RESPONSE,
+                AUTHINFO_USER_RESPONSE,
+                AUTHINFO_RESPONSE,
+                STARTTLS_RESPONSE,
+            ]
+            .concat()
+        );
+        assert_eq!(stats.snapshot().commands, 7);
     }
 
     #[tokio::test]
@@ -3036,32 +7323,157 @@ mod tests {
     }
 
     #[test]
-    fn parse_command_batch_bytes_returns_consumed_prefix() {
+    fn for_each_request_line_in_batch_returns_consumed_prefix() {
         let mut batch = Vec::with_capacity(8);
-        let consumed = parse_command_batch_bytes(b"ARTICLE 1\r\nBODY 2\r\nQUIT", 8, &mut batch);
+        let consumed =
+            for_each_request_line_in_batch(b"ARTICLE 1\r\nBODY 2\r\nQUIT", 8, |request| {
+                batch.push(request.kind());
+            });
 
         assert_eq!(consumed, b"ARTICLE 1\r\nBODY 2\r\n".len());
-        assert_eq!(batch, vec![ParsedCommand::Article, ParsedCommand::Body]);
+        assert_eq!(batch, vec![RequestKind::Article, RequestKind::Body]);
 
-        let consumed = parse_command_batch_bytes(b"DATE\nMODE READER\n", 8, &mut batch);
-        assert_eq!(consumed, b"DATE\nMODE READER\n".len());
-        assert_eq!(batch, vec![ParsedCommand::Date, ParsedCommand::ModeReader]);
+        batch.clear();
+        // RFC 3977 section 3.1 makes CRLF the only line terminator:
+        // https://www.rfc-editor.org/rfc/rfc3977#section-3.1
+        // The batch scanner must not keep the old LF-only command behavior.
+        let consumed = for_each_request_line_in_batch(b"DATE\nMODE READER\n", 8, |request| {
+            batch.push(request.kind());
+        });
+        assert_eq!(consumed, 0);
+        assert!(batch.is_empty());
+
+        batch.clear();
+        let consumed = for_each_request_line_in_batch(
+            b"TAKETHIS <take@test>\r\nHeader: value\r\n\r\nbody\r\n.\r\nQUIT\r\n",
+            8,
+            |request| batch.push(request.kind()),
+        );
+        assert_eq!(
+            consumed,
+            b"TAKETHIS <take@test>\r\nHeader: value\r\n\r\nbody\r\n.\r\nQUIT\r\n".len()
+        );
+        assert_eq!(batch, vec![RequestKind::TakeThis, RequestKind::Quit]);
     }
 
     #[test]
-    fn process_command_to_buffer_counts_and_returns_quit() {
+    fn for_each_request_line_in_batch_skips_incomplete_takethis_until_body_finishes() {
+        // RFC 3977 section 3.1.1 requires a complete "." CRLF terminator before a
+        // TAKETHIS body is complete. Without that dot line, the batch scanner must not
+        // expose the TAKETHIS command or any following bytes as separate commands:
+        // https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1
+        let mut batch = Vec::with_capacity(4);
+        let input = b"TAKETHIS <take@test>\r\nHeader: value\r\n\r\nbody\r\nQUIT\r\n";
+        let consumed = for_each_request_line_in_batch(input, 8, |request| {
+            batch.push(request.kind());
+        });
+
+        assert_eq!(consumed, 0);
+        assert!(batch.is_empty());
+    }
+
+    #[test]
+    fn for_each_request_line_in_batch_requires_crlf_dot_terminator_for_takethis() {
+        // RFC 3977 section 3.1.1 names "." CRLF as the multiline terminator. The batch
+        // scanner must not treat "." LF as a complete TAKETHIS body terminator even if a
+        // later command line has a valid CRLF:
+        // https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1
+        let mut batch = Vec::with_capacity(4);
+        let input = b"TAKETHIS <take@test>\r\nHeader: value\r\n\r\nbody\n.\nQUIT\r\n";
+        let consumed = for_each_request_line_in_batch(input, 8, |request| {
+            batch.push(request.kind());
+        });
+
+        assert_eq!(consumed, 0);
+        assert!(batch.is_empty());
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+
+        #[test]
+        fn batch_scanner_requires_exact_rfc_takethis_dot_terminator(
+            mut prefix in vec(dangerous_takethis_body_bytes(), 0..32),
+            mut suffix in vec(dangerous_takethis_body_bytes(), 0..32),
+            near_miss in prop::sample::select(vec![
+                b".\n".to_vec(),
+                b".\r".to_vec(),
+                b".\r ".to_vec(),
+                b"..\r\n".to_vec(),
+                b".body\r\n".to_vec(),
+                b"\n.\r\n".to_vec(),
+                b"\r.\r\n".to_vec(),
+                b"\r\n.\n".to_vec(),
+            ]),
+        ) {
+            // RFC 3977 section 3.1.1 reserves only "." CRLF as the command-continuation
+            // terminator. Generated TAKETHIS bodies containing bare-LF, incomplete-CR, or
+            // dot-stuffed near misses must not be exposed as complete commands:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1
+            remove_rfc_dot_terminators(&mut prefix);
+            remove_rfc_dot_terminators(&mut suffix);
+            let mut input = b"TAKETHIS <take@test>\r\n".to_vec();
+            input.push(b'x');
+            input.extend_from_slice(&prefix);
+            input.extend_from_slice(&near_miss);
+            input.extend_from_slice(&suffix);
+            prop_assume!(find_dot_terminated_block_end(&input, b"TAKETHIS <take@test>\r\n".len()).is_none());
+            input.extend_from_slice(b"QUIT\r\n");
+
+            let mut batch = Vec::with_capacity(4);
+            let consumed = for_each_request_line_in_batch(&input, 8, |request| {
+                batch.push(request.kind());
+            });
+
+            prop_assert_eq!(consumed, 0, "{:?}", input);
+            prop_assert!(batch.is_empty(), "{:?}", input);
+        }
+
+        #[test]
+        fn batch_scanner_consumes_takethis_through_first_rfc_dot_terminator(
+            mut body in vec(dangerous_takethis_body_bytes(), 0..48),
+            trailer in "[A-Za-z0-9 ._-]{0,16}",
+        ) {
+            // RFC 3977 section 3.1.1 says the first "." CRLF line ends a TAKETHIS
+            // continuation. The scanner must consume exactly through that dot line and
+            // then allow the following request line to be parsed separately:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1
+            remove_rfc_dot_terminators(&mut body);
+            body.insert(0, b'x');
+            body.push(b'x');
+            let mut input = b"TAKETHIS <take@test>\r\n".to_vec();
+            input.extend_from_slice(&body);
+            input.extend_from_slice(b"\r\n");
+            input.extend_from_slice(b".\r\nQUIT\r\n");
+            input.extend_from_slice(trailer.as_bytes());
+
+            let mut batch = Vec::with_capacity(4);
+            let consumed = for_each_request_line_in_batch(&input, 8, |request| {
+                batch.push(request.kind());
+            });
+
+            prop_assert_eq!(batch, vec![RequestKind::TakeThis, RequestKind::Quit]);
+            prop_assert_eq!(
+                consumed,
+                b"TAKETHIS <take@test>\r\n".len() + body.len() + b"\r\n.\r\nQUIT\r\n".len()
+            );
+        }
+    }
+
+    #[test]
+    fn process_request_to_buffer_counts_and_returns_quit() {
         let config = test_config();
         let stats = Stats::new();
         let mut output = Vec::new();
 
-        assert!(!process_command_to_buffer(
-            ParsedCommand::Article,
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"ARTICLE <bench@nntpbench.local>\r\n"),
             &config,
             &stats,
             &mut output,
         ));
-        assert!(process_command_to_buffer(
-            ParsedCommand::Quit,
+        assert!(process_request_to_buffer(
+            RequestLine::parse(b"QUIT\r\n"),
             &config,
             &stats,
             &mut output,
@@ -3075,164 +7487,447 @@ mod tests {
     }
 
     #[test]
-    fn process_command_to_buffer_supports_negotiation_commands() {
+    fn process_request_to_buffer_supports_negotiation_commands() {
         let config = test_config();
         let stats = Stats::new();
         let mut output = Vec::new();
 
-        assert!(!process_command_to_buffer(
-            ParsedCommand::ModeReader,
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"LIST ACTIVE\r\n"),
             &config,
             &stats,
             &mut output,
         ));
-        assert!(!process_command_to_buffer(
-            ParsedCommand::Date,
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"LIST ACTIVE.TIMES\r\n"),
+            &config,
+            &stats,
+            &mut output,
+        ));
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"LIST ACTIVE.TIMES comp.lang.*\r\n"),
+            &config,
+            &stats,
+            &mut output,
+        ));
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"LIST NEWSGROUPS\r\n"),
+            &config,
+            &stats,
+            &mut output,
+        ));
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"LIST NEWSGROUPS comp.lang.*\r\n"),
+            &config,
+            &stats,
+            &mut output,
+        ));
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"LIST OVERVIEW.FMT\r\n"),
+            &config,
+            &stats,
+            &mut output,
+        ));
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"LIST HEADERS\r\n"),
+            &config,
+            &stats,
+            &mut output,
+        ));
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"LIST DISTRIB.PATS\r\n"),
+            &config,
+            &stats,
+            &mut output,
+        ));
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"HELP\r\n"),
+            &config,
+            &stats,
+            &mut output,
+        ));
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"MODE READER\r\n"),
+            &config,
+            &stats,
+            &mut output,
+        ));
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"DATE\r\n"),
             &config,
             &stats,
             &mut output,
         ));
 
-        assert_eq!(output, [MODE_READER_RESPONSE, DATE_RESPONSE].concat());
+        assert_eq!(
+            output,
+            [
+                LIST_RESPONSE,
+                LIST_ACTIVE_TIMES_RESPONSE,
+                LIST_ACTIVE_TIMES_RESPONSE,
+                LIST_NEWSGROUPS_RESPONSE,
+                LIST_NEWSGROUPS_RESPONSE,
+                LIST_OVERVIEW_FMT_RESPONSE,
+                LIST_HEADERS_RESPONSE,
+                LIST_DISTRIB_PATS_RESPONSE,
+                HELP_RESPONSE,
+                MODE_READER_RESPONSE,
+                DATE_RESPONSE
+            ]
+            .concat()
+        );
+        assert_eq!(stats.snapshot().commands, 11);
+    }
+
+    #[test]
+    fn process_request_to_buffer_supports_remaining_rfc_commands() {
+        let config = test_config();
+        let stats = Stats::new();
+        let mut output = Vec::new();
+
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"POST\r\n"),
+            &config,
+            &stats,
+            &mut output,
+        ));
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"IHAVE <article@test>\r\n"),
+            &config,
+            &stats,
+            &mut output,
+        ));
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"CHECK <article@test>\r\n"),
+            &config,
+            &stats,
+            &mut output,
+        ));
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"TAKETHIS <article@test>\r\n"),
+            &config,
+            &stats,
+            &mut output,
+        ));
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"AUTHINFO USER bench\r\n"),
+            &config,
+            &stats,
+            &mut output,
+        ));
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"AUTHINFO PASS bench\r\n"),
+            &config,
+            &stats,
+            &mut output,
+        ));
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"AUTHINFO SASL bench\r\n"),
+            &config,
+            &stats,
+            &mut output,
+        ));
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"STARTTLS\r\n"),
+            &config,
+            &stats,
+            &mut output,
+        ));
+
+        assert_eq!(
+            output,
+            [
+                POST_RESPONSE,
+                IHAVE_RESPONSE,
+                CHECK_RESPONSE,
+                TAKETHIS_RESPONSE,
+                AUTHINFO_USER_RESPONSE,
+                AUTHINFO_RESPONSE,
+                AUTHINFO_RESPONSE,
+                STARTTLS_RESPONSE,
+            ]
+            .concat()
+        );
+        assert_eq!(stats.snapshot().commands, 8);
+    }
+
+    #[test]
+    fn process_request_to_buffer_supports_overview_commands() {
+        let config = test_config();
+        let stats = Stats::new();
+        let mut output = Vec::new();
+
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"OVER 1-10\r\n"),
+            &config,
+            &stats,
+            &mut output,
+        ));
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"OVER <overview@test>\r\n"),
+            &config,
+            &stats,
+            &mut output,
+        ));
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"XOVER 1-10\r\n"),
+            &config,
+            &stats,
+            &mut output,
+        ));
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"XOVER <overview@test>\r\n"),
+            &config,
+            &stats,
+            &mut output,
+        ));
+
+        assert_eq!(
+            output,
+            [OVER_RESPONSE, OVER_RESPONSE, XOVER_RESPONSE, XOVER_RESPONSE].concat()
+        );
+        assert_eq!(stats.snapshot().commands, 4);
+    }
+
+    #[test]
+    fn process_request_to_buffer_supports_group_navigation_commands() {
+        let config = test_config();
+        let stats = Stats::new();
+        let mut output = Vec::new();
+
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"GROUP alt.binaries.test\r\n"),
+            &config,
+            &stats,
+            &mut output,
+        ));
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"LISTGROUP\r\n"),
+            &config,
+            &stats,
+            &mut output,
+        ));
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"LISTGROUP alt.binaries.test\r\n"),
+            &config,
+            &stats,
+            &mut output,
+        ));
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"LISTGROUP 1-\r\n"),
+            &config,
+            &stats,
+            &mut output,
+        ));
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"LISTGROUP alt.binaries.test 1-10\r\n"),
+            &config,
+            &stats,
+            &mut output,
+        ));
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"LAST\r\n"),
+            &config,
+            &stats,
+            &mut output,
+        ));
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"NEXT\r\n"),
+            &config,
+            &stats,
+            &mut output,
+        ));
+
+        assert_eq!(
+            output,
+            [
+                GROUP_RESPONSE,
+                LISTGROUP_RESPONSE,
+                LISTGROUP_RESPONSE,
+                LISTGROUP_RESPONSE,
+                LISTGROUP_RESPONSE,
+                LAST_RESPONSE,
+                NEXT_RESPONSE
+            ]
+            .concat()
+        );
+        assert_eq!(stats.snapshot().commands, 7);
+    }
+
+    #[test]
+    fn process_request_to_buffer_supports_discovery_commands() {
+        let config = test_config();
+        let stats = Stats::new();
+        let mut output = Vec::new();
+
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"NEWGROUPS 231231 235959 GMT\r\n"),
+            &config,
+            &stats,
+            &mut output,
+        ));
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"NEWNEWS alt.binaries.test 231231 235959 GMT\r\n"),
+            &config,
+            &stats,
+            &mut output,
+        ));
+
+        assert_eq!(output, [NEWGROUPS_RESPONSE, NEWNEWS_RESPONSE].concat());
         assert_eq!(stats.snapshot().commands, 2);
     }
 
     #[test]
-    fn process_command_to_buffer_supports_body_capabilities_and_unknown() {
+    fn process_request_to_buffer_supports_body_head_stat_capabilities_and_unknown() {
         let config = test_config();
         let stats = Stats::new();
         let mut output = Vec::new();
 
-        assert!(!process_command_to_buffer(
-            ParsedCommand::Body,
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"BODY <body@test>\r\n"),
             &config,
             &stats,
             &mut output,
         ));
-        assert!(!process_command_to_buffer(
-            ParsedCommand::Capabilities,
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"CAPABILITIES\r\n"),
             &config,
             &stats,
             &mut output,
         ));
-        assert!(!process_command_to_buffer(
-            ParsedCommand::Unknown,
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"HEAD 1\r\n"),
+            &config,
+            &stats,
+            &mut output,
+        ));
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"STAT 1\r\n"),
+            &config,
+            &stats,
+            &mut output,
+        ));
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"XYZZY 1\r\n"),
             &config,
             &stats,
             &mut output,
         ));
 
         let snapshot = stats.snapshot();
-        assert_eq!(snapshot.commands, 3);
+        assert_eq!(snapshot.commands, 5);
+        assert_eq!(snapshot.article_requests, 2);
         assert_eq!(snapshot.body_requests, 1);
         assert!(output.starts_with(b"222 "));
+        assert!(
+            output
+                .windows(HEAD_RESPONSE.len())
+                .any(|window| window == HEAD_RESPONSE)
+        );
+        assert!(
+            output
+                .windows(STAT_RESPONSE.len())
+                .any(|window| window == STAT_RESPONSE)
+        );
         assert!(output.ends_with(b"500 unknown command\r\n"));
     }
 
     #[test]
-    fn client_command_batch_generates_article_and_body_without_growth() {
-        let mut output = [0_u8; 4 * MAX_CLIENT_COMMAND_BYTES];
-        let written = fill_client_command_batch(
-            &mut output,
-            CommandBatchSpec {
-                start_command_id: 1,
-                start_request_index: 0,
-                count: 4,
-                mix: ClientCommandMix::Alternate,
-                segments: None,
-                client_index: 0,
-                total_clients: 1,
-            },
-        );
-
-        assert_eq!(
-            &output[..written],
-            b"ARTICLE <bench.1@nntpbench.local>\r\n\
-BODY <bench.2@nntpbench.local>\r\n\
-ARTICLE <bench.3@nntpbench.local>\r\n\
-BODY <bench.4@nntpbench.local>\r\n"
-        );
-    }
-
-    #[test]
-    fn client_command_batch_can_use_segment_message_ids() {
+    fn synchronous_hot_path_units_do_not_allocate() {
+        let config = ServerConfig::from_args(test_args());
+        let stats = Stats::new();
+        let mut output = FixedWrite::<4096>::new();
         let segments = SegmentSet {
-            ids: vec![
-                b"<a@nntpbench.local>".to_vec().into_boxed_slice(),
-                b"<b@nntpbench.local>".to_vec().into_boxed_slice(),
-            ]
-            .into_boxed_slice(),
-            max_id_len: b"<a@nntpbench.local>".len(),
+            ids: vec![MessageId::from_shared(Arc::<str>::from("<segment@test>")).unwrap()]
+                .into_boxed_slice(),
         };
-        let mut output = [0_u8; 128];
-        let written = fill_client_command_batch(
-            &mut output,
-            CommandBatchSpec {
-                start_command_id: 0,
-                start_request_index: 0,
-                count: 2,
-                mix: ClientCommandMix::Alternate,
-                segments: Some(&segments),
-                client_index: 0,
-                total_clients: 1,
+        let article_target = ArticleDownloadTarget::MessageId(
+            MessageId::from_shared(Arc::<str>::from("<article-path@test>")).unwrap(),
+        );
+        let mut article_path = PathBuf::with_capacity(2048);
+        article_download_target_path_into(
+            &mut article_path,
+            Path::new("/tmp/nntpbench-hot-path"),
+            &article_target,
+        )
+        .unwrap();
+        let long_message = format!("<{}@example.test>", "a".repeat(480));
+        let long_command = format!("ARTICLE {long_message}\r\n");
+        assert!(long_command.len() <= MAX_COMMAND_LINE_BYTES);
+        let mut command_lines = CommandLineBatch::default();
+
+        assert_no_allocations(
+            "request parse, scan, serialize, and generated response",
+            || {
+                let request = RequestLine::parse(b"BODY 1\r\n");
+                assert_eq!(request.kind(), RequestKind::Body);
+
+                let mut seen = 0;
+                let consumed =
+                    for_each_request_line_in_batch(b"ARTICLE 1\r\nBODY 2\r\n", 8, |_| {
+                        seen += 1;
+                    });
+                assert_eq!(seen, 2);
+                assert_eq!(consumed, b"ARTICLE 1\r\nBODY 2\r\n".len());
+
+                output.clear();
+                Request::body_number(42).unwrap().write_wire_to(&mut output);
+                assert_eq!(output.as_slice(), b"BODY 42\r\n");
+
+                let segment_request = typed_request_for_command(
+                    42,
+                    0,
+                    ClientCommandMix::Article,
+                    Some(&segments),
+                    0,
+                    1,
+                )
+                .unwrap();
+                assert_eq!(
+                    segment_request.message_id().map(MessageId::as_str),
+                    Some("<segment@test>")
+                );
+
+                let article_ref = article_ref_for_download_target(&article_target).unwrap();
+                assert_eq!(
+                    article_ref.message_id().map(MessageId::as_str),
+                    Some("<article-path@test>")
+                );
+                article_download_target_path_into(
+                    &mut article_path,
+                    Path::new("/tmp/nntpbench-hot-path"),
+                    &article_target,
+                )
+                .unwrap();
+
+                let command = parse_command_line(long_command.as_bytes(), 0);
+                command_lines.copy_line(0, long_command.as_bytes());
+                assert_eq!(
+                    command_message_id(&command, &command_lines)
+                        .unwrap()
+                        .as_str(),
+                    long_message
+                );
+
+                output.clear();
+                assert!(!process_request_to_buffer(
+                    request,
+                    &config,
+                    &stats,
+                    &mut output,
+                ));
+                assert!(output.as_slice().starts_with(BODY_RESPONSE_PREFIX));
+                assert!(output.as_slice().ends_with(DOT_TERMINATOR));
             },
         );
-
-        assert_eq!(
-            &output[..written],
-            b"BODY <a@nntpbench.local>\r\nARTICLE <b@nntpbench.local>\r\n"
-        );
     }
 
     #[test]
-    fn client_command_counts_match_alternating_id_parity() {
-        assert_eq!(
-            count_client_commands(1, 5, ClientCommandMix::Alternate),
-            (3, 2)
-        );
-        assert_eq!(
-            count_client_commands(2, 5, ClientCommandMix::Alternate),
-            (2, 3)
-        );
-        assert_eq!(
-            count_client_commands(7, 5, ClientCommandMix::Article),
-            (5, 0)
-        );
-        assert_eq!(count_client_commands(7, 5, ClientCommandMix::Body), (0, 5));
-    }
-
-    #[test]
-    fn multiline_scanner_uses_tail_buffer_across_boundaries() {
-        let mut scanner = MultilineScanner::default();
-
-        assert_eq!(scanner.count_terminators(b"222 body\r\npayload\r"), 0);
-        assert_eq!(scanner.count_terminators(b"\n.\r"), 0);
-        assert_eq!(scanner.count_terminators(b"\n220 article\r\n.\r\n"), 2);
-    }
-
-    #[test]
-    fn multiline_scanner_counts_packed_responses_in_one_pass() {
-        let mut scanner = MultilineScanner::default();
-
-        assert_eq!(
-            scanner.count_terminators(
-                b"222 body follows\r\npayload\r\n.\r\n220 article follows\r\npayload\r\n.\r\n"
-            ),
-            2
-        );
-        assert_eq!(scanner.count_terminators(b".\r\n"), 0);
-    }
-
-    #[test]
-    fn in_chunk_terminator_counter_rejects_plain_dots() {
-        assert_eq!(
-            count_in_chunk_terminators(b"line.with.dots\r\nnot done\r\n"),
-            (0, 0)
-        );
-
-        assert_eq!(
-            count_in_chunk_terminators(b"one\r\n.\r\ntwo\r\n..\r\nthree\r\n.\r\npartial\r\n.\r"),
-            (2, 27)
-        );
+    fn generated_response_descriptor_does_not_allocate() {
+        assert_no_allocations("generated response descriptor construction", || {
+            let response = GeneratedResponse::new(BODY_RESPONSE_PREFIX, 1024 * 1024);
+            assert_eq!(response.prefix, BODY_RESPONSE_PREFIX);
+            assert_eq!(response.target_bytes, 1024 * 1024);
+        });
     }
 }

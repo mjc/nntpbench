@@ -9,13 +9,26 @@ set -e
 # Outputs:
 #   strace mode:  strace.log + summary
 #   offcpu mode:  flamegraph-offcpu.svg
+#   macOS sample mode: latency-sample.txt
+#   macOS dtrace mode: dtrace-syscalls.log
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR"
 
-MODE="${1:-strace}"
-shift 1 2>/dev/null || true
+PLATFORM="$(uname -s)"
+case "${1:-}" in
+    -h|--help|strace|offcpu|sample|dtrace)
+        MODE="$1"
+        shift
+        ;;
+    *)
+        case "$PLATFORM" in
+            Darwin) MODE="sample" ;;
+            *) MODE="strace" ;;
+        esac
+        ;;
+esac
 
 TARGET="server"
 if [ $# -gt 0 ]; then
@@ -35,8 +48,14 @@ if [ "$MODE" = "-h" ] || [ "$MODE" = "--help" ]; then
     echo "Profile nntpbench latency and waiting patterns"
     echo ""
     echo "Modes:"
-    echo "  strace  - Record syscall latency (default)"
-    echo "  offcpu  - Off-CPU flamegraph (what we're waiting on)"
+    echo "  strace  - Linux syscall latency"
+    echo "  offcpu  - Linux off-CPU flamegraph"
+    echo "  sample  - macOS sampled wait/CPU stacks, default on Darwin"
+    echo "  dtrace  - macOS syscall latency aggregation"
+    echo ""
+    echo "Environment:"
+    echo "  PROFILE_SECONDS       macOS sample/dtrace duration, default 10"
+    echo "  SAMPLE_INTERVAL_MS    macOS sample interval, default 1"
     echo ""
     echo "Arguments:"
     echo '  TARGET    server (default), nntpbench, or a custom path'
@@ -70,23 +89,105 @@ case "$TARGET" in
         ;;
 esac
 
-# Fix perf permissions
-echo 0 | sudo tee /proc/sys/kernel/kptr_restrict > /dev/null
-echo -1 | sudo tee /proc/sys/kernel/perf_event_paranoid > /dev/null
-sudo chmod -R a+rx /sys/kernel/tracing 2>/dev/null || true
-sudo chmod -R a+rx /sys/kernel/debug/tracing 2>/dev/null || true
-
-# Build with profiling flags (only the binary we need)
-if [ -n "$BIN_NAME" ]; then
-    echo "Building $BIN_NAME..."
-    RUSTFLAGS="-C target-cpu=native -C force-frame-pointers=yes" cargo build --profile profiling --bin "$BIN_NAME"
-fi
+build_profile_binary() {
+    if [ -n "$BIN_NAME" ]; then
+        echo "Building $BIN_NAME..."
+        RUSTFLAGS="-C target-cpu=native -C force-frame-pointers=yes" cargo build --profile profiling --bin "$BIN_NAME"
+    fi
+}
 
 echo "=== Latency Profile Mode: $MODE ==="
 echo ""
 
-case "$MODE" in
-  strace)
+run_macos_sample() {
+    local output="latency-sample.txt"
+    local seconds="${PROFILE_SECONDS:-10}"
+    local interval_ms="${SAMPLE_INTERVAL_MS:-1}"
+
+    if ! command -v sample &> /dev/null; then
+        echo "Error: macOS sample tool not found"
+        exit 1
+    fi
+
+    build_profile_binary
+    echo "Profiling: $BINARY ${RUN_ARGS[*]} ${EXTRA_ARGS[*]}"
+    "$BINARY" "${RUN_ARGS[@]}" "${EXTRA_ARGS[@]}" &
+    APP_PID=$!
+    set +e
+    echo "Sampling PID $APP_PID for ${seconds}s at ${interval_ms}ms intervals..."
+    sample "$APP_PID" "$seconds" "$interval_ms" -mayDie -file "$output"
+    SAMPLE_STATUS=$?
+    if kill -0 "$APP_PID" 2>/dev/null; then
+        kill -INT "$APP_PID" 2>/dev/null || true
+    fi
+    wait "$APP_PID" 2>/dev/null || true
+    set -e
+    echo "Done: $output"
+    exit "$SAMPLE_STATUS"
+}
+
+run_macos_dtrace() {
+    local output="dtrace-syscalls.log"
+    local seconds="${PROFILE_SECONDS:-10}"
+
+    if ! command -v dtrace &> /dev/null; then
+        echo "Error: macOS dtrace tool not found"
+        exit 1
+    fi
+
+    build_profile_binary
+    echo "Profiling: $BINARY ${RUN_ARGS[*]} ${EXTRA_ARGS[*]}"
+    "$BINARY" "${RUN_ARGS[@]}" "${EXTRA_ARGS[@]}" &
+    APP_PID=$!
+    sleep 0.2
+
+    echo "Recording syscall latency for ${seconds}s with dtrace..."
+    echo "This may require sudo and may be limited by SIP on macOS."
+    sudo -v
+    set +e
+    sudo dtrace -q -p "$APP_PID" -n '
+        syscall:::entry /pid == $target/ {
+            self->start = timestamp;
+            self->name = probefunc;
+        }
+        syscall:::return /self->start/ {
+            @latency_ms[self->name] = quantize((timestamp - self->start) / 1000000);
+            @count[self->name] = count();
+            self->start = 0;
+            self->name = 0;
+        }' > "$output" &
+    DTRACE_PID=$!
+    sleep "$seconds"
+    kill -INT "$DTRACE_PID" 2>/dev/null || true
+    wait "$DTRACE_PID" 2>/dev/null
+    DTRACE_STATUS=$?
+    if kill -0 "$APP_PID" 2>/dev/null; then
+        kill -INT "$APP_PID" 2>/dev/null || true
+    fi
+    wait "$APP_PID" 2>/dev/null || true
+    set -e
+
+    echo "Done: $output"
+    exit "$DTRACE_STATUS"
+}
+
+case "$PLATFORM:$MODE" in
+  Darwin:sample)
+    run_macos_sample
+    ;;
+
+  Darwin:dtrace)
+    run_macos_dtrace
+    ;;
+
+  Darwin:*)
+    echo "Error: mode '$MODE' is not supported on macOS. Use sample or dtrace."
+    exit 1
+    ;;
+
+  Linux:strace)
+    build_profile_binary
+
     echo "Recording syscall latency with strace..."
     echo "Stop nntpbench to generate report."
     echo ""
@@ -127,7 +228,13 @@ case "$MODE" in
     echo "Full logs: strace.log"
     ;;
 
-  offcpu)
+  Linux:offcpu)
+    echo 0 | sudo tee /proc/sys/kernel/kptr_restrict > /dev/null
+    echo -1 | sudo tee /proc/sys/kernel/perf_event_paranoid > /dev/null
+    sudo chmod -R a+rx /sys/kernel/tracing 2>/dev/null || true
+    sudo chmod -R a+rx /sys/kernel/debug/tracing 2>/dev/null || true
+    build_profile_binary
+
     echo "Recording off-CPU time (what we're waiting on)..."
     echo "Stop nntpbench to generate flamegraph."
     echo ""
@@ -205,11 +312,7 @@ case "$MODE" in
     ;;
 
   *)
-    echo "Usage: $0 [strace|offcpu] [BIN] [ARGS...]"
-    echo ""
-    echo "Modes:"
-    echo "  strace  - Record syscall latency (default)"
-    echo "  offcpu  - Off-CPU flamegraph"
+    echo "Error: mode '$MODE' is not supported on $PLATFORM"
     exit 1
     ;;
 esac

@@ -19,8 +19,8 @@ supported! {
         Callgrind, LibraryBenchmarkConfig, library_benchmark, library_benchmark_group, main,
     };
     use nntpbench::{
-        CommandLine, ParsedCommand, ServerArgs, ServerConfig, Stats, parse_command_batch_bytes,
-        process_command_to_buffer,
+        RequestKind, RequestLine, ServerArgs, ServerConfig, Stats, for_each_request_line_in_batch,
+        process_request_to_buffer,
     };
     use std::hint::black_box;
     use std::sync::Arc;
@@ -35,6 +35,7 @@ supported! {
             listen: "127.0.0.1:0".parse().unwrap(),
             body_bytes,
             article_bytes,
+            article_dir: None,
             max_connections: 4096,
             threads: 1,
             max_pipeline_depth: 64,
@@ -45,6 +46,7 @@ supported! {
             socket_send_buffer: 0,
             stats_interval_secs: 0,
             flush: false,
+            pending_write_bytes: 800 * 1024,
         }
     }
 
@@ -73,7 +75,7 @@ supported! {
     struct PipelineHarness {
         config: Arc<ServerConfig>,
         stats: Stats,
-        commands: Vec<ParsedCommand>,
+        commands: Vec<RequestKind>,
         output: Vec<u8>,
     }
 
@@ -87,23 +89,23 @@ supported! {
     }
 
     #[library_benchmark]
-    #[bench::article(args = (b"ARTICLE <bench@nntpbench.local>"))]
-    #[bench::body(args = (b"BODY <bench@nntpbench.local>"))]
-    #[bench::capabilities(args = (b"CAPABILITIES"))]
-    #[bench::date(args = (b"DATE"))]
-    #[bench::mode_reader(args = (b"MODE READER"))]
-    #[bench::unknown(args = (b"HEAD 1"))]
-    #[bench::quit(args = (b"QUIT"))]
-    fn parse_command(command: &[u8]) -> ParsedCommand {
-        black_box(CommandLine::parse(black_box(command)))
+    #[bench::article(args = (b"ARTICLE <bench@nntpbench.local>\r\n"))]
+    #[bench::body(args = (b"BODY <bench@nntpbench.local>\r\n"))]
+    #[bench::capabilities(args = (b"CAPABILITIES\r\n"))]
+    #[bench::date(args = (b"DATE\r\n"))]
+    #[bench::mode_reader(args = (b"MODE READER\r\n"))]
+    #[bench::unknown(args = (b"XYZZY 1\r\n"))]
+    #[bench::quit(args = (b"QUIT\r\n"))]
+    fn parse_command(command: &[u8]) -> RequestKind {
+        black_box(RequestLine::parse(black_box(command)).kind())
     }
 
     #[library_benchmark]
     #[bench::article_64k(setup = setup_64k)]
     #[bench::article_768k(setup = setup_768k)]
     fn process_article(mut harness: ProcessHarness) -> usize {
-        process_command_to_buffer(
-            ParsedCommand::Article,
+        process_request_to_buffer(
+            RequestLine::parse(b"ARTICLE <bench@nntpbench.local>\r\n"),
             &harness.config,
             &harness.stats,
             &mut harness.output,
@@ -115,8 +117,8 @@ supported! {
     #[bench::body_64k(setup = setup_64k)]
     #[bench::body_768k(setup = setup_768k)]
     fn process_body(mut harness: ProcessHarness) -> usize {
-        process_command_to_buffer(
-            ParsedCommand::Body,
+        process_request_to_buffer(
+            RequestLine::parse(b"BODY <bench@nntpbench.local>\r\n"),
             &harness.config,
             &harness.stats,
             &mut harness.output,
@@ -127,8 +129,8 @@ supported! {
     #[library_benchmark]
     #[bench::capabilities(setup = setup_64k)]
     fn process_capabilities(mut harness: ProcessHarness) -> usize {
-        process_command_to_buffer(
-            ParsedCommand::Capabilities,
+        process_request_to_buffer(
+            RequestLine::parse(b"CAPABILITIES\r\n"),
             &harness.config,
             &harness.stats,
             &mut harness.output,
@@ -139,8 +141,8 @@ supported! {
     #[library_benchmark]
     #[bench::unknown(setup = setup_64k)]
     fn process_unknown(mut harness: ProcessHarness) -> usize {
-        process_command_to_buffer(
-            ParsedCommand::Unknown,
+        process_request_to_buffer(
+            RequestLine::parse(b"XYZZY 1\r\n"),
             &harness.config,
             &harness.stats,
             &mut harness.output,
@@ -151,8 +153,8 @@ supported! {
     #[library_benchmark]
     #[bench::date(setup = setup_64k)]
     fn process_date(mut harness: ProcessHarness) -> usize {
-        process_command_to_buffer(
-            ParsedCommand::Date,
+        process_request_to_buffer(
+            RequestLine::parse(b"DATE\r\n"),
             &harness.config,
             &harness.stats,
             &mut harness.output,
@@ -163,8 +165,8 @@ supported! {
     #[library_benchmark]
     #[bench::mode_reader(setup = setup_64k)]
     fn process_mode_reader(mut harness: ProcessHarness) -> usize {
-        process_command_to_buffer(
-            ParsedCommand::ModeReader,
+        process_request_to_buffer(
+            RequestLine::parse(b"MODE READER\r\n"),
             &harness.config,
             &harness.stats,
             &mut harness.output,
@@ -175,8 +177,8 @@ supported! {
     #[library_benchmark]
     #[bench::quit(setup = setup_64k)]
     fn process_quit(mut harness: ProcessHarness) -> bool {
-        black_box(process_command_to_buffer(
-            ParsedCommand::Quit,
+        black_box(process_request_to_buffer(
+            RequestLine::parse(b"QUIT\r\n"),
             &harness.config,
             &harness.stats,
             &mut harness.output,
@@ -192,20 +194,18 @@ ARTICLE <article@nntpbench.local>\r\n\
 CAPABILITIES\r\n\
 DATE\r\n\
 MODE READER\r\n\
-HEAD 1\r\n\
+XYZZY 1\r\n\
 QUIT\r\n",
         );
-        let consumed = parse_command_batch_bytes(request, 64, &mut harness.commands);
-        for command in &harness.commands {
-            if process_command_to_buffer(
-                *command,
+        let consumed = for_each_request_line_in_batch(request, 64, |request| {
+            harness.commands.push(request.kind());
+            let _ = process_request_to_buffer(
+                request,
                 &harness.config,
                 &harness.stats,
                 &mut harness.output,
-            ) {
-                break;
-            }
-        }
+            );
+        });
         black_box(consumed + harness.output.len())
     }
 
