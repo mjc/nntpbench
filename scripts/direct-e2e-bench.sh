@@ -72,7 +72,7 @@ grep -m1 "server listening" "$SERVER_LOG"
 for run in $(seq 1 "$RUNS"); do
     printf 'run=%s body_bytes=%s article_bytes=%s pending_write_bytes=%s command_mix=%s\n' \
         "$run" "$BODY_BYTES" "$ARTICLE_BYTES" "$PENDING_WRITE_BYTES" "$COMMAND_MIX"
-    "$TARGET_DIR/release/nntpbench" client \
+    "$TARGET_DIR/release/nntpbench" typed-client \
         --connect "$LISTEN" \
         --transfer-bytes "$TRANSFER_BYTES" \
         --connections "$CONNECTIONS" \
