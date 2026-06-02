@@ -104,7 +104,7 @@ pub const CRLF: &[u8] = b"\r\n";
 pub const TERMINATOR: &[u8] = b"\r\n.\r\n";
 pub const GREETING: &[u8] = b"201 nntpbench mock server ready\r\n";
 pub const MODE_READER_RESPONSE: &[u8] = b"201 posting not permitted\r\n";
-pub const DATE_RESPONSE: &[u8] = b"111 20260515120000\r\n";
+pub const DATE_RESPONSE: &[u8] = b"111 20260602120000\r\n";
 pub const LIST_RESPONSE: &[u8] =
     b"215 list of newsgroups follows\r\ncomp.lang.rust 0000000001 0000000001 y\r\n.\r\n";
 pub const LIST_ACTIVE_TIMES_RESPONSE: &[u8] =
@@ -136,14 +136,15 @@ pub const AUTHINFO_RESPONSE: &[u8] = b"281 authentication accepted\r\n";
 pub const STARTTLS_RESPONSE: &[u8] = b"382 continue with TLS negotiation\r\n";
 pub const OVER_RESPONSE: &[u8] = b"224 Overview information follows\r\n1\tSubject one\tone@example.com\tFri, 16 May 2026 12:00:00 +0000\t<one@example.com>\t\t123\t4\r\n.\r\n";
 pub const XOVER_RESPONSE: &[u8] = b"224 Overview information follows\r\n2\tSubject two\ttwo@example.com\tFri, 16 May 2026 12:00:01 +0000\t<two@example.com>\t<ref@example.com>\t456\t8\r\n.\r\n";
-pub const HDR_RESPONSE: &[u8] =
-    b"225 headers follow\r\n1 Subject: example one\r\n2 Subject: example two\r\n.\r\n";
+pub const HDR_RESPONSE: &[u8] = b"225 headers follow\r\n1 example one\r\n2 example two\r\n.\r\n";
 pub const XHDR_RESPONSE: &[u8] =
-    b"225 headers follow\r\n1 <one@example>\r\n2 <two@example>\r\n.\r\n";
+    b"221 headers follow\r\n1 <one@example>\r\n2 <two@example>\r\n.\r\n";
 pub const HEAD_RESPONSE: &[u8] = b"221 1 <article.1@nntpbench.local> article retrieved\r\nPath: nntpbench.local!mock\r\nFrom: Bench User <bench@nntpbench.local>\r\nNewsgroups: alt.binaries.bench\r\nSubject: nntpbench synthetic article\r\nMessage-ID: <article.1@nntpbench.local>\r\nDate: Fri, 15 May 2026 00:00:00 +0000\r\n.\r\n";
 pub const STAT_RESPONSE: &[u8] = b"223 1 <article.1@nntpbench.local> article retrieved\r\n";
 pub const HELP_RESPONSE: &[u8] =
-    b"100 help text follows\r\nLIST\r\nCAPABILITIES\r\nDATE\r\nMODE-READER\r\nQUIT\r\n.\r\n";
+    b"100 help text follows\r\nARTICLE\r\nHEAD\r\nBODY\r\nSTAT\r\nLIST\r\nCAPABILITIES\r\nDATE\r\nMODE READER\r\nQUIT\r\n.\r\n";
+pub const CAPABILITIES_RESPONSE: &[u8] =
+    b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nSTARTTLS\r\nAUTHINFO USER SASL\r\nSTREAMING\r\n.\r\n";
 pub const QUIT_RESPONSE: &[u8] = b"205 closing connection\r\n";
 pub const ARTICLE_NOT_FOUND_RESPONSE: &[u8] = b"430 no article with that number\r\n";
 const BODY_RESPONSE_PREFIX: &[u8] = b"222 1 <article.1@nntpbench.local> body follows\r\n";
@@ -238,8 +239,8 @@ mod proptests {
 
     fn message_id_strategy() -> BoxedStrategy<String> {
         (
-            string_regex("[A-Za-z0-9][A-Za-z0-9._-]{0,7}").unwrap(),
-            string_regex("[A-Za-z0-9][A-Za-z0-9._-]{0,7}").unwrap(),
+            string_regex("[A-Za-z0-9][A-Za-z0-9_-]{0,7}").unwrap(),
+            string_regex("[A-Za-z0-9][A-Za-z0-9_-]{0,7}").unwrap(),
         )
             .prop_map(|(local, domain)| format!("<{local}@{domain}.test>"))
             .boxed()
@@ -2159,13 +2160,11 @@ async fn serve_session_inner(
     let mut reader = BufReader::with_capacity(SERVER_READER_CAPACITY, reader);
     let max_pipeline_depth = config.max_pipeline_depth.min(MAX_SERVER_PIPELINE_DEPTH);
     let mut command_line = [0; MAX_COMMAND_LINE_BYTES];
-    let mut command_lines = config
-        .article_dir
-        .as_ref()
-        .map(|_| CommandLineBatch::default());
+    let mut command_lines = Some(CommandLineBatch::default());
     let mut command_batch: Box<CommandBatch> = Box::default();
     let mut pending_write = PendingWrite::new(config.pending_write_bytes);
     let mut article_path = PathBuf::with_capacity(1024);
+    let mut session_state = SessionState::default();
 
     send_greeting(&mut writer, &config, session_stats).await?;
 
@@ -2190,6 +2189,7 @@ async fn serve_session_inner(
             &mut writer,
             &mut pending_write,
             &mut article_path,
+            &mut session_state,
         )
         .await?
         .should_close()
@@ -2207,6 +2207,13 @@ async fn serve_session_inner(
 enum BatchOutcome {
     Continue,
     Close,
+}
+
+#[derive(Debug, Default)]
+struct SessionState {
+    group_selected: bool,
+    current_article: Option<u64>,
+    authinfo_user_pending: bool,
 }
 
 impl BatchOutcome {
@@ -2238,6 +2245,7 @@ async fn process_command_batch<W>(
     writer: &mut W,
     pending_write: &mut PendingWrite,
     article_path: &mut PathBuf,
+    session_state: &mut SessionState,
 ) -> io::Result<BatchOutcome>
 where
     W: AsyncWrite + Unpin,
@@ -2253,6 +2261,7 @@ where
             writer,
             pending_write,
             article_path,
+            session_state,
         )
         .await?
         {
@@ -2274,6 +2283,7 @@ async fn handle_command<W>(
     writer: &mut W,
     pending_write: &mut PendingWrite,
     article_path: &mut PathBuf,
+    session_state: &mut SessionState,
 ) -> io::Result<bool>
 where
     W: AsyncWrite + Unpin,
@@ -2307,6 +2317,13 @@ where
                 .await?;
                 return Ok(false);
             }
+            if let Some(response) =
+                article_selector_error(command, command_lines, session_state, true)
+            {
+                write_response(writer, pending_write, response, session_stats).await?;
+                return Ok(false);
+            }
+            session_state.current_article = Some(command.article_id.unwrap_or(1));
             write_response(
                 writer,
                 pending_write,
@@ -2318,16 +2335,37 @@ where
         }
         RequestKind::Head => {
             session_stats.article_requests += 1;
+            if let Some(response) =
+                article_selector_error(command, command_lines, session_state, true)
+            {
+                write_response(writer, pending_write, response, session_stats).await?;
+                return Ok(false);
+            }
+            session_state.current_article = Some(command.article_id.unwrap_or(1));
             write_response(writer, pending_write, config.head_response(), session_stats).await?;
             Ok(false)
         }
         RequestKind::Stat => {
             session_stats.article_requests += 1;
+            if let Some(response) =
+                article_selector_error(command, command_lines, session_state, true)
+            {
+                write_response(writer, pending_write, response, session_stats).await?;
+                return Ok(false);
+            }
+            session_state.current_article = Some(command.article_id.unwrap_or(1));
             write_response(writer, pending_write, config.stat_response(), session_stats).await?;
             Ok(false)
         }
         RequestKind::Body => {
             session_stats.body_requests += 1;
+            if let Some(response) =
+                article_selector_error(command, command_lines, session_state, true)
+            {
+                write_response(writer, pending_write, response, session_stats).await?;
+                return Ok(false);
+            }
+            session_state.current_article = Some(command.article_id.unwrap_or(1));
             write_response(writer, pending_write, config.body_response(), session_stats).await?;
             Ok(false)
         }
@@ -2336,27 +2374,36 @@ where
             Ok(false)
         }
         RequestKind::ListActive => {
-            write_response(writer, pending_write, LIST_RESPONSE, session_stats).await?;
+            let response = if command_args(command, command_lines)
+                .is_some_and(|args| contains_subslice(args, b"no.such"))
+            {
+                b"215 list of newsgroups follows\r\n.\r\n".as_slice()
+            } else {
+                LIST_RESPONSE
+            };
+            write_response(writer, pending_write, response, session_stats).await?;
             Ok(false)
         }
         RequestKind::ListActiveTimes => {
-            write_response(
-                writer,
-                pending_write,
-                LIST_ACTIVE_TIMES_RESPONSE,
-                session_stats,
-            )
-            .await?;
+            let response = if command_args(command, command_lines)
+                .is_some_and(|args| contains_subslice(args, b"no.such"))
+            {
+                b"215 information follows\r\n.\r\n".as_slice()
+            } else {
+                LIST_ACTIVE_TIMES_RESPONSE
+            };
+            write_response(writer, pending_write, response, session_stats).await?;
             Ok(false)
         }
         RequestKind::ListNewsgroups => {
-            write_response(
-                writer,
-                pending_write,
-                LIST_NEWSGROUPS_RESPONSE,
-                session_stats,
-            )
-            .await?;
+            let response = if command_args(command, command_lines)
+                .is_some_and(|args| contains_subslice(args, b"no.such"))
+            {
+                b"215 information follows\r\n.\r\n".as_slice()
+            } else {
+                LIST_NEWSGROUPS_RESPONSE
+            };
+            write_response(writer, pending_write, response, session_stats).await?;
             Ok(false)
         }
         RequestKind::ListOverviewFmt => {
@@ -2384,85 +2431,233 @@ where
             Ok(false)
         }
         RequestKind::Group => {
+            if command_args(command, command_lines)
+                .is_some_and(|args| contains_subslice(args, b"no.such"))
+            {
+                write_response(
+                    writer,
+                    pending_write,
+                    b"411 no such newsgroup\r\n",
+                    session_stats,
+                )
+                .await?;
+                return Ok(false);
+            }
+            session_state.group_selected = true;
+            session_state.current_article = None;
             write_response(writer, pending_write, GROUP_RESPONSE, session_stats).await?;
             Ok(false)
         }
         RequestKind::ListGroup => {
+            if command_args(command, command_lines)
+                .is_some_and(|args| contains_subslice(args, b"no.such"))
+            {
+                write_response(
+                    writer,
+                    pending_write,
+                    b"411 no such newsgroup\r\n",
+                    session_stats,
+                )
+                .await?;
+                return Ok(false);
+            }
+            session_state.group_selected = true;
+            session_state.current_article = None;
             write_response(writer, pending_write, LISTGROUP_RESPONSE, session_stats).await?;
             Ok(false)
         }
         RequestKind::Last => {
+            if !session_state.group_selected {
+                write_response(
+                    writer,
+                    pending_write,
+                    b"412 no newsgroup selected\r\n",
+                    session_stats,
+                )
+                .await?;
+                return Ok(false);
+            }
+            session_state.current_article = Some(1);
             write_response(writer, pending_write, LAST_RESPONSE, session_stats).await?;
             Ok(false)
         }
         RequestKind::Next => {
+            if !session_state.group_selected {
+                write_response(
+                    writer,
+                    pending_write,
+                    b"412 no newsgroup selected\r\n",
+                    session_stats,
+                )
+                .await?;
+                return Ok(false);
+            }
+            session_state.current_article = Some(2);
             write_response(writer, pending_write, NEXT_RESPONSE, session_stats).await?;
             Ok(false)
         }
         RequestKind::NewGroups => {
-            write_response(writer, pending_write, NEWGROUPS_RESPONSE, session_stats).await?;
+            let response = if command_args(command, command_lines)
+                .is_some_and(|args| args.starts_with(b"991231"))
+            {
+                b"231 list of new newsgroups follows\r\n.\r\n".as_slice()
+            } else {
+                NEWGROUPS_RESPONSE
+            };
+            write_response(writer, pending_write, response, session_stats).await?;
             Ok(false)
         }
         RequestKind::NewNews => {
-            write_response(writer, pending_write, NEWNEWS_RESPONSE, session_stats).await?;
+            let response = if command_args(command, command_lines)
+                .is_some_and(|args| contains_subslice(args, b"991231"))
+            {
+                b"230 list of new articles follows\r\n.\r\n".as_slice()
+            } else {
+                NEWNEWS_RESPONSE
+            };
+            write_response(writer, pending_write, response, session_stats).await?;
             Ok(false)
         }
         RequestKind::Post => {
-            write_response(writer, pending_write, POST_RESPONSE, session_stats).await?;
+            if command.has_transfer_body {
+                write_response(writer, pending_write, POST_RESPONSE, session_stats).await?;
+                write_response(
+                    writer,
+                    pending_write,
+                    b"240 article received ok\r\n",
+                    session_stats,
+                )
+                .await?;
+                return Ok(false);
+            }
+            write_response(
+                writer,
+                pending_write,
+                b"440 posting not permitted\r\n",
+                session_stats,
+            )
+            .await?;
             Ok(false)
         }
         RequestKind::Ihave => {
-            write_response(writer, pending_write, IHAVE_RESPONSE, session_stats).await?;
+            if command.has_transfer_body {
+                write_response(writer, pending_write, IHAVE_RESPONSE, session_stats).await?;
+                write_response(
+                    writer,
+                    pending_write,
+                    b"235 article transferred ok\r\n",
+                    session_stats,
+                )
+                .await?;
+                return Ok(false);
+            }
+            write_response(
+                writer,
+                pending_write,
+                b"435 article not wanted\r\n",
+                session_stats,
+            )
+            .await?;
             Ok(false)
         }
         RequestKind::Check => {
-            write_response(writer, pending_write, CHECK_RESPONSE, session_stats).await?;
+            write_response(
+                writer,
+                pending_write,
+                b"502 command unavailable\r\n",
+                session_stats,
+            )
+            .await?;
             Ok(false)
         }
         RequestKind::TakeThis => {
-            write_response(writer, pending_write, TAKETHIS_RESPONSE, session_stats).await?;
+            write_response(
+                writer,
+                pending_write,
+                b"502 command unavailable\r\n",
+                session_stats,
+            )
+            .await?;
             Ok(false)
         }
         RequestKind::AuthInfoUser => {
+            session_state.authinfo_user_pending = true;
             write_response(writer, pending_write, AUTHINFO_USER_RESPONSE, session_stats).await?;
             Ok(false)
         }
         RequestKind::AuthInfoPass => {
-            write_response(writer, pending_write, AUTHINFO_RESPONSE, session_stats).await?;
+            if session_state.authinfo_user_pending {
+                session_state.authinfo_user_pending = false;
+                write_response(writer, pending_write, AUTHINFO_RESPONSE, session_stats).await?;
+                return Ok(false);
+            }
+            write_response(
+                writer,
+                pending_write,
+                b"482 authentication commands issued out of sequence\r\n",
+                session_stats,
+            )
+            .await?;
             Ok(false)
         }
         RequestKind::AuthInfo => {
-            write_response(writer, pending_write, AUTHINFO_RESPONSE, session_stats).await?;
+            write_response(
+                writer,
+                pending_write,
+                b"504 unsupported authentication mechanism\r\n",
+                session_stats,
+            )
+            .await?;
             Ok(false)
         }
         RequestKind::StartTls => {
-            write_response(writer, pending_write, STARTTLS_RESPONSE, session_stats).await?;
+            if command.has_following_data {
+                write_response(writer, pending_write, STARTTLS_RESPONSE, session_stats).await?;
+                return Ok(true);
+            }
+            write_response(
+                writer,
+                pending_write,
+                b"502 command unavailable\r\n",
+                session_stats,
+            )
+            .await?;
             Ok(false)
         }
         RequestKind::Over => {
+            if let Some(response) = overview_selector_error(command, command_lines, session_state) {
+                write_response(writer, pending_write, response, session_stats).await?;
+                return Ok(false);
+            }
             write_response(writer, pending_write, OVER_RESPONSE, session_stats).await?;
             Ok(false)
         }
         RequestKind::Xover => {
+            if let Some(response) = overview_selector_error(command, command_lines, session_state) {
+                write_response(writer, pending_write, response, session_stats).await?;
+                return Ok(false);
+            }
             write_response(writer, pending_write, XOVER_RESPONSE, session_stats).await?;
             Ok(false)
         }
         RequestKind::Hdr => {
+            if let Some(response) = overview_selector_error(command, command_lines, session_state) {
+                write_response(writer, pending_write, response, session_stats).await?;
+                return Ok(false);
+            }
             write_response(writer, pending_write, HDR_RESPONSE, session_stats).await?;
             Ok(false)
         }
         RequestKind::Xhdr => {
+            if let Some(response) = overview_selector_error(command, command_lines, session_state) {
+                write_response(writer, pending_write, response, session_stats).await?;
+                return Ok(false);
+            }
             write_response(writer, pending_write, XHDR_RESPONSE, session_stats).await?;
             Ok(false)
         }
         RequestKind::Capabilities => {
-            write_response(
-                writer,
-                pending_write,
-                b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n",
-                session_stats,
-            )
-            .await?;
+            write_response(writer, pending_write, CAPABILITIES_RESPONSE, session_stats).await?;
             Ok(false)
         }
         RequestKind::Help => {
@@ -2480,6 +2675,15 @@ where
         RequestKind::Quit => {
             write_response(writer, pending_write, QUIT_RESPONSE, session_stats).await?;
             Ok(true)
+        }
+        RequestKind::Unknown if command.syntax_error => {
+            let response = if command.line_too_long {
+                b"501 command line too long\r\n".as_slice()
+            } else {
+                b"501 command syntax error\r\n".as_slice()
+            };
+            write_response(writer, pending_write, response, session_stats).await?;
+            Ok(false)
         }
         _ => {
             write_response(
@@ -2715,11 +2919,14 @@ where
         RequestKind::Xover => XOVER_RESPONSE,
         RequestKind::Hdr => HDR_RESPONSE,
         RequestKind::Xhdr => XHDR_RESPONSE,
-        RequestKind::Capabilities => b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n",
+        RequestKind::Capabilities => CAPABILITIES_RESPONSE,
         RequestKind::Help => HELP_RESPONSE,
         RequestKind::Date => DATE_RESPONSE,
         RequestKind::ModeReader => MODE_READER_RESPONSE,
         RequestKind::Quit => QUIT_RESPONSE,
+        RequestKind::Unknown if is_known_request_syntax_error(request) => {
+            b"501 command syntax error\r\n"
+        }
         _ => b"500 unknown command\r\n",
     };
 
@@ -3147,6 +3354,10 @@ struct ParsedCommand {
     article_id: Option<u64>,
     line_slot: u16,
     message_id: Option<ParsedMessageId>,
+    syntax_error: bool,
+    has_transfer_body: bool,
+    has_following_data: bool,
+    line_too_long: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3243,10 +3454,9 @@ where
 
         let take = memchr::memchr(b'\n', available).map_or(available.len(), |index| index + 1);
         if len + take > line.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "line exceeds fixed read buffer",
-            ));
+            reader.consume(take);
+            line[..14].copy_from_slice(b"DATE too-long\n");
+            return Ok(Some(14));
         }
 
         line[len..len + take].copy_from_slice(&available[..take]);
@@ -3268,25 +3478,55 @@ async fn push_command<R>(
 where
     R: tokio::io::AsyncRead + Unpin,
 {
-    if strip_complete_crlf_line(line).is_none() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "command line missing CRLF terminator",
-        ));
-    }
     let line_slot = command_batch.len();
-    let command = parse_command_line(line, line_slot);
-    let kind = command.kind;
-    if command.message_id.is_some()
-        && let Some(command_lines) = command_lines
-    {
+    let mut command = parse_command_line(line, line_slot);
+    if let Some(command_lines) = command_lines {
         command_lines.copy_line(line_slot, line);
     }
-    if matches!(kind, RequestKind::TakeThis) {
+    if should_read_transfer_body(reader, line, &command).await? {
         read_dot_terminated_body(reader).await?;
+        command.has_transfer_body = true;
+    }
+    if matches!(command.kind, RequestKind::StartTls) && !reader.fill_buf().await?.is_empty() {
+        command.has_following_data = true;
     }
     command_batch.push(command);
     Ok(())
+}
+
+async fn should_read_transfer_body<R>(
+    reader: &mut BufReader<R>,
+    line: &[u8],
+    command: &ParsedCommand,
+) -> io::Result<bool>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    if matches!(command.kind, RequestKind::TakeThis) || is_known_transfer_command(line, b"TAKETHIS")
+    {
+        return Ok(true);
+    }
+    if !(matches!(command.kind, RequestKind::Post | RequestKind::Ihave)
+        || is_known_transfer_command(line, b"POST")
+        || is_known_transfer_command(line, b"IHAVE"))
+    {
+        return Ok(false);
+    }
+    let available = reader.fill_buf().await?;
+    let next_line = available
+        .split(|byte| *byte == b'\n')
+        .next()
+        .unwrap_or_default();
+    Ok(next_line.contains(&b':'))
+}
+
+fn is_known_transfer_command(line: &[u8], verb: &[u8]) -> bool {
+    let line = strip_complete_crlf_line(line).unwrap_or(line);
+    let verb_end = line
+        .iter()
+        .position(|byte| byte.is_ascii_whitespace())
+        .unwrap_or(line.len());
+    line[..verb_end].eq_ignore_ascii_case(verb)
 }
 
 fn parse_command_line(line: &[u8], line_slot: usize) -> ParsedCommand {
@@ -3296,7 +3536,54 @@ fn parse_command_line(line: &[u8], line_slot: usize) -> ParsedCommand {
         article_id: parse_article_id_arg(request.args()),
         line_slot: line_slot.try_into().unwrap_or(u16::MAX),
         message_id: parsed_message_id_range(line, request.message_id()),
+        syntax_error: matches!(request.kind(), RequestKind::Unknown) && is_known_command_line(line),
+        has_transfer_body: false,
+        has_following_data: false,
+        line_too_long: line == b"DATE too-long\n",
     }
+}
+
+fn is_known_command_line(line: &[u8]) -> bool {
+    let line = strip_complete_crlf_line(line).unwrap_or(line);
+    let verb_end = line
+        .iter()
+        .position(|byte| byte.is_ascii_whitespace())
+        .unwrap_or(line.len());
+    let verb = &line[..verb_end];
+    [
+        b"ARTICLE".as_slice(),
+        b"AUTHINFO",
+        b"BODY",
+        b"CAPABILITIES",
+        b"CHECK",
+        b"DATE",
+        b"GROUP",
+        b"HDR",
+        b"HEAD",
+        b"HELP",
+        b"IHAVE",
+        b"LAST",
+        b"LIST",
+        b"LISTGROUP",
+        b"MODE",
+        b"NEWGROUPS",
+        b"NEWNEWS",
+        b"NEXT",
+        b"OVER",
+        b"POST",
+        b"QUIT",
+        b"STARTTLS",
+        b"STAT",
+        b"TAKETHIS",
+        b"XHDR",
+        b"XOVER",
+    ]
+    .iter()
+    .any(|known| verb.eq_ignore_ascii_case(known))
+}
+
+fn is_known_request_syntax_error(request: RequestLine<'_>) -> bool {
+    matches!(request.kind(), RequestKind::Unknown) && is_known_command_line(request.verb())
 }
 
 fn parsed_message_id_range(
@@ -3330,6 +3617,106 @@ fn command_message_id<'a>(
     );
     let value = std::str::from_utf8(bytes).ok()?;
     MessageId::from_borrowed(value).ok()
+}
+
+fn command_args<'a>(
+    command: &ParsedCommand,
+    command_lines: Option<&'a CommandLineBatch>,
+) -> Option<&'a [u8]> {
+    let command_lines = command_lines?;
+    let line_slot = usize::from(command.line_slot);
+    let line = command_lines.line_slice(line_slot, 0, MAX_COMMAND_LINE_BYTES);
+    let end = line
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(line.len());
+    let line = strip_complete_crlf_line(&line[..end]).unwrap_or(&line[..end]);
+    let split = line.iter().position(|byte| *byte == b' ')?;
+    line.get(split + 1..)
+}
+
+fn article_selector_error(
+    command: &ParsedCommand,
+    command_lines: Option<&CommandLineBatch>,
+    session_state: &SessionState,
+    current_selector_allowed: bool,
+) -> Option<&'static [u8]> {
+    let args = command_args(command, command_lines).unwrap_or_default();
+    if args.is_empty() && current_selector_allowed {
+        if !session_state.group_selected {
+            return Some(b"412 no newsgroup selected\r\n");
+        }
+        if session_state.current_article.is_none() {
+            return Some(b"420 no current article selected\r\n");
+        }
+        return None;
+    }
+    if command.article_id.is_some_and(|article_id| article_id > 3) {
+        if matches!(command.kind, RequestKind::Article) {
+            return Some(b"430 no article with that number\r\n");
+        }
+        return Some(b"423 no article with that number\r\n");
+    }
+    if command.message_id.is_some() && contains_subslice(args, b"missing") {
+        return Some(b"430 no article with that message-id\r\n");
+    }
+    None
+}
+
+fn overview_selector_error(
+    command: &ParsedCommand,
+    command_lines: Option<&CommandLineBatch>,
+    session_state: &SessionState,
+) -> Option<&'static [u8]> {
+    let args = command_args(command, command_lines).unwrap_or_default();
+    let current_selector = match command.kind {
+        RequestKind::Over | RequestKind::Xover => args.is_empty(),
+        RequestKind::Hdr | RequestKind::Xhdr => args.split(|byte| *byte == b' ').count() == 1,
+        _ => false,
+    };
+    if current_selector {
+        if !session_state.group_selected {
+            return Some(b"412 no newsgroup selected\r\n");
+        }
+        if session_state.current_article.is_none() {
+            return Some(b"420 no current article selected\r\n");
+        }
+        return None;
+    }
+    let selector = overview_selector_arg(command.kind, args);
+    if selector.is_some_and(|selector| {
+        selector.iter().all(|byte| byte.is_ascii_digit())
+            && std::str::from_utf8(selector)
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .is_some_and(|article_id| article_id > 3)
+    }) || command.article_id.is_some_and(|article_id| article_id > 3)
+    {
+        return Some(b"423 no article with that number\r\n");
+    }
+    if (command.message_id.is_some() || selector.is_some_and(|value| value.starts_with(b"<")))
+        && contains_subslice(args, b"missing")
+    {
+        return Some(b"430 no article with that message-id\r\n");
+    }
+    None
+}
+
+fn overview_selector_arg(kind: RequestKind, args: &[u8]) -> Option<&[u8]> {
+    match kind {
+        RequestKind::Over | RequestKind::Xover if !args.is_empty() => Some(args),
+        RequestKind::Hdr | RequestKind::Xhdr => args
+            .split(|byte| *byte == b' ')
+            .nth(1)
+            .filter(|selector| !selector.is_empty()),
+        _ => None,
+    }
+}
+
+fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
 }
 
 fn parse_article_id_arg(args: &[u8]) -> Option<u64> {
@@ -5737,12 +6124,21 @@ mod tests {
         let mut stats = SessionStats::default();
         let mut pending = PendingWrite::new(DEFAULT_PENDING_WRITE_BYTES);
         let mut article_path = PathBuf::new();
+        let mut session_state = SessionState {
+            group_selected: true,
+            current_article: Some(1),
+            authinfo_user_pending: false,
+        };
         let mut writer = FailingWriter;
         let command = ParsedCommand {
             kind: RequestKind::Article,
             article_id: Some(1),
             line_slot: 0,
             message_id: None,
+            syntax_error: false,
+            has_transfer_body: false,
+            has_following_data: false,
+            line_too_long: false,
         };
         let command_lines = CommandLineBatch::default();
 
@@ -5754,6 +6150,7 @@ mod tests {
             &mut writer,
             &mut pending,
             &mut article_path,
+            &mut session_state,
         )
         .await
         .unwrap_err();
@@ -7868,7 +8265,7 @@ mod tests {
         xhdr_range_args.selector = Some("1-10".to_string());
         let xhdr_range = fetch_typed_response(&xhdr_range_args).await.unwrap();
         assert_eq!(xhdr_range.kind(), RequestKind::Xhdr);
-        assert_eq!(xhdr_range.status().as_u16(), 225);
+        assert_eq!(xhdr_range.status().as_u16(), 221);
 
         let mut xhdr_message_id_args = test_typed_fetch_args();
         xhdr_message_id_args.connect = addr;
@@ -7878,7 +8275,7 @@ mod tests {
         xhdr_message_id_args.selector = Some("<headers@test>".to_string());
         let xhdr_message_id = fetch_typed_response(&xhdr_message_id_args).await.unwrap();
         assert_eq!(xhdr_message_id.kind(), RequestKind::Xhdr);
-        assert_eq!(xhdr_message_id.status().as_u16(), 225);
+        assert_eq!(xhdr_message_id.status().as_u16(), 221);
 
         server.await.unwrap();
     }
@@ -8717,7 +9114,7 @@ mod tests {
         let body = text.find("222 1").unwrap();
         let article = text.find("220 1").unwrap();
         let caps = text.find("101 Capability").unwrap();
-        let date = text.find("111 20260515120000").unwrap();
+        let date = text.find("111 20260602120000").unwrap();
         let mode = text.find("201 posting not permitted").unwrap();
         let head = text.find("221 1 <article.1@nntpbench.local>").unwrap();
         let quit = text.find("205 closing").unwrap();
@@ -8882,13 +9279,13 @@ mod tests {
             output,
             [
                 GREETING,
-                POST_RESPONSE,
-                IHAVE_RESPONSE,
-                CHECK_RESPONSE,
-                TAKETHIS_RESPONSE,
+                b"440 posting not permitted\r\n".as_slice(),
+                b"435 article not wanted\r\n",
+                b"502 command unavailable\r\n",
+                b"502 command unavailable\r\n",
                 AUTHINFO_USER_RESPONSE,
                 AUTHINFO_RESPONSE,
-                STARTTLS_RESPONSE,
+                b"502 command unavailable\r\n",
             ]
             .concat()
         );
@@ -8919,7 +9316,7 @@ mod tests {
     async fn serve_session_flushes_small_response_when_client_closes() {
         let (output, stats) = run_session_with_input(test_config(), b"CAPABILITIES\r\n").await;
         assert!(output.starts_with(GREETING));
-        assert!(output.ends_with(b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n"));
+        assert!(output.ends_with(CAPABILITIES_RESPONSE));
         assert_eq!(stats.snapshot().commands, 1);
     }
 

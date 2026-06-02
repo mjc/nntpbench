@@ -45,8 +45,8 @@ mod proptests {
 
     fn message_id_strategy() -> BoxedStrategy<String> {
         (
-            string_regex("[A-Za-z0-9][A-Za-z0-9._-]{0,7}").unwrap(),
-            string_regex("[A-Za-z0-9][A-Za-z0-9._-]{0,7}").unwrap(),
+            string_regex("[A-Za-z0-9][A-Za-z0-9_-]{0,7}").unwrap(),
+            string_regex("[A-Za-z0-9][A-Za-z0-9_-]{0,7}").unwrap(),
         )
             .prop_map(|(local, domain)| format!("<{local}@{domain}.test>"))
             .boxed()
@@ -245,7 +245,7 @@ mod proptests {
             prop_assert!(parsed_body.headers.is_none());
             prop_assert_eq!(parsed_body.body, Some(body.as_bytes()));
 
-            let stat_frame = format!("223 {article_number} {message_id}\r\n.\r\n");
+            let stat_frame = format!("223 {article_number} {message_id}\r\n");
             let stat = Article::parse(stat_frame.as_bytes()).unwrap();
             prop_assert_eq!(stat.message_id.as_str(), message_id.as_str());
             prop_assert_eq!(stat.article_number, Some(ArticleNumber::from(article_number as u64)));
@@ -278,7 +278,7 @@ mod proptests {
             let article_frame = format!("220 {first_line}\r\n{header_block}\r\n{body}.\r\n");
             let head_frame = format!("221 {first_line}\r\n{header_block}.\r\n");
             let body_frame = format!("222 {first_line}\r\n{body}.\r\n");
-            let stat_frame = format!("223 {first_line}\r\n.\r\n");
+            let stat_frame = format!("223 {first_line}\r\n");
 
             let article = Article::parse(article_frame.as_bytes()).unwrap();
             prop_assert_eq!(article.message_id.as_str(), message_id.as_str());
@@ -352,7 +352,7 @@ mod proptests {
             let article_frame = format!("220 {first_line}\r\n{header_block}\r\n{body}.\r\n");
             let head_frame = format!("221 {first_line}\r\n{header_block}.\r\n");
             let body_frame = format!("222 {first_line}\r\n{body}.\r\n");
-            let stat_frame = format!("223 {first_line}\r\n.\r\n");
+            let stat_frame = format!("223 {first_line}\r\n");
 
             let article = Article::parse(article_frame.as_bytes()).unwrap();
             prop_assert_eq!(article.message_id.as_str(), message_id.as_str());
@@ -392,7 +392,7 @@ mod proptests {
                 format!("220 {first_line}\r\n{header_block}\r\n{body}.\r\n"),
                 format!("221 {first_line}\r\n{header_block}.\r\n"),
                 format!("222 {first_line}\r\n{body}.\r\n"),
-                format!("223 {first_line}\r\n.\r\n"),
+                format!("223 {first_line}\r\n"),
             ] {
                 prop_assert_eq!(
                     Article::parse(frame.as_bytes()).unwrap_err(),
@@ -402,7 +402,7 @@ mod proptests {
         }
 
         #[test]
-        fn stat_accepts_minimal_and_dot_terminated_forms_equivalently(
+        fn stat_accepts_minimal_and_rejects_dot_terminated_body(
             message_id in message_id_strategy(),
             article_number in 0_u32..=999_999,
             include_number in any::<bool>(),
@@ -415,9 +415,10 @@ mod proptests {
             let minimal = format!("223 {first_line}\r\n");
             let dot_terminated = format!("223 {first_line}\r\n.\r\n");
 
+            prop_assert!(Article::parse(minimal.as_bytes()).is_ok());
             prop_assert_eq!(
-                Article::parse(minimal.as_bytes()),
-                Article::parse(dot_terminated.as_bytes())
+                Article::parse(dot_terminated.as_bytes()).unwrap_err(),
+                ArticleParseError::UnexpectedBody
             );
         }
 
@@ -440,7 +441,7 @@ mod proptests {
             let article_frame = format!("220 {first_line}\r\n{header_block}\r\n{body}.\r\n");
             let head_frame = format!("221 {first_line}\r\n{header_block}.\r\n");
             let body_frame = format!("222 {first_line}\r\n{body}.\r\n");
-            let stat_frame = format!("223 {first_line}\r\n.\r\n");
+            let stat_frame = format!("223 {first_line}\r\n");
 
             let article = Article::parse(article_frame.as_bytes()).unwrap();
             prop_assert_eq!(article.message_id.as_str(), message_id.as_str());
@@ -526,7 +527,7 @@ mod proptests {
                 format!("220 {article_number} {message_id}\r\n{header_block}\r\n{body}.\r\n"),
                 format!("221 {article_number} {message_id}\r\n{header_block}.\r\n"),
                 format!("222 {article_number} {message_id}\r\n{body}.\r\n"),
-                format!("223 {article_number} {message_id}\r\n.\r\n"),
+                format!("223 {article_number} {message_id}\r\n"),
             ] {
                 prop_assert_eq!(
                     Article::try_from(frame.as_bytes()),
@@ -661,7 +662,7 @@ mod proptests {
             // adjacent bytes as part of the status token, even when the first three bytes
             // happen to be a known article status:
             // https://www.rfc-editor.org/rfc/rfc3977#section-3.1
-            let frame = format!("{status} {article_number} {message_id}\r\n.\r\n");
+            let frame = format!("{status} {article_number} {message_id}\r\n");
 
             prop_assert_eq!(
                 Article::parse(frame.as_bytes()).unwrap_err(),
@@ -925,7 +926,7 @@ mod proptests {
             prop_assert!((body_start..body_end).contains(&(body_slice.as_ptr() as usize)));
             prop_assert!(parsed_body.headers.is_none());
 
-            let stat_frame = format!("223 {article_number} {message_id}\r\n.\r\n");
+            let stat_frame = format!("223 {article_number} {message_id}\r\n");
             let stat = Article::parse(stat_frame.as_bytes()).unwrap();
             let stat_start = stat_frame.as_ptr() as usize;
             let stat_end = stat_start + stat_frame.len();
@@ -1174,6 +1175,7 @@ impl<'a> Article<'a> {
         let body_start = separator_pos + 4;
         let body_end = find_article_content_end(buf, body_start)
             .ok_or(ArticleParseError::MissingTerminator)?;
+        let body_start = unstuff_leading_dot(buf, body_start, body_end);
 
         Ok(Self {
             message_id,
@@ -1209,6 +1211,7 @@ impl<'a> Article<'a> {
         let body_start = first_line_end + 2;
         let body_end = find_article_content_end(buf, body_start)
             .ok_or(ArticleParseError::MissingTerminator)?;
+        let body_start = unstuff_leading_dot(buf, body_start, body_end);
 
         Ok(Self {
             message_id,
@@ -1223,7 +1226,7 @@ impl<'a> Article<'a> {
             strict_crlf_line_content_end_from(buf, 0).ok_or(ArticleParseError::BufferTooShort)?;
         let (message_id, article_number) = parse_first_line(&buf[..first_line_end])?;
         let content_start = first_line_end + 2;
-        if content_start < buf.len() && !buf[content_start..].starts_with(DOT_TERMINATOR) {
+        if content_start != buf.len() {
             return Err(ArticleParseError::UnexpectedBody);
         }
 
@@ -1248,6 +1251,7 @@ impl<'a> Article<'a> {
         if body_start > content_end {
             return Err(ArticleParseError::BufferTooShort);
         }
+        let body_start = unstuff_leading_dot(buf, body_start, content_end);
 
         Ok(Self {
             message_id,
@@ -1283,6 +1287,7 @@ impl<'a> Article<'a> {
         content_end: usize,
     ) -> Result<Self, ArticleParseError> {
         let (message_id, article_number) = parse_first_line(&buf[..first_line_end])?;
+        let content_start = unstuff_leading_dot(buf, content_start, content_end);
 
         Ok(Self {
             message_id,
@@ -1319,6 +1324,14 @@ fn find_article_content_end(buf: &[u8], start: usize) -> Option<usize> {
     }
 
     find_terminator_content_end(buf, start)
+}
+
+fn unstuff_leading_dot(buf: &[u8], start: usize, end: usize) -> usize {
+    if start < end && buf[start] == b'.' {
+        start + 1
+    } else {
+        start
+    }
 }
 
 fn parse_status_code(buf: &[u8]) -> Result<u16, ArticleParseError> {
@@ -1508,7 +1521,7 @@ Actual body content\r\n\
 
     #[test]
     fn parse_stat_response_223() {
-        let buf = b"223 100 <test@example.com>\r\n.\r\n";
+        let buf = b"223 100 <test@example.com>\r\n";
         let article = Article::parse(buf).unwrap();
         assert_eq!(article.article_number, Some(ArticleNumber(100)));
         assert!(article.headers.is_none());

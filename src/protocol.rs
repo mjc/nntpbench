@@ -109,7 +109,13 @@ impl<'a> ResponseFrame<'a> {
         let Some(status) = StatusCode::parse(buffer) else {
             return ResponseFrameParse::Invalid;
         };
+        if status_line_end < 5 || buffer.get(3) != Some(&b' ') {
+            return ResponseFrameParse::Invalid;
+        }
         let descriptor = ResponseDescriptor::for_request_status(kind, status);
+        if matches!(descriptor.framing(), ResponseFraming::Unexpected) {
+            return ResponseFrameParse::Invalid;
+        }
 
         let (consumed, content, terminator) = if descriptor.framing().is_multiline() {
             let Some(block) = find_dot_terminated_block(buffer, status_line_end) else {
@@ -117,6 +123,9 @@ impl<'a> ResponseFrame<'a> {
             };
             (block.block_end(), block.content(), block.terminator())
         } else {
+            if find_dot_terminated_block(buffer, status_line_end).is_some() {
+                return ResponseFrameParse::Invalid;
+            }
             (
                 status_line_end,
                 &buffer[status_line_end..status_line_end],
@@ -269,17 +278,17 @@ mod proptests {
     use proptest::prelude::*;
     use proptest::string::string_regex;
 
-    fn token_atom_strategy() -> BoxedStrategy<String> {
-        string_regex("[A-Za-z0-9][A-Za-z0-9._-]{0,15}")
+    fn message_id_atom_strategy() -> BoxedStrategy<String> {
+        string_regex("[A-Za-z0-9][A-Za-z0-9_-]{0,15}")
             .unwrap()
             .boxed()
     }
 
     fn message_id_inner_strategy() -> BoxedStrategy<String> {
         (
-            token_atom_strategy(),
-            token_atom_strategy(),
-            token_atom_strategy(),
+            message_id_atom_strategy(),
+            message_id_atom_strategy(),
+            message_id_atom_strategy(),
         )
             .prop_map(|(local, domain, tld)| format!("{local}@{domain}.{tld}"))
             .boxed()
@@ -350,7 +359,16 @@ mod proptests {
                 article_number_token_strategy(),
                 article_number_token_strategy()
             )
-                .prop_map(|(start, end)| format!("{start}-{end}")),
+                .prop_map(|(left, right)| {
+                    let left = left.parse::<u64>().unwrap();
+                    let right = right.parse::<u64>().unwrap();
+                    let (start, end) = if left <= right {
+                        (left, right)
+                    } else {
+                        (right, left)
+                    };
+                    format!("{start}-{end}")
+                }),
             article_number_token_strategy().prop_map(|start| format!("{start}-")),
         ]
         .boxed()
@@ -386,17 +404,35 @@ mod proptests {
     }
 
     fn auth_info_value_strategy() -> BoxedStrategy<String> {
-        string_regex("[ -~]{1,20}").unwrap().boxed()
+        string_regex("[!-~]{1,20}").unwrap().boxed()
     }
 
     fn nntp_date_strategy() -> BoxedStrategy<String> {
         prop_oneof![
-            (0_u8..=99, 1_u8..=12, 1_u8..=31)
+            (0_u8..=99, 1_u8..=12)
+                .prop_flat_map(|(year, month)| {
+                    let max_day = valid_days_in_month(u16::from(year) + 2000, month);
+                    (Just(year), Just(month), 1_u8..=max_day)
+                })
                 .prop_map(|(year, month, day)| format!("{year:02}{month:02}{day:02}")),
-            (2000_u16..=2099, 1_u8..=12, 1_u8..=31)
+            (2000_u16..=2099, 1_u8..=12)
+                .prop_flat_map(|(year, month)| {
+                    let max_day = valid_days_in_month(year, month);
+                    (Just(year), Just(month), 1_u8..=max_day)
+                })
                 .prop_map(|(year, month, day)| format!("{year:04}{month:02}{day:02}")),
         ]
         .boxed()
+    }
+
+    fn valid_days_in_month(year: u16, month: u8) -> u8 {
+        match month {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            2 if is_leap_year(year) => 29,
+            2 => 28,
+            _ => unreachable!("strategy only generates valid months"),
+        }
     }
 
     fn invalid_nntp_date_strategy() -> BoxedStrategy<String> {
@@ -410,7 +446,7 @@ mod proptests {
     }
 
     fn nntp_time_strategy() -> BoxedStrategy<String> {
-        (0_u8..=23, 0_u8..=59, 0_u8..=60)
+        (0_u8..=23, 0_u8..=59, 0_u8..=59)
             .prop_map(|(hour, minute, second)| format!("{hour:02}{minute:02}{second:02}"))
             .boxed()
     }
@@ -877,7 +913,7 @@ mod proptests {
             | RequestKind::ListDistribPats => code == 215,
             RequestKind::Over | RequestKind::Xover => code == 224,
             RequestKind::Hdr => code == 225,
-            RequestKind::Xhdr => code == 221 || code == 225,
+            RequestKind::Xhdr => code == 221,
             RequestKind::NewNews => code == 230,
             RequestKind::NewGroups => code == 231,
             RequestKind::Unknown => status_implies_multiline(code),
@@ -1495,9 +1531,20 @@ fn validate_message_id(value: &str) -> Result<(), InvalidMessageId> {
     if value.len() < 3 || !value.starts_with('<') || !value.ends_with('>') {
         return Err(InvalidMessageId);
     }
-    if value[1..value.len() - 1]
-        .bytes()
-        .any(|byte| byte.is_ascii_whitespace())
+    let inner = &value[1..value.len() - 1];
+    if inner.bytes().any(|byte| {
+        byte.is_ascii_whitespace() || byte.is_ascii_control() || matches!(byte, b'<' | b'>')
+    }) {
+        return Err(InvalidMessageId);
+    }
+    let Some((left, right)) = inner.split_once('@') else {
+        return Err(InvalidMessageId);
+    };
+    if left.is_empty()
+        || right.is_empty()
+        || right.contains("..")
+        || inner.matches('@').count() != 1
+        || right.split('.').any(str::is_empty)
     {
         return Err(InvalidMessageId);
     }
@@ -1632,7 +1679,24 @@ fn validate_article_selector(value: &str) -> Result<(), InvalidArticleSelector> 
         return Err(InvalidArticleSelector);
     }
 
-    Ok(())
+    if value.starts_with('<') {
+        return MessageId::from_borrowed(value)
+            .map(|_| ())
+            .map_err(|_| InvalidArticleSelector);
+    }
+
+    if let Some((start, end)) = value.split_once('-') {
+        let start = article_number_token_value(start).map_err(|_| InvalidArticleSelector)?;
+        if end.is_empty() {
+            return Ok(());
+        }
+        let end = article_number_token_value(end).map_err(|_| InvalidArticleSelector)?;
+        return (start <= end).then_some(()).ok_or(InvalidArticleSelector);
+    }
+
+    article_number_token_value(value)
+        .map(|_| ())
+        .map_err(|_| InvalidArticleSelector)
 }
 
 /// Validated LISTGROUP range argument.
@@ -1677,9 +1741,12 @@ fn validate_listgroup_range(value: &str) -> Result<(), InvalidListGroupRange> {
     }
 
     if let Some((start, end)) = value.split_once('-') {
-        validate_article_number_token(start).map_err(|_| InvalidListGroupRange)?;
+        let start = article_number_token_value(start).map_err(|_| InvalidListGroupRange)?;
         if !end.is_empty() {
-            validate_article_number_token(end).map_err(|_| InvalidListGroupRange)?;
+            let end = article_number_token_value(end).map_err(|_| InvalidListGroupRange)?;
+            if start > end {
+                return Err(InvalidListGroupRange);
+            }
         }
         return Ok(());
     }
@@ -1691,7 +1758,15 @@ fn validate_listgroup_range(value: &str) -> Result<(), InvalidListGroupRange> {
 struct InvalidArticleNumberToken;
 
 fn validate_article_number_token(value: &str) -> Result<(), InvalidArticleNumberToken> {
-    if value.is_empty() || value.len() > 16 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+    article_number_token_value(value).map(|_| ())
+}
+
+fn article_number_token_value(value: &str) -> Result<u64, InvalidArticleNumberToken> {
+    if value.is_empty()
+        || value.len() > 16
+        || value.len() > 1 && value.starts_with('0')
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+    {
         return Err(InvalidArticleNumberToken);
     }
 
@@ -1702,7 +1777,7 @@ fn validate_article_number_token(value: &str) -> Result<(), InvalidArticleNumber
         return Err(InvalidArticleNumberToken);
     }
 
-    Ok(())
+    Ok(number)
 }
 
 /// Validated group name for GROUP/LISTGROUP requests.
@@ -1741,7 +1816,10 @@ fn validate_group_name(value: &str) -> Result<(), InvalidGroupName> {
         || value.bytes().any(|byte| {
             byte.is_ascii_whitespace()
                 || byte.is_ascii_control()
-                || matches!(byte, b'<' | b'>' | b'*' | b'?' | b'[' | b']' | b'\\')
+                || matches!(
+                    byte,
+                    b'<' | b'>' | b'*' | b'?' | b'[' | b']' | b'\\' | b',' | b':' | b'/' | b'@'
+                )
         })
     {
         return Err(InvalidGroupName);
@@ -1897,7 +1975,26 @@ fn validate_nntp_date(value: &str) -> Result<(), InvalidNntpDate> {
     let month =
         parse_two_digits(&bytes[bytes.len() - 4..bytes.len() - 2]).ok_or(InvalidNntpDate)?;
     let day = parse_two_digits(&bytes[bytes.len() - 2..]).ok_or(InvalidNntpDate)?;
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+    if !(1..=12).contains(&month) || day == 0 {
+        return Err(InvalidNntpDate);
+    }
+    let year = if bytes.len() == 8 {
+        std::str::from_utf8(&bytes[..4])
+            .ok()
+            .and_then(|value| value.parse::<u16>().ok())
+            .ok_or(InvalidNntpDate)?
+    } else {
+        let short_year = parse_two_digits(&bytes[..2]).ok_or(InvalidNntpDate)?;
+        u16::from(short_year) + 2000
+    };
+    let max_day = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => return Err(InvalidNntpDate),
+    };
+    if day > max_day {
         return Err(InvalidNntpDate);
     }
 
@@ -1941,11 +2038,15 @@ fn validate_nntp_time(value: &str) -> Result<(), InvalidNntpTime> {
     let hour = parse_two_digits(&bytes[..2]).ok_or(InvalidNntpTime)?;
     let minute = parse_two_digits(&bytes[2..4]).ok_or(InvalidNntpTime)?;
     let second = parse_two_digits(&bytes[4..]).ok_or(InvalidNntpTime)?;
-    if hour > 23 || minute > 59 || second > 60 {
+    if hour > 23 || minute > 59 || second > 59 {
         return Err(InvalidNntpTime);
     }
 
     Ok(())
+}
+
+const fn is_leap_year(year: u16) -> bool {
+    (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
 }
 
 /// Validated wildmat argument for NEWNEWS.
@@ -2167,7 +2268,6 @@ static RESPONSE_DESCRIPTORS: &[ResponseDescriptor] = &[
     // data. RFC 3977 standardized HDR as 225, but real servers still expose
     // the deployed XHDR 221 form.
     response_descriptor(RequestKind::Xhdr, 221, ResponseFraming::Multiline),
-    response_descriptor(RequestKind::Xhdr, 225, ResponseFraming::Multiline),
     // RFC 3977 section 6.3 transfer/posting commands.
     response_descriptor(RequestKind::Post, 340, ResponseFraming::SingleLine),
     response_descriptor(RequestKind::Post, 240, ResponseFraming::SingleLine),
@@ -3239,17 +3339,21 @@ impl<'a> RequestLine<'a> {
                 args: &[],
             };
         };
+        if command_spacing_is_invalid(line) {
+            return Self {
+                kind: RequestKind::Unknown,
+                verb: line,
+                args: &[],
+            };
+        }
+
         let split = line
             .iter()
-            .position(|byte| byte.is_ascii_whitespace())
+            .position(|byte| *byte == b' ')
             .unwrap_or(line.len());
         let verb = &line[..split];
         let args = if split < line.len() {
-            let args_start = line[split..]
-                .iter()
-                .position(|byte| !byte.is_ascii_whitespace())
-                .map_or(line.len(), |relative| split + relative);
-            &line[args_start..]
+            &line[split + 1..]
         } else {
             &[]
         };
@@ -3423,13 +3527,6 @@ static LIST_SUBCOMMANDS: &[(&[u8], RequestKind)] = &[
     (b"DISTRIB.PATS", RequestKind::ListDistribPats),
 ];
 
-static AUTHINFO_SUBCOMMANDS: &[(&[u8], RequestKind)] = &[
-    // RFC 4643 section 2.3 defines AUTHINFO USER/PASS. Unknown AUTHINFO
-    // subcommands are kept as RequestKind::AuthInfo for extension handling.
-    (b"USER", RequestKind::AuthInfoUser),
-    (b"PASS", RequestKind::AuthInfoPass),
-];
-
 fn classify_request_kind(verb: &[u8], args: &[u8]) -> RequestKind {
     let Some(descriptor) = COMMAND_DESCRIPTORS
         .iter()
@@ -3439,15 +3536,187 @@ fn classify_request_kind(verb: &[u8], args: &[u8]) -> RequestKind {
     };
 
     match descriptor.kind {
-        CommandKind::Direct(kind) => kind,
+        CommandKind::Direct(kind) => classify_direct_command(kind, args),
         CommandKind::List => classify_subcommand(args, LIST_SUBCOMMANDS, RequestKind::List),
-        CommandKind::AuthInfo => {
-            classify_subcommand(args, AUTHINFO_SUBCOMMANDS, RequestKind::AuthInfo)
-        }
-        CommandKind::Mode if eq_ignore_ascii_case_const(trim_ascii_whitespace(args), b"READER") => {
-            RequestKind::ModeReader
-        }
+        CommandKind::AuthInfo => classify_authinfo_command(args),
+        CommandKind::Mode if eq_ignore_ascii_case_const(args, b"READER") => RequestKind::ModeReader,
         CommandKind::Mode => RequestKind::Unknown,
+    }
+}
+
+fn command_spacing_is_invalid(line: &[u8]) -> bool {
+    line.is_empty()
+        || line.starts_with(b" ")
+        || line.ends_with(b" ")
+        || line.windows(2).any(|window| window == b"  ")
+        || line
+            .iter()
+            .any(|byte| byte.is_ascii_whitespace() && *byte != b' ')
+}
+
+fn classify_direct_command(kind: RequestKind, args: &[u8]) -> RequestKind {
+    match kind {
+        RequestKind::Article | RequestKind::Body | RequestKind::Head | RequestKind::Stat => {
+            if args.is_empty() || validate_article_fetch_selector(args).is_ok() {
+                kind
+            } else {
+                RequestKind::Unknown
+            }
+        }
+        RequestKind::Group => {
+            validate_utf8_arg(args, GroupName::from_borrowed).map_or(RequestKind::Unknown, |_| kind)
+        }
+        RequestKind::ListGroup => {
+            if args.is_empty() {
+                return kind;
+            }
+            let mut parts = args.split(|byte| *byte == b' ');
+            match (parts.next(), parts.next(), parts.next()) {
+                (Some(one), None, None) => {
+                    let one = std::str::from_utf8(one).ok();
+                    let Some(value) = one else {
+                        return RequestKind::Unknown;
+                    };
+                    if (value.contains('-') || value.bytes().all(|byte| byte.is_ascii_digit()))
+                        && ListGroupRange::from_borrowed(value).is_err()
+                    {
+                        return RequestKind::Unknown;
+                    }
+                    if ListGroupRange::from_borrowed(value).is_ok()
+                        || GroupName::from_borrowed(value).is_ok()
+                    {
+                        kind
+                    } else {
+                        RequestKind::Unknown
+                    }
+                }
+                (Some(group), Some(range), None) => {
+                    if validate_utf8_arg(group, GroupName::from_borrowed).is_ok()
+                        && validate_utf8_arg(range, ListGroupRange::from_borrowed).is_ok()
+                    {
+                        kind
+                    } else {
+                        RequestKind::Unknown
+                    }
+                }
+                _ => RequestKind::Unknown,
+            }
+        }
+        RequestKind::Over | RequestKind::Xover => {
+            if args.is_empty() || validate_utf8_arg(args, ArticleSelector::from_borrowed).is_ok() {
+                kind
+            } else {
+                RequestKind::Unknown
+            }
+        }
+        RequestKind::Hdr | RequestKind::Xhdr => {
+            let mut parts = args.split(|byte| *byte == b' ');
+            match (parts.next(), parts.next(), parts.next()) {
+                (Some(header), None, None) => {
+                    if validate_utf8_arg(header, HeaderName::from_borrowed).is_ok() {
+                        kind
+                    } else {
+                        RequestKind::Unknown
+                    }
+                }
+                (Some(header), Some(selector), None) => {
+                    if validate_utf8_arg(header, HeaderName::from_borrowed).is_ok()
+                        && validate_utf8_arg(selector, ArticleSelector::from_borrowed).is_ok()
+                    {
+                        kind
+                    } else {
+                        RequestKind::Unknown
+                    }
+                }
+                _ => RequestKind::Unknown,
+            }
+        }
+        RequestKind::Ihave | RequestKind::Check | RequestKind::TakeThis => {
+            validate_utf8_arg(args, MessageId::from_borrowed).map_or(RequestKind::Unknown, |_| kind)
+        }
+        RequestKind::NewGroups => {
+            validate_discovery_datetime_args(args, false).map_or(RequestKind::Unknown, |_| kind)
+        }
+        RequestKind::NewNews => validate_newnews_args(args).map_or(RequestKind::Unknown, |_| kind),
+        RequestKind::Capabilities
+        | RequestKind::Date
+        | RequestKind::Help
+        | RequestKind::Last
+        | RequestKind::Next
+        | RequestKind::Post
+        | RequestKind::Quit
+        | RequestKind::StartTls => {
+            if args.is_empty() {
+                kind
+            } else {
+                RequestKind::Unknown
+            }
+        }
+        _ => kind,
+    }
+}
+
+fn validate_article_fetch_selector(args: &[u8]) -> Result<(), ()> {
+    let value = std::str::from_utf8(args).map_err(|_| ())?;
+    if value.bytes().all(|byte| byte.is_ascii_digit()) {
+        validate_article_number_token(value).map_err(|_| ())
+    } else {
+        MessageId::from_borrowed(value).map(|_| ()).map_err(|_| ())
+    }
+}
+
+fn validate_utf8_arg<'a, T, E>(
+    args: &'a [u8],
+    validate: impl FnOnce(&'a str) -> Result<T, E>,
+) -> Result<T, E> {
+    let value = std::str::from_utf8(args).map_err(|_| panic!("non-utf8 NNTP argument"))?;
+    validate(value)
+}
+
+fn validate_discovery_datetime_args(args: &[u8], allow_wildmat: bool) -> Result<(), ()> {
+    let mut parts = args.split(|byte| *byte == b' ');
+    if allow_wildmat {
+        let wildmat = parts.next().ok_or(())?;
+        validate_utf8_arg(wildmat, Wildmat::from_borrowed).map_err(|_| ())?;
+    }
+    let date = parts.next().ok_or(())?;
+    let time = parts.next().ok_or(())?;
+    validate_utf8_arg(date, NntpDate::from_borrowed).map_err(|_| ())?;
+    validate_utf8_arg(time, NntpTime::from_borrowed).map_err(|_| ())?;
+    match (parts.next(), parts.next()) {
+        (None, None) => Ok(()),
+        (Some(gmt), None) if eq_ignore_ascii_case_const(gmt, b"GMT") => Ok(()),
+        _ => Err(()),
+    }
+}
+
+fn validate_newnews_args(args: &[u8]) -> Result<(), ()> {
+    validate_discovery_datetime_args(args, true)
+}
+
+fn classify_authinfo_command(args: &[u8]) -> RequestKind {
+    let mut parts = args.split(|byte| *byte == b' ');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(subcommand), Some(value), None)
+            if eq_ignore_ascii_case_const(subcommand, b"USER")
+                && validate_utf8_arg(value, AuthInfoValue::from_borrowed).is_ok() =>
+        {
+            RequestKind::AuthInfoUser
+        }
+        (Some(subcommand), Some(value), None)
+            if eq_ignore_ascii_case_const(subcommand, b"PASS")
+                && validate_utf8_arg(value, AuthInfoValue::from_borrowed).is_ok() =>
+        {
+            RequestKind::AuthInfoPass
+        }
+        (Some(subcommand), Some(value), None)
+            if eq_ignore_ascii_case_const(subcommand, b"SASL")
+                && validate_utf8_arg(value, AuthInfoValue::from_borrowed).is_ok() =>
+        {
+            RequestKind::AuthInfo
+        }
+        (None, None, None) => RequestKind::AuthInfo,
+        _ => RequestKind::Unknown,
     }
 }
 
@@ -3456,30 +3725,54 @@ fn classify_subcommand(
     table: &[(&'static [u8], RequestKind)],
     default: RequestKind,
 ) -> RequestKind {
-    let subcommand = args
-        .split(|byte| byte.is_ascii_whitespace())
-        .find(|segment| !segment.is_empty());
+    let mut parts = args.split(|byte| *byte == b' ');
+    let subcommand = parts.next();
 
     let Some(subcommand) = subcommand else {
         return default;
     };
 
-    table
+    let Some(kind) = table
         .iter()
         .find_map(|(wire, kind)| eq_ignore_ascii_case_const(subcommand, wire).then_some(*kind))
-        .unwrap_or(default)
-}
+    else {
+        return if subcommand.is_empty() {
+            default
+        } else {
+            RequestKind::Unknown
+        };
+    };
 
-fn trim_ascii_whitespace(value: &[u8]) -> &[u8] {
-    let start = value
-        .iter()
-        .position(|byte| !byte.is_ascii_whitespace())
-        .unwrap_or(value.len());
-    let end = value
-        .iter()
-        .rposition(|byte| !byte.is_ascii_whitespace())
-        .map_or(start, |index| index + 1);
-    &value[start..end]
+    match kind {
+        RequestKind::ListActive | RequestKind::ListActiveTimes | RequestKind::ListNewsgroups => {
+            match (parts.next(), parts.next()) {
+                (None, None) => kind,
+                (Some(wildmat), None)
+                    if validate_utf8_arg(wildmat, Wildmat::from_borrowed).is_ok() =>
+                {
+                    kind
+                }
+                _ => RequestKind::Unknown,
+            }
+        }
+        RequestKind::AuthInfoUser | RequestKind::AuthInfoPass => match (parts.next(), parts.next())
+        {
+            (Some(value), None)
+                if validate_utf8_arg(value, AuthInfoValue::from_borrowed).is_ok() =>
+            {
+                kind
+            }
+            _ => RequestKind::Unknown,
+        },
+        RequestKind::ListOverviewFmt | RequestKind::ListHeaders | RequestKind::ListDistribPats => {
+            if parts.next().is_none() {
+                kind
+            } else {
+                RequestKind::Unknown
+            }
+        }
+        _ => kind,
+    }
 }
 
 const fn eq_ignore_ascii_case_const(left: &[u8], right: &[u8]) -> bool {
@@ -3789,7 +4082,8 @@ mod tests {
 
     #[test]
     fn message_id_validation_covers_rfc_edge_shapes() {
-        assert!(MessageId::from_borrowed("<a>").is_ok());
+        assert!(MessageId::from_borrowed("<a>").is_err());
+        assert!(MessageId::from_borrowed("<a@b>").is_ok());
         assert!(MessageId::from_borrowed("<>").is_err());
         assert!(MessageId::from_borrowed("<no-end").is_err());
         assert!(MessageId::from_borrowed("no-start>").is_err());
@@ -3827,8 +4121,8 @@ mod tests {
             "260101"
         );
         assert_eq!(
-            NntpTime::from_borrowed("235960").unwrap().as_str(),
-            "235960"
+            NntpTime::from_borrowed("235959").unwrap().as_str(),
+            "235959"
         );
         assert_eq!(
             Wildmat::from_borrowed("comp.lang.*,alt.test")
@@ -3939,15 +4233,15 @@ mod tests {
         );
         assert_eq!(
             RequestLine::parse(b"GROUP\talt.test\r\n").kind(),
-            RequestKind::Group
+            RequestKind::Unknown
         );
         assert_eq!(
             RequestLine::parse(b"MODE\tREADER\r\n").kind(),
-            RequestKind::ModeReader
+            RequestKind::Unknown
         );
         assert_eq!(
             RequestLine::parse(b"MODE  READER\r\n").kind(),
-            RequestKind::ModeReader
+            RequestKind::Unknown
         );
         assert_eq!(RequestLine::parse(b"QUIT\r\n").kind(), RequestKind::Quit);
         assert_eq!(RequestLine::parse(b"HEAD 1\r\n").kind(), RequestKind::Head);
@@ -3999,11 +4293,7 @@ mod tests {
             (b"DATE".as_slice(), RequestKind::Date),
             (b"HELP".as_slice(), RequestKind::Help),
             (b"CAPABILITIES".as_slice(), RequestKind::Capabilities),
-            (b"GROUP\talt.test".as_slice(), RequestKind::Group),
-            (b"LIST\tACTIVE".as_slice(), RequestKind::ListActive),
             (b"MODE READER".as_slice(), RequestKind::ModeReader),
-            (b"MODE\tREADER".as_slice(), RequestKind::ModeReader),
-            (b"MODE  READER".as_slice(), RequestKind::ModeReader),
             (b"QUIT".as_slice(), RequestKind::Quit),
             (b"OVER 1-10".as_slice(), RequestKind::Over),
             (b"XOVER 1-10".as_slice(), RequestKind::Xover),
@@ -4108,16 +4398,6 @@ mod tests {
                 b"9".as_slice(),
             ),
             (
-                b"GROUP\talt.test\r\n".as_slice(),
-                b"GROUP".as_slice(),
-                b"alt.test".as_slice(),
-            ),
-            (
-                b"MODE  READER\r\n".as_slice(),
-                b"MODE".as_slice(),
-                b"READER".as_slice(),
-            ),
-            (
                 b"STAT <stat@test>\r\n".as_slice(),
                 b"STAT".as_slice(),
                 b"<stat@test>".as_slice(),
@@ -4150,7 +4430,6 @@ mod tests {
         assert!(RequestKind::ListDistribPats.expects_multiline_response(StatusCode(215)));
         assert!(RequestKind::Over.expects_multiline_response(StatusCode(224)));
         assert!(RequestKind::Xhdr.expects_multiline_response(StatusCode(221)));
-        assert!(RequestKind::Xhdr.expects_multiline_response(StatusCode(225)));
         assert!(RequestKind::NewGroups.expects_multiline_response(StatusCode(231)));
         assert!(RequestKind::NewNews.expects_multiline_response(StatusCode(230)));
         assert!(!RequestKind::Post.expects_multiline_response(StatusCode(340)));
@@ -4224,7 +4503,7 @@ mod tests {
 
     #[test]
     fn response_frame_parse_returns_single_line_frame_without_waiting_for_dot() {
-        let wire = b"430 no article with that message-id\r\n.\r\n";
+        let wire = b"430 no article with that message-id\r\nNEXT";
         let response = match ResponseFrame::parse(RequestKind::Article, wire) {
             ResponseFrameParse::Complete(response) => response,
             other => panic!("unexpected parse result: {other:?}"),

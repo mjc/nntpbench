@@ -3709,7 +3709,7 @@ mod tests {
         // move completion earlier or later than the first RFC terminator:
         // https://www.rfc-editor.org/rfc/rfc3977#section-3.1
         // https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1
-        let single = b"430 no article\r\n222 later\r\n.\r\n";
+        let single = b"430 no article\r\n222 later\r\nx\r\n";
         assert_decoder_completes_on_all_three_push_schedules(
             RequestKind::Article,
             single,
@@ -3756,6 +3756,7 @@ mod tests {
             let status_line = b"430 no article with that message-id\r\n";
             let mut frame = status_line.to_vec();
             frame.extend_from_slice(&trailer);
+            remove_rfc_multiline_terminators(&mut frame);
 
             for split in 0..=frame.len() {
                 let (status, consumed) = complete_after_split(RequestKind::Article, &frame, split);
@@ -4841,10 +4842,10 @@ mod tests {
         assert_eq!(hdr_message_id.status().as_u16(), 225);
         assert_eq!(hdr_message_id.as_bytes(), crate::HDR_RESPONSE);
         assert_eq!(xhdr_range.kind(), RequestKind::Xhdr);
-        assert_eq!(xhdr_range.status().as_u16(), 225);
+        assert_eq!(xhdr_range.status().as_u16(), 221);
         assert_eq!(xhdr_range.as_bytes(), crate::XHDR_RESPONSE);
         assert_eq!(xhdr_message_id.kind(), RequestKind::Xhdr);
-        assert_eq!(xhdr_message_id.status().as_u16(), 225);
+        assert_eq!(xhdr_message_id.status().as_u16(), 221);
         assert_eq!(xhdr_message_id.as_bytes(), crate::XHDR_RESPONSE);
 
         server.await.unwrap();
@@ -5334,7 +5335,7 @@ mod tests {
         assert_eq!(hdr_message_id.kind(), RequestKind::Hdr);
         assert_eq!(hdr_message_id.status().as_u16(), 225);
         assert_eq!(xhdr_range.kind(), RequestKind::Xhdr);
-        assert_eq!(xhdr_range.status().as_u16(), 225);
+        assert_eq!(xhdr_range.status().as_u16(), 221);
         assert_eq!(
             xhdr_message_id
                 .request()
@@ -5343,7 +5344,7 @@ mod tests {
             Some(("Message-ID", "<headers@test>"))
         );
         assert_eq!(xhdr_message_id.response().kind(), RequestKind::Xhdr);
-        assert_eq!(xhdr_message_id.response().status().as_u16(), 225);
+        assert_eq!(xhdr_message_id.response().status().as_u16(), 221);
 
         server.await.unwrap();
     }
