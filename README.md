@@ -1,12 +1,12 @@
 # nntpbench
 
-Small async mock NNTP server and typed client for throughput, latency, and profiling work.
+Small async mock NNTP server and client for throughput, latency, and profiling work.
 
-The current focus is hot-path throughput and typed protocol/client work, with the longer-term goal of growing this into a more fully featured NNTP implementation.
+The current focus is hot-path throughput and protocol/client work, with the longer-term goal of growing this into a more fully featured NNTP implementation.
 
 ## Latest direct benchmark single-run snapshot
 
-Single direct `nntpbench typed-client -> nntpbench server` run with no proxy in the
+Single direct `nntpbench client -> nntpbench server` run with no proxy in the
 middle. Snapshot from macOS on 2026-05-19, after the generated-response hot-path
 change. This records one representative run; the benchmark script defaults to
 10 runs for repeatable local comparisons.
@@ -14,7 +14,7 @@ change. This records one representative run; the benchmark script defaults to
 Shape:
 
 - server: `4` Tokio threads, `max-pipeline-depth=256`, `body-bytes=786432`, `article-bytes=786432`, `pending-write-bytes=819200`
-- typed client: `16` connections, `4` Tokio threads, `pipeline-depth=128`, `command-mix=article`
+- client: `16` connections, `4` Tokio threads, `pipeline-depth=128`, `command-mix=article`
 - socket buffers: Darwin default from this repo, `1 MiB` send and receive buffers
 - workload: `129203` requests, `101609890508` response bytes, about `100GB`
 - runs: `1`

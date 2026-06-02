@@ -17,11 +17,11 @@ struct Args {
 
 #[derive(Debug, clap::Subcommand)]
 enum Command {
-    /// Send one typed ARTICLE/BODY request and print the raw response.
+    /// Send one ARTICLE/BODY request and print the raw response.
     Fetch(TypedFetchArgs),
 
-    /// Run the typed request/future benchmark client.
-    TypedClient(TypedClientArgs),
+    /// Run the request/future benchmark client.
+    Client(TypedClientArgs),
 
     /// Run the mock NNTP server.
     Server(ServerArgs),
@@ -33,7 +33,7 @@ fn main() -> io::Result<()> {
 
     match args.command {
         Command::Fetch(args) => build_runtime(args.threads)?.block_on(run_typed_fetch(args)),
-        Command::TypedClient(args) => build_runtime(args.threads)?.block_on(run_typed_client(args)),
+        Command::Client(args) => build_runtime(args.threads)?.block_on(run_typed_client(args)),
         Command::Server(args) => build_runtime(args.threads)?.block_on(run_server(args)),
     }
 }

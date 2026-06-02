@@ -404,7 +404,7 @@ pub struct TypedClientArgs {
     #[arg(long)]
     pub article_verify_dir: Option<PathBuf>,
 
-    /// Total typed ARTICLE/BODY requests to complete. Use 0 to disable this limit.
+    /// Total ARTICLE/BODY requests to complete. Use 0 to disable this limit.
     #[arg(long, default_value_t = 0)]
     pub requests: u64,
 
@@ -432,7 +432,7 @@ pub struct TypedClientArgs {
     #[arg(long, default_value_t = 1)]
     pub threads: usize,
 
-    /// Maximum in-flight typed requests allowed on each connection.
+    /// Maximum in-flight requests allowed on each connection.
     #[arg(long, default_value_t = 64)]
     pub pipeline_depth: usize,
 
@@ -527,7 +527,7 @@ pub struct TypedFetchArgs {
     #[arg(long, default_value_t = CLIENT_READER_CAPACITY)]
     pub read_buffer_bytes: usize,
 
-    /// Maximum in-flight typed requests allowed on the connection.
+    /// Maximum in-flight requests allowed on the connection.
     #[arg(long, default_value_t = 64)]
     pub pipeline_depth: usize,
 
@@ -604,7 +604,7 @@ async fn run_typed_workload(config: TypedClientConfig) -> io::Result<()> {
     let stop = Arc::new(AtomicBool::new(false));
 
     eprintln!(
-        "nntpbench typed-client connecting to {} requests={} transfer_bytes={} duration_secs={} connections={} total_clients={} client_offset={} pipeline_depth={} command_mix={:?}",
+        "nntpbench client connecting to {} requests={} transfer_bytes={} duration_secs={} connections={} total_clients={} client_offset={} pipeline_depth={} command_mix={:?}",
         config.connect,
         config.requests,
         config.transfer_bytes,
@@ -702,7 +702,7 @@ async fn run_article_id_download_workload(config: TypedClientConfig) -> io::Resu
         .expect("article id workload requires output dir");
 
     eprintln!(
-        "nntpbench typed-client connecting to {} article_targets={} output_dir={} connections={} total_clients={} client_offset={}",
+        "nntpbench client connecting to {} article_targets={} output_dir={} connections={} total_clients={} client_offset={}",
         config.connect,
         article_targets.len(),
         output_dir.display(),
