@@ -8388,6 +8388,18 @@ mod tests {
                         frame: b"215 information follows\r\nalt.* Synthetic group\r\n.\r\n",
                     },
                     ResponseFrameCase {
+                        name: "LIST NEWSGROUPS rejects empty description",
+                        reference: "RFC 3977 sections 7.6.6 and 9.6 https://www.rfc-editor.org/rfc/rfc3977#section-9.6",
+                        kind: RequestKind::ListNewsgroups,
+                        frame: b"215 information follows\r\nalt.test \r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "LIST NEWSGROUPS rejects description without leading S-CHAR",
+                        reference: "RFC 3977 sections 7.6.6 and 9.6 https://www.rfc-editor.org/rfc/rfc3977#section-9.6",
+                        kind: RequestKind::ListNewsgroups,
+                        frame: b"215 information follows\r\nalt.test \0Synthetic group\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "NEWGROUPS rejects malformed active row",
                         reference: "RFC 3977 sections 7.3 and 7.6.3 https://www.rfc-editor.org/rfc/rfc3977#section-7.3",
                         kind: RequestKind::NewGroups,

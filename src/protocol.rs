@@ -2605,13 +2605,36 @@ fn is_p_char(ch: char) -> bool {
 }
 
 fn validate_newsgroups_response_line(line: &[u8]) -> bool {
-    let Some(space) = memchr::memchr(b' ', line) else {
+    let Some((group, description)) = split_newsgroups_response_line(line) else {
         return false;
     };
 
-    std::str::from_utf8(&line[..space])
+    std::str::from_utf8(group)
         .ok()
         .is_some_and(|group| GroupName::from_borrowed(group).is_ok())
+        && validate_u_text(description)
+}
+
+fn split_newsgroups_response_line(line: &[u8]) -> Option<(&[u8], &[u8])> {
+    let separator_start = line.iter().position(|byte| matches!(*byte, b' ' | b'\t'))?;
+    let group = &line[..separator_start];
+    let description = skip_response_ws(&line[separator_start..])?;
+    if description.is_empty() {
+        return None;
+    }
+    Some((group, description))
+}
+
+fn skip_response_ws(value: &[u8]) -> Option<&[u8]> {
+    if !matches!(value.first(), Some(b' ' | b'\t')) {
+        return None;
+    }
+    Some(
+        value
+            .iter()
+            .position(|byte| !matches!(*byte, b' ' | b'\t'))
+            .map_or(&[][..], |index| &value[index..]),
+    )
 }
 
 fn validate_overview_fmt_response_content(content: &[u8]) -> bool {
@@ -5532,6 +5555,11 @@ mod tests {
                 b"215 information follows\r\nalt.test Synthetic group\r\n.\r\n".as_slice(),
             ),
             (
+                RequestKind::ListNewsgroups,
+                b"215 information follows\r\nalt.test\tSynthetic group with tab separator\r\n.\r\n"
+                    .as_slice(),
+            ),
+            (
                 RequestKind::NewGroups,
                 b"231 new groups follow\r\nalt.test 3 1 y\r\n.\r\n".as_slice(),
             ),
@@ -5630,6 +5658,14 @@ mod tests {
             (
                 RequestKind::ListNewsgroups,
                 b"215 information follows\r\nalt.* Synthetic group\r\n.\r\n".as_slice(),
+            ),
+            (
+                RequestKind::ListNewsgroups,
+                b"215 information follows\r\nalt.test \r\n.\r\n".as_slice(),
+            ),
+            (
+                RequestKind::ListNewsgroups,
+                b"215 information follows\r\nalt.test \0Synthetic group\r\n.\r\n".as_slice(),
             ),
             (
                 RequestKind::NewGroups,
