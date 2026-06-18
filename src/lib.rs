@@ -5509,6 +5509,14 @@ mod tests {
                     "STAT message-id not separated from text",
                     b"223 1 <bad-space@test>extra\r\n".as_slice(),
                 ),
+                (
+                    "HEAD NUL trailing response text",
+                    b"221 1 <bad-trailing@test> bad\0text\r\nSubject: bad\r\n.\r\n".as_slice(),
+                ),
+                (
+                    "BODY non-UTF-8 trailing response text",
+                    b"222 1 <bad-trailing@test> bad caf\xe9\r\nbody\r\n.\r\n".as_slice(),
+                ),
             ] {
                 assert!(
                     Article::parse(input).is_err(),

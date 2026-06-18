@@ -2,7 +2,9 @@
 
 use std::{borrow::Cow, fmt};
 
-use super::{InvalidMessageId, MAX_ARTICLE_NUMBER, MessageId, StatusCode};
+use super::{
+    InvalidMessageId, MAX_ARTICLE_NUMBER, MessageId, StatusCode, validate_optional_trailing_comment,
+};
 use crate::terminator::{
     DOT_TERMINATOR, find_terminator_content_end, strict_crlf_line_content_end_from,
 };
@@ -656,6 +658,25 @@ mod proptests {
                 } else {
                     ArticleParseError::InvalidArticleNumber
                 }
+            );
+        }
+
+        #[test]
+        fn parse_first_line_rejects_invalid_trailing_response_text(
+            status in prop_oneof![Just("220"), Just("221"), Just("222"), Just("223")],
+            message_id in message_id_strategy(),
+            article_number in 0_u32..=999_999,
+            trailing in prop::sample::select(vec![
+                b" bad\0text".to_vec(),
+                b" bad caf\xe9".to_vec(),
+            ]),
+        ) {
+            let mut line = format!("{status} {article_number} {message_id}").into_bytes();
+            line.extend_from_slice(&trailing);
+
+            prop_assert_eq!(
+                parse_first_line(&line).unwrap_err(),
+                ArticleParseError::InvalidMessageId
             );
         }
 
@@ -1441,6 +1462,9 @@ fn parse_first_line(
         .map(|pos| msgid_start + pos + 1)
         .ok_or(ArticleParseError::InvalidMessageId)?;
     if msgid_end < line.len() && line.get(msgid_end) != Some(&b' ') {
+        return Err(ArticleParseError::InvalidMessageId);
+    }
+    if msgid_end < line.len() && !validate_optional_trailing_comment(&line[msgid_end..]) {
         return Err(ArticleParseError::InvalidMessageId);
     }
     let msgid = std::str::from_utf8(&line[msgid_start..msgid_end])
