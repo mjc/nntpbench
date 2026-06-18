@@ -2908,7 +2908,16 @@ fn validate_capabilities_response_content(content: &[u8]) -> bool {
         let Some(line_end) = strict_crlf_line_content_end_from(content, offset) else {
             return false;
         };
-        if !validate_capability_response_line(&content[offset..line_end]) {
+        let line = &content[offset..line_end];
+        if !validate_capability_response_line(line) {
+            return false;
+        }
+        let Some((label, _)) = split_response_ws_token(line) else {
+            return false;
+        };
+        if label.eq_ignore_ascii_case(b"VERSION")
+            || capability_label_seen(content, version_line_end + crate::CRLF.len(), offset, label)
+        {
             return false;
         }
         offset = line_end + crate::CRLF.len();
@@ -2916,11 +2925,28 @@ fn validate_capabilities_response_content(content: &[u8]) -> bool {
     true
 }
 
+fn capability_label_seen(content: &[u8], start: usize, end: usize, label: &[u8]) -> bool {
+    let mut offset = start;
+    while offset < end {
+        let Some(line_end) = strict_crlf_line_content_end_from(content, offset) else {
+            return false;
+        };
+        let Some((seen_label, _)) = split_response_ws_token(&content[offset..line_end]) else {
+            return false;
+        };
+        if seen_label.eq_ignore_ascii_case(label) {
+            return true;
+        }
+        offset = line_end + crate::CRLF.len();
+    }
+    false
+}
+
 fn validate_version_response_line(line: &[u8]) -> bool {
     let Some((label, mut rest)) = split_response_ws_token(line) else {
         return false;
     };
-    if label != b"VERSION" || rest.is_empty() {
+    if !label.eq_ignore_ascii_case(b"VERSION") || rest.is_empty() {
         return false;
     }
 

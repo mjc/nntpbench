@@ -8782,6 +8782,12 @@ mod tests {
                         frame: b"101 capability list follows\r\nVERSION\t2\r\nIMPLEMENTATION\tbench\r\n.\r\n",
                     },
                     ResponseFrameCase {
+                        name: "CAPABILITIES accepts case-insensitive VERSION label",
+                        reference: "RFC 3977 sections 3.3.1 and 5.2.2 https://www.rfc-editor.org/rfc/rfc3977#section-3.3.1",
+                        kind: RequestKind::Capabilities,
+                        frame: b"101 capability list follows\r\nVersion 2\r\nreader\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "CAPABILITIES accepts P-CHAR capability arguments",
                         reference: "RFC 3977 sections 5.2, 9.5, and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.5",
                         kind: RequestKind::Capabilities,
@@ -9177,6 +9183,18 @@ mod tests {
                         reference: "RFC 3977 sections 9.4.3 and 9.5 https://www.rfc-editor.org/rfc/rfc3977#section-9.4.3",
                         kind: RequestKind::Capabilities,
                         frame: b"101 Capability list:\r\nREADER\r\nVERSION 2\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "CAPABILITIES rejects duplicate capability label",
+                        reference: "RFC 3977 section 5.2.2 https://www.rfc-editor.org/rfc/rfc3977#section-5.2.2",
+                        kind: RequestKind::Capabilities,
+                        frame: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nreader\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "CAPABILITIES rejects duplicate VERSION capability",
+                        reference: "RFC 3977 section 5.2.2 https://www.rfc-editor.org/rfc/rfc3977#section-5.2.2",
+                        kind: RequestKind::Capabilities,
+                        frame: b"101 Capability list:\r\nVERSION 2\r\nVersion 3\r\n.\r\n",
                     },
                     ResponseFrameCase {
                         name: "CAPABILITIES rejects zero version number",
