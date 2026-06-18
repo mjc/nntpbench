@@ -325,9 +325,11 @@ mod proptests {
     }
 
     fn article_number_token_strategy() -> BoxedStrategy<String> {
-        article_number_strategy()
-            .prop_map(|number| number.to_string())
-            .boxed()
+        prop_oneof![
+            article_number_strategy().prop_map(|number| number.to_string()),
+            article_number_strategy().prop_map(|number| format!("{number:016}")),
+        ]
+        .boxed()
     }
 
     fn header_name_strategy() -> BoxedStrategy<String> {
@@ -1144,8 +1146,9 @@ mod proptests {
             request.write_wire_to(&mut wire);
             let parsed = RequestLine::parse(&wire);
             let expected_args = match &selector {
-                SelectorCase::Current => "",
-                SelectorCase::Number(number) | SelectorCase::MessageId(number) => number.as_str(),
+                SelectorCase::Current => String::new(),
+                SelectorCase::Number(number) => number.parse::<u64>().unwrap().to_string(),
+                SelectorCase::MessageId(number) => number.clone(),
             };
 
             prop_assert_eq!(parsed.kind(), family.as_kind());
@@ -1768,11 +1771,7 @@ fn validate_article_number_token(value: &str) -> Result<(), InvalidArticleNumber
 }
 
 fn article_number_token_value(value: &str) -> Result<u64, InvalidArticleNumberToken> {
-    if value.is_empty()
-        || value.len() > 16
-        || value.len() > 1 && value.starts_with('0')
-        || !value.bytes().all(|byte| byte.is_ascii_digit())
-    {
+    if value.is_empty() || value.len() > 16 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err(InvalidArticleNumberToken);
     }
 
@@ -2443,7 +2442,16 @@ fn is_response_decimal_token(value: &[u8]) -> bool {
 }
 
 fn validate_response_article_number(value: &[u8]) -> bool {
-    !value.is_empty() && value.len() <= 16 && value.iter().all(u8::is_ascii_digit)
+    if value.is_empty() || value.len() > 16 || !value.iter().all(u8::is_ascii_digit) {
+        return false;
+    }
+    value
+        .iter()
+        .try_fold(0_u64, |acc, byte| {
+            acc.checked_mul(10)?
+                .checked_add(u64::from(byte.checked_sub(b'0')?))
+        })
+        .is_some_and(|number| number <= MAX_ARTICLE_NUMBER)
 }
 
 fn validate_article_status_response_arguments(value: &[u8]) -> bool {
@@ -5759,7 +5767,7 @@ mod tests {
             ),
             (
                 RequestKind::ListGroup,
-                b"211 1 1 9999999999999999 alt.test\r\n9999999999999999\r\n.\r\n".as_slice(),
+                b"211 1 1 2147483647 alt.test\r\n2147483647\r\n.\r\n".as_slice(),
             ),
             (
                 RequestKind::List,
@@ -5850,7 +5858,7 @@ mod tests {
             ),
             (
                 RequestKind::Hdr,
-                b"225 headers follow\r\n9999999999999999 value\r\n.\r\n".as_slice(),
+                b"225 headers follow\r\n2147483647 value\r\n.\r\n".as_slice(),
             ),
             (
                 RequestKind::Xhdr,
@@ -5875,6 +5883,10 @@ mod tests {
             (
                 RequestKind::ListGroup,
                 b"211 1 1 1 alt.test\r\n12345678901234567\r\n.\r\n".as_slice(),
+            ),
+            (
+                RequestKind::ListGroup,
+                b"211 1 1 9999999999999999 alt.test\r\n1\r\n.\r\n".as_slice(),
             ),
             (
                 RequestKind::ListActive,
@@ -6033,6 +6045,10 @@ mod tests {
             (
                 RequestKind::Hdr,
                 b"225 headers follow\r\n12345678901234567 value\r\n.\r\n".as_slice(),
+            ),
+            (
+                RequestKind::Hdr,
+                b"225 headers follow\r\n9999999999999999 value\r\n.\r\n".as_slice(),
             ),
             (
                 RequestKind::Xhdr,

@@ -6539,6 +6539,12 @@ mod tests {
                     expected: LISTGROUP_2_3_RESPONSE,
                 },
                 ServerResponseCase {
+                    name: "LISTGROUP leading-zero range filters article numbers",
+                    reference: "RFC 3977 sections 3.2.1 and 6.1.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.2",
+                    input: b"LISTGROUP alt.test 0002-0003\r\n",
+                    expected: LISTGROUP_2_3_RESPONSE,
+                },
+                ServerResponseCase {
                     name: "LISTGROUP reversed range is valid and empty",
                     reference: "RFC 3977 section 6.1.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.2",
                     input: b"LISTGROUP alt.test 3-2\r\n",
@@ -7659,6 +7665,12 @@ mod tests {
                     expected: b"501 command syntax error\r\n",
                 },
                 ServerResponseCase {
+                    name: "STAT leading-zero selector is numeric",
+                    reference: "RFC 3977 sections 3.2.1 and 6.2.4 https://www.rfc-editor.org/rfc/rfc3977#section-6.2.4",
+                    input: b"GROUP alt.test\r\nSTAT 0002\r\n",
+                    expected: b"211 3 1 3 alt.test\r\n223 2 <article.2@nntpbench.local> article retrieved\r\n",
+                },
+                ServerResponseCase {
                     name: "XOVER current before GROUP",
                     reference: "RFC 2980 section 2.1.7 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.7",
                     input: b"XOVER\r\n",
@@ -8065,9 +8077,14 @@ mod tests {
                         ArticleSelector::from_borrowed("0").is_err(),
                     ),
                     (
-                        "article reference selector rejects leading-zero number",
-                        "RFC 3977 section 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
-                        ArticleRef::from_selector("0001").is_err(),
+                        "article reference selector accepts leading-zero number",
+                        "RFC 3977 sections 3.2.1 and 3.6 https://www.rfc-editor.org/rfc/rfc3977#section-3.6",
+                        ArticleRef::from_selector("0001").is_ok(),
+                    ),
+                    (
+                        "article selector accepts leading-zero number",
+                        "RFC 3977 sections 3.2.1 and 3.6 https://www.rfc-editor.org/rfc/rfc3977#section-3.6",
+                        ArticleSelector::from_borrowed("0002").is_ok(),
                     ),
                     (
                         "article selector rejects zero range start",
@@ -8115,14 +8132,14 @@ mod tests {
                         ListGroupRange::from_borrowed("10-1").is_ok(),
                     ),
                     (
-                        "LISTGROUP range rejects leading-zero number",
-                        "RFC 3977 section 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
-                        ListGroupRange::from_borrowed("0001").is_err(),
+                        "LISTGROUP range accepts leading-zero number",
+                        "RFC 3977 sections 3.2.1 and 6.1.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.2",
+                        ListGroupRange::from_borrowed("0001").is_ok(),
                     ),
                     (
-                        "LISTGROUP range rejects leading-zero endpoint",
-                        "RFC 3977 section 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
-                        ListGroupRange::from_borrowed("1-0002").is_err(),
+                        "LISTGROUP range accepts leading-zero endpoint",
+                        "RFC 3977 sections 3.2.1 and 6.1.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.2",
+                        ListGroupRange::from_borrowed("1-0002").is_ok(),
                     ),
                     (
                         "date accepts earliest RFC 3977 four-digit year",
@@ -8642,6 +8659,12 @@ mod tests {
                         frame: b"223 12345678901234567 <stat@test> article exists\r\n",
                     },
                     ResponseFrameCase {
+                        name: "NEXT rejects article number over RFC maximum",
+                        reference: "RFC 3977 section 3.6 https://www.rfc-editor.org/rfc/rfc3977#section-3.6",
+                        kind: RequestKind::Next,
+                        frame: b"223 2147483648 <stat@test> article exists\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "ARTICLE rejects STAT success code",
                         reference: "RFC 3977 sections 6.2.1 and 6.2.4 https://www.rfc-editor.org/rfc/rfc3977#section-6.2",
                         kind: RequestKind::Article,
@@ -8766,6 +8789,12 @@ mod tests {
                         reference: "RFC 3977 sections 6.1.1 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
                         kind: RequestKind::Group,
                         frame: b"211 3 1 12345678901234567 alt.test\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "GROUP rejects high-water article number over RFC maximum",
+                        reference: "RFC 3977 sections 3.6 and 6.1.1 https://www.rfc-editor.org/rfc/rfc3977#section-3.6",
+                        kind: RequestKind::Group,
+                        frame: b"211 3 1 2147483648 alt.test\r\n",
                     },
                     ResponseFrameCase {
                         name: "LISTGROUP rejects invalid article count argument",
@@ -8978,6 +9007,12 @@ mod tests {
                         frame: b"224 overview follows\r\n12345678901234567\tSubject\tfrom@test\r\n.\r\n",
                     },
                     ResponseFrameCase {
+                        name: "OVER rejects article number over RFC maximum",
+                        reference: "RFC 3977 sections 3.6 and 8.3.1 https://www.rfc-editor.org/rfc/rfc3977#section-3.6",
+                        kind: RequestKind::Over,
+                        frame: b"224 overview follows\r\n2147483648\tSubject\tfrom@test\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "OVER rejects labeled bytes metadata field",
                         reference: "RFC 3977 sections 8.1.1 and 8.3.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.3.2",
                         kind: RequestKind::Over,
@@ -9048,6 +9083,12 @@ mod tests {
                         reference: "RFC 3977 sections 8.5.1 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
                         kind: RequestKind::Hdr,
                         frame: b"225 headers follow\r\n12345678901234567 value\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "HDR rejects article number over RFC maximum",
+                        reference: "RFC 3977 sections 3.6 and 8.5.1 https://www.rfc-editor.org/rfc/rfc3977#section-3.6",
+                        kind: RequestKind::Hdr,
+                        frame: b"225 headers follow\r\n2147483648 value\r\n.\r\n",
                     },
                     ResponseFrameCase {
                         name: "XHDR rejects body row without numeric article number",
@@ -11028,7 +11069,7 @@ mod tests {
     async fn fetch_response_rejects_invalid_article_selector() {
         let mut args = test_fetch_args();
         args.message_id = None;
-        args.selector = Some("0001".to_string());
+        args.selector = Some("0".to_string());
 
         let err = fetch_response(&args).await.unwrap_err();
         assert!(matches!(err, ClientError::InvalidArticleSelector));
