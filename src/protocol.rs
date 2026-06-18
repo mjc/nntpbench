@@ -3183,10 +3183,7 @@ fn validate_known_capability_response_line(label: &[u8], mut rest: &[u8]) -> Opt
             let Some((token, next)) = split_response_ws_token(rest) else {
                 return Some(false);
             };
-            if ![b"USER".as_slice(), b"SASL".as_slice()]
-                .iter()
-                .any(|known| token.eq_ignore_ascii_case(known))
-            {
+            if !validate_capability_argument_token(token) {
                 return Some(false);
             }
             rest = next;

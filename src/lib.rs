@@ -8030,6 +8030,12 @@ mod tests {
                         frame: b"101 capability list follows\r\nVERSION 2\r\nSTARTTLS\r\nSTREAMING\r\nAUTHINFO USER SASL\r\nSASL CRAM-MD5 DIGEST-MD5 GSSAPI PLAIN EXTERNAL\r\n.\r\n",
                     },
                     ResponseFrameCase {
+                        name: "CAPABILITIES accepts future AUTHINFO arguments",
+                        reference: "RFC 4643 section 2.1 https://www.rfc-editor.org/rfc/rfc4643#section-2.1",
+                        kind: RequestKind::Capabilities,
+                        frame: b"101 capability list follows\r\nVERSION 2\r\nAUTHINFO USER FUTURE-AUTH\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "HELP accepts UTF-8 multiline text",
                         reference: "RFC 3977 section 7.2 https://www.rfc-editor.org/rfc/rfc3977#section-7.2",
                         kind: RequestKind::Help,
@@ -8703,10 +8709,10 @@ mod tests {
                         frame: b"101 Capability list:\r\nVERSION 2\r\nSTREAMING feed\r\n.\r\n",
                     },
                     ResponseFrameCase {
-                        name: "CAPABILITIES rejects AUTHINFO unknown variant",
-                        reference: "RFC 4643 section 3.4 https://www.rfc-editor.org/rfc/rfc4643#section-3.4",
+                        name: "CAPABILITIES rejects malformed AUTHINFO argument",
+                        reference: "RFC 4643 sections 2.1 and 3.4 https://www.rfc-editor.org/rfc/rfc4643#section-2.1",
                         kind: RequestKind::Capabilities,
-                        frame: b"101 Capability list:\r\nVERSION 2\r\nAUTHINFO USER PASS\r\n.\r\n",
+                        frame: b"101 Capability list:\r\nVERSION 2\r\nAUTHINFO USER BAD\0TOKEN\r\n.\r\n",
                     },
                     ResponseFrameCase {
                         name: "CAPABILITIES rejects SASL without mechanisms",
