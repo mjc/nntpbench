@@ -2634,7 +2634,7 @@ fn split_active_response_line(line: &[u8]) -> Option<ActiveResponseFields<'_>> {
 fn split_spa_field(value: &[u8]) -> Option<(&[u8], &[u8])> {
     let field_end = memchr::memchr(b' ', value)?;
     let field = &value[..field_end];
-    let rest = skip_ascii_spaces(&value[field_end..])?;
+    let rest = value.get(field_end + 1..)?;
     if field.is_empty() || rest.is_empty() {
         return None;
     }
@@ -2667,28 +2667,16 @@ fn validate_active_times_response_line(line: &[u8]) -> bool {
 fn split_active_times_response_line(line: &[u8]) -> Option<(&[u8], &[u8], &[u8])> {
     let group_end = memchr::memchr(b' ', line)?;
     let group = &line[..group_end];
-    let after_group = skip_ascii_spaces(&line[group_end..])?;
+    let after_group = line.get(group_end + 1..)?;
 
     let timestamp_end = memchr::memchr(b' ', after_group)?;
     let timestamp = &after_group[..timestamp_end];
-    let creator = skip_ascii_spaces(&after_group[timestamp_end..])?;
+    let creator = after_group.get(timestamp_end + 1..)?;
     if creator.is_empty() {
         return None;
     }
 
     Some((group, timestamp, creator))
-}
-
-fn skip_ascii_spaces(value: &[u8]) -> Option<&[u8]> {
-    if value.first() != Some(&b' ') {
-        return None;
-    }
-    Some(
-        value
-            .iter()
-            .position(|byte| *byte != b' ')
-            .map_or(&[][..], |index| &value[index..]),
-    )
 }
 
 fn validate_u_text(value: &[u8]) -> bool {
@@ -5965,7 +5953,7 @@ mod tests {
             ),
             (
                 RequestKind::List,
-                b"215 list follows\r\nalt.test 3 1 y\r\nmulti.space   3  1   y\r\nredirect.test 0 0 =alt.test\r\n.\r\n"
+                b"215 list follows\r\nalt.test 3 1 y\r\nsingle.space 3 1 y\r\nredirect.test 0 0 =alt.test\r\n.\r\n"
                     .as_slice(),
             ),
             (
@@ -5974,7 +5962,7 @@ mod tests {
             ),
             (
                 RequestKind::ListActiveTimes,
-                b"215 information follows\r\nalt.test   1715907600   admin test creator\r\n.\r\n"
+                b"215 information follows\r\nalt.test 1715907600 admin test creator\r\n.\r\n"
                     .as_slice(),
             ),
             (
@@ -5988,7 +5976,7 @@ mod tests {
             ),
             (
                 RequestKind::NewGroups,
-                b"231 new groups follow\r\nalt.test   3  1   y\r\n.\r\n".as_slice(),
+                b"231 new groups follow\r\nalt.test 3 1 y\r\n.\r\n".as_slice(),
             ),
             (
                 RequestKind::ListOverviewFmt,
