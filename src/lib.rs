@@ -2177,7 +2177,9 @@ async fn read_greeting(stream: &mut TcpStream) -> io::Result<()> {
             &buffer[..total],
             protocol::MAX_INITIAL_RESPONSE_LINE_BYTES,
         ) {
-            BoundedResponseLineStatus::CompleteAt(_) => return Ok(()),
+            BoundedResponseLineStatus::CompleteAt(line_end) => {
+                return validate_service_ready_greeting(&buffer[..line_end]);
+            }
             BoundedResponseLineStatus::NeedMore => {}
             BoundedResponseLineStatus::Invalid => {
                 return Err(io::Error::new(
@@ -2192,6 +2194,29 @@ async fn read_greeting(stream: &mut TcpStream) -> io::Result<()> {
                 ));
             }
         }
+    }
+}
+
+fn validate_service_ready_greeting(line: &[u8]) -> io::Result<()> {
+    let protocol::ResponseFrameParse::Complete(frame) =
+        protocol::ResponseFrame::parse(RequestKind::Unknown, line)
+    else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "server greeting is not a valid NNTP response line",
+        ));
+    };
+
+    match frame.status().as_u16() {
+        200 | 201 => Ok(()),
+        400 | 502 => Err(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            "server greeting reports service unavailable",
+        )),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "server greeting used an invalid status code",
+        )),
     }
 }
 
@@ -10792,6 +10817,54 @@ mod tests {
         let mut client = TcpStream::connect(addr).await.unwrap();
         read_greeting(&mut client).await.unwrap();
         server.await.unwrap();
+    }
+
+    async fn read_greeting_result_for(greeting: &'static [u8]) -> io::Result<()> {
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(greeting).await.unwrap();
+        });
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let result = read_greeting(&mut client).await;
+        server.await.unwrap();
+        result
+    }
+
+    #[tokio::test]
+    async fn rfc3977_red_read_greeting_status_matrix() {
+        // RFC 3977 section 5.1 allows only 200, 201, 400, and 502 as initial
+        // connection greeting codes. 200 and 201 are service-ready states;
+        // 400 and 502 require the server to close and must not be treated as
+        // a usable client connection:
+        // https://www.rfc-editor.org/rfc/rfc3977#section-5.1
+        for greeting in [
+            b"200 service ready, posting allowed\r\n".as_slice(),
+            b"201 service ready, posting prohibited\r\n".as_slice(),
+        ] {
+            read_greeting_result_for(greeting).await.unwrap();
+        }
+
+        for greeting in [
+            b"400 service temporarily unavailable\r\n".as_slice(),
+            b"502 service permanently unavailable\r\n".as_slice(),
+        ] {
+            let err = read_greeting_result_for(greeting).await.unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused, "{greeting:?}");
+        }
+
+        for greeting in [
+            b"100 help follows\r\n".as_slice(),
+            b"205 closing connection\r\n".as_slice(),
+            b"500 unknown command\r\n".as_slice(),
+            b"999 invalid response class\r\n".as_slice(),
+            b"ready\r\n".as_slice(),
+            b"201 ready caf\xe9\r\n".as_slice(),
+        ] {
+            let err = read_greeting_result_for(greeting).await.unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{greeting:?}");
+        }
     }
 
     #[tokio::test]
