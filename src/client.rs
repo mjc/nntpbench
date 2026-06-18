@@ -26,7 +26,6 @@ use crate::{
     StatusCode, Wildmat,
 };
 
-const DRAINED_PENDING_READ_BYTES: usize = 1024 * 1024;
 const OWNED_RESPONSE_PREALLOC_BYTES: usize = 8 * 1024 * 1024;
 const STREAMING_STATUS_LINE_BYTES: usize = crate::protocol::MAX_INITIAL_RESPONSE_LINE_BYTES;
 
@@ -2154,6 +2153,7 @@ fn find_in_chunk_terminator(chunk: &[u8]) -> Option<usize> {
     })
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug)]
 enum StreamingDecodeProgress {
     NeedMore { consumed: usize },
@@ -2236,195 +2236,6 @@ impl PendingExchange {
                 request: completed.request,
                 response,
             }),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct DrainedResponse {
-    status: StatusCode,
-    bytes_len: usize,
-}
-
-impl DrainedResponse {
-    pub(crate) fn status(&self) -> StatusCode {
-        self.status
-    }
-
-    pub(crate) fn bytes_len(&self) -> usize {
-        self.bytes_len
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct DrainedResponseFrame<'a> {
-    status: StatusCode,
-    bytes: &'a [u8],
-}
-
-impl<'a> DrainedResponseFrame<'a> {
-    pub(crate) fn status(&self) -> StatusCode {
-        self.status
-    }
-
-    pub(crate) fn as_bytes(&self) -> &'a [u8] {
-        self.bytes
-    }
-}
-
-pub(crate) struct DrainedResponseReader {
-    pending_read: Vec<u8>,
-    pending_len: usize,
-    pending_start: usize,
-    read_chunk_bytes: usize,
-}
-
-impl DrainedResponseReader {
-    pub(crate) fn new(read_chunk_bytes: usize) -> Self {
-        Self {
-            pending_read: Vec::with_capacity(DRAINED_PENDING_READ_BYTES),
-            pending_len: 0,
-            pending_start: 0,
-            read_chunk_bytes: read_chunk_bytes.max(1),
-        }
-    }
-
-    pub(crate) async fn read_response<R>(
-        &mut self,
-        reader: &mut R,
-        kind: RequestKind,
-    ) -> Result<DrainedResponse, ClientError>
-    where
-        R: AsyncRead + Unpin,
-    {
-        if self.pending_len == 0 {
-            self.pending_start = 0;
-            self.pending_read.clear();
-        }
-        let mut decoder = StreamingResponseDecoder::new(kind);
-        let mut bytes_len = 0usize;
-
-        loop {
-            if self.pending_start < self.pending_len {
-                match decoder.push(&self.pending_read[self.pending_start..self.pending_len]) {
-                    Ok(StreamingDecodeProgress::NeedMore { consumed }) => {
-                        bytes_len += consumed;
-                        self.pending_start += consumed;
-                        if self.pending_start == self.pending_len {
-                            self.pending_len = 0;
-                            self.pending_start = 0;
-                            self.pending_read.clear();
-                        }
-                    }
-                    Ok(StreamingDecodeProgress::Complete {
-                        status, consumed, ..
-                    }) => {
-                        bytes_len += consumed;
-                        self.pending_start += consumed;
-                        if self.pending_start == self.pending_len {
-                            self.pending_len = 0;
-                            self.pending_start = 0;
-                            self.pending_read.clear();
-                        }
-
-                        return Ok(DrainedResponse { status, bytes_len });
-                    }
-                    Err(err) => return Err(err),
-                }
-            }
-
-            if self.pending_len == self.pending_read.capacity() {
-                compact_drained_pending_read(
-                    &mut self.pending_read,
-                    &mut self.pending_start,
-                    &mut self.pending_len,
-                );
-                if self.pending_len == self.pending_read.capacity() {
-                    reserve_next_read_capacity(&mut self.pending_read, self.read_chunk_bytes);
-                }
-            }
-
-            let read = read_into_pending(
-                reader,
-                &mut self.pending_read,
-                self.pending_len,
-                self.read_chunk_bytes,
-            )
-            .await?;
-
-            if read == 0 {
-                return Err(ClientError::UnexpectedEof);
-            }
-
-            self.pending_len += read;
-        }
-    }
-
-    pub(crate) async fn read_response_frame<R>(
-        &mut self,
-        reader: &mut R,
-        kind: RequestKind,
-    ) -> Result<DrainedResponseFrame<'_>, ClientError>
-    where
-        R: AsyncRead + Unpin,
-    {
-        if self.pending_len == 0 {
-            self.pending_start = 0;
-            self.pending_read.clear();
-        }
-        let mut frame_start = self.pending_start;
-
-        loop {
-            if frame_start < self.pending_len {
-                match ResponseDecoder::new(kind)
-                    .push(&self.pending_read[frame_start..self.pending_len])
-                {
-                    Ok(DecodeProgress::NeedMore) => {}
-                    Ok(DecodeProgress::Complete {
-                        status, consumed, ..
-                    }) => {
-                        let frame_end = frame_start + consumed;
-                        self.pending_start = frame_end;
-                        if self.pending_start == self.pending_len {
-                            self.pending_len = 0;
-                            self.pending_start = 0;
-                        }
-                        return Ok(DrainedResponseFrame {
-                            status,
-                            bytes: &self.pending_read[frame_start..frame_end],
-                        });
-                    }
-                    Err(err) => return Err(err),
-                }
-            }
-
-            if self.pending_len == self.pending_read.capacity() {
-                if frame_start == 0 {
-                    reserve_next_read_capacity(&mut self.pending_read, self.read_chunk_bytes);
-                } else {
-                    let frame_len = self.pending_len - frame_start;
-                    self.pending_read
-                        .copy_within(frame_start..self.pending_len, 0);
-                    self.pending_read.truncate(frame_len);
-                    self.pending_start = 0;
-                    self.pending_len = frame_len;
-                    frame_start = 0;
-                }
-            }
-
-            let read = read_into_pending(
-                reader,
-                &mut self.pending_read,
-                self.pending_len,
-                self.read_chunk_bytes,
-            )
-            .await?;
-
-            if read == 0 {
-                return Err(ClientError::UnexpectedEof);
-            }
-
-            self.pending_len += read;
         }
     }
 }
@@ -2568,27 +2379,6 @@ where
         Request::ModeReader => write_simple_request_wire(writer, b"MODE READER").await,
         Request::Quit => write_simple_request_wire(writer, b"QUIT").await,
     }
-}
-
-pub(crate) async fn write_article_request_wire<W>(
-    writer: &mut W,
-    article_ref: &ArticleRef<'_>,
-) -> io::Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
-    write_article_ref_request_wire(writer, b"ARTICLE", article_ref).await
-}
-
-pub(crate) async fn write_authinfo_wire<W>(
-    writer: &mut W,
-    kind: AuthInfoKind,
-    value: &AuthInfoValue<'_>,
-) -> io::Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
-    write_authinfo_request_wire(writer, kind, value.as_str()).await
 }
 
 #[doc(hidden)]
@@ -2986,39 +2776,6 @@ async fn run_reader_task(
     }
 }
 
-fn reserve_next_read_capacity(pending_read: &mut Vec<u8>, read_chunk_bytes: usize) {
-    pending_read.reserve(read_chunk_bytes.max(1));
-}
-
-async fn read_into_pending<R>(
-    reader: &mut R,
-    pending_read: &mut Vec<u8>,
-    pending_len: usize,
-    read_chunk_bytes: usize,
-) -> Result<usize, ClientError>
-where
-    R: AsyncRead + Unpin,
-{
-    debug_assert_eq!(pending_read.len(), pending_len);
-    let read_len = read_chunk_bytes.min(pending_read.capacity() - pending_len);
-    poll_fn(|cx| {
-        let mut read_buf = ReadBuf::uninit(&mut pending_read.spare_capacity_mut()[..read_len]);
-        match Pin::new(&mut *reader).poll_read(cx, &mut read_buf) {
-            std::task::Poll::Ready(Ok(())) => {
-                let read = read_buf.filled().len();
-                // `poll_read` initialized exactly `read` bytes in the spare capacity.
-                unsafe {
-                    pending_read.set_len(pending_len + read);
-                }
-                std::task::Poll::Ready(Ok(read))
-            }
-            std::task::Poll::Ready(Err(err)) => std::task::Poll::Ready(Err(ClientError::Io(err))),
-            std::task::Poll::Pending => std::task::Poll::Pending,
-        }
-    })
-    .await
-}
-
 async fn read_into_pending_bytes<R>(
     reader: &mut R,
     pending_read: &mut BytesMut,
@@ -3046,29 +2803,6 @@ where
         }
     })
     .await
-}
-
-fn compact_drained_pending_read(
-    pending_read: &mut Vec<u8>,
-    pending_start: &mut usize,
-    pending_len: &mut usize,
-) {
-    if *pending_start == 0 {
-        return;
-    }
-
-    if *pending_start == *pending_len {
-        *pending_len = 0;
-        *pending_start = 0;
-        pending_read.clear();
-        return;
-    }
-
-    let tail_len = *pending_len - *pending_start;
-    pending_read.copy_within(*pending_start..*pending_len, 0);
-    pending_read.truncate(tail_len);
-    *pending_len = tail_len;
-    *pending_start = 0;
 }
 
 async fn poison_writer_engine(
@@ -4055,65 +3789,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn streaming_drained_decoder_handles_pipelined_body_frames_in_fixed_chunks() {
-        let mut response = Vec::new();
-        for id in 1..=4 {
-            response
-                .extend_from_slice(format!("222 {id} <body{id}@test> body follows\r\n").as_bytes());
-            while response.len() % (64 * 1024) < (64 * 1024 - 128) {
-                response.extend_from_slice(
-                    b"This is synthetic NNTP article payload for throughput and latency benchmarking\r\n",
-                );
-            }
-            response.extend_from_slice(b".\r\n");
-        }
-
-        let mut offset = 0;
-        for _ in 0..4 {
-            let mut decoder = StreamingResponseDecoder::new(RequestKind::Body);
-            loop {
-                let end = (offset + DRAINED_PENDING_READ_BYTES).min(response.len());
-                match decoder.push(&response[offset..end]).unwrap() {
-                    StreamingDecodeProgress::NeedMore { consumed } => {
-                        offset += consumed;
-                    }
-                    StreamingDecodeProgress::Complete { consumed, .. } => {
-                        offset += consumed;
-                        break;
-                    }
-                }
-            }
-        }
-        assert_eq!(offset, response.len());
-    }
-
-    #[test]
-    fn compact_drained_pending_read_clears_fully_consumed_buffer() {
-        let mut pending_read = Vec::with_capacity(DRAINED_PENDING_READ_BYTES);
-        pending_read.extend_from_slice(b"abc");
-        let mut pending_len = 3;
-        let mut pending_start = pending_len;
-
-        compact_drained_pending_read(&mut pending_read, &mut pending_start, &mut pending_len);
-
-        assert_eq!(pending_len, 0);
-        assert_eq!(pending_start, 0);
-    }
-
-    #[test]
-    fn compact_drained_pending_read_moves_leftover_prefix_between_responses() {
-        let mut pending_read = Vec::with_capacity(DRAINED_PENDING_READ_BYTES);
-        pending_read.extend_from_slice(b"abcd1234");
-        let mut pending_len = 8;
-        let mut pending_start = 4;
-
-        compact_drained_pending_read(&mut pending_read, &mut pending_start, &mut pending_len);
-
-        assert_eq!(&pending_read[..pending_len], b"1234");
-        assert_eq!(pending_start, 0);
-    }
-
     #[tokio::test]
     async fn owned_pending_read_honors_chunk_size_and_grows_past_prealloc() {
         let mut reader = ProbeReader::new(b"abcdef");
@@ -4134,36 +3809,6 @@ mod tests {
         assert_eq!(read, 1);
         assert_eq!(pending_read.len(), OWNED_RESPONSE_PREALLOC_BYTES + 1);
         assert_eq!(pending_read[OWNED_RESPONSE_PREALLOC_BYTES], b'z');
-    }
-
-    #[tokio::test]
-    async fn drained_response_frame_grows_past_initial_pending_capacity() {
-        let (mut writer, mut reader) = tokio::io::duplex(64 * 1024);
-        let response_len = DRAINED_PENDING_READ_BYTES + 1024;
-        let server = tokio::spawn(async move {
-            writer
-                .write_all(b"222 1 <large@test> body follows\r\n")
-                .await
-                .unwrap();
-            let chunk = vec![b'x'; 64 * 1024];
-            let mut remaining = response_len;
-            while remaining != 0 {
-                let write_len = remaining.min(chunk.len());
-                writer.write_all(&chunk[..write_len]).await.unwrap();
-                remaining -= write_len;
-            }
-            writer.write_all(b"\r\n.\r\n").await.unwrap();
-        });
-
-        let mut response_reader = DrainedResponseReader::new(32 * 1024);
-        let frame = response_reader
-            .read_response_frame(&mut reader, RequestKind::Body)
-            .await
-            .unwrap();
-
-        assert_eq!(frame.status().as_u16(), 222);
-        assert!(frame.as_bytes().len() > DRAINED_PENDING_READ_BYTES);
-        server.await.unwrap();
     }
 
     #[tokio::test]
