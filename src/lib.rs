@@ -130,7 +130,7 @@ pub const LIST_OVERVIEW_FMT_RESPONSE: &[u8] =
 pub const LIST_HEADERS_RESPONSE: &[u8] =
     b"215 headers supported\r\n:bytes\r\n:lines\r\nSubject\r\nFrom\r\nDate\r\nMessage-ID\r\nReferences\r\n.\r\n";
 pub const LIST_DISTRIB_PATS_RESPONSE: &[u8] =
-    b"215 distribution patterns\r\nworld:* world\r\nlocal:*.local local\r\n.\r\n";
+    b"215 distribution patterns\r\n1:*:world\r\n2:*.local:local\r\n.\r\n";
 pub const GROUP_RESPONSE: &[u8] = b"211 3 1 3 alt.test\r\n";
 const GROUP_COMP_RESPONSE: &[u8] = b"211 1 1 1 comp.lang.rust\r\n";
 pub const LISTGROUP_RESPONSE: &[u8] = b"211 3 1 3 alt.test\r\n1\r\n2\r\n3\r\n.\r\n";
@@ -6912,12 +6912,27 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc3977_red_list_distrib_pats_with_arguments_returns_501() {
-            // RFC 3977 section 7.6.5 defines LIST DISTRIB.PATS without arguments:
+        async fn rfc3977_red_list_distrib_pats_response_and_syntax_matrix() {
+            // RFC 3977 section 9.6 defines LIST DISTRIB.PATS content as
+            // priority:wildmat:distribution lines, and section 7.6.5 defines
+            // the command without arguments:
             // https://www.rfc-editor.org/rfc/rfc3977#section-7.6.5
-            let input = b"LIST DISTRIB.PATS world\r\n";
-            let (output, _) = run_session_with_input(test_config(), input).await;
-            assert_single_response(input, b"501 command syntax error\r\n", &output, "RFC 3977");
+            // https://www.rfc-editor.org/rfc/rfc3977#section-9.6
+            assert_red_server_response_cases(&[
+                ServerResponseCase {
+                    name: "LIST DISTRIB.PATS returns priority wildmat distribution triples",
+                    reference: "RFC 3977 section 9.6 https://www.rfc-editor.org/rfc/rfc3977#section-9.6",
+                    input: b"LIST DISTRIB.PATS\r\n",
+                    expected: LIST_DISTRIB_PATS_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "LIST DISTRIB.PATS rejects arguments",
+                    reference: "RFC 3977 section 7.6.5 https://www.rfc-editor.org/rfc/rfc3977#section-7.6.5",
+                    input: b"LIST DISTRIB.PATS world\r\n",
+                    expected: b"501 command syntax error\r\n",
+                },
+            ])
+            .await;
         }
 
         #[tokio::test]
