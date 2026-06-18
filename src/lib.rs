@@ -8250,6 +8250,24 @@ mod tests {
                         frame: b"223 1 <a@test> article exists\r\n",
                     },
                     ResponseFrameCase {
+                        name: "ARTICLE rejects missing article number",
+                        reference: "RFC 3977 section 6.2.1 https://www.rfc-editor.org/rfc/rfc3977#section-6.2.1",
+                        kind: RequestKind::Article,
+                        frame: b"220 <a@test> article follows\r\nSubject: bad\r\n\r\nbody\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "HEAD rejects non-numeric article number",
+                        reference: "RFC 3977 section 6.2.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.2.2",
+                        kind: RequestKind::Head,
+                        frame: b"221 one <a@test> article retrieved\r\nSubject: bad\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "BODY rejects malformed message-id argument",
+                        reference: "RFC 3977 section 6.2.3 https://www.rfc-editor.org/rfc/rfc3977#section-6.2.3",
+                        kind: RequestKind::Body,
+                        frame: b"222 1 a@test body follows\r\nbody\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "HELP rejects LIST success code",
                         reference: "RFC 3977 sections 7.2 and 7.6 https://www.rfc-editor.org/rfc/rfc3977#section-7.2",
                         kind: RequestKind::Help,
@@ -9289,9 +9307,9 @@ mod tests {
 
                 while let Some(line_len) = find_crlf_line_end(&pending, 0) {
                     let response: &[u8] = if pending[..line_len].starts_with(b"ARTICLE ") {
-                        b"220 1 article follows\r\nbody\r\n.\r\n"
+                        b"220 1 <loopback-article@test> article follows\r\nbody\r\n.\r\n"
                     } else {
-                        b"222 1 body follows\r\nbody\r\n.\r\n"
+                        b"222 1 <loopback-body@test> body follows\r\nbody\r\n.\r\n"
                     };
                     stream.write_all(response).await.unwrap();
                     pending.drain(..line_len);
@@ -9974,7 +9992,7 @@ mod tests {
             }
 
             stream
-                .write_all(b"220 1 article follows\r\nbody\r\n.\r\n")
+                .write_all(b"220 1 <pipeline-1@test> article follows\r\nbody\r\n.\r\n")
                 .await
                 .unwrap();
 
@@ -9989,11 +10007,11 @@ mod tests {
             .expect("client should refill pipeline before draining the original batch");
 
             stream
-                .write_all(b"222 1 body follows\r\nbody\r\n.\r\n")
+                .write_all(b"222 1 <pipeline-2@test> body follows\r\nbody\r\n.\r\n")
                 .await
                 .unwrap();
             stream
-                .write_all(b"220 1 article follows\r\nbody\r\n.\r\n")
+                .write_all(b"220 1 <pipeline-3@test> article follows\r\nbody\r\n.\r\n")
                 .await
                 .unwrap();
         });
@@ -10051,7 +10069,7 @@ mod tests {
             let read = stream.read(&mut scratch).await.unwrap();
             assert_ne!(read, 0);
             stream
-                .write_all(b"222 1 body follows\r\nresponse payload\r\n.\r\n")
+                .write_all(b"222 1 <transfer@test> body follows\r\nresponse payload\r\n.\r\n")
                 .await
                 .unwrap();
         });

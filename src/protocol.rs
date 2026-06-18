@@ -2364,7 +2364,10 @@ fn validate_response_initial_line(kind: RequestKind, status: StatusCode, line: &
         (RequestKind::Group | RequestKind::ListGroup, 211) => {
             validate_group_response_arguments(&line[4..line.len() - 2])
         }
-        (RequestKind::Stat | RequestKind::Last | RequestKind::Next, 223) => {
+        (RequestKind::Article, 220)
+        | (RequestKind::Head, 221)
+        | (RequestKind::Body, 222)
+        | (RequestKind::Stat | RequestKind::Last | RequestKind::Next, 223) => {
             validate_article_status_response_arguments(&line[4..line.len() - 2])
         }
         (RequestKind::Check, 238 | 431 | 438) | (RequestKind::TakeThis, 239 | 439) => {
@@ -4962,11 +4965,14 @@ mod tests {
         crate::COUNT_TEST_ALLOCATIONS.with(|enabled| enabled.set(true));
 
         assert!(matches!(
-            ResponseFrame::parse(RequestKind::Body, b"222 body follows\r\nbody"),
+            ResponseFrame::parse(RequestKind::Body, b"222 1 <body@test> body follows\r\nbody"),
             ResponseFrameParse::NeedMore
         ));
         assert!(matches!(
-            ResponseFrame::parse(RequestKind::Body, b"222 body follows\nbody\r\n.\r\n"),
+            ResponseFrame::parse(
+                RequestKind::Body,
+                b"222 1 <body@test> body follows\nbody\r\n.\r\n"
+            ),
             ResponseFrameParse::Invalid
         ));
         assert!(matches!(
@@ -5092,19 +5098,39 @@ mod tests {
 
     #[test]
     fn article_status_response_frame_validates_rfc_status_line_arguments() {
-        // RFC 3977 sections 6.1.3, 6.1.4, and 6.2.4 define LAST, NEXT,
-        // and STAT 223 response initial lines as article number and message-id.
-        for (kind, input) in [
+        // RFC 3977 sections 6.1.3, 6.1.4, and 6.2 define ARTICLE,
+        // HEAD, BODY, STAT, LAST, and NEXT response initial lines as article
+        // number and message-id followed by optional response text.
+        for (kind, status, input) in [
+            (
+                RequestKind::Article,
+                StatusCode(220),
+                b"220 1 <article@test> article follows\r\nSubject: ok\r\n\r\nbody\r\n.\r\n"
+                    .as_slice(),
+            ),
+            (
+                RequestKind::Head,
+                StatusCode(221),
+                b"221 1 <head@test> article retrieved\r\nSubject: ok\r\n.\r\n".as_slice(),
+            ),
+            (
+                RequestKind::Body,
+                StatusCode(222),
+                b"222 1 <body@test> body follows\r\nbody\r\n.\r\n".as_slice(),
+            ),
             (
                 RequestKind::Stat,
+                StatusCode(223),
                 b"223 1 <stat@test> article exists\r\n".as_slice(),
             ),
             (
                 RequestKind::Last,
+                StatusCode(223),
                 b"223 2 <last@test> article retrieved\r\n".as_slice(),
             ),
             (
                 RequestKind::Next,
+                StatusCode(223),
                 b"223 3 <next@test> article retrieved\r\n".as_slice(),
             ),
         ] {
@@ -5112,20 +5138,33 @@ mod tests {
                 matches!(
                     ResponseFrame::parse(kind, input),
                     ResponseFrameParse::Complete(response)
-                        if response.status() == StatusCode(223)
+                        if response.status() == status
                 ),
                 "{kind:?} {input:?}"
             );
             assert!(
                 matches!(
                     ResponseInitial::parse(kind, input),
-                    ResponseInitialParse::Complete(initial) if initial.status() == StatusCode(223)
+                    ResponseInitialParse::Complete(initial) if initial.status() == status
                 ),
                 "{kind:?} {input:?}"
             );
         }
 
         for (kind, input) in [
+            (
+                RequestKind::Article,
+                b"220 <article@test> article follows\r\nSubject: bad\r\n\r\nbody\r\n.\r\n"
+                    .as_slice(),
+            ),
+            (
+                RequestKind::Head,
+                b"221 one <head@test> article retrieved\r\nSubject: bad\r\n.\r\n".as_slice(),
+            ),
+            (
+                RequestKind::Body,
+                b"222 1 body@test body follows\r\nbody\r\n.\r\n".as_slice(),
+            ),
             (
                 RequestKind::Stat,
                 b"223 <stat@test> article exists\r\n".as_slice(),
@@ -5162,7 +5201,7 @@ mod tests {
 
     #[test]
     fn multiline_response_frame_validates_rfc_body_line_formats() {
-        // RFC 3977 sections 6.1.2, 7.4, 8.3.1, and 8.5.1 define typed
+        // RFC 3977 sections 6.1.2, 7.4, 8.3.1, and 8.5.1 define structured
         // per-line bodies for LISTGROUP, NEWNEWS, OVER, and HDR. RFC 2980
         // sections 2.1.6 and 2.1.7 define the matching XHDR/XOVER extension
         // body shapes.
