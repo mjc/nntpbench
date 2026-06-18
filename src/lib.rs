@@ -8394,6 +8394,18 @@ mod tests {
                         frame: b"215 list of newsgroups follows\r\nalt.test 12345678901234567 1 y\r\n.\r\n",
                     },
                     ResponseFrameCase {
+                        name: "LIST ACTIVE rejects tab field separator",
+                        reference: "RFC 3977 sections 7.6.3 and 9.4.3 https://www.rfc-editor.org/rfc/rfc3977#section-9.4.3",
+                        kind: RequestKind::ListActive,
+                        frame: b"215 list of newsgroups follows\r\nalt.test\t3 1 y\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "LIST ACTIVE rejects extra active row field",
+                        reference: "RFC 3977 sections 7.6.3 and 9.4.3 https://www.rfc-editor.org/rfc/rfc3977#section-9.4.3",
+                        kind: RequestKind::ListActive,
+                        frame: b"215 list of newsgroups follows\r\nalt.test 3 1 y extra\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "LIST ACTIVE.TIMES rejects non-numeric timestamp",
                         reference: "RFC 3977 section 7.6.4 https://www.rfc-editor.org/rfc/rfc3977#section-7.6.4",
                         kind: RequestKind::ListActiveTimes,
@@ -8434,6 +8446,12 @@ mod tests {
                         reference: "RFC 3977 sections 7.3 and 7.6.3 https://www.rfc-editor.org/rfc/rfc3977#section-7.3",
                         kind: RequestKind::NewGroups,
                         frame: b"231 list of new newsgroups follows\r\nalt.test 3 1 open\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "NEWGROUPS rejects extra active row field",
+                        reference: "RFC 3977 sections 7.3 and 9.4.3 https://www.rfc-editor.org/rfc/rfc3977#section-9.4.3",
+                        kind: RequestKind::NewGroups,
+                        frame: b"231 list of new newsgroups follows\r\nalt.test 3 1 y extra\r\n.\r\n",
                     },
                     ResponseFrameCase {
                         name: "LIST OVERVIEW.FMT rejects invalid overview field name",

@@ -2536,17 +2536,40 @@ fn validate_crlf_lines(content: &[u8], mut validate: impl FnMut(&[u8]) -> bool) 
 }
 
 fn validate_active_response_line(line: &[u8]) -> bool {
-    let Some((tokens, trailing_text)) = split_required_response_tokens::<4>(line) else {
+    let Some((group, high, low, status)) = split_active_response_line(line) else {
         return false;
     };
 
-    trailing_text.is_empty()
-        && std::str::from_utf8(tokens[0])
-            .ok()
-            .is_some_and(|group| GroupName::from_borrowed(group).is_ok())
-        && validate_response_article_number(tokens[1])
-        && validate_response_article_number(tokens[2])
-        && validate_active_status_token(tokens[3])
+    std::str::from_utf8(group)
+        .ok()
+        .is_some_and(|group| GroupName::from_borrowed(group).is_ok())
+        && validate_response_article_number(high)
+        && validate_response_article_number(low)
+        && validate_active_status_token(status)
+}
+
+type ActiveResponseFields<'a> = (&'a [u8], &'a [u8], &'a [u8], &'a [u8]);
+
+fn split_active_response_line(line: &[u8]) -> Option<ActiveResponseFields<'_>> {
+    let (group, rest) = split_spa_field(line)?;
+    let (high, rest) = split_spa_field(rest)?;
+    let (low, status) = split_spa_field(rest)?;
+    if status.is_empty() || status.contains(&b' ') {
+        return None;
+    }
+
+    Some((group, high, low, status))
+}
+
+fn split_spa_field(value: &[u8]) -> Option<(&[u8], &[u8])> {
+    let field_end = memchr::memchr(b' ', value)?;
+    let field = &value[..field_end];
+    let rest = skip_ascii_spaces(&value[field_end..])?;
+    if field.is_empty() || rest.is_empty() {
+        return None;
+    }
+
+    Some((field, rest))
 }
 
 fn validate_active_status_token(token: &[u8]) -> bool {
@@ -5546,7 +5569,7 @@ mod tests {
             ),
             (
                 RequestKind::List,
-                b"215 list follows\r\nalt.test 3 1 y\r\nredirect.test 0 0 =alt.test\r\n.\r\n"
+                b"215 list follows\r\nalt.test 3 1 y\r\nmulti.space   3  1   y\r\nredirect.test 0 0 =alt.test\r\n.\r\n"
                     .as_slice(),
             ),
             (
@@ -5569,7 +5592,7 @@ mod tests {
             ),
             (
                 RequestKind::NewGroups,
-                b"231 new groups follow\r\nalt.test 3 1 y\r\n.\r\n".as_slice(),
+                b"231 new groups follow\r\nalt.test   3  1   y\r\n.\r\n".as_slice(),
             ),
             (
                 RequestKind::ListOverviewFmt,
@@ -5664,6 +5687,14 @@ mod tests {
                 b"215 list follows\r\nalt.test 12345678901234567 1 y\r\n.\r\n".as_slice(),
             ),
             (
+                RequestKind::ListActive,
+                b"215 list follows\r\nalt.test\t3 1 y\r\n.\r\n".as_slice(),
+            ),
+            (
+                RequestKind::ListActive,
+                b"215 list follows\r\nalt.test 3 1 y extra\r\n.\r\n".as_slice(),
+            ),
+            (
                 RequestKind::ListActiveTimes,
                 b"215 information follows\r\nalt.test yesterday admin@test\r\n.\r\n".as_slice(),
             ),
@@ -5690,6 +5721,10 @@ mod tests {
             (
                 RequestKind::NewGroups,
                 b"231 new groups follow\r\nalt.test 3 1 open\r\n.\r\n".as_slice(),
+            ),
+            (
+                RequestKind::NewGroups,
+                b"231 new groups follow\r\nalt.test 3 1 y extra\r\n.\r\n".as_slice(),
             ),
             (
                 RequestKind::ListOverviewFmt,
