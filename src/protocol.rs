@@ -2543,9 +2543,8 @@ fn validate_multiline_response_content(kind: RequestKind, content: &[u8]) -> boo
         RequestKind::Over | RequestKind::Xover => {
             validate_crlf_lines(content, validate_overview_response_line)
         }
-        RequestKind::Hdr | RequestKind::Xhdr => {
-            validate_crlf_lines(content, validate_header_response_line)
-        }
+        RequestKind::Hdr => validate_crlf_lines(content, validate_header_response_line),
+        RequestKind::Xhdr => validate_crlf_lines(content, validate_xhdr_response_line),
         RequestKind::Capabilities => validate_capabilities_response_content(content),
         RequestKind::Help => validate_crlf_lines(content, validate_help_text_line),
         _ => true,
@@ -2857,11 +2856,27 @@ fn validate_overview_optional_field(field: &[u8]) -> bool {
 }
 
 fn validate_header_response_line(line: &[u8]) -> bool {
+    validate_header_response_line_with_key(line, validate_response_article_number)
+}
+
+fn validate_xhdr_response_line(line: &[u8]) -> bool {
+    validate_header_response_line_with_key(line, |key| {
+        validate_response_article_number(key)
+            || std::str::from_utf8(key)
+                .ok()
+                .is_some_and(|message_id| MessageId::from_borrowed(message_id).is_ok())
+    })
+}
+
+fn validate_header_response_line_with_key(
+    line: &[u8],
+    validate_key: impl FnOnce(&[u8]) -> bool,
+) -> bool {
     let Some(space) = memchr::memchr(b' ', line) else {
         return false;
     };
 
-    validate_response_article_number(&line[..space]) && validate_hdr_content(&line[space + 1..])
+    validate_key(&line[..space]) && validate_hdr_content(&line[space + 1..])
 }
 
 fn validate_hdr_content(value: &[u8]) -> bool {

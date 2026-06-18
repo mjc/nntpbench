@@ -8491,6 +8491,12 @@ mod tests {
                         kind: RequestKind::Hdr,
                         frame: b"225 headers follow\r\n1 \r\n2 value\r\n.\r\n",
                     },
+                    ResponseFrameCase {
+                        name: "XHDR accepts message-id response row key",
+                        reference: "RFC 2980 section 2.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.6",
+                        kind: RequestKind::Xhdr,
+                        frame: b"221 headers follow\r\n<one@test> value\r\n.\r\n",
+                    },
                 ]);
             }
 
