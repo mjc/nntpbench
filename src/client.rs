@@ -3528,8 +3528,8 @@ mod tests {
         // RFC 3977 section 3.1.1 represents an empty multiline response as "." CRLF
         // immediately after the response initial line:
         // https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1
-        let mut decoder = ResponseDecoder::new(RequestKind::Capabilities);
-        let buffer = b"101 Capability list:\r\n.\r\n";
+        let mut decoder = ResponseDecoder::new(RequestKind::Help);
+        let buffer = b"100 help text follows\r\n.\r\n";
 
         let DecodeProgress::Complete {
             status, consumed, ..
@@ -3537,10 +3537,10 @@ mod tests {
         else {
             panic!("decoder should complete");
         };
-        let response = response_from_bytes(RequestKind::Capabilities, status, &buffer[..consumed]);
+        let response = response_from_bytes(RequestKind::Help, status, &buffer[..consumed]);
 
         assert_eq!(consumed, buffer.len());
-        assert_eq!(response.status().as_u16(), 101);
+        assert_eq!(response.status().as_u16(), 100);
         assert_eq!(response.as_bytes(), buffer);
     }
 
@@ -3549,8 +3549,8 @@ mod tests {
         // RFC 3977 section 3.1.1 allows the empty "." CRLF terminator to arrive in a
         // later read; the decoder must still treat it as content-start termination:
         // https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1
-        let mut decoder = ResponseDecoder::new(RequestKind::Capabilities);
-        let mut buffer = b"101 Capability list:\r\n".to_vec();
+        let mut decoder = ResponseDecoder::new(RequestKind::Help);
+        let mut buffer = b"100 help text follows\r\n".to_vec();
         assert!(matches!(
             decoder.push(&buffer).unwrap(),
             DecodeProgress::NeedMore
@@ -3563,10 +3563,10 @@ mod tests {
         else {
             panic!("decoder should complete");
         };
-        let response = response_from_bytes(RequestKind::Capabilities, status, &buffer[..consumed]);
+        let response = response_from_bytes(RequestKind::Help, status, &buffer[..consumed]);
 
         assert_eq!(consumed, buffer.len());
-        assert_eq!(response.status().as_u16(), 101);
+        assert_eq!(response.status().as_u16(), 100);
         assert_eq!(response.as_bytes(), buffer);
     }
 
@@ -3576,8 +3576,8 @@ mod tests {
         // This exercises all split positions inside that three-byte terminator:
         // https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1
         for split in 1..3 {
-            let mut decoder = ResponseDecoder::new(RequestKind::Capabilities);
-            let mut buffer = b"101 Capability list:\r\n".to_vec();
+            let mut decoder = ResponseDecoder::new(RequestKind::Help);
+            let mut buffer = b"100 help text follows\r\n".to_vec();
             buffer.extend_from_slice(&b".\r\n"[..split]);
             assert!(matches!(
                 decoder.push(&buffer).unwrap(),
@@ -3591,11 +3591,10 @@ mod tests {
             else {
                 panic!("decoder should complete for split {split}");
             };
-            let response =
-                response_from_bytes(RequestKind::Capabilities, status, &buffer[..consumed]);
+            let response = response_from_bytes(RequestKind::Help, status, &buffer[..consumed]);
 
             assert_eq!(consumed, buffer.len());
-            assert_eq!(response.status().as_u16(), 101);
+            assert_eq!(response.status().as_u16(), 100);
             assert_eq!(response.as_bytes(), buffer);
         }
     }
@@ -3660,12 +3659,12 @@ mod tests {
             b"430 no article\r\n".len(),
         );
 
-        let empty = b"101 Capability list:\r\n.\r\n222 later\r\n.\r\n";
+        let empty = b"100 help text follows\r\n.\r\n222 later\r\n.\r\n";
         assert_decoder_completes_on_all_three_push_schedules(
-            RequestKind::Capabilities,
+            RequestKind::Help,
             empty,
-            101,
-            b"101 Capability list:\r\n.\r\n".len(),
+            100,
+            b"100 help text follows\r\n.\r\n".len(),
         );
 
         let non_empty = b"222 1 <a@b> body follows\r\nxx\r\n.\r\n.\r\n";
@@ -3722,13 +3721,13 @@ mod tests {
             // exactly "." CRLF after the response initial line. The decoder must consume
             // that frame, across every split, and leave any trailer for the next response:
             // https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1
-            let response = b"101 Capability list:\r\n.\r\n";
+            let response = b"100 help text follows\r\n.\r\n";
             let mut frame = response.to_vec();
             frame.extend_from_slice(&trailer);
 
             for split in 0..=frame.len() {
-                let (status, consumed) = complete_after_split(RequestKind::Capabilities, &frame, split);
-                prop_assert_eq!(status.as_u16(), 101);
+                let (status, consumed) = complete_after_split(RequestKind::Help, &frame, split);
+                prop_assert_eq!(status.as_u16(), 100);
                 prop_assert_eq!(
                     consumed,
                     response.len(),

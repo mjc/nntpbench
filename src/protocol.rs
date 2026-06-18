@@ -2516,9 +2516,7 @@ fn validate_multiline_response_content(kind: RequestKind, content: &[u8]) -> boo
         RequestKind::Hdr | RequestKind::Xhdr => {
             validate_crlf_lines(content, validate_header_response_line)
         }
-        RequestKind::Capabilities => {
-            validate_crlf_lines(content, validate_capability_response_line)
-        }
+        RequestKind::Capabilities => validate_capabilities_response_content(content),
         _ => true,
     }
 }
@@ -2625,6 +2623,49 @@ fn validate_header_response_line(line: &[u8]) -> bool {
         return false;
     };
     is_response_decimal_token(&line[..space])
+}
+
+fn validate_capabilities_response_content(content: &[u8]) -> bool {
+    let Some(version_line_end) = strict_crlf_line_content_end_from(content, 0) else {
+        return false;
+    };
+    if !validate_version_response_line(&content[..version_line_end]) {
+        return false;
+    }
+
+    let mut offset = version_line_end + crate::CRLF.len();
+    while offset < content.len() {
+        let Some(line_end) = strict_crlf_line_content_end_from(content, offset) else {
+            return false;
+        };
+        if !validate_capability_response_line(&content[offset..line_end]) {
+            return false;
+        }
+        offset = line_end + crate::CRLF.len();
+    }
+    true
+}
+
+fn validate_version_response_line(line: &[u8]) -> bool {
+    let mut tokens = line.split(|byte| *byte == b' ');
+    if tokens.next() != Some(b"VERSION".as_slice()) {
+        return false;
+    }
+    let mut seen_version = false;
+    for token in tokens {
+        if !validate_version_number_token(token) {
+            return false;
+        }
+        seen_version = true;
+    }
+    seen_version
+}
+
+fn validate_version_number_token(token: &[u8]) -> bool {
+    !token.is_empty()
+        && token.len() <= 6
+        && matches!(token[0], b'1'..=b'9')
+        && token.iter().all(u8::is_ascii_digit)
 }
 
 fn validate_capability_response_line(line: &[u8]) -> bool {
@@ -5033,7 +5074,7 @@ mod tests {
             ResponseFrameParse::Invalid
         ));
         assert!(matches!(
-            ResponseFrame::parse(RequestKind::Capabilities, b"101 capabilities follow\r\n.\r\n"),
+            ResponseFrame::parse(RequestKind::Help, b"100 help follows\r\n.\r\n"),
             ResponseFrameParse::Complete(response)
                 if response.content().is_empty() && response.terminator() == b".\r\n"
         ));
@@ -5355,6 +5396,10 @@ mod tests {
                 b"101 capabilities follow\r\nVERSION 2\r\nREADER\r\nOVER MSGID\r\n.\r\n".as_slice(),
             ),
             (
+                RequestKind::Capabilities,
+                b"101 capabilities follow\r\nVERSION 2 3\r\nREADER\r\n.\r\n".as_slice(),
+            ),
+            (
                 RequestKind::NewNews,
                 b"230 articles follow\r\n<one@test>\r\n<two@test>\r\n.\r\n".as_slice(),
             ),
@@ -5423,6 +5468,18 @@ mod tests {
             (
                 RequestKind::Capabilities,
                 b"101 capabilities follow\r\nVERSION 2\r\nBAD  TOKEN\r\n.\r\n".as_slice(),
+            ),
+            (
+                RequestKind::Capabilities,
+                b"101 capabilities follow\r\nREADER\r\nVERSION 2\r\n.\r\n".as_slice(),
+            ),
+            (
+                RequestKind::Capabilities,
+                b"101 capabilities follow\r\nVERSION 0\r\nREADER\r\n.\r\n".as_slice(),
+            ),
+            (
+                RequestKind::Capabilities,
+                b"101 capabilities follow\r\nVERSION 1234567\r\nREADER\r\n.\r\n".as_slice(),
             ),
             (
                 RequestKind::NewNews,
