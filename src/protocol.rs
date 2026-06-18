@@ -401,7 +401,7 @@ mod proptests {
     }
 
     fn group_name_strategy() -> BoxedStrategy<String> {
-        vec(string_regex("[A-Za-z0-9-]{1,8}").unwrap(), 1..=4)
+        vec(string_regex("[A-Za-z0-9:@/<>._+-]{1,8}").unwrap(), 1..=4)
             .prop_map(|segments| segments.join("."))
             .boxed()
     }
@@ -409,10 +409,12 @@ mod proptests {
     fn invalid_group_name_strategy() -> BoxedStrategy<String> {
         prop_oneof![
             Just(String::new()),
-            group_name_strategy().prop_map(|name| format!(".{name}")),
-            group_name_strategy().prop_map(|name| format!("{name}.")),
-            group_name_strategy().prop_map(|name| format!("{name}..bad")),
             group_name_strategy().prop_map(|name| format!("{name}*")),
+            group_name_strategy().prop_map(|name| format!("{name}?")),
+            group_name_strategy().prop_map(|name| format!("{name},bad")),
+            group_name_strategy().prop_map(|name| format!("{name}[bad")),
+            group_name_strategy().prop_map(|name| format!("{name}\\bad")),
+            group_name_strategy().prop_map(|name| format!("{name} bad")),
         ]
         .boxed()
     }
@@ -1814,32 +1816,21 @@ pub struct InvalidGroupName;
 
 fn validate_group_name(value: &str) -> Result<(), InvalidGroupName> {
     if value.is_empty()
-        || value.starts_with('.')
-        || value.ends_with('.')
-        || value.contains("..")
-        || value.bytes().any(|byte| {
-            byte.is_ascii_whitespace()
-                || byte.is_ascii_control()
-                || matches!(
-                    byte,
-                    b'<' | b'>'
-                        | b'!'
-                        | b'*'
-                        | b'?'
-                        | b'['
-                        | b']'
-                        | b'\\'
-                        | b','
-                        | b':'
-                        | b'/'
-                        | b'@'
-                )
-        })
+        || value
+            .bytes()
+            .any(|byte| !is_wildmat_exact_or_utf8_non_ascii(byte))
     {
         return Err(InvalidGroupName);
     }
 
     Ok(())
+}
+
+fn is_wildmat_exact_or_utf8_non_ascii(byte: u8) -> bool {
+    matches!(
+        byte,
+        0x22..=0x29 | 0x2b | 0x2d..=0x3e | 0x40..=0x5a | 0x5e..=0x7e | 0x80..=0xff
+    )
 }
 
 /// Validated AUTHINFO argument value.
@@ -6728,7 +6719,7 @@ mod tests {
         assert!(Request::stat_number(MAX_ARTICLE_NUMBER + 1).is_err());
         assert!(Request::body_selector("1-10").is_err());
         assert!(Request::group("").is_err());
-        assert!(Request::listgroup("<a@b>").is_err());
+        assert!(Request::listgroup("alt!test").is_err());
         assert!(Request::listgroup_range("0").is_err());
         assert!(Request::listgroup_range("-10").is_err());
         assert!(Request::listgroup_range("1-10-20").is_err());

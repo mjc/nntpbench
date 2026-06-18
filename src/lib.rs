@@ -7688,6 +7688,12 @@ mod tests {
                     input: b"STAT 1 2\r\n",
                     expected: b"501 command syntax error\r\n",
                 },
+                ServerResponseCase {
+                    name: "GROUP RFC wildmat-exact punctuation missing group",
+                    reference: "RFC 3977 sections 6.1.1 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
+                    input: b"GROUP alt:test/with@punct\r\n",
+                    expected: b"411 no such newsgroup\r\n",
+                },
             ])
             .await;
 
@@ -7967,10 +7973,30 @@ mod tests {
                             "wrapped message-id accepts opaque unbracketed value",
                             MessageId::from_str_or_wrap("@example.com").is_ok(),
                         ),
+                        (
+                            "group name accepts colon from wildmat-exact",
+                            GroupName::from_borrowed("alt:test").is_ok(),
+                        ),
+                        (
+                            "group name accepts slash from wildmat-exact",
+                            GroupName::from_borrowed("alt/test").is_ok(),
+                        ),
+                        (
+                            "group name accepts @ from wildmat-exact",
+                            GroupName::from_borrowed("alt@test").is_ok(),
+                        ),
+                        (
+                            "group name accepts angle brackets from wildmat-exact",
+                            GroupName::from_borrowed("alt<test>").is_ok(),
+                        ),
+                        (
+                            "group name accepts dot edge cases from wildmat-exact",
+                            GroupName::from_borrowed(".alt..test.").is_ok(),
+                        ),
                     ]
                     .iter()
                     .all(|(_, accepted)| *accepted),
-                    "RFC 3977 sections 3.6 and 9.8 define message-id as opaque printable US-ASCII in angle brackets"
+                    "RFC 3977 sections 3.6, 4.1, and 9.8 define message-id and newsgroup-name ABNF"
                 );
                 assert_red_invalid_values(&[
                     (
@@ -8019,24 +8045,19 @@ mod tests {
                         GroupName::from_borrowed("alt.test,comp.test").is_err(),
                     ),
                     (
-                        "group name rejects colon",
-                        "RFC 3977 section 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
-                        GroupName::from_borrowed("alt:test").is_err(),
-                    ),
-                    (
-                        "group name rejects slash",
-                        "RFC 3977 section 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
-                        GroupName::from_borrowed("alt/test").is_err(),
-                    ),
-                    (
-                        "group name rejects @",
-                        "RFC 3977 section 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
-                        GroupName::from_borrowed("alt@test").is_err(),
-                    ),
-                    (
                         "group name rejects !",
                         "RFC 3977 sections 4.1 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-4.1",
                         GroupName::from_borrowed("alt!test").is_err(),
+                    ),
+                    (
+                        "group name rejects wildcard *",
+                        "RFC 3977 sections 4.1 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-4.1",
+                        GroupName::from_borrowed("alt*test").is_err(),
+                    ),
+                    (
+                        "group name rejects wildcard ?",
+                        "RFC 3977 sections 4.1 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-4.1",
+                        GroupName::from_borrowed("alt?test").is_err(),
                     ),
                     (
                         "article selector rejects zero",
@@ -8215,6 +8236,12 @@ mod tests {
                         b"GROUP  alt.test\r\n",
                         RequestKind::Group,
                         "RFC 3977 section 9.2 https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
+                    ),
+                    (
+                        "GROUP accepts wildmat-exact punctuation",
+                        b"GROUP alt:test/with@punct\r\n",
+                        RequestKind::Group,
+                        "RFC 3977 section 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
                     ),
                     (
                         "BODY tab separator",
@@ -8502,6 +8529,19 @@ mod tests {
                         reference: "RFC 3977 sections 7.6.3 and 9.4.3 https://www.rfc-editor.org/rfc/rfc3977#section-9.4.3",
                         kind: RequestKind::ListActive,
                         frame: b"215 list of newsgroups follows\r\nalt.test 3 1 archived\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "GROUP accepts wildmat-exact punctuation in group name",
+                        reference: "RFC 3977 sections 6.1.1 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
+                        kind: RequestKind::Group,
+                        frame: b"211 3 1 3 alt:test/with@punct\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "LIST ACTIVE accepts wildmat-exact punctuation in group name",
+                        reference: "RFC 3977 sections 7.6.3 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
+                        kind: RequestKind::ListActive,
+                        frame:
+                            b"215 list of newsgroups follows\r\nalt:test/with@punct 3 1 y\r\n.\r\n",
                     },
                     ResponseFrameCase {
                         name: "NEWGROUPS accepts private status token",
