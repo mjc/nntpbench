@@ -118,6 +118,10 @@ mod proptests {
         ]
     }
 
+    fn body_content_bytes() -> impl Strategy<Value = u8> {
+        prop_oneof![Just(b'.'), Just(b' '), b'0'..=b'9', b'a'..=b'z']
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(48))]
 
@@ -797,7 +801,7 @@ mod proptests {
         fn article_body_terminator_is_first_rfc_dot_line(
             message_id in message_id_strategy(),
             article_number in 0_u32..=999_999,
-            mut body in vec(dangerous_wire_bytes(), 0..48),
+            mut body in vec(body_content_bytes(), 0..48),
             trailer in vec(dangerous_wire_bytes(), 0..16),
         ) {
             // RFC 3977 section 3.1.1 terminates a non-empty multiline block with the first
@@ -1373,6 +1377,13 @@ fn find_article_content_end(buf: &[u8], start: usize) -> Option<usize> {
 fn validate_body_content(buf: &[u8]) -> Result<(), ArticleParseError> {
     if buf.contains(&b'\0') {
         return Err(ArticleParseError::InvalidBody);
+    }
+
+    let mut pos = 0;
+    while pos < buf.len() {
+        let line_end =
+            strict_crlf_line_content_end_from(buf, pos).ok_or(ArticleParseError::InvalidBody)?;
+        pos = line_end + crate::CRLF.len();
     }
 
     Ok(())

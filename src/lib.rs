@@ -5482,6 +5482,38 @@ mod tests {
         }
 
         #[test]
+        fn rfc3977_red_article_parser_rejects_bare_lf_or_cr_in_body_lines() {
+            // RFC 3977 section 3.1.1 defines each multi-line data block line as
+            // B-CHAR *B-CHAR CRLF, and section 9.7 excludes CR and LF from B-CHAR:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1
+            // https://www.rfc-editor.org/rfc/rfc3977#section-9.7
+            for (name, input) in [
+                (
+                    "BODY bare LF before valid terminator",
+                    b"222 1 <body@test>\r\nfirst\nsecond\r\n.\r\n".as_slice(),
+                ),
+                (
+                    "BODY bare CR before valid terminator",
+                    b"222 1 <body@test>\r\nfirst\rsecond\r\n.\r\n".as_slice(),
+                ),
+                (
+                    "ARTICLE body bare LF before valid terminator",
+                    b"220 1 <body@test>\r\nSubject: body\r\n\r\nfirst\nsecond\r\n.\r\n".as_slice(),
+                ),
+                (
+                    "ARTICLE body malformed CR before valid terminator",
+                    b"220 1 <body@test>\r\nSubject: body\r\n\r\nfirst\r second\r\n.\r\n".as_slice(),
+                ),
+            ] {
+                assert_eq!(
+                    Article::parse(input),
+                    Err(ArticleParseError::InvalidBody),
+                    "{name}: RFC 3977 body lines must be CRLF-terminated"
+                );
+            }
+        }
+
+        #[test]
         fn rfc3977_red_article_parser_rejects_invalid_success_line_arguments() {
             // RFC 3977 sections 6.2.1 through 6.2.4 define successful
             // ARTICLE/HEAD/BODY/STAT responses as status, article number,
