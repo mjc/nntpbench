@@ -8823,10 +8823,28 @@ mod tests {
                             b"215 list of newsgroups follows\r\nalt:test/with@punct 3 1 y\r\n.\r\n",
                     },
                     ResponseFrameCase {
+                        name: "LIST ACTIVE accepts one-or-more SP field separators",
+                        reference: "RFC 3977 section 7.6.3 https://www.rfc-editor.org/rfc/rfc3977#section-7.6.3",
+                        kind: RequestKind::ListActive,
+                        frame: b"215 list of newsgroups follows\r\nalt.test  3   1    y\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "NEWGROUPS accepts defined and private status tokens",
                         reference: "RFC 3977 sections 7.3, 7.6.3, and 9.4 plus RFC 6048 section 3.1 https://www.rfc-editor.org/rfc/rfc3977#section-9.4",
                         kind: RequestKind::NewGroups,
                         frame: b"231 list of new newsgroups follows\r\nalt.y 3 1 y\r\nalt.x 3 1 x\r\nalt.redirect 3 1 =alt.target\r\nalt.private 3 1 archived\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "NEWGROUPS accepts one-or-more SP active row separators",
+                        reference: "RFC 3977 sections 7.3 and 7.6.3 https://www.rfc-editor.org/rfc/rfc3977#section-7.3",
+                        kind: RequestKind::NewGroups,
+                        frame: b"231 list of new newsgroups follows\r\nalt.test  3   1    y\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "LIST ACTIVE.TIMES accepts one-or-more SP field separators",
+                        reference: "RFC 3977 section 7.6.4 https://www.rfc-editor.org/rfc/rfc3977#section-7.6.4",
+                        kind: RequestKind::ListActiveTimes,
+                        frame: b"215 information follows\r\nalt.test  1715907600   admin test creator\r\n.\r\n",
                     },
                     ResponseFrameCase {
                         name: "LIST NEWSGROUPS accepts byte-oriented S-TEXT description",
@@ -9178,12 +9196,6 @@ mod tests {
                         frame: b"215 list of newsgroups follows\r\nalt.test\t3 1 y\r\n.\r\n",
                     },
                     ResponseFrameCase {
-                        name: "LIST ACTIVE rejects repeated SP field separator",
-                        reference: "RFC 3977 sections 7.6.3 and 9.4.3 https://www.rfc-editor.org/rfc/rfc3977#section-7.6.3",
-                        kind: RequestKind::ListActive,
-                        frame: b"215 list of newsgroups follows\r\nalt.test  3 1 y\r\n.\r\n",
-                    },
-                    ResponseFrameCase {
                         name: "LIST ACTIVE rejects extra active row field",
                         reference: "RFC 3977 sections 7.6.3 and 9.4.3 https://www.rfc-editor.org/rfc/rfc3977#section-9.4.3",
                         kind: RequestKind::ListActive,
@@ -9206,18 +9218,6 @@ mod tests {
                         reference: "RFC 3977 sections 7.6.4 and 9.6 https://www.rfc-editor.org/rfc/rfc3977#section-9.6",
                         kind: RequestKind::ListActiveTimes,
                         frame: b"215 information follows\r\nalt.test 1715907600 \tadmin@test\r\n.\r\n",
-                    },
-                    ResponseFrameCase {
-                        name: "LIST ACTIVE.TIMES rejects repeated SP after group",
-                        reference: "RFC 3977 sections 7.6.4 and 9.6 https://www.rfc-editor.org/rfc/rfc3977#section-7.6.4",
-                        kind: RequestKind::ListActiveTimes,
-                        frame: b"215 information follows\r\nalt.test  1715907600 admin@test\r\n.\r\n",
-                    },
-                    ResponseFrameCase {
-                        name: "LIST ACTIVE.TIMES rejects repeated SP after timestamp",
-                        reference: "RFC 3977 sections 7.6.4 and 9.6 https://www.rfc-editor.org/rfc/rfc3977#section-7.6.4",
-                        kind: RequestKind::ListActiveTimes,
-                        frame: b"215 information follows\r\nalt.test 1715907600  admin@test\r\n.\r\n",
                     },
                     ResponseFrameCase {
                         name: "LIST NEWSGROUPS rejects invalid group name line",
@@ -9248,12 +9248,6 @@ mod tests {
                         reference: "RFC 3977 sections 7.3 and 9.4.3 https://www.rfc-editor.org/rfc/rfc3977#section-9.4.3",
                         kind: RequestKind::NewGroups,
                         frame: b"231 list of new newsgroups follows\r\nalt.test 3 1 y extra\r\n.\r\n",
-                    },
-                    ResponseFrameCase {
-                        name: "NEWGROUPS rejects repeated SP active row separator",
-                        reference: "RFC 3977 sections 7.3 and 7.6.3 https://www.rfc-editor.org/rfc/rfc3977#section-7.3",
-                        kind: RequestKind::NewGroups,
-                        frame: b"231 list of new newsgroups follows\r\nalt.test 3  1 y\r\n.\r\n",
                     },
                     ResponseFrameCase {
                         name: "LIST OVERVIEW.FMT rejects invalid overview field name",
