@@ -5386,6 +5386,37 @@ mod tests {
             }
         }
 
+        #[test]
+        fn rfc3977_red_article_parser_rejects_invalid_success_line_arguments() {
+            // RFC 3977 sections 6.2.1 through 6.2.4 define successful
+            // ARTICLE/HEAD/BODY/STAT responses as status, article number,
+            // and message-id, with response arguments separated by single spaces:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-6.2.1
+            for (name, input) in [
+                (
+                    "ARTICLE missing article number",
+                    b"220 <missing-number@test>\r\nSubject: bad\r\n\r\nbody\r\n.\r\n".as_slice(),
+                ),
+                (
+                    "HEAD non-numeric article number",
+                    b"221 abc <bad-number@test>\r\nSubject: bad\r\n.\r\n".as_slice(),
+                ),
+                (
+                    "BODY overflowing article number",
+                    b"222 999999999999999999999999 <overflow@test>\r\nbody\r\n.\r\n".as_slice(),
+                ),
+                (
+                    "STAT message-id not separated from text",
+                    b"223 1 <bad-space@test>extra\r\n".as_slice(),
+                ),
+            ] {
+                assert!(
+                    Article::parse(input).is_err(),
+                    "{name}: RFC 3977 article-family success line should reject invalid arguments"
+                );
+            }
+        }
+
         #[tokio::test]
         async fn rfc3977_red_server_returns_501_for_syntax_error_not_article_body() {
             // RFC 3977 sections 3.2.1 and 6.2.1 reserve 501 for command syntax

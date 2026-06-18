@@ -17,6 +17,7 @@ pub enum ArticleParseError {
     InvalidHeader(InvalidHeaderReason),
     UnexpectedBody,
     BufferTooShort,
+    InvalidArticleNumber,
     InvalidMessageId,
 }
 
@@ -254,10 +255,9 @@ mod proptests {
         }
 
         #[test]
-        fn generated_response_first_lines_preserve_message_id_and_optional_number(
+        fn generated_response_first_lines_preserve_message_id_and_article_number(
             message_id in message_id_strategy(),
             article_number in 0_u32..=999_999,
-            include_number in any::<bool>(),
             headers in header_pairs_strategy(),
             body_lines in vec(body_line_strategy(), 1..=3),
         ) {
@@ -269,12 +269,8 @@ mod proptests {
                 header_block.push_str("\r\n");
             }
             let body = format!("{}\r\n", body_lines.join("\r\n"));
-            let first_line = if include_number {
-                format!("{article_number} {message_id}")
-            } else {
-                message_id.clone()
-            };
-            let expected_number = include_number.then_some(ArticleNumber::from(article_number as u64));
+            let first_line = format!("{article_number} {message_id}");
+            let expected_number = Some(ArticleNumber::from(article_number as u64));
             let article_frame = format!("220 {first_line}\r\n{header_block}\r\n{body}.\r\n");
             let head_frame = format!("221 {first_line}\r\n{header_block}.\r\n");
             let body_frame = format!("222 {first_line}\r\n{body}.\r\n");
@@ -301,14 +297,9 @@ mod proptests {
         fn generated_empty_content_shapes_parse_consistently(
             message_id in message_id_strategy(),
             article_number in 0_u32..=999_999,
-            include_number in any::<bool>(),
         ) {
-            let first_line = if include_number {
-                format!("{article_number} {message_id}")
-            } else {
-                message_id.clone()
-            };
-            let expected_number = include_number.then_some(ArticleNumber::from(article_number as u64));
+            let first_line = format!("{article_number} {message_id}");
+            let expected_number = Some(ArticleNumber::from(article_number as u64));
 
             let article_frame = format!("220 {first_line}\r\n\r\n\r\n.\r\n");
             let article = Article::parse(article_frame.as_bytes()).unwrap();
@@ -396,7 +387,7 @@ mod proptests {
             ] {
                 prop_assert_eq!(
                     Article::parse(frame.as_bytes()).unwrap_err(),
-                    ArticleParseError::InvalidMessageId
+                    ArticleParseError::InvalidArticleNumber
                 );
             }
         }
@@ -405,13 +396,8 @@ mod proptests {
         fn stat_accepts_minimal_and_rejects_dot_terminated_body(
             message_id in message_id_strategy(),
             article_number in 0_u32..=999_999,
-            include_number in any::<bool>(),
         ) {
-            let first_line = if include_number {
-                format!("{article_number} {message_id}")
-            } else {
-                message_id.clone()
-            };
+            let first_line = format!("{article_number} {message_id}");
             let minimal = format!("223 {first_line}\r\n");
             let dot_terminated = format!("223 {first_line}\r\n.\r\n");
 
@@ -423,7 +409,7 @@ mod proptests {
         }
 
         #[test]
-        fn generated_response_first_lines_treat_overflowing_article_numbers_as_missing(
+        fn generated_response_first_lines_reject_overflowing_article_numbers(
             message_id in message_id_strategy(),
             overflowing_number in overflowing_article_number_token_strategy(),
             headers in header_pairs_strategy(),
@@ -443,21 +429,12 @@ mod proptests {
             let body_frame = format!("222 {first_line}\r\n{body}.\r\n");
             let stat_frame = format!("223 {first_line}\r\n");
 
-            let article = Article::parse(article_frame.as_bytes()).unwrap();
-            prop_assert_eq!(article.message_id.as_str(), message_id.as_str());
-            prop_assert_eq!(article.article_number, None);
-
-            let head = Article::parse(head_frame.as_bytes()).unwrap();
-            prop_assert_eq!(head.message_id.as_str(), message_id.as_str());
-            prop_assert_eq!(head.article_number, None);
-
-            let parsed_body = Article::parse(body_frame.as_bytes()).unwrap();
-            prop_assert_eq!(parsed_body.message_id.as_str(), message_id.as_str());
-            prop_assert_eq!(parsed_body.article_number, None);
-
-            let stat = Article::parse(stat_frame.as_bytes()).unwrap();
-            prop_assert_eq!(stat.message_id.as_str(), message_id.as_str());
-            prop_assert_eq!(stat.article_number, None);
+            for frame in [article_frame, head_frame, body_frame, stat_frame] {
+                prop_assert_eq!(
+                    Article::parse(frame.as_bytes()).unwrap_err(),
+                    ArticleParseError::InvalidArticleNumber
+                );
+            }
         }
 
         #[test]
@@ -556,18 +533,13 @@ mod proptests {
         }
 
         #[test]
-        fn parse_first_line_extracts_optional_article_numbers_and_ignores_trailing_text(
+        fn parse_first_line_extracts_article_numbers_and_ignores_trailing_text(
             status in prop_oneof![Just("220"), Just("221"), Just("222"), Just("223")],
             message_id in message_id_strategy(),
             article_number in 0_u32..=999_999,
-            include_number in any::<bool>(),
             suffix in first_line_suffix_strategy(),
         ) {
-            let line = if include_number {
-                format!("{status} {article_number} {message_id}{suffix}")
-            } else {
-                format!("{status} {message_id}")
-            };
+            let line = format!("{status} {article_number} {message_id}{suffix}");
 
             let (parsed_message_id, parsed_number) = parse_first_line(line.as_bytes()).unwrap();
             let line_start = line.as_ptr() as usize;
@@ -576,12 +548,12 @@ mod proptests {
             prop_assert!((line_start..line_end).contains(&(parsed_message_id.as_str().as_ptr() as usize)));
             prop_assert_eq!(
                 parsed_number,
-                include_number.then_some(ArticleNumber::from(article_number as u64))
+                Some(ArticleNumber::from(article_number as u64))
             );
         }
 
         #[test]
-        fn parse_first_line_rejects_trailing_text_without_article_number(
+        fn parse_first_line_rejects_missing_article_number(
             status in prop_oneof![Just("220"), Just("221"), Just("222"), Just("223")],
             message_id in message_id_strategy(),
             suffix in string_regex(" [A-Za-z0-9._-]{1,20}").unwrap(),
@@ -589,12 +561,12 @@ mod proptests {
             let line = format!("{status} {message_id}{suffix}");
             prop_assert_eq!(
                 parse_first_line(line.as_bytes()).unwrap_err(),
-                ArticleParseError::InvalidMessageId
+                ArticleParseError::InvalidArticleNumber
             );
         }
 
         #[test]
-        fn parse_first_line_treats_non_numeric_middle_tokens_as_missing_article_numbers(
+        fn parse_first_line_rejects_non_numeric_article_numbers(
             status in prop_oneof![Just("220"), Just("221"), Just("222"), Just("223")],
             invalid_number in invalid_article_number_token_strategy(),
             message_id in message_id_strategy(),
@@ -602,16 +574,14 @@ mod proptests {
         ) {
             let line = format!("{status} {invalid_number} {message_id}{suffix}");
 
-            let (parsed_message_id, parsed_number) = parse_first_line(line.as_bytes()).unwrap();
-            let line_start = line.as_ptr() as usize;
-            let line_end = line_start + line.len();
-            prop_assert_eq!(parsed_message_id.as_str(), message_id.as_str());
-            prop_assert!((line_start..line_end).contains(&(parsed_message_id.as_str().as_ptr() as usize)));
-            prop_assert_eq!(parsed_number, None);
+            prop_assert_eq!(
+                parse_first_line(line.as_bytes()).unwrap_err(),
+                ArticleParseError::InvalidArticleNumber
+            );
         }
 
         #[test]
-        fn parse_first_line_treats_overflowing_article_numbers_as_missing(
+        fn parse_first_line_rejects_overflowing_article_numbers(
             status in prop_oneof![Just("220"), Just("221"), Just("222"), Just("223")],
             overflowing_number in overflowing_article_number_token_strategy(),
             message_id in message_id_strategy(),
@@ -619,12 +589,10 @@ mod proptests {
         ) {
             let line = format!("{status} {overflowing_number} {message_id}{suffix}");
 
-            let (parsed_message_id, parsed_number) = parse_first_line(line.as_bytes()).unwrap();
-            let line_start = line.as_ptr() as usize;
-            let line_end = line_start + line.len();
-            prop_assert_eq!(parsed_message_id.as_str(), message_id.as_str());
-            prop_assert!((line_start..line_end).contains(&(parsed_message_id.as_str().as_ptr() as usize)));
-            prop_assert_eq!(parsed_number, None);
+            prop_assert_eq!(
+                parse_first_line(line.as_bytes()).unwrap_err(),
+                ArticleParseError::InvalidArticleNumber
+            );
         }
 
         #[test]
@@ -647,7 +615,11 @@ mod proptests {
 
             prop_assert_eq!(
                 parse_first_line(line.as_bytes()).unwrap_err(),
-                ArticleParseError::InvalidMessageId
+                if include_number {
+                    ArticleParseError::InvalidMessageId
+                } else {
+                    ArticleParseError::InvalidArticleNumber
+                }
             );
         }
 
@@ -956,6 +928,7 @@ impl fmt::Display for ArticleParseError {
             Self::InvalidHeader(reason) => write!(f, "invalid header: {reason}"),
             Self::UnexpectedBody => write!(f, "response contains unexpected body"),
             Self::BufferTooShort => write!(f, "buffer too short to contain valid response"),
+            Self::InvalidArticleNumber => write!(f, "invalid article number"),
             Self::InvalidMessageId => write!(f, "invalid message-id"),
         }
     }
@@ -1401,30 +1374,38 @@ fn parse_first_line(
     if first_space != 3 {
         return Err(ArticleParseError::InvalidStatusPrefix);
     }
-    let second_space =
-        memchr::memchr(b' ', &line[first_space + 1..]).map(|pos| first_space + 1 + pos);
+    let second_space = memchr::memchr(b' ', &line[first_space + 1..])
+        .map(|pos| first_space + 1 + pos)
+        .ok_or(ArticleParseError::InvalidArticleNumber)?;
 
-    let (msgid_start_search, article_number) = match second_space {
-        Some(second_space) => {
-            let number = std::str::from_utf8(&line[first_space + 1..second_space])
-                .ok()
-                .and_then(|s| s.parse::<u64>().ok())
-                .map(ArticleNumber::from);
-            (second_space, number)
-        }
-        None => (first_space, None),
-    };
+    let article_number = parse_response_article_number(&line[first_space + 1..second_space])?;
+    let msgid_start = second_space + 1;
+    if line.get(msgid_start) != Some(&b'<') {
+        return Err(ArticleParseError::InvalidMessageId);
+    }
 
-    let msgid_start = memchr::memchr(b'<', &line[msgid_start_search..])
-        .map(|pos| msgid_start_search + pos)
-        .ok_or(ArticleParseError::InvalidMessageId)?;
     let msgid_end = memchr::memchr(b'>', &line[msgid_start..])
         .map(|pos| msgid_start + pos + 1)
         .ok_or(ArticleParseError::InvalidMessageId)?;
+    if msgid_end < line.len() && line.get(msgid_end) != Some(&b' ') {
+        return Err(ArticleParseError::InvalidMessageId);
+    }
     let msgid = std::str::from_utf8(&line[msgid_start..msgid_end])
         .map_err(|_| ArticleParseError::InvalidMessageId)?;
 
-    Ok((MessageId::from_borrowed(msgid)?, article_number))
+    Ok((MessageId::from_borrowed(msgid)?, Some(article_number)))
+}
+
+fn parse_response_article_number(value: &[u8]) -> Result<ArticleNumber, ArticleParseError> {
+    if value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
+        return Err(ArticleParseError::InvalidArticleNumber);
+    }
+
+    let number = std::str::from_utf8(value)
+        .map_err(|_| ArticleParseError::InvalidArticleNumber)?
+        .parse::<u64>()
+        .map_err(|_| ArticleParseError::InvalidArticleNumber)?;
+    Ok(ArticleNumber::from(number))
 }
 
 fn find_blank_line(buf: &[u8], start: usize) -> Result<usize, ArticleParseError> {
