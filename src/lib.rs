@@ -2683,17 +2683,6 @@ where
             Ok(false)
         }
         RequestKind::Post => {
-            if command.has_transfer_body {
-                write_response(writer, pending_write, POST_RESPONSE, session_stats).await?;
-                write_response(
-                    writer,
-                    pending_write,
-                    b"240 article received ok\r\n",
-                    session_stats,
-                )
-                .await?;
-                return Ok(false);
-            }
             write_response(
                 writer,
                 pending_write,
@@ -3249,7 +3238,7 @@ where
         RequestKind::Next => NEXT_RESPONSE,
         RequestKind::NewGroups => NEWGROUPS_RESPONSE,
         RequestKind::NewNews => NEWNEWS_RESPONSE,
-        RequestKind::Post => POST_RESPONSE,
+        RequestKind::Post => b"440 posting not permitted\r\n",
         RequestKind::Ihave => IHAVE_RESPONSE,
         RequestKind::Check | RequestKind::TakeThis | RequestKind::StartTls => {
             b"502 command unavailable\r\n"
@@ -5277,16 +5266,17 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc3977_red_post_continuation_is_consumed_before_next_command() {
-            // RFC 3977 sections 3.1.1 and 6.3.1 require POST to read the
-            // dot-terminated article data block after a 340 continuation:
+        async fn rfc3977_red_posting_disabled_rejects_pipelined_body_before_next_command() {
+            // RFC 3977 section 6.3.1 requires 440 when posting is prohibited.
+            // The mock server may still discard an already-sent body to recover
+            // the next command, but it must not emit 340/240:
             // https://www.rfc-editor.org/rfc/rfc3977#section-6.3.1
             let input = b"POST\r\nSubject: one\r\n\r\nbody\r\n.\r\nQUIT\r\n";
             let (output, _) = run_session_with_input(test_config(), input).await;
             assert_eq!(
                 without_greeting(&output),
-                b"340 send article to be posted\r\n240 article received ok\r\n205 closing connection\r\n",
-                "RFC 3977 POST continuation should consume the article before QUIT"
+                b"440 posting not permitted\r\n205 closing connection\r\n",
+                "RFC 3977 disabled POST should reject without 340/240 and recover QUIT"
             );
         }
 
@@ -10215,7 +10205,7 @@ mod tests {
         assert_eq!(
             output,
             [
-                POST_RESPONSE,
+                b"440 posting not permitted\r\n".as_slice(),
                 IHAVE_RESPONSE,
                 b"502 command unavailable\r\n",
                 b"502 command unavailable\r\n",
