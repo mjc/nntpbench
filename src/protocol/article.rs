@@ -857,21 +857,24 @@ mod proptests {
 
             let headers = Headers::parse(data.as_bytes()).unwrap();
             let items: Vec<_> = headers.iter().collect();
+            let mut first_expected = first_value.trim_start_matches([' ', '\t']).to_owned();
+            for value in &folded_values {
+                if first_expected.is_empty() {
+                    first_expected.push_str(value.trim_start_matches([' ', '\t']));
+                } else {
+                    first_expected.push(' ');
+                    first_expected.push_str(value.trim_start_matches([' ', '\t']));
+                }
+            }
             prop_assert_eq!(items.len(), 2);
             prop_assert_eq!(items[0].0, first_name.as_bytes());
-            prop_assert_eq!(
-                items[0].1,
-                first_value.trim_start_matches([' ', '\t']).as_bytes()
-            );
+            prop_assert_eq!(items[0].1, first_expected.as_bytes());
             prop_assert_eq!(items[1].0, second_name.as_bytes());
             prop_assert_eq!(
                 items[1].1,
                 second_value.trim_start_matches([' ', '\t']).as_bytes()
             );
-            prop_assert_eq!(
-                headers.get(&first_name),
-                Some(first_value.trim_start_matches([' ', '\t']).as_bytes())
-            );
+            prop_assert_eq!(headers.get(&first_name), Some(first_expected.as_bytes()));
             prop_assert_eq!(
                 headers.get(&second_name),
                 Some(second_value.trim_start_matches([' ', '\t']).as_bytes())
@@ -900,7 +903,8 @@ mod proptests {
             let article_start = article_frame.as_ptr() as usize;
             let article_end = article_start + article_frame.len();
             let article_message_id = article.message_id.as_str();
-            let article_headers = article.headers.unwrap().as_bytes();
+            let article_headers = article.headers.unwrap();
+            let article_headers = article_headers.as_bytes();
             let article_body = article.body.unwrap();
             prop_assert!((article_start..article_end).contains(&(article_message_id.as_ptr() as usize)));
             prop_assert!((article_start..article_end).contains(&(article_headers.as_ptr() as usize)));
@@ -912,7 +916,8 @@ mod proptests {
             let head_start = head_frame.as_ptr() as usize;
             let head_end = head_start + head_frame.len();
             let head_message_id = head.message_id.as_str();
-            let head_headers = head.headers.unwrap().as_bytes();
+            let head_headers = head.headers.unwrap();
+            let head_headers = head_headers.as_bytes();
             prop_assert!((head_start..head_end).contains(&(head_message_id.as_ptr() as usize)));
             prop_assert!((head_start..head_end).contains(&(head_headers.as_ptr() as usize)));
             prop_assert!(head.body.is_none());
@@ -993,28 +998,31 @@ impl From<u64> for ArticleNumber {
     }
 }
 
-/// Validated zero-copy header block.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Validated header block.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Headers<'a> {
-    data: &'a [u8],
+    data: Cow<'a, [u8]>,
 }
 
 impl<'a> Headers<'a> {
     /// Parse and validate a header block.
     pub fn parse(data: &'a [u8]) -> Result<Self, ArticleParseError> {
         validate_headers(data)?;
-        Ok(Self { data })
+        Ok(Self {
+            data: unfold_header_continuations(data),
+        })
     }
 
     /// Return a header value by case-insensitive name.
     #[must_use]
-    pub fn get(&self, name: &str) -> Option<&'a [u8]> {
+    pub fn get(&self, name: &str) -> Option<&[u8]> {
         let lookup = name.as_bytes();
         let mut pos = 0;
+        let data = self.data.as_ref();
 
-        while pos < self.data.len() {
-            let line_end = strict_crlf_line_content_end_from(self.data, pos)?;
-            let line = &self.data[pos..line_end];
+        while pos < data.len() {
+            let line_end = strict_crlf_line_content_end_from(data, pos)?;
+            let line = &data[pos..line_end];
             if line.is_empty() {
                 pos = line_end + 2;
                 continue;
@@ -1044,23 +1052,23 @@ impl<'a> Headers<'a> {
 
     /// Iterate over parsed headers.
     #[must_use]
-    pub const fn iter(&self) -> HeaderIter<'a> {
+    pub fn iter(&self) -> HeaderIter<'_> {
         HeaderIter {
-            data: self.data,
+            data: self.data.as_ref(),
             pos: 0,
         }
     }
 
     /// Return the raw header bytes.
     #[must_use]
-    pub const fn as_bytes(&self) -> &'a [u8] {
-        self.data
+    pub fn as_bytes(&self) -> &[u8] {
+        self.data.as_ref()
     }
 }
 
-impl<'a> IntoIterator for &Headers<'a> {
-    type Item = (&'a [u8], &'a [u8]);
-    type IntoIter = HeaderIter<'a>;
+impl<'headers, 'data> IntoIterator for &'headers Headers<'data> {
+    type Item = (&'headers [u8], &'headers [u8]);
+    type IntoIter = HeaderIter<'headers>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
@@ -1321,6 +1329,38 @@ fn find_article_content_end(buf: &[u8], start: usize) -> Option<usize> {
     }
 
     find_terminator_content_end(buf, start)
+}
+
+fn unfold_header_continuations(buf: &[u8]) -> Cow<'_, [u8]> {
+    if !has_header_continuation(buf) {
+        return Cow::Borrowed(buf);
+    }
+
+    let mut unfolded = Vec::with_capacity(buf.len());
+    let mut pos = 0;
+    while pos < buf.len() {
+        if pos + 2 < buf.len()
+            && buf[pos] == b'\r'
+            && buf[pos + 1] == b'\n'
+            && matches!(buf[pos + 2], b' ' | b'\t')
+        {
+            unfolded.push(b' ');
+            pos += 3;
+            while pos < buf.len() && matches!(buf[pos], b' ' | b'\t') {
+                pos += 1;
+            }
+        } else {
+            unfolded.push(buf[pos]);
+            pos += 1;
+        }
+    }
+
+    Cow::Owned(unfolded)
+}
+
+fn has_header_continuation(buf: &[u8]) -> bool {
+    buf.windows(3)
+        .any(|window| window[0] == b'\r' && window[1] == b'\n' && matches!(window[2], b' ' | b'\t'))
 }
 
 fn unstuff_dot_lines(buf: &[u8]) -> Cow<'_, [u8]> {
@@ -1722,7 +1762,12 @@ Actual body content\r\n\
     fn folded_headers_and_large_headers_parse() {
         let folded = Article::parse(FOLDED_HEADER).unwrap();
         let headers = folded.headers.unwrap();
-        assert_eq!(headers.get("Subject"), Some(&b"This is a long subject"[..]));
+        // RFC 5322 section 2.2.3: a field value may be folded across CRLF followed by
+        // whitespace and is interpreted as one unfolded logical header field.
+        assert_eq!(
+            headers.get("Subject"),
+            Some(&b"This is a long subject that continues on the next line"[..])
+        );
         assert_eq!(headers.iter().count(), 2);
 
         let long_header = format!(
