@@ -137,8 +137,11 @@ pub const STARTTLS_RESPONSE: &[u8] = b"382 continue with TLS negotiation\r\n";
 pub const OVER_RESPONSE: &[u8] = b"224 Overview information follows\r\n1\tSubject one\tone@example.com\tFri, 16 May 2026 12:00:00 +0000\t<one@example.com>\t\t123\t4\r\n.\r\n";
 pub const XOVER_RESPONSE: &[u8] = b"224 Overview information follows\r\n2\tSubject two\ttwo@example.com\tFri, 16 May 2026 12:00:01 +0000\t<two@example.com>\t<ref@example.com>\t456\t8\r\n.\r\n";
 pub const HDR_RESPONSE: &[u8] = b"225 headers follow\r\n1 example one\r\n2 example two\r\n.\r\n";
-pub const XHDR_RESPONSE: &[u8] =
-    b"221 headers follow\r\n1 <one@example>\r\n2 <two@example>\r\n.\r\n";
+pub const XHDR_RESPONSE: &[u8] = b"221 headers follow\r\n1 example one\r\n2 example two\r\n.\r\n";
+const HDR_MESSAGE_ID_RESPONSE: &[u8] =
+    b"225 headers follow\r\n1 <one@example.com>\r\n2 <two@example.com>\r\n.\r\n";
+const XHDR_MESSAGE_ID_RESPONSE: &[u8] =
+    b"221 headers follow\r\n1 <one@example.com>\r\n2 <two@example.com>\r\n.\r\n";
 pub const HEAD_RESPONSE: &[u8] = b"221 1 <article.1@nntpbench.local> article retrieved\r\nPath: nntpbench.local!mock\r\nFrom: Bench User <bench@nntpbench.local>\r\nNewsgroups: alt.binaries.bench\r\nSubject: nntpbench synthetic article\r\nMessage-ID: <article.1@nntpbench.local>\r\nDate: Fri, 15 May 2026 00:00:00 +0000\r\n.\r\n";
 pub const STAT_RESPONSE: &[u8] = b"223 1 <article.1@nntpbench.local> article retrieved\r\n";
 pub const HELP_RESPONSE: &[u8] =
@@ -2699,7 +2702,13 @@ where
                 write_response(writer, pending_write, response, session_stats).await?;
                 return Ok(false);
             }
-            write_response(writer, pending_write, HDR_RESPONSE, session_stats).await?;
+            write_response(
+                writer,
+                pending_write,
+                hdr_response(command, command_lines),
+                session_stats,
+            )
+            .await?;
             Ok(false)
         }
         RequestKind::Xhdr => {
@@ -2707,7 +2716,13 @@ where
                 write_response(writer, pending_write, response, session_stats).await?;
                 return Ok(false);
             }
-            write_response(writer, pending_write, XHDR_RESPONSE, session_stats).await?;
+            write_response(
+                writer,
+                pending_write,
+                xhdr_response(command, command_lines),
+                session_stats,
+            )
+            .await?;
             Ok(false)
         }
         RequestKind::Capabilities => {
@@ -2981,8 +2996,8 @@ where
         RequestKind::AuthInfo => b"504 unsupported authentication mechanism\r\n",
         RequestKind::Over => OVER_RESPONSE,
         RequestKind::Xover => XOVER_RESPONSE,
-        RequestKind::Hdr => HDR_RESPONSE,
-        RequestKind::Xhdr => XHDR_RESPONSE,
+        RequestKind::Hdr => hdr_response_for_args(request.args()),
+        RequestKind::Xhdr => xhdr_response_for_args(request.args()),
         RequestKind::Capabilities => CAPABILITIES_RESPONSE,
         RequestKind::Help => HELP_RESPONSE,
         RequestKind::ModeReader => MODE_READER_RESPONSE,
@@ -3774,6 +3789,46 @@ fn overview_selector_arg(kind: RequestKind, args: &[u8]) -> Option<&[u8]> {
             .filter(|selector| !selector.is_empty()),
         _ => None,
     }
+}
+
+fn header_query_name_from_args(args: &[u8]) -> Option<&[u8]> {
+    args.split(|byte| *byte == b' ')
+        .next()
+        .filter(|header| !header.is_empty())
+}
+
+fn hdr_response_for_args(args: &[u8]) -> &'static [u8] {
+    if header_query_name_from_args(args)
+        .is_some_and(|header| header.eq_ignore_ascii_case(b"Message-ID"))
+    {
+        return HDR_MESSAGE_ID_RESPONSE;
+    }
+    HDR_RESPONSE
+}
+
+fn xhdr_response_for_args(args: &[u8]) -> &'static [u8] {
+    if header_query_name_from_args(args)
+        .is_some_and(|header| header.eq_ignore_ascii_case(b"Message-ID"))
+    {
+        return XHDR_MESSAGE_ID_RESPONSE;
+    }
+    XHDR_RESPONSE
+}
+
+fn hdr_response(
+    command: &ParsedCommand,
+    command_lines: Option<&CommandLineBatch>,
+) -> &'static [u8] {
+    let args = command_args(command, command_lines).unwrap_or_default();
+    hdr_response_for_args(args)
+}
+
+fn xhdr_response(
+    command: &ParsedCommand,
+    command_lines: Option<&CommandLineBatch>,
+) -> &'static [u8] {
+    let args = command_args(command, command_lines).unwrap_or_default();
+    xhdr_response_for_args(args)
 }
 
 fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
@@ -5149,6 +5204,53 @@ mod tests {
             assert!(
                 text.starts_with("225 ") && !text.contains(" Subject:"),
                 "RFC 3977 HDR Subject should return header values without field names, got {text:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn rfc3977_red_hdr_message_id_returns_valid_message_id_values() {
+            // RFC 3977 section 8.5 returns the requested header metadata. When
+            // Message-ID is requested, each value should use the message-id grammar:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-8.5
+            let input = b"HDR Message-ID 1\r\n";
+            let (output, _) = run_session_with_input(test_config(), input).await;
+            let text = String::from_utf8_lossy(without_greeting(&output));
+            assert!(
+                text.contains("1 <one@example.com>\r\n")
+                    && text.contains("2 <two@example.com>\r\n"),
+                "RFC 3977 HDR Message-ID should return valid message-id values, got {text:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn rfc2980_red_xhdr_subject_returns_subject_values_not_message_ids() {
+            // RFC 2980 section 2.1.6 returns values for the requested header.
+            // XHDR Subject must not return Message-ID-shaped values:
+            // https://www.rfc-editor.org/rfc/rfc2980#section-2.1.6
+            let input = b"XHDR Subject 1\r\n";
+            let (output, _) = run_session_with_input(test_config(), input).await;
+            let text = String::from_utf8_lossy(without_greeting(&output));
+            assert!(
+                text.starts_with("221 ")
+                    && text.contains("1 example one\r\n")
+                    && !text.contains("<one@example"),
+                "RFC 2980 XHDR Subject should return subject values, got {text:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn rfc2980_red_xhdr_message_id_returns_valid_message_id_values() {
+            // RFC 2980 section 2.1.6 returns values for the requested header.
+            // Message-ID values should still satisfy the RFC 3977 message-id grammar:
+            // https://www.rfc-editor.org/rfc/rfc2980#section-2.1.6
+            let input = b"XHDR Message-ID 1\r\n";
+            let (output, _) = run_session_with_input(test_config(), input).await;
+            let text = String::from_utf8_lossy(without_greeting(&output));
+            assert!(
+                text.starts_with("221 ")
+                    && text.contains("1 <one@example.com>\r\n")
+                    && text.contains("2 <two@example.com>\r\n"),
+                "RFC 2980 XHDR Message-ID should return valid message-id values, got {text:?}"
             );
         }
 
@@ -9651,12 +9753,46 @@ mod tests {
             &stats,
             &mut output,
         ));
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"HDR Subject 1\r\n"),
+            &config,
+            &stats,
+            &mut output,
+        ));
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"HDR Message-ID 1\r\n"),
+            &config,
+            &stats,
+            &mut output,
+        ));
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"XHDR Subject 1\r\n"),
+            &config,
+            &stats,
+            &mut output,
+        ));
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"XHDR Message-ID 1\r\n"),
+            &config,
+            &stats,
+            &mut output,
+        ));
 
         assert_eq!(
             output,
-            [OVER_RESPONSE, OVER_RESPONSE, XOVER_RESPONSE, XOVER_RESPONSE].concat()
+            [
+                OVER_RESPONSE,
+                OVER_RESPONSE,
+                XOVER_RESPONSE,
+                XOVER_RESPONSE,
+                HDR_RESPONSE,
+                HDR_MESSAGE_ID_RESPONSE,
+                XHDR_RESPONSE,
+                XHDR_MESSAGE_ID_RESPONSE,
+            ]
+            .concat()
         );
-        assert_eq!(stats.snapshot().commands, 4);
+        assert_eq!(stats.snapshot().commands, 8);
     }
 
     #[test]
