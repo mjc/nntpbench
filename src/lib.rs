@@ -8907,6 +8907,18 @@ mod tests {
                         frame: b"221 headers follow\r\n<one@test> value\r\n.\r\n",
                     },
                     ResponseFrameCase {
+                        name: "OVER accepts omitted trailing overview fields",
+                        reference: "RFC 3977 sections 8.3.2 and 9.4.3 https://www.rfc-editor.org/rfc/rfc3977#section-8.3.2",
+                        kind: RequestKind::Over,
+                        frame: b"224 overview follows\r\n1\tSubject only\r\n2\tSubject\tfrom@test\tdate\t<two@test>\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "XOVER accepts omitted trailing overview fields",
+                        reference: "RFC 2980 section 2.1.7 and RFC 3977 section 8.3.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.3.2",
+                        kind: RequestKind::Xover,
+                        frame: b"224 overview follows\r\n1\tSubject only\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "AUTHINFO SASL 283 accepts trailing comment after challenge",
                         reference: "RFC 3977 section 9.4.1 and RFC 4643 section 3.3 https://www.rfc-editor.org/rfc/rfc3977#section-9.4.1",
                         kind: RequestKind::AuthInfo,
@@ -9412,12 +9424,6 @@ mod tests {
                         frame: b"224 overview follows\r\n1 Subject without tabs\r\n.\r\n",
                     },
                     ResponseFrameCase {
-                        name: "OVER rejects missing required overview fields",
-                        reference: "RFC 3977 sections 8.3.1 and 9.6 https://www.rfc-editor.org/rfc/rfc3977#section-9.6",
-                        kind: RequestKind::Over,
-                        frame: b"224 overview follows\r\n1\tSubject\r\n.\r\n",
-                    },
-                    ResponseFrameCase {
                         name: "OVER rejects unlabeled optional overview field",
                         reference: "RFC 3977 sections 8.3.2 and 9.4.3 https://www.rfc-editor.org/rfc/rfc3977#section-9.4.3",
                         kind: RequestKind::Over,
@@ -9446,12 +9452,6 @@ mod tests {
                         reference: "RFC 3977 sections 8.3.2, 9.4.3, and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.4.3",
                         kind: RequestKind::Over,
                         frame: b"224 overview follows\r\n1\tSubject\0bad\tfrom@test\tdate\t<one@test>\t\t1\t1\r\n.\r\n",
-                    },
-                    ResponseFrameCase {
-                        name: "XOVER rejects missing required overview fields",
-                        reference: "RFC 2980 section 2.1.7 and RFC 3977 section 9.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.7",
-                        kind: RequestKind::Xover,
-                        frame: b"224 overview follows\r\n1\tSubject\tfrom@test\tdate\t<one@test>\r\n.\r\n",
                     },
                     ResponseFrameCase {
                         name: "XOVER rejects body row without numeric article number",

@@ -2882,7 +2882,7 @@ fn validate_overview_response_line(line: &[u8]) -> bool {
         }
     }
 
-    field_count >= 7
+    field_count >= 1
 }
 
 fn validate_overview_optional_field(field: &[u8]) -> bool {
@@ -6033,9 +6033,18 @@ mod tests {
                     .as_slice(),
             ),
             (
+                RequestKind::Over,
+                b"224 overview follows\r\n1\tSubject\r\n2\tSubject\tfrom@test\tdate\t<two@test>\r\n.\r\n"
+                    .as_slice(),
+            ),
+            (
                 RequestKind::Xover,
                 b"224 overview follows\r\n1\tSubject\tfrom@test\tdate\t<one@test>\t\t1\t1\r\n.\r\n"
                     .as_slice(),
+            ),
+            (
+                RequestKind::Xover,
+                b"224 overview follows\r\n1\tSubject\r\n.\r\n".as_slice(),
             ),
             (
                 RequestKind::Hdr,
@@ -6203,10 +6212,6 @@ mod tests {
             ),
             (
                 RequestKind::Over,
-                b"224 overview follows\r\n1\tSubject\r\n.\r\n".as_slice(),
-            ),
-            (
-                RequestKind::Over,
                 b"224 overview follows\r\n12345678901234567\tSubject\tfrom@test\r\n.\r\n"
                     .as_slice(),
             ),
@@ -6218,11 +6223,6 @@ mod tests {
             (
                 RequestKind::Over,
                 b"224 overview follows\r\n1\tSubject\tfrom@test\tdate\t<one@test>\t\t1\t1\toptional without label\r\n.\r\n"
-                    .as_slice(),
-            ),
-            (
-                RequestKind::Xover,
-                b"224 overview follows\r\n1\tSubject\tfrom@test\tdate\t<one@test>\r\n.\r\n"
                     .as_slice(),
             ),
             (
