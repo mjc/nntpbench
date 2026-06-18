@@ -141,6 +141,10 @@ pub const LAST_RESPONSE: &[u8] =
     b"223 1 <prev@alt.test> article retrieved - request text separately\r\n";
 pub const NEXT_RESPONSE: &[u8] =
     b"223 2 <next@alt.test> article retrieved - request text separately\r\n";
+const NAVIGATION_ARTICLE_2_RESPONSE: &[u8] =
+    b"223 2 <article.2@alt.test> article retrieved - request text separately\r\n";
+const NAVIGATION_ARTICLE_3_RESPONSE: &[u8] =
+    b"223 3 <article.3@alt.test> article retrieved - request text separately\r\n";
 pub const NEWGROUPS_RESPONSE: &[u8] =
     b"231 list of new newsgroups follows\r\ncomp.lang.rust 0000000001 0000000001 y\r\nalt.test 0000000003 0000000001 y\r\n.\r\n";
 const NEWGROUPS_EMPTY_RESPONSE: &[u8] = b"231 list of new newsgroups follows\r\n.\r\n";
@@ -2648,8 +2652,15 @@ where
                 .await?;
                 return Ok(false);
             }
-            session_state.current_article = Some(1);
-            write_response(writer, pending_write, LAST_RESPONSE, session_stats).await?;
+            let previous_article = current_article - 1;
+            session_state.current_article = Some(previous_article);
+            write_response(
+                writer,
+                pending_write,
+                last_response_for_article(previous_article),
+                session_stats,
+            )
+            .await?;
             Ok(false)
         }
         RequestKind::Next => {
@@ -2683,8 +2694,15 @@ where
                 .await?;
                 return Ok(false);
             }
-            session_state.current_article = Some(2);
-            write_response(writer, pending_write, NEXT_RESPONSE, session_stats).await?;
+            let next_article = current_article + 1;
+            session_state.current_article = Some(next_article);
+            write_response(
+                writer,
+                pending_write,
+                next_response_for_article(next_article),
+                session_stats,
+            )
+            .await?;
             Ok(false)
         }
         RequestKind::NewGroups => {
@@ -4336,6 +4354,22 @@ fn group_response_for_args(args: &[u8]) -> &'static [u8] {
         .unwrap_or(b"411 no such newsgroup\r\n")
 }
 
+fn last_response_for_article(article_id: u64) -> &'static [u8] {
+    match article_id {
+        1 => LAST_RESPONSE,
+        2 => NAVIGATION_ARTICLE_2_RESPONSE,
+        _ => b"423 no article with that number\r\n",
+    }
+}
+
+fn next_response_for_article(article_id: u64) -> &'static [u8] {
+    match article_id {
+        2 => NEXT_RESPONSE,
+        3 => NAVIGATION_ARTICLE_3_RESPONSE,
+        _ => b"423 no article with that number\r\n",
+    }
+}
+
 fn listgroup_response_for_args(args: &[u8], current_group: Option<FixtureGroup>) -> &'static [u8] {
     if listgroup_explicit_group_arg(args)
         .is_some_and(|group| fixture_group_from_name(group).is_none())
@@ -5363,6 +5397,42 @@ mod tests {
                     name: "NEXT at last article",
                     reference: "RFC 3977 section 6.1.4",
                     input: b"GROUP alt.test\r\nARTICLE 3\r\nNEXT\r\n",
+                    expected: b"421 no next article in this group\r\n",
+                },
+            ])
+            .await;
+        }
+
+        #[tokio::test]
+        async fn rfc3977_red_last_next_move_relative_to_current_article() {
+            // RFC 3977 sections 6.1.3 and 6.1.4 define LAST and NEXT as moving
+            // to the previous or next article relative to the current article,
+            // not as fixed jumps to one canned article number:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-6.1.3
+            // https://www.rfc-editor.org/rfc/rfc3977#section-6.1.4
+            assert_red_server_response_tail_cases(&[
+                ServerResponseCase {
+                    name: "LAST from article 2 moves to article 1",
+                    reference: "RFC 3977 section 6.1.3 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.3",
+                    input: b"GROUP alt.test\r\nARTICLE 2\r\nLAST\r\n",
+                    expected: LAST_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "LAST from article 3 moves to article 2",
+                    reference: "RFC 3977 section 6.1.3 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.3",
+                    input: b"GROUP alt.test\r\nARTICLE 3\r\nLAST\r\n",
+                    expected: NAVIGATION_ARTICLE_2_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "NEXT from article 2 moves to article 3",
+                    reference: "RFC 3977 section 6.1.4 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.4",
+                    input: b"GROUP alt.test\r\nARTICLE 2\r\nNEXT\r\n",
+                    expected: NAVIGATION_ARTICLE_3_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "NEXT in one-article group has no next article",
+                    reference: "RFC 3977 section 6.1.4 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.4",
+                    input: b"GROUP comp.lang.rust\r\nNEXT\r\n",
                     expected: b"421 no next article in this group\r\n",
                 },
             ])
