@@ -198,7 +198,7 @@ pub const STAT_RESPONSE: &[u8] = b"223 1 <article.1@nntpbench.local> article ret
 pub const HELP_RESPONSE: &[u8] =
     b"100 help text follows\r\nARTICLE\r\nHEAD\r\nBODY\r\nSTAT\r\nLIST\r\nCAPABILITIES\r\nDATE\r\nMODE READER\r\nQUIT\r\n.\r\n";
 pub const CAPABILITIES_RESPONSE: &[u8] =
-    b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nAUTHINFO\r\n.\r\n";
+    b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nLIST ACTIVE ACTIVE.TIMES DISTRIB.PATS NEWSGROUPS OVERVIEW.FMT HEADERS\r\nOVER MSGID\r\nHDR\r\nNEWNEWS\r\nAUTHINFO\r\n.\r\n";
 pub const QUIT_RESPONSE: &[u8] = b"205 closing connection\r\n";
 pub const ARTICLE_NOT_FOUND_RESPONSE: &[u8] = b"430 no article with that number\r\n";
 const BODY_RESPONSE_PREFIX: &[u8] = b"222 1 <article.1@nntpbench.local> body follows\r\n";
@@ -5882,13 +5882,44 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc3977_red_capabilities_with_arguments_returns_501() {
-            // RFC 3977 sections 5.2 and 9.2 define CAPABILITIES with no
-            // arguments. Extra tokens are a command syntax error:
+        async fn rfc3977_red_capabilities_keyword_argument_matrix() {
+            // RFC 3977 section 5.2 defines CAPABILITIES [keyword]. Unknown
+            // keyword arguments still receive the normal 101 capability list,
+            // while non-keyword or extra arguments are syntax errors:
             // https://www.rfc-editor.org/rfc/rfc3977#section-5.2
-            let input = b"CAPABILITIES extra\r\n";
-            let (output, _) = run_session_with_input(test_config(), input).await;
-            assert_single_response(input, b"501 command syntax error\r\n", &output, "RFC 3977");
+            assert_red_server_response_cases(&[
+                ServerResponseCase {
+                    name: "CAPABILITIES unknown keyword",
+                    reference: "RFC 3977 section 5.2 https://www.rfc-editor.org/rfc/rfc3977#section-5.2",
+                    input: b"CAPABILITIES AUTOUPDATE\r\n",
+                    expected: CAPABILITIES_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "CAPABILITIES lowercase keyword",
+                    reference: "RFC 3977 sections 5.2 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-5.2",
+                    input: b"CAPABILITIES autoupdate\r\n",
+                    expected: CAPABILITIES_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "CAPABILITIES one-character non-keyword",
+                    reference: "RFC 3977 sections 5.2 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
+                    input: b"CAPABILITIES X\r\n",
+                    expected: b"501 command syntax error\r\n",
+                },
+                ServerResponseCase {
+                    name: "CAPABILITIES numeric non-keyword",
+                    reference: "RFC 3977 sections 5.2 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
+                    input: b"CAPABILITIES 123\r\n",
+                    expected: b"501 command syntax error\r\n",
+                },
+                ServerResponseCase {
+                    name: "CAPABILITIES extra keyword token",
+                    reference: "RFC 3977 sections 5.2 and 9.2 https://www.rfc-editor.org/rfc/rfc3977#section-5.2",
+                    input: b"CAPABILITIES AUTOUPDATE EXTRA\r\n",
+                    expected: b"501 command syntax error\r\n",
+                },
+            ])
+            .await;
         }
 
         #[tokio::test]

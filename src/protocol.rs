@@ -3658,8 +3658,14 @@ fn classify_direct_command(kind: RequestKind, args: &[u8]) -> RequestKind {
             validate_discovery_datetime_args(args, false).map_or(RequestKind::Unknown, |_| kind)
         }
         RequestKind::NewNews => validate_newnews_args(args).map_or(RequestKind::Unknown, |_| kind),
-        RequestKind::Capabilities
-        | RequestKind::Date
+        RequestKind::Capabilities => {
+            if args.is_empty() || validate_capabilities_args(args).is_ok() {
+                kind
+            } else {
+                RequestKind::Unknown
+            }
+        }
+        RequestKind::Date
         | RequestKind::Help
         | RequestKind::Last
         | RequestKind::Next
@@ -3673,6 +3679,34 @@ fn classify_direct_command(kind: RequestKind, args: &[u8]) -> RequestKind {
             }
         }
         _ => kind,
+    }
+}
+
+fn validate_capabilities_args(args: &[u8]) -> Result<(), ()> {
+    if args.contains(&b' ') {
+        return Err(());
+    }
+    validate_utf8_arg(args, validate_keyword).map(|_| ())
+}
+
+fn validate_keyword(value: &str) -> Result<(), ()> {
+    let bytes = value.as_bytes();
+    let Some((first, rest)) = bytes.split_first() else {
+        return Err(());
+    };
+    if !first.is_ascii_alphabetic() {
+        return Err(());
+    }
+    if rest.len() < 2 {
+        return Err(());
+    }
+    if rest
+        .iter()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'.' | b'-'))
+    {
+        Ok(())
+    } else {
+        Err(())
     }
 }
 
