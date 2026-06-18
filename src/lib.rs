@@ -2742,7 +2742,7 @@ where
             write_response(
                 writer,
                 pending_write,
-                b"504 unsupported authentication mechanism\r\n",
+                b"503 unsupported authentication mechanism\r\n",
                 session_stats,
             )
             .await?;
@@ -3242,7 +3242,7 @@ where
         RequestKind::AuthInfoUser | RequestKind::AuthInfoPass => {
             b"483 command unavailable until TLS has been negotiated\r\n"
         }
-        RequestKind::AuthInfo => b"504 unsupported authentication mechanism\r\n",
+        RequestKind::AuthInfo => b"503 unsupported authentication mechanism\r\n",
         RequestKind::Over => OVER_RESPONSE,
         RequestKind::Xover => XOVER_RESPONSE,
         RequestKind::Hdr => hdr_response_for_args(request.args()),
@@ -5340,7 +5340,7 @@ mod tests {
             let (output, _) = run_session_with_input(test_config(), input).await;
             assert_single_response(
                 input,
-                b"504 unsupported authentication mechanism\r\n",
+                b"503 unsupported authentication mechanism\r\n",
                 &output,
                 "RFC 4643",
             );
@@ -10526,7 +10526,7 @@ mod tests {
                 b"502 command unavailable\r\n",
                 b"483 command unavailable until TLS has been negotiated\r\n",
                 b"483 command unavailable until TLS has been negotiated\r\n",
-                b"504 unsupported authentication mechanism\r\n",
+                b"503 unsupported authentication mechanism\r\n",
                 b"502 command unavailable\r\n",
             ]
             .concat()
