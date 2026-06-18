@@ -119,6 +119,7 @@ pub const LIST_DISTRIB_PATS_RESPONSE: &[u8] =
     b"215 distribution patterns\r\nworld:* world\r\nlocal:*.local local\r\n.\r\n";
 pub const GROUP_RESPONSE: &[u8] = b"211 3 1 3 alt.test\r\n";
 pub const LISTGROUP_RESPONSE: &[u8] = b"211 3 1 3 alt.test\r\n1\r\n2\r\n3\r\n.\r\n";
+const LISTGROUP_2_3_RESPONSE: &[u8] = b"211 3 1 3 alt.test\r\n2\r\n3\r\n.\r\n";
 pub const LAST_RESPONSE: &[u8] =
     b"223 1 <prev@alt.test> article retrieved - request text separately\r\n";
 pub const NEXT_RESPONSE: &[u8] =
@@ -2506,21 +2507,20 @@ where
             Ok(false)
         }
         RequestKind::ListGroup => {
-            if command_args(command, command_lines)
-                .is_some_and(|args| contains_subslice(args, b"no.such"))
-            {
-                write_response(
-                    writer,
-                    pending_write,
-                    b"411 no such newsgroup\r\n",
-                    session_stats,
-                )
-                .await?;
+            let args = command_args(command, command_lines).unwrap_or_default();
+            if let Some(response) = listgroup_state_error(args, session_state) {
+                write_response(writer, pending_write, response, session_stats).await?;
                 return Ok(false);
             }
             session_state.group_selected = true;
             session_state.current_article = None;
-            write_response(writer, pending_write, LISTGROUP_RESPONSE, session_stats).await?;
+            write_response(
+                writer,
+                pending_write,
+                listgroup_response_for_args(args),
+                session_stats,
+            )
+            .await?;
             Ok(false)
         }
         RequestKind::Last => {
@@ -2981,7 +2981,7 @@ where
         RequestKind::ListHeaders => LIST_HEADERS_RESPONSE,
         RequestKind::ListDistribPats => LIST_DISTRIB_PATS_RESPONSE,
         RequestKind::Group => GROUP_RESPONSE,
-        RequestKind::ListGroup => LISTGROUP_RESPONSE,
+        RequestKind::ListGroup => listgroup_response_for_args(request.args()),
         RequestKind::Last => LAST_RESPONSE,
         RequestKind::Next => NEXT_RESPONSE,
         RequestKind::NewGroups => NEWGROUPS_RESPONSE,
@@ -3789,6 +3789,36 @@ fn overview_selector_arg(kind: RequestKind, args: &[u8]) -> Option<&[u8]> {
             .filter(|selector| !selector.is_empty()),
         _ => None,
     }
+}
+
+fn listgroup_state_error(args: &[u8], session_state: &SessionState) -> Option<&'static [u8]> {
+    if contains_subslice(args, b"no.such") {
+        return Some(b"411 no such newsgroup\r\n");
+    }
+    if !session_state.group_selected && listgroup_uses_current_group(args) {
+        return Some(b"412 no newsgroup selected\r\n");
+    }
+    None
+}
+
+fn listgroup_uses_current_group(args: &[u8]) -> bool {
+    if args.is_empty() {
+        return true;
+    }
+    let Some(first) = args.split(|byte| *byte == b' ').next() else {
+        return true;
+    };
+    first.iter().all(|byte| byte.is_ascii_digit()) || first.contains(&b'-')
+}
+
+fn listgroup_response_for_args(args: &[u8]) -> &'static [u8] {
+    if args
+        .split(|byte| *byte == b' ')
+        .any(|part| part == b"2-3" || part == b"2-")
+    {
+        return LISTGROUP_2_3_RESPONSE;
+    }
+    LISTGROUP_RESPONSE
 }
 
 fn header_query_name_from_args(args: &[u8]) -> Option<&[u8]> {
@@ -4884,6 +4914,36 @@ mod tests {
             let input = b"LISTGROUP no.such.group\r\n";
             let (output, _) = run_session_with_input(test_config(), input).await;
             assert_single_response(input, b"411 no such newsgroup\r\n", &output, "RFC 3977");
+        }
+
+        #[tokio::test]
+        async fn rfc3977_red_listgroup_current_before_group_returns_412() {
+            // RFC 3977 section 6.1.2 uses the current selected group when
+            // LISTGROUP omits an explicit group. Without one, response 412 applies:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-6.1.2
+            let input = b"LISTGROUP\r\n";
+            let (output, _) = run_session_with_input(test_config(), input).await;
+            assert_single_response(input, b"412 no newsgroup selected\r\n", &output, "RFC 3977");
+        }
+
+        #[tokio::test]
+        async fn rfc3977_red_listgroup_current_range_before_group_returns_412() {
+            // RFC 3977 section 6.1.2 treats a bare range as applying to the current
+            // selected group, so it must also fail with 412 before GROUP:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-6.1.2
+            let input = b"LISTGROUP 2-3\r\n";
+            let (output, _) = run_session_with_input(test_config(), input).await;
+            assert_single_response(input, b"412 no newsgroup selected\r\n", &output, "RFC 3977");
+        }
+
+        #[tokio::test]
+        async fn rfc3977_red_listgroup_range_filters_article_numbers() {
+            // RFC 3977 section 6.1.2 says LISTGROUP's optional range limits the
+            // article numbers returned in the multi-line body:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-6.1.2
+            let input = b"LISTGROUP alt.test 2-3\r\n";
+            let (output, _) = run_session_with_input(test_config(), input).await;
+            assert_single_response(input, LISTGROUP_2_3_RESPONSE, &output, "RFC 3977");
         }
 
         #[tokio::test]
@@ -9194,7 +9254,7 @@ mod tests {
     async fn serve_session_supports_group_navigation_commands() {
         let (output, stats) = run_session_with_input(
             test_config(),
-            b"GROUP alt.test\r\nLISTGROUP\r\nLISTGROUP alt.test\r\nLISTGROUP 1-\r\nLISTGROUP alt.test 1-10\r\nLAST\r\nNEXT\r\n",
+            b"GROUP alt.test\r\nLISTGROUP\r\nLISTGROUP alt.test\r\nLISTGROUP 1-\r\nLISTGROUP 2-3\r\nLISTGROUP alt.test 1-10\r\nLAST\r\nNEXT\r\n",
         )
         .await;
 
@@ -9206,13 +9266,14 @@ mod tests {
                 LISTGROUP_RESPONSE,
                 LISTGROUP_RESPONSE,
                 LISTGROUP_RESPONSE,
+                LISTGROUP_2_3_RESPONSE,
                 LISTGROUP_RESPONSE,
                 LAST_RESPONSE,
                 NEXT_RESPONSE,
             ]
             .concat()
         );
-        assert_eq!(stats.snapshot().commands, 7);
+        assert_eq!(stats.snapshot().commands, 8);
     }
 
     #[tokio::test]
@@ -9826,6 +9887,12 @@ mod tests {
             &mut output,
         ));
         assert!(!process_request_to_buffer(
+            RequestLine::parse(b"LISTGROUP 2-3\r\n"),
+            &config,
+            &stats,
+            &mut output,
+        ));
+        assert!(!process_request_to_buffer(
             RequestLine::parse(b"LISTGROUP alt.binaries.test 1-10\r\n"),
             &config,
             &stats,
@@ -9851,13 +9918,14 @@ mod tests {
                 LISTGROUP_RESPONSE,
                 LISTGROUP_RESPONSE,
                 LISTGROUP_RESPONSE,
+                LISTGROUP_2_3_RESPONSE,
                 LISTGROUP_RESPONSE,
                 LAST_RESPONSE,
                 NEXT_RESPONSE
             ]
             .concat()
         );
-        assert_eq!(stats.snapshot().commands, 7);
+        assert_eq!(stats.snapshot().commands, 8);
     }
 
     #[test]
