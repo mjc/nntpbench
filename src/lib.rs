@@ -4387,7 +4387,7 @@ fn overview_selector_error(
         overview_selector_is_range(selector)
             && !overview_selector_range_selects_articles(selector, session_state.article_count())
     }) {
-        if matches!(command.kind, RequestKind::Xover) {
+        if legacy_overview_uses_420_for_missing_range(command.kind) {
             return Some(b"420 no article(s) selected\r\n");
         }
         return Some(b"423 no articles in that range\r\n");
@@ -4402,7 +4402,7 @@ fn overview_selector_error(
         .article_id
         .is_some_and(|article_id| article_id > session_state.article_count())
     {
-        if matches!(command.kind, RequestKind::Xover) {
+        if legacy_overview_uses_420_for_missing_range(command.kind) {
             return Some(b"420 no article(s) selected\r\n");
         }
         return Some(b"423 no article with that number\r\n");
@@ -4413,6 +4413,10 @@ fn overview_selector_error(
         return Some(b"430 no article with that message-id\r\n");
     }
     None
+}
+
+fn legacy_overview_uses_420_for_missing_range(kind: RequestKind) -> bool {
+    matches!(kind, RequestKind::Xover | RequestKind::Xhdr)
 }
 
 fn overview_selector_requires_group(selector: &[u8]) -> bool {
@@ -7687,22 +7691,28 @@ mod tests {
                     expected: b"423 no articles in that range\r\n",
                 },
                 ServerResponseCase {
-                    name: "XHDR Subject empty range returns 423",
+                    name: "XHDR Subject empty range returns 420",
                     reference: "RFC 2980 section 2.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.6",
                     input: b"GROUP alt.test\r\nXHDR Subject 4-5\r\n",
-                    expected: b"423 no articles in that range\r\n",
+                    expected: b"420 no article(s) selected\r\n",
                 },
                 ServerResponseCase {
-                    name: "XHDR Subject reversed range returns 423",
+                    name: "XHDR Subject reversed range returns 420",
                     reference: "RFC 3977 section 6.1.2 and RFC 2980 section 2.6 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.2",
                     input: b"GROUP alt.test\r\nXHDR Subject 3-1\r\n",
-                    expected: b"423 no articles in that range\r\n",
+                    expected: b"420 no article(s) selected\r\n",
                 },
                 ServerResponseCase {
-                    name: "XHDR metadata empty range returns 423",
+                    name: "XHDR metadata empty range returns 420",
                     reference: "RFC 2980 section 2.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.6",
                     input: b"GROUP alt.test\r\nXHDR :lines 4-\r\n",
-                    expected: b"423 no articles in that range\r\n",
+                    expected: b"420 no article(s) selected\r\n",
+                },
+                ServerResponseCase {
+                    name: "XHDR Subject missing article number returns 420",
+                    reference: "RFC 2980 section 2.6 treats an article number as a range form https://www.rfc-editor.org/rfc/rfc2980#section-2.6",
+                    input: b"GROUP alt.test\r\nXHDR Subject 4\r\n",
+                    expected: b"420 no article(s) selected\r\n",
                 },
             ])
             .await;
