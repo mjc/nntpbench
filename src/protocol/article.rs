@@ -25,6 +25,7 @@ pub enum ArticleParseError {
 pub enum InvalidHeaderReason {
     LeadingFold,
     EmptyFold,
+    MissingHeader,
     MissingColon,
     MissingSpaceAfterColon,
     EmptyName,
@@ -300,7 +301,7 @@ mod proptests {
         }
 
         #[test]
-        fn generated_empty_content_shapes_parse_consistently(
+        fn generated_empty_content_shapes_follow_article_family_rules(
             message_id in message_id_strategy(),
             article_number in 0_u32..=999_999,
         ) {
@@ -308,18 +309,16 @@ mod proptests {
             let expected_number = Some(ArticleNumber::from(article_number as u64));
 
             let article_frame = format!("220 {first_line}\r\n\r\n\r\n.\r\n");
-            let article = Article::parse(article_frame.as_bytes()).unwrap();
-            prop_assert_eq!(article.message_id.as_str(), message_id.as_str());
-            prop_assert_eq!(article.article_number, expected_number);
-            prop_assert_eq!(article.headers.unwrap().iter().count(), 0);
-            prop_assert_eq!(article.body.as_deref(), Some(&b""[..]));
+            prop_assert_eq!(
+                Article::parse(article_frame.as_bytes()).unwrap_err(),
+                ArticleParseError::InvalidHeader(InvalidHeaderReason::MissingHeader)
+            );
 
             let head_frame = format!("221 {first_line}\r\n.\r\n");
-            let head = Article::parse(head_frame.as_bytes()).unwrap();
-            prop_assert_eq!(head.message_id.as_str(), message_id.as_str());
-            prop_assert_eq!(head.article_number, expected_number);
-            prop_assert_eq!(head.headers.unwrap().iter().count(), 0);
-            prop_assert!(head.body.is_none());
+            prop_assert_eq!(
+                Article::parse(head_frame.as_bytes()).unwrap_err(),
+                ArticleParseError::InvalidHeader(InvalidHeaderReason::MissingHeader)
+            );
 
             let body_frame = format!("222 {first_line}\r\n.\r\n");
             let parsed_body = Article::parse(body_frame.as_bytes()).unwrap();
@@ -947,6 +946,7 @@ impl fmt::Display for InvalidHeaderReason {
         match self {
             Self::LeadingFold => write!(f, "header cannot start with folding whitespace"),
             Self::EmptyFold => write!(f, "folded header line cannot contain only whitespace"),
+            Self::MissingHeader => write!(f, "header block must contain at least one header"),
             Self::MissingColon => write!(f, "header missing colon"),
             Self::MissingSpaceAfterColon => write!(f, "header missing space after colon"),
             Self::EmptyName => write!(f, "empty header name"),
@@ -1424,6 +1424,7 @@ fn find_blank_line(buf: &[u8], start: usize) -> Result<usize, ArticleParseError>
 
 fn validate_headers(data: &[u8]) -> Result<(), ArticleParseError> {
     let mut pos = 0;
+    let mut has_header = false;
     while pos < data.len() {
         let line_end = strict_crlf_line_content_end_from(data, pos)
             .ok_or(ArticleParseError::BufferTooShort)?;
@@ -1448,6 +1449,7 @@ fn validate_headers(data: &[u8]) -> Result<(), ArticleParseError> {
             pos = line_end + 2;
             continue;
         }
+        has_header = true;
 
         let colon_pos = memchr::memchr(b':', line).ok_or(ArticleParseError::InvalidHeader(
             InvalidHeaderReason::MissingColon,
@@ -1474,7 +1476,13 @@ fn validate_headers(data: &[u8]) -> Result<(), ArticleParseError> {
         pos = line_end + 2;
     }
 
-    Ok(())
+    if has_header {
+        Ok(())
+    } else {
+        Err(ArticleParseError::InvalidHeader(
+            InvalidHeaderReason::MissingHeader,
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -1602,6 +1610,7 @@ Actual body content\r\n\
     #[test]
     fn article_header_parsing_does_not_allocate() {
         let valid = b"Subject: Test\r\nFrom: user@example.com\r\n";
+        let empty = b"";
         let missing_colon = b"Invalid Header\r\n";
         let missing_space = b"Subject:Test\r\n";
         let invalid_name = b"Invalid Header: value\r\n";
@@ -1615,6 +1624,10 @@ Actual body content\r\n\
         let headers = Headers::parse(valid).unwrap();
         assert_eq!(headers.get("subject"), Some(&b"Test"[..]));
         assert_eq!(headers.iter().count(), 2);
+        assert_eq!(
+            Headers::parse(empty).unwrap_err(),
+            ArticleParseError::InvalidHeader(InvalidHeaderReason::MissingHeader)
+        );
         assert_eq!(
             Headers::parse(missing_colon).unwrap_err(),
             ArticleParseError::InvalidHeader(InvalidHeaderReason::MissingColon)
@@ -1754,6 +1767,14 @@ Actual body content\r\n\
                 b"220 12345 <test@example.com>\r\nSubject: Test\r\n \t\r\n\r\nBody\r\n.\r\n"
                     .as_slice(),
                 ArticleParseError::InvalidHeader(InvalidHeaderReason::EmptyFold),
+            ),
+            (
+                b"220 12345 <test@example.com>\r\n\r\nBody\r\n.\r\n".as_slice(),
+                ArticleParseError::MissingSeparator,
+            ),
+            (
+                b"221 12345 <test@example.com>\r\n.\r\n".as_slice(),
+                ArticleParseError::InvalidHeader(InvalidHeaderReason::MissingHeader),
             ),
             (
                 b"221 12345 <test@example.com>\r\nSubject: Test\r\n\r\nThis body should not be here\r\n.\r\n"

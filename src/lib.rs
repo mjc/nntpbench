@@ -5556,6 +5556,29 @@ mod tests {
             }
         }
 
+        #[test]
+        fn rfc3977_red_article_parser_rejects_missing_header_block() {
+            // RFC 3977 section 3.6 requires articles to contain one or more
+            // header lines. Section 9.4.3 also defines HEAD content as
+            // 1*header:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-3.6
+            for (name, input) in [
+                (
+                    "ARTICLE empty header block",
+                    b"220 1 <headers@test>\r\n\r\nbody\r\n.\r\n".as_slice(),
+                ),
+                (
+                    "HEAD empty header block",
+                    b"221 1 <headers@test>\r\n.\r\n".as_slice(),
+                ),
+            ] {
+                assert!(
+                    Article::parse(input).is_err(),
+                    "{name}: RFC 3977 article-family response should contain at least one header"
+                );
+            }
+        }
+
         #[tokio::test]
         async fn rfc3977_red_server_returns_501_for_syntax_error_not_article_body() {
             // RFC 3977 sections 3.2.1 and 6.2.1 reserve 501 for command syntax
