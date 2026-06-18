@@ -106,7 +106,11 @@ pub const GREETING: &[u8] = b"201 nntpbench mock server ready\r\n";
 pub const MODE_READER_RESPONSE: &[u8] = b"201 posting not permitted\r\n";
 pub const DATE_RESPONSE: &[u8] = b"111 20260602120000\r\n";
 pub const LIST_RESPONSE: &[u8] =
+    b"215 list of newsgroups follows\r\ncomp.lang.rust 0000000001 0000000001 y\r\nalt.test 0000000003 0000000001 y\r\n.\r\n";
+const LIST_ACTIVE_COMP_RESPONSE: &[u8] =
     b"215 list of newsgroups follows\r\ncomp.lang.rust 0000000001 0000000001 y\r\n.\r\n";
+const LIST_ACTIVE_ALT_RESPONSE: &[u8] =
+    b"215 list of newsgroups follows\r\nalt.test 0000000003 0000000001 y\r\n.\r\n";
 const LIST_EMPTY_RESPONSE: &[u8] = b"215 list of newsgroups follows\r\n.\r\n";
 pub const LIST_ACTIVE_TIMES_RESPONSE: &[u8] =
     b"215 information follows\r\ncomp.lang.rust 1715904000 admin@nntpbench.local\r\nalt.test 1715907600 admin@nntpbench.local\r\n.\r\n";
@@ -3971,10 +3975,13 @@ fn command_args<'a>(
 }
 
 fn list_active_response(args: &[u8]) -> &'static [u8] {
-    if args.is_empty() || wildmat_matches(args, b"comp.lang.rust") {
-        LIST_RESPONSE
-    } else {
-        LIST_EMPTY_RESPONSE
+    let matches_comp = args.is_empty() || wildmat_matches(args, b"comp.lang.rust");
+    let matches_alt = args.is_empty() || wildmat_matches(args, b"alt.test");
+    match (matches_comp, matches_alt) {
+        (true, true) => LIST_RESPONSE,
+        (true, false) => LIST_ACTIVE_COMP_RESPONSE,
+        (false, true) => LIST_ACTIVE_ALT_RESPONSE,
+        (false, false) => LIST_EMPTY_RESPONSE,
     }
 }
 
@@ -5807,6 +5814,18 @@ mod tests {
                     reference: "RFC 3977 section 7.6.3 https://www.rfc-editor.org/rfc/rfc3977#section-7.6.3",
                     input: b"LIST ACTIVE comp.lang.python\r\n",
                     expected: LIST_EMPTY_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "LIST ACTIVE comp wildmat",
+                    reference: "RFC 3977 section 7.6.3 https://www.rfc-editor.org/rfc/rfc3977#section-7.6.3",
+                    input: b"LIST ACTIVE comp.lang.*\r\n",
+                    expected: LIST_ACTIVE_COMP_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "LIST ACTIVE alt wildmat",
+                    reference: "RFC 3977 section 7.6.3 https://www.rfc-editor.org/rfc/rfc3977#section-7.6.3",
+                    input: b"LIST ACTIVE alt.*\r\n",
+                    expected: LIST_ACTIVE_ALT_RESPONSE,
                 },
                 ServerResponseCase {
                     name: "LIST ACTIVE.TIMES comp wildmat",
