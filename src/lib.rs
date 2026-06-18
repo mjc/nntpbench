@@ -6797,7 +6797,7 @@ mod tests {
                 ServerResponseCase {
                     name: "LIST ACTIVE rightmost positive wildmat re-includes alt",
                     reference: "RFC 3977 sections 4.2 and 7.6.3 https://www.rfc-editor.org/rfc/rfc3977#section-4.2",
-                    input: b"LIST ACTIVE !alt.*,alt.*\r\n",
+                    input: b"LIST ACTIVE misc.*,!alt.*,alt.*\r\n",
                     expected: LIST_ACTIVE_ALT_RESPONSE,
                 },
                 ServerResponseCase {
@@ -7790,9 +7790,27 @@ mod tests {
                     expected: b"501 command syntax error\r\n",
                 },
                 ServerResponseCase {
+                    name: "LIST ACTIVE.TIMES rejects leading wildmat negation",
+                    reference: "RFC 3977 sections 4.1 and 7.6.4 https://www.rfc-editor.org/rfc/rfc3977#section-4.1",
+                    input: b"LIST ACTIVE.TIMES !alt.*\r\n",
+                    expected: b"501 command syntax error\r\n",
+                },
+                ServerResponseCase {
                     name: "LIST NEWSGROUPS invalid wildmat",
                     reference: "RFC 3977 sections 4 and 7.6.6 https://www.rfc-editor.org/rfc/rfc3977#section-7.6.6",
                     input: b"LIST NEWSGROUPS !\r\n",
+                    expected: b"501 command syntax error\r\n",
+                },
+                ServerResponseCase {
+                    name: "LIST NEWSGROUPS rejects leading wildmat negation",
+                    reference: "RFC 3977 sections 4.1 and 7.6.6 https://www.rfc-editor.org/rfc/rfc3977#section-4.1",
+                    input: b"LIST NEWSGROUPS !alt.*\r\n",
+                    expected: b"501 command syntax error\r\n",
+                },
+                ServerResponseCase {
+                    name: "NEWNEWS rejects leading wildmat negation",
+                    reference: "RFC 3977 sections 4.1 and 7.4.1 https://www.rfc-editor.org/rfc/rfc3977#section-4.1",
+                    input: b"NEWNEWS !alt.* 20260101 000000 GMT\r\n",
                     expected: b"501 command syntax error\r\n",
                 },
                 ServerResponseCase {
@@ -8197,6 +8215,11 @@ mod tests {
                         NntpTime::from_borrowed("000060").is_ok(),
                     ),
                     (
+                        "wildmat rejects leading ! before first pattern",
+                        "RFC 3977 section 4.1 https://www.rfc-editor.org/rfc/rfc3977#section-4.1",
+                        Wildmat::from_borrowed("!alt.test").is_err(),
+                    ),
+                    (
                         "wildmat rejects ! outside negation marker",
                         "RFC 3977 section 4.1 https://www.rfc-editor.org/rfc/rfc3977#section-4.1",
                         Wildmat::from_borrowed("alt!test").is_err(),
@@ -8351,6 +8374,26 @@ mod tests {
                         "RFC 3977 sections 4.1 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-4.1",
                     ),
                     (
+                        "LIST ACTIVE rejects leading wildmat negation",
+                        b"LIST ACTIVE !alt.*\r\n",
+                        "RFC 3977 sections 4.1 and 7.6.3 https://www.rfc-editor.org/rfc/rfc3977#section-4.1",
+                    ),
+                    (
+                        "LIST ACTIVE.TIMES rejects leading wildmat negation",
+                        b"LIST ACTIVE.TIMES !alt.*\r\n",
+                        "RFC 3977 sections 4.1 and 7.6.4 https://www.rfc-editor.org/rfc/rfc3977#section-4.1",
+                    ),
+                    (
+                        "LIST NEWSGROUPS rejects leading wildmat negation",
+                        b"LIST NEWSGROUPS !alt.*\r\n",
+                        "RFC 3977 sections 4.1 and 7.6.6 https://www.rfc-editor.org/rfc/rfc3977#section-4.1",
+                    ),
+                    (
+                        "NEWNEWS rejects leading wildmat negation",
+                        b"NEWNEWS !alt.* 20260101 000000\r\n",
+                        "RFC 3977 sections 4.1 and 7.4.1 https://www.rfc-editor.org/rfc/rfc3977#section-4.1",
+                    ),
+                    (
                         "LIST ACTIVE excludes [ from wildmat",
                         b"LIST ACTIVE alt[test\r\n",
                         "RFC 3977 sections 4.1 and 7.6.3 https://www.rfc-editor.org/rfc/rfc3977#section-4.1",
@@ -8408,6 +8451,30 @@ mod tests {
                         name: "GROUP excludes ! from newsgroup-name",
                         reference: "RFC 3977 sections 4.1 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-4.1",
                         input: b"GROUP alt!test\r\n",
+                        expected: b"501 command syntax error\r\n",
+                    },
+                    ServerResponseCase {
+                        name: "LIST ACTIVE rejects leading wildmat negation",
+                        reference: "RFC 3977 sections 4.1 and 7.6.3 https://www.rfc-editor.org/rfc/rfc3977#section-4.1",
+                        input: b"LIST ACTIVE !alt.*\r\n",
+                        expected: b"501 command syntax error\r\n",
+                    },
+                    ServerResponseCase {
+                        name: "LIST ACTIVE.TIMES rejects leading wildmat negation",
+                        reference: "RFC 3977 sections 4.1 and 7.6.4 https://www.rfc-editor.org/rfc/rfc3977#section-4.1",
+                        input: b"LIST ACTIVE.TIMES !alt.*\r\n",
+                        expected: b"501 command syntax error\r\n",
+                    },
+                    ServerResponseCase {
+                        name: "LIST NEWSGROUPS rejects leading wildmat negation",
+                        reference: "RFC 3977 sections 4.1 and 7.6.6 https://www.rfc-editor.org/rfc/rfc3977#section-4.1",
+                        input: b"LIST NEWSGROUPS !alt.*\r\n",
+                        expected: b"501 command syntax error\r\n",
+                    },
+                    ServerResponseCase {
+                        name: "NEWNEWS rejects leading wildmat negation",
+                        reference: "RFC 3977 sections 4.1 and 7.4.1 https://www.rfc-editor.org/rfc/rfc3977#section-4.1",
+                        input: b"NEWNEWS !alt.* 20260101 000000\r\n",
                         expected: b"501 command syntax error\r\n",
                     },
                     ServerResponseCase {

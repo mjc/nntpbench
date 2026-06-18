@@ -496,6 +496,7 @@ mod proptests {
             Just(String::new()),
             wildmat_strategy().prop_map(|wildmat| format!("{wildmat},,")),
             Just("!".to_string()),
+            Just("!alt.test".to_string()),
             Just("alt.test,!".to_string()),
             Just("alt test".to_string()),
         ]
@@ -2097,8 +2098,12 @@ fn validate_wildmat(value: &str) -> Result<(), InvalidWildmat> {
         return Err(InvalidWildmat);
     }
 
-    for pattern in value.split(',') {
-        let pattern = pattern.strip_prefix('!').unwrap_or(pattern);
+    for (index, pattern) in value.split(',').enumerate() {
+        let pattern = if index == 0 {
+            pattern
+        } else {
+            pattern.strip_prefix('!').unwrap_or(pattern)
+        };
         if pattern.is_empty()
             || pattern
                 .bytes()
