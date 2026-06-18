@@ -2883,16 +2883,23 @@ fn validate_capabilities_response_content(content: &[u8]) -> bool {
 }
 
 fn validate_version_response_line(line: &[u8]) -> bool {
-    let mut tokens = line.split(|byte| *byte == b' ');
-    if tokens.next() != Some(b"VERSION".as_slice()) {
+    let Some((label, mut rest)) = split_response_ws_token(line) else {
+        return false;
+    };
+    if label != b"VERSION" || rest.is_empty() {
         return false;
     }
+
     let mut seen_version = false;
-    for token in tokens {
+    while !rest.is_empty() {
+        let Some((token, next)) = split_response_ws_token(rest) else {
+            return false;
+        };
         if !validate_version_number_token(token) {
             return false;
         }
         seen_version = true;
+        rest = next;
     }
     seen_version
 }
@@ -2905,18 +2912,49 @@ fn validate_version_number_token(token: &[u8]) -> bool {
 }
 
 fn validate_capability_response_line(line: &[u8]) -> bool {
-    let mut tokens = line.split(|byte| *byte == b' ');
-    let Some(label) = tokens.next() else {
+    let Some((label, mut rest)) = split_response_ws_token(line) else {
         return false;
     };
-    validate_ascii_token(label, validate_keyword) && tokens.all(validate_capability_argument_token)
+    if !validate_ascii_token(label, validate_keyword) {
+        return false;
+    }
+
+    while !rest.is_empty() {
+        let Some((token, next)) = split_response_ws_token(rest) else {
+            return false;
+        };
+        if !validate_capability_argument_token(token) {
+            return false;
+        }
+        rest = next;
+    }
+
+    true
 }
 
 fn validate_capability_argument_token(token: &[u8]) -> bool {
-    !token.is_empty()
-        && token
-            .iter()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'.' | b'-' | b'_'))
+    validate_p_char_token(token)
+}
+
+fn split_response_ws_token(line: &[u8]) -> Option<(&[u8], &[u8])> {
+    if line.is_empty() || matches!(line.first(), Some(b' ' | b'\t')) {
+        return None;
+    }
+
+    let token_end = line
+        .iter()
+        .position(|byte| matches!(*byte, b' ' | b'\t'))
+        .unwrap_or(line.len());
+    let token = &line[..token_end];
+    if token_end == line.len() {
+        return Some((token, &[]));
+    }
+
+    let rest_with_ws = &line[token_end..];
+    let rest_start = rest_with_ws
+        .iter()
+        .position(|byte| !matches!(*byte, b' ' | b'\t'))?;
+    Some((token, &rest_with_ws[rest_start..]))
 }
 
 fn validate_ascii_token(token: &[u8], validate: impl FnOnce(&str) -> Result<(), ()>) -> bool {
@@ -5873,7 +5911,7 @@ mod tests {
             ),
             (
                 RequestKind::Capabilities,
-                b"101 capabilities follow\r\nVERSION 2\r\nBAD  TOKEN\r\n.\r\n".as_slice(),
+                b"101 capabilities follow\r\nVERSION 2\r\nBAD \0TOKEN\r\n.\r\n".as_slice(),
             ),
             (
                 RequestKind::Capabilities,

@@ -8428,6 +8428,18 @@ mod tests {
                         frame: b"215 information follows\r\nalt.test \x01control-prefixed\r\n.\r\n",
                     },
                     ResponseFrameCase {
+                        name: "CAPABILITIES accepts TAB-separated WS tokens",
+                        reference: "RFC 3977 sections 5.2 and 9.5 https://www.rfc-editor.org/rfc/rfc3977#section-9.5",
+                        kind: RequestKind::Capabilities,
+                        frame: b"101 capability list follows\r\nVERSION\t2\r\nIMPLEMENTATION\tbench\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "CAPABILITIES accepts P-CHAR capability arguments",
+                        reference: "RFC 3977 sections 5.2, 9.5, and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.5",
+                        kind: RequestKind::Capabilities,
+                        frame: b"101 capability list follows\r\nVERSION 2\r\nIMPLEMENTATION caf\xc3\xa9 build!\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "HDR accepts omitted space for empty field content",
                         reference: "RFC 3977 section 8.5.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.2",
                         kind: RequestKind::Hdr,
@@ -8753,10 +8765,10 @@ mod tests {
                         frame: b"215 distribution patterns\r\n1:*:local world\r\n.\r\n",
                     },
                     ResponseFrameCase {
-                        name: "CAPABILITIES rejects empty capability token",
+                        name: "CAPABILITIES rejects invalid capability argument token",
                         reference: "RFC 3977 sections 5.2 and 9.5 https://www.rfc-editor.org/rfc/rfc3977#section-5.2",
                         kind: RequestKind::Capabilities,
-                        frame: b"101 Capability list:\r\nVERSION 2\r\nBAD  TOKEN\r\n.\r\n",
+                        frame: b"101 Capability list:\r\nVERSION 2\r\nBAD \0TOKEN\r\n.\r\n",
                     },
                     ResponseFrameCase {
                         name: "CAPABILITIES rejects missing first VERSION line",
