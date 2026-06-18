@@ -2768,7 +2768,7 @@ where
             write_response(
                 writer,
                 pending_write,
-                b"503 unsupported authentication mechanism\r\n",
+                b"502 command unavailable\r\n",
                 session_stats,
             )
             .await?;
@@ -3280,7 +3280,7 @@ where
         RequestKind::AuthInfoUser | RequestKind::AuthInfoPass => {
             b"483 command unavailable until TLS has been negotiated\r\n"
         }
-        RequestKind::AuthInfo => b"503 unsupported authentication mechanism\r\n",
+        RequestKind::AuthInfo => b"502 command unavailable\r\n",
         RequestKind::Over => over_response_for_args(request.args()),
         RequestKind::Xover => xover_response_for_args(request.args()),
         RequestKind::Hdr => hdr_response_for_args(request.args()),
@@ -5746,38 +5746,32 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc4643_red_authinfo_sasl_requires_supported_mechanism() {
-            // RFC 4643 section 2.2 requires AUTHINFO SASL to name an advertised
-            // SASL mechanism; arbitrary SASL values must not be accepted:
-            // https://www.rfc-editor.org/rfc/rfc4643#section-2.2
-            let input = b"AUTHINFO SASL MADE-UP-MECHANISM\r\n";
-            let (output, _) = run_session_with_input(test_config(), input).await;
-            assert_single_response(
-                input,
-                b"503 unsupported authentication mechanism\r\n",
-                &output,
-                "RFC 4643",
-            );
-        }
-
-        #[tokio::test]
-        async fn rfc4643_red_authinfo_sasl_initial_response_is_valid_syntax() {
-            // RFC 4643 section 2.4.1 allows AUTHINFO SASL to include an
-            // optional base64 initial response. Unsupported mechanisms still
-            // fail as 503, not as command syntax errors:
+        async fn rfc4643_red_authinfo_sasl_unavailable_with_valid_syntax() {
+            // RFC 4643 section 2.1 says AUTHINFO without arguments means no
+            // authentication commands are permitted in the current state.
+            // Section 2.4.1 still allows AUTHINFO SASL to include an optional
+            // base64 initial response; valid syntax should reach the same
+            // unavailable-command response, not a syntax error:
+            // https://www.rfc-editor.org/rfc/rfc4643#section-2.1
             // https://www.rfc-editor.org/rfc/rfc4643#section-2.4.1
             assert_red_server_response_cases(&[
+                ServerResponseCase {
+                    name: "SASL mechanism unavailable when AUTHINFO has no arguments",
+                    reference: "RFC 4643 sections 2.1 and 2.4.1 https://www.rfc-editor.org/rfc/rfc4643#section-2.1",
+                    input: b"AUTHINFO SASL MADE-UP-MECHANISM\r\n",
+                    expected: b"502 command unavailable\r\n",
+                },
                 ServerResponseCase {
                     name: "SASL zero-length initial response marker",
                     reference: "RFC 4643 section 2.4.1 https://www.rfc-editor.org/rfc/rfc4643#section-2.4.1",
                     input: b"AUTHINFO SASL MADE-UP-MECHANISM =\r\n",
-                    expected: b"503 unsupported authentication mechanism\r\n",
+                    expected: b"502 command unavailable\r\n",
                 },
                 ServerResponseCase {
                     name: "SASL padded base64 initial response",
                     reference: "RFC 4643 section 2.4.1 https://www.rfc-editor.org/rfc/rfc4643#section-2.4.1",
                     input: b"AUTHINFO SASL MADE-UP-MECHANISM YQ==\r\n",
-                    expected: b"503 unsupported authentication mechanism\r\n",
+                    expected: b"502 command unavailable\r\n",
                 },
             ])
             .await;
@@ -11593,7 +11587,7 @@ mod tests {
                 b"502 command unavailable\r\n",
                 b"483 command unavailable until TLS has been negotiated\r\n",
                 b"483 command unavailable until TLS has been negotiated\r\n",
-                b"503 unsupported authentication mechanism\r\n",
+                b"502 command unavailable\r\n",
                 b"502 command unavailable\r\n",
             ]
             .concat()
