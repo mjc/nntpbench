@@ -162,7 +162,8 @@ pub const STARTTLS_RESPONSE: &[u8] = b"382 continue with TLS negotiation\r\n";
 pub const OVER_RESPONSE: &[u8] = b"224 Overview information follows\r\n1\tSubject one\tone@example.com\tFri, 16 May 2026 12:00:00 +0000\t<one@example.com>\t\t123\t4\r\n.\r\n";
 const OVER_MESSAGE_ID_RESPONSE: &[u8] = b"224 Overview information follows\r\n0\tSubject one\tone@example.com\tFri, 16 May 2026 12:00:00 +0000\t<one@example.com>\t\t123\t4\r\n.\r\n";
 const OVER_2_RESPONSE: &[u8] = b"224 Overview information follows\r\n2\tSubject two\ttwo@example.com\tFri, 16 May 2026 12:00:01 +0000\t<two@example.com>\t<ref@example.com>\t456\t8\r\n.\r\n";
-pub const XOVER_RESPONSE: &[u8] = b"224 Overview information follows\r\n2\tSubject two\ttwo@example.com\tFri, 16 May 2026 12:00:01 +0000\t<two@example.com>\t<ref@example.com>\t456\t8\r\n.\r\n";
+const OVER_RANGE_RESPONSE: &[u8] = b"224 Overview information follows\r\n1\tSubject one\tone@example.com\tFri, 16 May 2026 12:00:00 +0000\t<one@example.com>\t\t123\t4\r\n2\tSubject two\ttwo@example.com\tFri, 16 May 2026 12:00:01 +0000\t<two@example.com>\t<ref@example.com>\t456\t8\r\n.\r\n";
+pub const XOVER_RESPONSE: &[u8] = OVER_RANGE_RESPONSE;
 pub const HDR_RESPONSE: &[u8] = b"225 headers follow\r\n1 example one\r\n2 example two\r\n.\r\n";
 const HDR_SUBJECT_MESSAGE_ID_RESPONSE: &[u8] = b"225 headers follow\r\n0 example one\r\n.\r\n";
 const HDR_SUBJECT_1_RESPONSE: &[u8] = b"225 headers follow\r\n1 example one\r\n.\r\n";
@@ -4253,16 +4254,22 @@ fn over_response_for_args(args: &[u8]) -> &'static [u8] {
         OVER_MESSAGE_ID_RESPONSE
     } else if overview_selector_starts_at_second(args) {
         OVER_2_RESPONSE
+    } else if overview_selector_includes_first_two(args) {
+        OVER_RANGE_RESPONSE
     } else {
         OVER_RESPONSE
     }
 }
 
 fn xover_response_for_args(args: &[u8]) -> &'static [u8] {
-    if overview_selector_is_message_id(args) {
+    if args.is_empty() {
+        OVER_RESPONSE
+    } else if overview_selector_is_message_id(args) {
         OVER_MESSAGE_ID_RESPONSE
     } else if overview_selector_starts_at_second(args) {
         OVER_2_RESPONSE
+    } else if overview_selector_includes_first_two(args) {
+        OVER_RANGE_RESPONSE
     } else {
         XOVER_RESPONSE
     }
@@ -4274,6 +4281,27 @@ fn overview_selector_starts_at_second(selector: &[u8]) -> bool {
 
 fn overview_selector_selects_first_only(selector: &[u8]) -> bool {
     selector == b"1"
+}
+
+fn overview_selector_includes_first_two(selector: &[u8]) -> bool {
+    let Ok(selector) = std::str::from_utf8(selector) else {
+        return false;
+    };
+    let Some((start, end)) = selector.split_once('-') else {
+        return false;
+    };
+    let Ok(start) = start.parse::<u64>() else {
+        return false;
+    };
+    let end = if end.is_empty() {
+        u64::MAX
+    } else {
+        match end.parse::<u64>() {
+            Ok(end) => end,
+            Err(_) => return false,
+        }
+    };
+    start <= 1 && end >= 2
 }
 
 fn overview_selector_is_message_id(selector: &[u8]) -> bool {
@@ -6918,10 +6946,29 @@ mod tests {
         #[tokio::test]
         async fn rfc3977_red_overview_and_header_range_selectors_filter_results() {
             // RFC 3977 sections 8.3.2 and 8.5.2 apply article-range selectors
-            // to overview and header metadata. A lower bound of 2 must not
-            // return article 1 rows:
+            // to overview and header metadata. Ranges must include every
+            // matching article row, and a lower bound of 2 must not return
+            // article 1 rows:
             // https://www.rfc-editor.org/rfc/rfc3977#section-8.3.2
             assert_red_server_response_tail_cases(&[
+                ServerResponseCase {
+                    name: "OVER range selector 1-2 returns both article rows",
+                    reference: "RFC 3977 section 8.3.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.3.2",
+                    input: b"GROUP alt.test\r\nOVER 1-2\r\n",
+                    expected: OVER_RANGE_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "OVER open range selector 1- returns both article rows",
+                    reference: "RFC 3977 section 8.3.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.3.2",
+                    input: b"GROUP alt.test\r\nOVER 1-\r\n",
+                    expected: OVER_RANGE_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "XOVER range selector 1-2 returns both article rows",
+                    reference: "RFC 2980 section 2.1.7 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.7",
+                    input: b"GROUP alt.test\r\nXOVER 1-2\r\n",
+                    expected: OVER_RANGE_RESPONSE,
+                },
                 ServerResponseCase {
                     name: "OVER range selector 2-",
                     reference: "RFC 3977 section 8.3.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.3.2",
@@ -11182,7 +11229,7 @@ mod tests {
             [
                 GREETING,
                 GROUP_RESPONSE,
-                OVER_RESPONSE,
+                OVER_RANGE_RESPONSE,
                 OVER_MESSAGE_ID_RESPONSE,
                 XOVER_RESPONSE,
                 OVER_MESSAGE_ID_RESPONSE
@@ -11786,7 +11833,7 @@ mod tests {
         assert_eq!(
             output,
             [
-                OVER_RESPONSE,
+                OVER_RANGE_RESPONSE,
                 OVER_MESSAGE_ID_RESPONSE,
                 XOVER_RESPONSE,
                 OVER_MESSAGE_ID_RESPONSE,
