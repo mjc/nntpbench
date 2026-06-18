@@ -7978,6 +7978,11 @@ mod tests {
                         HeaderName::from_borrowed(":bytes").is_ok(),
                     ),
                     (
+                        "HDR header-name accepts A-NOTCOLON punctuation",
+                        "RFC 3977 sections 8.5.1 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
+                        HeaderName::from_borrowed("X_Trace/Path").is_ok(),
+                    ),
+                    (
                         "HDR metadata name rejects bare colon",
                         "RFC 3977 section 8.5.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.2",
                         HeaderName::from_borrowed(":").is_err(),
@@ -8227,6 +8232,18 @@ mod tests {
                         RequestKind::AuthInfoPass,
                         "RFC 4643 section 3.1 and RFC 3977 section 9.8 https://www.rfc-editor.org/rfc/rfc4643#section-3.1",
                     ),
+                    (
+                        "HDR accepts A-NOTCOLON punctuation in header-name",
+                        b"HDR X_Trace/Path 1\r\n",
+                        RequestKind::Hdr,
+                        "RFC 3977 sections 8.5.1 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
+                    ),
+                    (
+                        "XHDR accepts A-NOTCOLON punctuation in header-name",
+                        b"XHDR X_Trace/Path 1\r\n",
+                        RequestKind::Xhdr,
+                        "RFC 2980 section 2.6 and RFC 3977 section 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
+                    ),
                 ]);
             }
 
@@ -8382,6 +8399,18 @@ mod tests {
                         reference: "RFC 2980 section 2.1.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.6",
                         input: b"XHDR Subject 1 extra\r\n",
                         expected: b"501 command syntax error\r\n",
+                    },
+                    ServerResponseCase {
+                        name: "HDR valid punctuation header-name is syntax-valid but unavailable",
+                        reference: "RFC 3977 sections 8.5.1, 8.5.2, and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
+                        input: b"GROUP alt.test\r\nHDR X_Trace/Path 1\r\n",
+                        expected: b"211 3 1 3 alt.test\r\n503 HDR field unavailable\r\n",
+                    },
+                    ServerResponseCase {
+                        name: "XHDR valid punctuation header-name is syntax-valid but unavailable",
+                        reference: "RFC 2980 section 2.6 and RFC 3977 section 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
+                        input: b"GROUP alt.test\r\nXHDR X_Trace/Path 1\r\n",
+                        expected: b"211 3 1 3 alt.test\r\n503 HDR field unavailable\r\n",
                     },
                     ServerResponseCase {
                         name: "CHECK extra argument",

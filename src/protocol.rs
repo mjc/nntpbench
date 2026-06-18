@@ -1651,9 +1651,9 @@ fn validate_header_name(value: &str) -> Result<(), InvalidHeaderName> {
         return Err(InvalidHeaderName);
     }
 
-    if value
+    if !value
         .bytes()
-        .any(|byte| !byte.is_ascii_alphanumeric() && byte != b'-')
+        .all(|byte| matches!(byte, 0x21..=0x39 | 0x3b..=0x7e))
     {
         return Err(InvalidHeaderName);
     }
