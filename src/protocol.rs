@@ -2495,9 +2495,7 @@ fn validate_multiline_response_content(kind: RequestKind, content: &[u8]) -> boo
         RequestKind::ListNewsgroups => {
             validate_crlf_lines(content, validate_newsgroups_response_line)
         }
-        RequestKind::ListOverviewFmt => {
-            validate_crlf_lines(content, validate_overview_fmt_response_line)
-        }
+        RequestKind::ListOverviewFmt => validate_overview_fmt_response_content(content),
         RequestKind::ListHeaders => {
             validate_crlf_lines(content, validate_header_list_response_line)
         }
@@ -2581,9 +2579,79 @@ fn validate_newsgroups_response_line(line: &[u8]) -> bool {
         .is_some_and(|group| GroupName::from_borrowed(group).is_ok())
 }
 
-fn validate_overview_fmt_response_line(line: &[u8]) -> bool {
-    let field = line.strip_suffix(b":").unwrap_or(line);
-    validate_header_name_bytes(field)
+fn validate_overview_fmt_response_content(content: &[u8]) -> bool {
+    let mut offset = 0;
+
+    for required in [
+        b"Subject:".as_slice(),
+        b"From:".as_slice(),
+        b"Date:".as_slice(),
+        b"Message-ID:".as_slice(),
+        b"References:".as_slice(),
+    ] {
+        let Some(line) = next_strict_crlf_line(content, &mut offset) else {
+            return false;
+        };
+        if !line.eq_ignore_ascii_case(required) {
+            return false;
+        }
+    }
+
+    let Some(bytes_line) = next_strict_crlf_line(content, &mut offset) else {
+        return false;
+    };
+    let Some(lines_line) = next_strict_crlf_line(content, &mut offset) else {
+        return false;
+    };
+    let modern_metadata =
+        bytes_line.eq_ignore_ascii_case(b":bytes") && lines_line.eq_ignore_ascii_case(b":lines");
+    let legacy_headers =
+        bytes_line.eq_ignore_ascii_case(b"Bytes:") && lines_line.eq_ignore_ascii_case(b"Lines:");
+    if !modern_metadata && !legacy_headers {
+        return false;
+    }
+
+    while offset < content.len() {
+        let Some(line) = next_strict_crlf_line(content, &mut offset) else {
+            return false;
+        };
+        if !validate_overview_fmt_extension_line(line) {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn next_strict_crlf_line<'a>(content: &'a [u8], offset: &mut usize) -> Option<&'a [u8]> {
+    let line_end = strict_crlf_line_content_end_from(content, *offset)?;
+    let line = &content[*offset..line_end];
+    *offset = line_end + crate::CRLF.len();
+    Some(line)
+}
+
+fn validate_overview_fmt_extension_line(line: &[u8]) -> bool {
+    const FULL_SUFFIX: &[u8] = b":full";
+    if line.len() > FULL_SUFFIX.len()
+        && line[line.len() - FULL_SUFFIX.len()..].eq_ignore_ascii_case(FULL_SUFFIX)
+    {
+        let header_name = &line[..line.len() - FULL_SUFFIX.len()];
+        return validate_header_name_abnf_bytes(header_name);
+    }
+    validate_metadata_name_abnf_bytes(line)
+}
+
+fn validate_metadata_name_abnf_bytes(value: &[u8]) -> bool {
+    value
+        .strip_prefix(b":")
+        .is_some_and(validate_header_name_abnf_bytes)
+}
+
+fn validate_header_name_abnf_bytes(value: &[u8]) -> bool {
+    !value.is_empty()
+        && value
+            .iter()
+            .all(|byte| matches!(byte, 0x21..=0x39 | 0x3b..=0x7e))
 }
 
 fn validate_header_list_response_line(line: &[u8]) -> bool {
@@ -5353,10 +5421,10 @@ mod tests {
 
     #[test]
     fn multiline_response_frame_validates_rfc_body_line_formats() {
-        // RFC 3977 sections 6.1.2, 7.4, 8.3.1, and 8.5.1 define structured
-        // per-line bodies for LISTGROUP, NEWNEWS, OVER, and HDR. RFC 2980
-        // sections 2.1.6 and 2.1.7 define the matching XHDR/XOVER extension
-        // body shapes.
+        // RFC 3977 sections 6.1.2, 7.4, 8.3.1, 8.4, 8.5.1, and 9.6
+        // define structured bodies for LISTGROUP, NEWNEWS, OVER,
+        // LIST OVERVIEW.FMT, and HDR. RFC 2980 sections 2.1.6 and 2.1.7
+        // define the matching XHDR/XOVER extension body shapes.
         for (kind, input) in [
             (
                 RequestKind::ListGroup,
@@ -5381,7 +5449,11 @@ mod tests {
             ),
             (
                 RequestKind::ListOverviewFmt,
-                b"215 overview format follows\r\nSubject:\r\n:bytes\r\n.\r\n".as_slice(),
+                b"215 overview format follows\r\nSubject:\r\nFrom:\r\nDate:\r\nMessage-ID:\r\nReferences:\r\n:bytes\r\n:lines\r\nXref:full\r\n:x-article-number\r\n.\r\n".as_slice(),
+            ),
+            (
+                RequestKind::ListOverviewFmt,
+                b"215 overview format follows\r\nSubject:\r\nFrom:\r\nDate:\r\nMessage-ID:\r\nReferences:\r\nBytes:\r\nLines:\r\n.\r\n".as_slice(),
             ),
             (
                 RequestKind::ListHeaders,
@@ -5456,6 +5528,22 @@ mod tests {
             (
                 RequestKind::ListOverviewFmt,
                 b"215 overview format follows\r\nBad Header:\r\n.\r\n".as_slice(),
+            ),
+            (
+                RequestKind::ListOverviewFmt,
+                b"215 overview format follows\r\nSubject:\r\n:bytes\r\n.\r\n".as_slice(),
+            ),
+            (
+                RequestKind::ListOverviewFmt,
+                b"215 overview format follows\r\nFrom:\r\nSubject:\r\nDate:\r\nMessage-ID:\r\nReferences:\r\n:bytes\r\n:lines\r\n.\r\n".as_slice(),
+            ),
+            (
+                RequestKind::ListOverviewFmt,
+                b"215 overview format follows\r\nSubject:\r\nFrom:\r\nDate:\r\nMessage-ID:\r\nReferences:\r\n:lines\r\n:bytes\r\n.\r\n".as_slice(),
+            ),
+            (
+                RequestKind::ListOverviewFmt,
+                b"215 overview format follows\r\nSubject:\r\nFrom:\r\nDate:\r\nMessage-ID:\r\nReferences:\r\n:bytes\r\n:lines\r\nXref:\r\n.\r\n".as_slice(),
             ),
             (
                 RequestKind::ListHeaders,

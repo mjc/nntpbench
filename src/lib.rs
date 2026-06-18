@@ -8383,9 +8383,33 @@ mod tests {
                     },
                     ResponseFrameCase {
                         name: "LIST OVERVIEW.FMT rejects invalid overview field name",
-                        reference: "RFC 3977 sections 8.4 and 8.6.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.4",
+                        reference: "RFC 3977 sections 8.4 and 9.6 https://www.rfc-editor.org/rfc/rfc3977#section-9.6",
                         kind: RequestKind::ListOverviewFmt,
                         frame: b"215 overview format follows\r\nBad Header:\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "LIST OVERVIEW.FMT rejects missing required overview fields",
+                        reference: "RFC 3977 section 9.6 https://www.rfc-editor.org/rfc/rfc3977#section-9.6",
+                        kind: RequestKind::ListOverviewFmt,
+                        frame: b"215 overview format follows\r\nSubject:\r\n:bytes\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "LIST OVERVIEW.FMT rejects wrong required field order",
+                        reference: "RFC 3977 section 9.6 https://www.rfc-editor.org/rfc/rfc3977#section-9.6",
+                        kind: RequestKind::ListOverviewFmt,
+                        frame: b"215 overview format follows\r\nFrom:\r\nSubject:\r\nDate:\r\nMessage-ID:\r\nReferences:\r\n:bytes\r\n:lines\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "LIST OVERVIEW.FMT rejects reversed required metadata order",
+                        reference: "RFC 3977 section 9.6 https://www.rfc-editor.org/rfc/rfc3977#section-9.6",
+                        kind: RequestKind::ListOverviewFmt,
+                        frame: b"215 overview format follows\r\nSubject:\r\nFrom:\r\nDate:\r\nMessage-ID:\r\nReferences:\r\n:lines\r\n:bytes\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "LIST OVERVIEW.FMT rejects optional header without full marker",
+                        reference: "RFC 3977 section 9.6 https://www.rfc-editor.org/rfc/rfc3977#section-9.6",
+                        kind: RequestKind::ListOverviewFmt,
+                        frame: b"215 overview format follows\r\nSubject:\r\nFrom:\r\nDate:\r\nMessage-ID:\r\nReferences:\r\n:bytes\r\n:lines\r\nXref:\r\n.\r\n",
                     },
                     ResponseFrameCase {
                         name: "LIST HEADERS rejects overview field colon suffix",
