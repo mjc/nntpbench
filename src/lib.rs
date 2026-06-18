@@ -2534,6 +2534,26 @@ where
                 .await?;
                 return Ok(false);
             }
+            let Some(current_article) = session_state.current_article else {
+                write_response(
+                    writer,
+                    pending_write,
+                    b"420 no current article selected\r\n",
+                    session_stats,
+                )
+                .await?;
+                return Ok(false);
+            };
+            if current_article <= 1 {
+                write_response(
+                    writer,
+                    pending_write,
+                    b"422 no previous article in this group\r\n",
+                    session_stats,
+                )
+                .await?;
+                return Ok(false);
+            }
             session_state.current_article = Some(1);
             write_response(writer, pending_write, LAST_RESPONSE, session_stats).await?;
             Ok(false)
@@ -2544,6 +2564,26 @@ where
                     writer,
                     pending_write,
                     b"412 no newsgroup selected\r\n",
+                    session_stats,
+                )
+                .await?;
+                return Ok(false);
+            }
+            let Some(current_article) = session_state.current_article else {
+                write_response(
+                    writer,
+                    pending_write,
+                    b"420 no current article selected\r\n",
+                    session_stats,
+                )
+                .await?;
+                return Ok(false);
+            };
+            if current_article >= 3 {
+                write_response(
+                    writer,
+                    pending_write,
+                    b"421 no next article in this group\r\n",
                     session_stats,
                 )
                 .await?;
@@ -4569,6 +4609,42 @@ mod tests {
             let input = b"NEXT\r\n";
             let (output, _) = run_session_with_input(test_config(), input).await;
             assert_single_response(input, b"412 no newsgroup selected\r\n", &output, "RFC 3977");
+        }
+
+        #[tokio::test]
+        async fn rfc3977_red_last_next_current_article_state_matrix() {
+            // RFC 3977 sections 6.1.3 and 6.1.4 require LAST/NEXT to reject an
+            // invalid current article pointer with 420, and group edge movement
+            // with 422/421 respectively:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-6.1.3
+            // https://www.rfc-editor.org/rfc/rfc3977#section-6.1.4
+            assert_red_server_response_tail_cases(&[
+                ServerResponseCase {
+                    name: "LAST after GROUP without current article",
+                    reference: "RFC 3977 section 6.1.3",
+                    input: b"GROUP alt.test\r\nLAST\r\n",
+                    expected: b"420 no current article selected\r\n",
+                },
+                ServerResponseCase {
+                    name: "NEXT after GROUP without current article",
+                    reference: "RFC 3977 section 6.1.4",
+                    input: b"GROUP alt.test\r\nNEXT\r\n",
+                    expected: b"420 no current article selected\r\n",
+                },
+                ServerResponseCase {
+                    name: "LAST at first article",
+                    reference: "RFC 3977 section 6.1.3",
+                    input: b"GROUP alt.test\r\nARTICLE 1\r\nLAST\r\n",
+                    expected: b"422 no previous article in this group\r\n",
+                },
+                ServerResponseCase {
+                    name: "NEXT at last article",
+                    reference: "RFC 3977 section 6.1.4",
+                    input: b"GROUP alt.test\r\nARTICLE 3\r\nNEXT\r\n",
+                    expected: b"421 no next article in this group\r\n",
+                },
+            ])
+            .await;
         }
 
         #[tokio::test]
@@ -9252,28 +9328,27 @@ mod tests {
 
     #[tokio::test]
     async fn serve_session_supports_group_navigation_commands() {
+        let config = test_config();
+        let article_response = config.article_response.clone();
         let (output, stats) = run_session_with_input(
-            test_config(),
-            b"GROUP alt.test\r\nLISTGROUP\r\nLISTGROUP alt.test\r\nLISTGROUP 1-\r\nLISTGROUP 2-3\r\nLISTGROUP alt.test 1-10\r\nLAST\r\nNEXT\r\n",
+            config,
+            b"GROUP alt.test\r\nLISTGROUP\r\nLISTGROUP alt.test\r\nLISTGROUP 1-\r\nLISTGROUP 2-3\r\nLISTGROUP alt.test 1-10\r\nARTICLE 2\r\nLAST\r\nNEXT\r\n",
         )
         .await;
 
-        assert_eq!(
-            output,
-            [
-                GREETING,
-                GROUP_RESPONSE,
-                LISTGROUP_RESPONSE,
-                LISTGROUP_RESPONSE,
-                LISTGROUP_RESPONSE,
-                LISTGROUP_2_3_RESPONSE,
-                LISTGROUP_RESPONSE,
-                LAST_RESPONSE,
-                NEXT_RESPONSE,
-            ]
-            .concat()
-        );
-        assert_eq!(stats.snapshot().commands, 8);
+        let mut expected = Vec::new();
+        expected.extend_from_slice(GREETING);
+        expected.extend_from_slice(GROUP_RESPONSE);
+        expected.extend_from_slice(LISTGROUP_RESPONSE);
+        expected.extend_from_slice(LISTGROUP_RESPONSE);
+        expected.extend_from_slice(LISTGROUP_RESPONSE);
+        expected.extend_from_slice(LISTGROUP_2_3_RESPONSE);
+        expected.extend_from_slice(LISTGROUP_RESPONSE);
+        expected.extend_from_slice(&article_response);
+        expected.extend_from_slice(LAST_RESPONSE);
+        expected.extend_from_slice(NEXT_RESPONSE);
+        assert_eq!(output, expected);
+        assert_eq!(stats.snapshot().commands, 9);
     }
 
     #[tokio::test]
