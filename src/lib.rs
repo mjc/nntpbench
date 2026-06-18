@@ -132,7 +132,9 @@ pub const LIST_HEADERS_RESPONSE: &[u8] =
 pub const LIST_DISTRIB_PATS_RESPONSE: &[u8] =
     b"215 distribution patterns\r\nworld:* world\r\nlocal:*.local local\r\n.\r\n";
 pub const GROUP_RESPONSE: &[u8] = b"211 3 1 3 alt.test\r\n";
+const GROUP_COMP_RESPONSE: &[u8] = b"211 1 1 1 comp.lang.rust\r\n";
 pub const LISTGROUP_RESPONSE: &[u8] = b"211 3 1 3 alt.test\r\n1\r\n2\r\n3\r\n.\r\n";
+const LISTGROUP_COMP_RESPONSE: &[u8] = b"211 1 1 1 comp.lang.rust\r\n1\r\n.\r\n";
 const LISTGROUP_2_3_RESPONSE: &[u8] = b"211 3 1 3 alt.test\r\n2\r\n3\r\n.\r\n";
 pub const LAST_RESPONSE: &[u8] =
     b"223 1 <prev@alt.test> article retrieved - request text separately\r\n";
@@ -2283,9 +2285,16 @@ enum BatchOutcome {
     Close,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FixtureGroup {
+    AltTest,
+    CompLangRust,
+}
+
 #[derive(Debug, Default)]
 struct SessionState {
     group_selected: bool,
+    selected_group: Option<FixtureGroup>,
     current_article: Option<u64>,
 }
 
@@ -2564,9 +2573,8 @@ where
             Ok(false)
         }
         RequestKind::Group => {
-            if command_args(command, command_lines)
-                .is_some_and(|args| contains_subslice(args, b"no.such"))
-            {
+            let args = command_args(command, command_lines).unwrap_or_default();
+            let Some(group) = fixture_group_from_name(args) else {
                 write_response(
                     writer,
                     pending_write,
@@ -2575,10 +2583,17 @@ where
                 )
                 .await?;
                 return Ok(false);
-            }
+            };
             session_state.group_selected = true;
+            session_state.selected_group = Some(group);
             session_state.current_article = Some(1);
-            write_response(writer, pending_write, GROUP_RESPONSE, session_stats).await?;
+            write_response(
+                writer,
+                pending_write,
+                group_response_for_group(group),
+                session_stats,
+            )
+            .await?;
             Ok(false)
         }
         RequestKind::ListGroup => {
@@ -2587,12 +2602,15 @@ where
                 write_response(writer, pending_write, response, session_stats).await?;
                 return Ok(false);
             }
+            let group = listgroup_selected_group(args, session_state.selected_group)
+                .unwrap_or(FixtureGroup::AltTest);
             session_state.group_selected = true;
+            session_state.selected_group = Some(group);
             session_state.current_article = Some(1);
             write_response(
                 writer,
                 pending_write,
-                listgroup_response_for_args(args),
+                listgroup_response_for_args(args, Some(group)),
                 session_stats,
             )
             .await?;
@@ -3247,8 +3265,8 @@ where
         RequestKind::ListOverviewFmt => LIST_OVERVIEW_FMT_RESPONSE,
         RequestKind::ListHeaders => LIST_HEADERS_RESPONSE,
         RequestKind::ListDistribPats => LIST_DISTRIB_PATS_RESPONSE,
-        RequestKind::Group => GROUP_RESPONSE,
-        RequestKind::ListGroup => listgroup_response_for_args(request.args()),
+        RequestKind::Group => group_response_for_args(request.args()),
+        RequestKind::ListGroup => listgroup_response_for_args(request.args(), None),
         RequestKind::Last => LAST_RESPONSE,
         RequestKind::Next => NEXT_RESPONSE,
         RequestKind::NewGroups => NEWGROUPS_RESPONSE,
@@ -4187,7 +4205,9 @@ fn xover_response_for_args(args: &[u8]) -> &'static [u8] {
 }
 
 fn listgroup_state_error(args: &[u8], session_state: &SessionState) -> Option<&'static [u8]> {
-    if contains_subslice(args, b"no.such") {
+    if listgroup_explicit_group_arg(args)
+        .is_some_and(|group| fixture_group_from_name(group).is_none())
+    {
         return Some(b"411 no such newsgroup\r\n");
     }
     if !session_state.group_selected && listgroup_uses_current_group(args) {
@@ -4206,7 +4226,60 @@ fn listgroup_uses_current_group(args: &[u8]) -> bool {
     first.iter().all(|byte| byte.is_ascii_digit()) || first.contains(&b'-')
 }
 
-fn listgroup_response_for_args(args: &[u8]) -> &'static [u8] {
+fn listgroup_explicit_group_arg(args: &[u8]) -> Option<&[u8]> {
+    let first = args
+        .split(|byte| *byte == b' ')
+        .next()
+        .filter(|part| !part.is_empty())?;
+    if first.iter().all(|byte| byte.is_ascii_digit()) || first.contains(&b'-') {
+        None
+    } else {
+        Some(first)
+    }
+}
+
+fn fixture_group_from_name(name: &[u8]) -> Option<FixtureGroup> {
+    if name.eq_ignore_ascii_case(b"alt.test") {
+        Some(FixtureGroup::AltTest)
+    } else if name.eq_ignore_ascii_case(b"comp.lang.rust") {
+        Some(FixtureGroup::CompLangRust)
+    } else {
+        None
+    }
+}
+
+fn listgroup_selected_group(
+    args: &[u8],
+    current_group: Option<FixtureGroup>,
+) -> Option<FixtureGroup> {
+    listgroup_explicit_group_arg(args)
+        .and_then(fixture_group_from_name)
+        .or(current_group)
+}
+
+fn group_response_for_group(group: FixtureGroup) -> &'static [u8] {
+    match group {
+        FixtureGroup::AltTest => GROUP_RESPONSE,
+        FixtureGroup::CompLangRust => GROUP_COMP_RESPONSE,
+    }
+}
+
+fn group_response_for_args(args: &[u8]) -> &'static [u8] {
+    fixture_group_from_name(args)
+        .map(group_response_for_group)
+        .unwrap_or(b"411 no such newsgroup\r\n")
+}
+
+fn listgroup_response_for_args(args: &[u8], current_group: Option<FixtureGroup>) -> &'static [u8] {
+    if listgroup_explicit_group_arg(args)
+        .is_some_and(|group| fixture_group_from_name(group).is_none())
+    {
+        return b"411 no such newsgroup\r\n";
+    }
+    let group = listgroup_selected_group(args, current_group).unwrap_or(FixtureGroup::AltTest);
+    if group == FixtureGroup::CompLangRust {
+        return LISTGROUP_COMP_RESPONSE;
+    }
     if args
         .split(|byte| *byte == b' ')
         .any(|part| part == b"2-3" || part == b"2-")
@@ -4975,6 +5048,47 @@ mod tests {
             let input = b"GROUP no.such.group\r\n";
             let (output, _) = run_session_with_input(test_config(), input).await;
             assert_single_response(input, b"411 no such newsgroup\r\n", &output, "RFC 3977");
+        }
+
+        #[tokio::test]
+        async fn rfc3977_red_group_and_listgroup_responses_match_selected_group() {
+            // RFC 3977 sections 6.1.1 and 6.1.2 require GROUP and LISTGROUP
+            // responses to describe the requested selected group, not a fixed
+            // fixture group:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-6.1.1
+            assert_red_server_response_cases(&[
+                ServerResponseCase {
+                    name: "GROUP comp.lang.rust describes comp.lang.rust",
+                    reference: "RFC 3977 section 6.1.1 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.1",
+                    input: b"GROUP comp.lang.rust\r\n",
+                    expected: GROUP_COMP_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "GROUP valid but nonexistent group returns 411",
+                    reference: "RFC 3977 section 6.1.1 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.1",
+                    input: b"GROUP example.valid\r\n",
+                    expected: b"411 no such newsgroup\r\n",
+                },
+                ServerResponseCase {
+                    name: "LISTGROUP comp.lang.rust describes comp.lang.rust",
+                    reference: "RFC 3977 section 6.1.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.2",
+                    input: b"LISTGROUP comp.lang.rust\r\n",
+                    expected: LISTGROUP_COMP_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "LISTGROUP valid but nonexistent group returns 411",
+                    reference: "RFC 3977 section 6.1.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.2",
+                    input: b"LISTGROUP example.valid\r\n",
+                    expected: b"411 no such newsgroup\r\n",
+                },
+                ServerResponseCase {
+                    name: "current LISTGROUP follows selected comp.lang.rust",
+                    reference: "RFC 3977 section 6.1.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.2",
+                    input: b"GROUP comp.lang.rust\r\nLISTGROUP\r\n",
+                    expected: b"211 1 1 1 comp.lang.rust\r\n211 1 1 1 comp.lang.rust\r\n1\r\n.\r\n",
+                },
+            ])
+            .await;
         }
 
         #[tokio::test]
@@ -6995,6 +7109,7 @@ mod tests {
         let mut article_path = PathBuf::new();
         let mut session_state = SessionState {
             group_selected: true,
+            selected_group: Some(FixtureGroup::AltTest),
             current_article: Some(1),
         };
         let mut writer = FailingWriter;
@@ -10721,7 +10836,7 @@ mod tests {
         let mut output = Vec::new();
 
         assert!(!process_request_to_buffer(
-            RequestLine::parse(b"GROUP alt.binaries.test\r\n"),
+            RequestLine::parse(b"GROUP alt.test\r\n"),
             &config,
             &stats,
             &mut output,
@@ -10733,7 +10848,7 @@ mod tests {
             &mut output,
         ));
         assert!(!process_request_to_buffer(
-            RequestLine::parse(b"LISTGROUP alt.binaries.test\r\n"),
+            RequestLine::parse(b"LISTGROUP comp.lang.rust\r\n"),
             &config,
             &stats,
             &mut output,
@@ -10751,7 +10866,7 @@ mod tests {
             &mut output,
         ));
         assert!(!process_request_to_buffer(
-            RequestLine::parse(b"LISTGROUP alt.binaries.test 1-10\r\n"),
+            RequestLine::parse(b"LISTGROUP example.valid\r\n"),
             &config,
             &stats,
             &mut output,
@@ -10774,10 +10889,10 @@ mod tests {
             [
                 GROUP_RESPONSE,
                 LISTGROUP_RESPONSE,
-                LISTGROUP_RESPONSE,
+                LISTGROUP_COMP_RESPONSE,
                 LISTGROUP_RESPONSE,
                 LISTGROUP_2_3_RESPONSE,
-                LISTGROUP_RESPONSE,
+                b"411 no such newsgroup\r\n".as_slice(),
                 LAST_RESPONSE,
                 NEXT_RESPONSE
             ]
