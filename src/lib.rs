@@ -8226,6 +8226,24 @@ mod tests {
                         frame: b"223 1 <stat@test> article exists\r\n.\r\n",
                     },
                     ResponseFrameCase {
+                        name: "STAT rejects missing article number",
+                        reference: "RFC 3977 section 6.2.4 https://www.rfc-editor.org/rfc/rfc3977#section-6.2.4",
+                        kind: RequestKind::Stat,
+                        frame: b"223 <stat@test> article exists\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "LAST rejects malformed message-id argument",
+                        reference: "RFC 3977 section 6.1.3 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.3",
+                        kind: RequestKind::Last,
+                        frame: b"223 1 stat@test article exists\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "NEXT rejects non-numeric article number",
+                        reference: "RFC 3977 section 6.1.4 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.4",
+                        kind: RequestKind::Next,
+                        frame: b"223 next <stat@test> article exists\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "ARTICLE rejects STAT success code",
                         reference: "RFC 3977 sections 6.2.1 and 6.2.4 https://www.rfc-editor.org/rfc/rfc3977#section-6.2",
                         kind: RequestKind::Article,

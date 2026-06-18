@@ -3410,7 +3410,7 @@ mod tests {
     fn decoder_enforces_rfc_initial_response_line_limit() {
         // RFC 3977 section 3.1 limits the response initial line to 512 octets,
         // including the status code and terminating CRLF.
-        let mut exact = Vec::from(b"223 ".as_slice());
+        let mut exact = Vec::from(b"223 1 <stat@test> ".as_slice());
         exact.resize(crate::protocol::MAX_INITIAL_RESPONSE_LINE_BYTES - 2, b'x');
         exact.extend_from_slice(b"\r\n");
         assert_eq!(
@@ -3422,7 +3422,7 @@ mod tests {
             Ok(DecodeProgress::Complete { .. })
         ));
 
-        let mut too_long_complete = Vec::from(b"223 ".as_slice());
+        let mut too_long_complete = Vec::from(b"223 1 <stat@test> ".as_slice());
         too_long_complete.resize(crate::protocol::MAX_INITIAL_RESPONSE_LINE_BYTES - 1, b'x');
         too_long_complete.extend_from_slice(b"\r\n");
         assert_eq!(
@@ -3434,7 +3434,7 @@ mod tests {
             Err(ClientError::InvalidStatusLine)
         ));
 
-        let mut too_long_incomplete = Vec::from(b"223 ".as_slice());
+        let mut too_long_incomplete = Vec::from(b"223 1 <stat@test> ".as_slice());
         too_long_incomplete.resize(crate::protocol::MAX_INITIAL_RESPONSE_LINE_BYTES, b'x');
         assert!(matches!(
             ResponseDecoder::new(RequestKind::Stat).push(&too_long_incomplete),
@@ -3446,7 +3446,7 @@ mod tests {
     fn streaming_decoder_enforces_rfc_initial_response_line_limit() {
         // RFC 3977 section 3.1 applies the same 512-octet initial-line limit
         // when the line arrives across streaming chunks.
-        let mut exact = Vec::from(b"223 ".as_slice());
+        let mut exact = Vec::from(b"223 1 <stat@test> ".as_slice());
         exact.resize(crate::protocol::MAX_INITIAL_RESPONSE_LINE_BYTES - 2, b'x');
         exact.extend_from_slice(b"\r\n");
         let split = 17;
@@ -3461,7 +3461,7 @@ mod tests {
                 if status.as_u16() == 223 && consumed == exact.len() - split
         ));
 
-        let mut too_long = Vec::from(b"223 ".as_slice());
+        let mut too_long = Vec::from(b"223 1 <stat@test> ".as_slice());
         too_long.resize(crate::protocol::MAX_INITIAL_RESPONSE_LINE_BYTES, b'x');
         too_long.push(b'x');
         let mut decoder = StreamingResponseDecoder::new(RequestKind::Stat);

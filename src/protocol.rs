@@ -2360,6 +2360,9 @@ fn validate_response_initial_line(kind: RequestKind, status: StatusCode, line: &
         (RequestKind::Group | RequestKind::ListGroup, 211) => {
             validate_group_response_arguments(&line[4..line.len() - 2])
         }
+        (RequestKind::Stat | RequestKind::Last | RequestKind::Next, 223) => {
+            validate_article_status_response_arguments(&line[4..line.len() - 2])
+        }
         _ => true,
     }
 }
@@ -2420,6 +2423,17 @@ fn split_required_response_tokens<const N: usize>(mut value: &[u8]) -> Option<([
 
 fn is_response_decimal_token(value: &[u8]) -> bool {
     !value.is_empty() && value.iter().all(u8::is_ascii_digit)
+}
+
+fn validate_article_status_response_arguments(value: &[u8]) -> bool {
+    let Some((tokens, _trailing_text)) = split_required_response_tokens::<2>(value) else {
+        return false;
+    };
+
+    is_response_decimal_token(tokens[0])
+        && std::str::from_utf8(tokens[1])
+            .ok()
+            .is_some_and(|message_id| MessageId::from_borrowed(message_id).is_ok())
 }
 
 /// Client client request for the current client NNTP surface.
@@ -4878,6 +4892,76 @@ mod tests {
             (
                 RequestKind::ListGroup,
                 b"211 3 1 3 alt.test extra\nbad\r\n.\r\n".as_slice(),
+            ),
+        ] {
+            assert!(
+                matches!(
+                    ResponseFrame::parse(kind, input),
+                    ResponseFrameParse::Invalid
+                ),
+                "{kind:?} {input:?}"
+            );
+            assert!(
+                matches!(
+                    ResponseInitial::parse(kind, input),
+                    ResponseInitialParse::Invalid
+                ),
+                "{kind:?} {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn article_status_response_frame_validates_rfc_status_line_arguments() {
+        // RFC 3977 sections 6.1.3, 6.1.4, and 6.2.4 define LAST, NEXT,
+        // and STAT 223 response initial lines as article number and message-id.
+        for (kind, input) in [
+            (
+                RequestKind::Stat,
+                b"223 1 <stat@test> article exists\r\n".as_slice(),
+            ),
+            (
+                RequestKind::Last,
+                b"223 2 <last@test> article retrieved\r\n".as_slice(),
+            ),
+            (
+                RequestKind::Next,
+                b"223 3 <next@test> article retrieved\r\n".as_slice(),
+            ),
+        ] {
+            assert!(
+                matches!(
+                    ResponseFrame::parse(kind, input),
+                    ResponseFrameParse::Complete(response)
+                        if response.status() == StatusCode(223)
+                ),
+                "{kind:?} {input:?}"
+            );
+            assert!(
+                matches!(
+                    ResponseInitial::parse(kind, input),
+                    ResponseInitialParse::Complete(initial) if initial.status() == StatusCode(223)
+                ),
+                "{kind:?} {input:?}"
+            );
+        }
+
+        for (kind, input) in [
+            (
+                RequestKind::Stat,
+                b"223 <stat@test> article exists\r\n".as_slice(),
+            ),
+            (
+                RequestKind::Stat,
+                b"223 one <stat@test> article exists\r\n".as_slice(),
+            ),
+            (
+                RequestKind::Last,
+                b"223 1 stat@test article exists\r\n".as_slice(),
+            ),
+            (
+                RequestKind::Next,
+                b"223 1 <next test> article exists\r\n".as_slice(),
             ),
         ] {
             assert!(
