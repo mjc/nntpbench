@@ -24,6 +24,7 @@ pub enum ArticleParseError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InvalidHeaderReason {
     LeadingFold,
+    EmptyFold,
     MissingColon,
     MissingSpaceAfterColon,
     EmptyName,
@@ -43,6 +44,10 @@ mod proptests {
 
     fn header_value_strategy() -> BoxedStrategy<String> {
         string_regex("[ -~]{0,20}").unwrap().boxed()
+    }
+
+    fn folded_header_value_strategy() -> BoxedStrategy<String> {
+        string_regex("[ \t]{0,4}[!-~][ -~]{0,16}").unwrap().boxed()
     }
 
     fn message_id_strategy() -> BoxedStrategy<String> {
@@ -814,7 +819,7 @@ mod proptests {
         fn headers_parse_accepts_folded_continuations_without_creating_extra_headers(
             first_name in header_name_strategy(),
             first_value in header_value_strategy(),
-            folded_values in vec(header_value_strategy(), 1..=3),
+            folded_values in vec(folded_header_value_strategy(), 1..=3),
             second_name in header_name_strategy(),
             second_value in header_value_strategy(),
             fold in prop_oneof![Just(" ".to_string()), Just("\t".to_string())],
@@ -941,6 +946,7 @@ impl fmt::Display for InvalidHeaderReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::LeadingFold => write!(f, "header cannot start with folding whitespace"),
+            Self::EmptyFold => write!(f, "folded header line cannot contain only whitespace"),
             Self::MissingColon => write!(f, "header missing colon"),
             Self::MissingSpaceAfterColon => write!(f, "header missing space after colon"),
             Self::EmptyName => write!(f, "empty header name"),
@@ -1434,6 +1440,11 @@ fn validate_headers(data: &[u8]) -> Result<(), ArticleParseError> {
                     InvalidHeaderReason::LeadingFold,
                 ));
             }
+            if line.iter().all(|byte| matches!(*byte, b' ' | b'\t')) {
+                return Err(ArticleParseError::InvalidHeader(
+                    InvalidHeaderReason::EmptyFold,
+                ));
+            }
             pos = line_end + 2;
             continue;
         }
@@ -1595,6 +1606,7 @@ Actual body content\r\n\
         let missing_space = b"Subject:Test\r\n";
         let invalid_name = b"Invalid Header: value\r\n";
         let leading_fold = b" folded\r\nSubject: Test\r\n";
+        let empty_fold = b"Subject: Test\r\n \t\r\n";
 
         crate::COUNT_TEST_ALLOCATIONS.with(|enabled| enabled.set(false));
         crate::TEST_ALLOCATIONS.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -1618,6 +1630,10 @@ Actual body content\r\n\
         assert_eq!(
             Headers::parse(leading_fold).unwrap_err(),
             ArticleParseError::InvalidHeader(InvalidHeaderReason::LeadingFold)
+        );
+        assert_eq!(
+            Headers::parse(empty_fold).unwrap_err(),
+            ArticleParseError::InvalidHeader(InvalidHeaderReason::EmptyFold)
         );
 
         crate::COUNT_TEST_ALLOCATIONS.with(|enabled| enabled.set(false));
@@ -1733,6 +1749,11 @@ Actual body content\r\n\
                 b"220 12345 <test@example.com>\r\nSubject:No space\r\n\r\nBody\r\n.\r\n"
                     .as_slice(),
                 ArticleParseError::InvalidHeader(InvalidHeaderReason::MissingSpaceAfterColon),
+            ),
+            (
+                b"220 12345 <test@example.com>\r\nSubject: Test\r\n \t\r\n\r\nBody\r\n.\r\n"
+                    .as_slice(),
+                ArticleParseError::InvalidHeader(InvalidHeaderReason::EmptyFold),
             ),
             (
                 b"221 12345 <test@example.com>\r\nSubject: Test\r\n\r\nThis body should not be here\r\n.\r\n"

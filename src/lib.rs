@@ -5534,6 +5534,28 @@ mod tests {
             }
         }
 
+        #[test]
+        fn rfc3977_red_article_parser_rejects_empty_folded_header_line() {
+            // RFC 3977 section 3.6 permits folded header lines but requires
+            // some octet other than space or tab between any two CRLF pairs:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-3.6
+            for (name, input) in [
+                (
+                    "ARTICLE folded header",
+                    b"220 1 <fold@test>\r\nSubject: good\r\n \t\r\n\r\nbody\r\n.\r\n".as_slice(),
+                ),
+                (
+                    "HEAD folded header",
+                    b"221 1 <fold@test>\r\nSubject: good\r\n \t\r\n.\r\n".as_slice(),
+                ),
+            ] {
+                assert!(
+                    Article::parse(input).is_err(),
+                    "{name}: RFC 3977 folded header line should contain a non-WSP octet"
+                );
+            }
+        }
+
         #[tokio::test]
         async fn rfc3977_red_server_returns_501_for_syntax_error_not_article_body() {
             // RFC 3977 sections 3.2.1 and 6.2.1 reserve 501 for command syntax
