@@ -138,6 +138,7 @@ pub const NEWGROUPS_RESPONSE: &[u8] =
     b"231 list of new newsgroups follows\r\ncomp.lang.rust 0000000003 0000000001 y\r\nalt.test 0000000003 0000000001 y\r\n.\r\n";
 pub const NEWNEWS_RESPONSE: &[u8] =
     b"230 list of new articles follows\r\n<one@alt.test>\r\n<two@alt.test>\r\n.\r\n";
+const NEWNEWS_EMPTY_RESPONSE: &[u8] = b"230 list of new articles follows\r\n.\r\n";
 pub const POST_RESPONSE: &[u8] = b"340 send article to be posted\r\n";
 pub const IHAVE_RESPONSE: &[u8] = b"335 send article to be transferred\r\n";
 pub const CHECK_RESPONSE: &[u8] = b"238 send article to be transferred\r\n";
@@ -2673,13 +2674,8 @@ where
             Ok(false)
         }
         RequestKind::NewNews => {
-            let response = if command_args(command, command_lines)
-                .is_some_and(|args| contains_subslice(args, b"991231"))
-            {
-                b"230 list of new articles follows\r\n.\r\n".as_slice()
-            } else {
-                NEWNEWS_RESPONSE
-            };
+            let response =
+                newnews_response(command_args(command, command_lines).unwrap_or_default());
             write_response(writer, pending_write, response, session_stats).await?;
             Ok(false)
         }
@@ -3238,7 +3234,7 @@ where
         RequestKind::Last => LAST_RESPONSE,
         RequestKind::Next => NEXT_RESPONSE,
         RequestKind::NewGroups => NEWGROUPS_RESPONSE,
-        RequestKind::NewNews => NEWNEWS_RESPONSE,
+        RequestKind::NewNews => newnews_response(request.args()),
         RequestKind::Post => b"440 posting not permitted\r\n",
         RequestKind::Ihave => b"435 article not wanted\r\n",
         RequestKind::Check | RequestKind::TakeThis | RequestKind::StartTls => {
@@ -4053,6 +4049,18 @@ fn wildmat_pattern_matches(pattern: &[u8], group: &[u8]) -> bool {
         return group.starts_with(prefix);
     }
     pattern == group
+}
+
+fn newnews_response(args: &[u8]) -> &'static [u8] {
+    if contains_subslice(args, b"991231") {
+        return NEWNEWS_EMPTY_RESPONSE;
+    }
+    let wildmat = args.split(|byte| *byte == b' ').next().unwrap_or_default();
+    if wildmat.is_empty() || wildmat_matches(wildmat, b"alt.test") {
+        NEWNEWS_RESPONSE
+    } else {
+        NEWNEWS_EMPTY_RESPONSE
+    }
 }
 
 fn article_selector_error(
@@ -5461,16 +5469,42 @@ mod tests {
             // the supplied wildmat and date/time arguments:
             // https://www.rfc-editor.org/rfc/rfc3977#section-7.4
             let (old_output, _) =
-                run_session_with_input(test_config(), b"NEWNEWS comp.lang.* 700101 000000 GMT\r\n")
-                    .await;
+                run_session_with_input(test_config(), b"NEWNEWS alt.* 700101 000000 GMT\r\n").await;
             let (future_output, _) =
-                run_session_with_input(test_config(), b"NEWNEWS comp.lang.* 991231 235959 GMT\r\n")
-                    .await;
+                run_session_with_input(test_config(), b"NEWNEWS alt.* 991231 235959 GMT\r\n").await;
             assert_ne!(
                 without_greeting(&old_output),
                 without_greeting(&future_output),
                 "RFC 3977 NEWNEWS should depend on requested date/time, not return a fixture"
             );
+        }
+
+        #[tokio::test]
+        async fn rfc3977_red_newnews_wildmat_filters_results() {
+            // RFC 3977 section 7.4 requires NEWNEWS to apply the supplied
+            // wildmat to the groups searched for new articles:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-7.4
+            assert_red_server_response_cases(&[
+                ServerResponseCase {
+                    name: "NEWNEWS matching alt wildmat",
+                    reference: "RFC 3977 section 7.4 https://www.rfc-editor.org/rfc/rfc3977#section-7.4",
+                    input: b"NEWNEWS alt.* 20260101 000000 GMT\r\n",
+                    expected: NEWNEWS_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "NEWNEWS nonmatching comp wildmat",
+                    reference: "RFC 3977 section 7.4 https://www.rfc-editor.org/rfc/rfc3977#section-7.4",
+                    input: b"NEWNEWS comp.lang.* 20260101 000000 GMT\r\n",
+                    expected: NEWNEWS_EMPTY_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "NEWNEWS nonmatching exact wildmat",
+                    reference: "RFC 3977 section 7.4 https://www.rfc-editor.org/rfc/rfc3977#section-7.4",
+                    input: b"NEWNEWS comp.lang.rust 20260101 000000 GMT\r\n",
+                    expected: NEWNEWS_EMPTY_RESPONSE,
+                },
+            ])
+            .await;
         }
 
         #[tokio::test]
@@ -9960,7 +9994,7 @@ mod tests {
     async fn serve_session_supports_discovery_commands() {
         let (output, stats) = run_session_with_input(
             test_config(),
-            b"NEWGROUPS 20260101 000000 GMT\r\nNEWNEWS comp.lang.* 20260101 000000\r\n",
+            b"NEWGROUPS 20260101 000000 GMT\r\nNEWNEWS alt.* 20260101 000000\r\n",
         )
         .await;
 
@@ -10624,7 +10658,7 @@ mod tests {
             &mut output,
         ));
         assert!(!process_request_to_buffer(
-            RequestLine::parse(b"NEWNEWS alt.binaries.test 231231 235959 GMT\r\n"),
+            RequestLine::parse(b"NEWNEWS alt.* 231231 235959 GMT\r\n"),
             &config,
             &stats,
             &mut output,
