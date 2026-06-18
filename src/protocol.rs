@@ -2809,7 +2809,7 @@ fn validate_overview_response_line(line: &[u8]) -> bool {
         }
     }
 
-    field_count > 0
+    field_count >= 7
 }
 
 fn validate_overview_optional_field(field: &[u8]) -> bool {
@@ -5798,12 +5798,21 @@ mod tests {
             ),
             (
                 RequestKind::Over,
+                b"224 overview follows\r\n1\tSubject\r\n.\r\n".as_slice(),
+            ),
+            (
+                RequestKind::Over,
                 b"224 overview follows\r\n12345678901234567\tSubject\tfrom@test\r\n.\r\n"
                     .as_slice(),
             ),
             (
                 RequestKind::Over,
                 b"224 overview follows\r\n1\tSubject\tfrom@test\tdate\t<one@test>\t\t1\t1\toptional without label\r\n.\r\n"
+                    .as_slice(),
+            ),
+            (
+                RequestKind::Xover,
+                b"224 overview follows\r\n1\tSubject\tfrom@test\tdate\t<one@test>\r\n.\r\n"
                     .as_slice(),
             ),
             (
