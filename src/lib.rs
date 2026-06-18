@@ -4027,6 +4027,23 @@ fn command_message_id<'a>(
     MessageId::from_borrowed(value).ok()
 }
 
+fn is_command_ws(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t')
+}
+
+fn skip_command_ws(line: &[u8]) -> &[u8] {
+    let start = line
+        .iter()
+        .position(|byte| !is_command_ws(*byte))
+        .unwrap_or(line.len());
+    &line[start..]
+}
+
+fn command_tokens(args: &[u8]) -> impl Iterator<Item = &[u8]> {
+    args.split(|byte| is_command_ws(*byte))
+        .filter(|token| !token.is_empty())
+}
+
 fn command_args<'a>(
     command: &ParsedCommand,
     command_lines: Option<&'a CommandLineBatch>,
@@ -4039,8 +4056,39 @@ fn command_args<'a>(
         .position(|byte| *byte == 0)
         .unwrap_or(line.len());
     let line = strip_complete_crlf_line(&line[..end]).unwrap_or(&line[..end]);
-    let split = line.iter().position(|byte| *byte == b' ')?;
-    line.get(split + 1..)
+    let split = line.iter().position(|byte| is_command_ws(*byte))?;
+    Some(skip_command_ws(&line[split..]))
+}
+
+fn split_command_arg_once(args: &[u8]) -> Option<(&[u8], &[u8])> {
+    let args = skip_command_ws(args);
+    if args.is_empty() {
+        return None;
+    }
+    let split = args.iter().position(|byte| is_command_ws(*byte))?;
+    let head = &args[..split];
+    let tail = skip_command_ws(&args[split..]);
+    Some((head, tail))
+}
+
+fn first_command_arg(args: &[u8]) -> Option<&[u8]> {
+    let args = skip_command_ws(args);
+    if args.is_empty() {
+        return None;
+    }
+    let end = args
+        .iter()
+        .position(|byte| is_command_ws(*byte))
+        .unwrap_or(args.len());
+    Some(&args[..end])
+}
+
+fn nth_command_arg(args: &[u8], index: usize) -> Option<&[u8]> {
+    command_tokens(args).nth(index)
+}
+
+fn command_arg_count(args: &[u8]) -> usize {
+    command_tokens(args).count()
 }
 
 fn list_active_response(args: &[u8]) -> &'static [u8] {
@@ -4067,14 +4115,12 @@ fn strip_list_variant_args<'a>(args: &'a [u8], keyword: &[u8]) -> &'a [u8] {
     if args.eq_ignore_ascii_case(keyword) {
         return b"";
     }
-    if args.len() > keyword.len()
-        && args[..keyword.len()].eq_ignore_ascii_case(keyword)
-        && args[keyword.len()] == b' '
+    if let Some((first, rest)) = split_command_arg_once(args)
+        && first.eq_ignore_ascii_case(keyword)
     {
-        &args[keyword.len() + 1..]
-    } else {
-        args
+        return rest;
     }
+    args
 }
 
 fn list_active_times_response(args: &[u8]) -> &'static [u8] {
@@ -4161,7 +4207,7 @@ fn newnews_response(args: &[u8]) -> &'static [u8] {
     if newnews_date_key(args).is_some_and(|date| date >= FAR_FUTURE_DATE_KEY) {
         return NEWNEWS_EMPTY_RESPONSE;
     }
-    let wildmat = args.split(|byte| *byte == b' ').next().unwrap_or_default();
+    let wildmat = first_command_arg(args).unwrap_or_default();
     if wildmat.is_empty() || wildmat_matches(wildmat, b"alt.test") {
         NEWNEWS_RESPONSE
     } else {
@@ -4170,12 +4216,12 @@ fn newnews_response(args: &[u8]) -> &'static [u8] {
 }
 
 fn newgroups_date_key(args: &[u8]) -> Option<u32> {
-    let date = args.split(|byte| *byte == b' ').next()?;
+    let date = first_command_arg(args)?;
     normalized_nntp_date_key(date, current_utc_year())
 }
 
 fn newnews_date_key(args: &[u8]) -> Option<u32> {
-    let date = args.split(|byte| *byte == b' ').nth(1)?;
+    let date = nth_command_arg(args, 1)?;
     normalized_nntp_date_key(date, current_utc_year())
 }
 
@@ -4259,7 +4305,7 @@ fn overview_selector_error(
     }
     let current_selector = match command.kind {
         RequestKind::Over | RequestKind::Xover => args.is_empty(),
-        RequestKind::Hdr | RequestKind::Xhdr => args.split(|byte| *byte == b' ').count() == 1,
+        RequestKind::Hdr | RequestKind::Xhdr => command_arg_count(args) == 1,
         _ => false,
     };
     if current_selector {
@@ -4308,10 +4354,7 @@ fn overview_selector_requires_group(selector: &[u8]) -> bool {
 fn overview_selector_arg(kind: RequestKind, args: &[u8]) -> Option<&[u8]> {
     match kind {
         RequestKind::Over | RequestKind::Xover if !args.is_empty() => Some(args),
-        RequestKind::Hdr | RequestKind::Xhdr => args
-            .split(|byte| *byte == b' ')
-            .nth(1)
-            .filter(|selector| !selector.is_empty()),
+        RequestKind::Hdr | RequestKind::Xhdr => nth_command_arg(args, 1),
         _ => None,
     }
 }
@@ -4403,17 +4446,14 @@ fn listgroup_uses_current_group(args: &[u8]) -> bool {
     if args.is_empty() {
         return true;
     }
-    let Some(first) = args.split(|byte| *byte == b' ').next() else {
+    let Some(first) = first_command_arg(args) else {
         return true;
     };
     first.iter().all(|byte| byte.is_ascii_digit()) || first.contains(&b'-')
 }
 
 fn listgroup_explicit_group_arg(args: &[u8]) -> Option<&[u8]> {
-    let first = args
-        .split(|byte| *byte == b' ')
-        .next()
-        .filter(|part| !part.is_empty())?;
+    let first = first_command_arg(args)?;
     if first.iter().all(|byte| byte.is_ascii_digit()) || first.contains(&b'-') {
         None
     } else {
@@ -4504,10 +4544,9 @@ fn listgroup_response_for_args(args: &[u8], current_group: Option<FixtureGroup>)
 }
 
 fn listgroup_range_arg(args: &[u8]) -> Option<&[u8]> {
-    let mut parts = args.split(|byte| *byte == b' ');
-    let first = parts.next().filter(|part| !part.is_empty())?;
+    let first = first_command_arg(args)?;
     if listgroup_explicit_group_arg(args).is_some() {
-        parts.next()
+        nth_command_arg(args, 1)
     } else if listgroup_uses_current_group(args) {
         Some(first)
     } else {
@@ -4540,9 +4579,7 @@ fn listgroup_range_bounds(range: &[u8]) -> Option<(u64, Option<u64>)> {
 }
 
 fn header_query_name_from_args(args: &[u8]) -> Option<&[u8]> {
-    args.split(|byte| *byte == b' ')
-        .next()
-        .filter(|header| !header.is_empty())
+    first_command_arg(args)
 }
 
 fn hdr_field_is_supported(field: &[u8]) -> bool {
@@ -4707,7 +4744,7 @@ fn current_overview_args(args: &[u8], session_state: &SessionState) -> Option<&'
 }
 
 fn current_header_args(args: &[u8], session_state: &SessionState) -> Option<&'static [u8]> {
-    if args.split(|byte| *byte == b' ').count() != 1 {
+    if command_arg_count(args) != 1 {
         return None;
     }
     let current = current_article_selector_args(session_state)?;
@@ -7370,6 +7407,48 @@ mod tests {
                     reference: "RFC 2980 section 2.1.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.6",
                     input: b"GROUP alt.test\r\nXHDR Subject 2\r\n",
                     expected: XHDR_SUBJECT_2_RESPONSE,
+                },
+            ])
+            .await;
+        }
+
+        #[tokio::test]
+        async fn rfc3977_red_server_preserves_tab_separated_command_arguments() {
+            // RFC 3977 section 3.1 defines command arguments as separated by WS,
+            // and section 9.8 defines WS as SP / TAB. Stateful server handling
+            // must therefore preserve arguments for TAB-separated valid commands:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-3.1
+            // https://www.rfc-editor.org/rfc/rfc3977#section-9.8
+            assert_red_server_response_tail_cases(&[
+                ServerResponseCase {
+                    name: "GROUP tab argument selects requested group",
+                    reference: "RFC 3977 sections 3.1 and 6.1.1 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.1",
+                    input: b"GROUP\tcomp.lang.rust\r\n",
+                    expected: GROUP_COMP_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "LISTGROUP tab range filters selected group",
+                    reference: "RFC 3977 sections 3.1 and 6.1.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.2",
+                    input: b"GROUP\talt.test\r\nLISTGROUP\t2-\r\n",
+                    expected: LISTGROUP_2_3_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "LIST ACTIVE tab wildmat filters response",
+                    reference: "RFC 3977 sections 3.1 and 7.6.3 https://www.rfc-editor.org/rfc/rfc3977#section-7.6.3",
+                    input: b"LIST\tACTIVE\tcomp.lang.*\r\n",
+                    expected: LIST_ACTIVE_COMP_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "HDR tab selector filters response",
+                    reference: "RFC 3977 sections 3.1 and 8.5.1 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.1",
+                    input: b"GROUP\talt.test\r\nHDR\tSubject\t2\r\n",
+                    expected: HDR_SUBJECT_2_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "NEWNEWS tab wildmat filters response",
+                    reference: "RFC 3977 sections 3.1 and 7.4 https://www.rfc-editor.org/rfc/rfc3977#section-7.4",
+                    input: b"NEWNEWS\tcomp.lang.*\t19700101\t000000\r\n",
+                    expected: NEWNEWS_EMPTY_RESPONSE,
                 },
             ])
             .await;
