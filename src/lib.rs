@@ -4215,6 +4215,12 @@ fn overview_selector_error(
         return Some(b"412 no newsgroup selected\r\n");
     }
     if selector.is_some_and(|selector| {
+        overview_selector_is_range(selector)
+            && !overview_selector_range_selects_articles(selector, session_state.article_count())
+    }) {
+        return Some(b"423 no articles in that range\r\n");
+    }
+    if selector.is_some_and(|selector| {
         selector.iter().all(|byte| byte.is_ascii_digit())
             && std::str::from_utf8(selector)
                 .ok()
@@ -4302,6 +4308,18 @@ fn overview_selector_includes_first_two(selector: &[u8]) -> bool {
         }
     };
     start <= 1 && end >= 2
+}
+
+fn overview_selector_is_range(selector: &[u8]) -> bool {
+    selector.contains(&b'-')
+}
+
+fn overview_selector_range_selects_articles(selector: &[u8], article_count: u64) -> bool {
+    let Some((start, end)) = listgroup_range_bounds(selector) else {
+        return false;
+    };
+    let end = end.unwrap_or(article_count).min(article_count);
+    start <= end && start <= article_count
 }
 
 fn overview_selector_is_message_id(selector: &[u8]) -> bool {
@@ -7053,6 +7071,42 @@ mod tests {
                     reference: "RFC 2980 section 2.1.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.6",
                     input: b"GROUP alt.test\r\nXHDR Message-ID 2-\r\n",
                     expected: XHDR_MESSAGE_ID_2_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "OVER empty range returns 423",
+                    reference: "RFC 3977 section 8.3.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.3.2",
+                    input: b"GROUP alt.test\r\nOVER 4-5\r\n",
+                    expected: b"423 no articles in that range\r\n",
+                },
+                ServerResponseCase {
+                    name: "XOVER empty range returns 423",
+                    reference: "RFC 2980 section 2.1.7 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.7",
+                    input: b"GROUP alt.test\r\nXOVER 4-\r\n",
+                    expected: b"423 no articles in that range\r\n",
+                },
+                ServerResponseCase {
+                    name: "HDR Subject empty range returns 423",
+                    reference: "RFC 3977 section 8.5.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.2",
+                    input: b"GROUP alt.test\r\nHDR Subject 4-5\r\n",
+                    expected: b"423 no articles in that range\r\n",
+                },
+                ServerResponseCase {
+                    name: "HDR metadata empty range returns 423",
+                    reference: "RFC 3977 section 8.5.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.2",
+                    input: b"GROUP alt.test\r\nHDR :bytes 4-\r\n",
+                    expected: b"423 no articles in that range\r\n",
+                },
+                ServerResponseCase {
+                    name: "XHDR Subject empty range returns 423",
+                    reference: "RFC 2980 section 2.1.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.6",
+                    input: b"GROUP alt.test\r\nXHDR Subject 4-5\r\n",
+                    expected: b"423 no articles in that range\r\n",
+                },
+                ServerResponseCase {
+                    name: "XHDR metadata empty range returns 423",
+                    reference: "RFC 2980 section 2.1.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.6",
+                    input: b"GROUP alt.test\r\nXHDR :lines 4-\r\n",
+                    expected: b"423 no articles in that range\r\n",
                 },
             ])
             .await;
