@@ -2555,16 +2555,53 @@ fn validate_active_status_token(token: &[u8]) -> bool {
 }
 
 fn validate_active_times_response_line(line: &[u8]) -> bool {
-    let Some((tokens, trailing_text)) = split_required_response_tokens::<3>(line) else {
+    let Some((group, timestamp, creator)) = split_active_times_response_line(line) else {
         return false;
     };
 
-    trailing_text.is_empty()
-        && std::str::from_utf8(tokens[0])
-            .ok()
-            .is_some_and(|group| GroupName::from_borrowed(group).is_ok())
-        && is_response_decimal_token(tokens[1])
-        && !tokens[2].is_empty()
+    std::str::from_utf8(group)
+        .ok()
+        .is_some_and(|group| GroupName::from_borrowed(group).is_ok())
+        && is_response_decimal_token(timestamp)
+        && validate_u_text(creator)
+}
+
+fn split_active_times_response_line(line: &[u8]) -> Option<(&[u8], &[u8], &[u8])> {
+    let group_end = memchr::memchr(b' ', line)?;
+    let group = &line[..group_end];
+    let after_group = skip_ascii_spaces(&line[group_end..])?;
+
+    let timestamp_end = memchr::memchr(b' ', after_group)?;
+    let timestamp = &after_group[..timestamp_end];
+    let creator = skip_ascii_spaces(&after_group[timestamp_end..])?;
+    if creator.is_empty() {
+        return None;
+    }
+
+    Some((group, timestamp, creator))
+}
+
+fn skip_ascii_spaces(value: &[u8]) -> Option<&[u8]> {
+    if value.first() != Some(&b' ') {
+        return None;
+    }
+    Some(
+        value
+            .iter()
+            .position(|byte| *byte != b' ')
+            .map_or(&[][..], |index| &value[index..]),
+    )
+}
+
+fn validate_u_text(value: &[u8]) -> bool {
+    std::str::from_utf8(value).is_ok_and(|text| {
+        let mut chars = text.chars();
+        chars.next().is_some_and(is_p_char) && chars.all(|ch| !matches!(ch, '\0' | '\r' | '\n'))
+    })
+}
+
+fn is_p_char(ch: char) -> bool {
+    !ch.is_ascii() || ('\x21'..='\x7e').contains(&ch)
 }
 
 fn validate_newsgroups_response_line(line: &[u8]) -> bool {
@@ -2697,12 +2734,7 @@ fn validate_wildmat_response_field(value: &[u8]) -> bool {
 }
 
 fn validate_p_char_token(value: &[u8]) -> bool {
-    std::str::from_utf8(value).is_ok_and(|token| {
-        !token.is_empty()
-            && token
-                .chars()
-                .all(|ch| !ch.is_ascii() || ('\x21'..='\x7e').contains(&ch))
-    })
+    std::str::from_utf8(value).is_ok_and(|token| !token.is_empty() && token.chars().all(is_p_char))
 }
 
 fn validate_overview_response_line(line: &[u8]) -> bool {
@@ -5491,6 +5523,11 @@ mod tests {
                 b"215 information follows\r\nalt.test 1715907600 admin@test\r\n.\r\n".as_slice(),
             ),
             (
+                RequestKind::ListActiveTimes,
+                b"215 information follows\r\nalt.test   1715907600   admin test creator\r\n.\r\n"
+                    .as_slice(),
+            ),
+            (
                 RequestKind::ListNewsgroups,
                 b"215 information follows\r\nalt.test Synthetic group\r\n.\r\n".as_slice(),
             ),
@@ -5581,6 +5618,14 @@ mod tests {
             (
                 RequestKind::ListActiveTimes,
                 b"215 information follows\r\nalt.test yesterday admin@test\r\n.\r\n".as_slice(),
+            ),
+            (
+                RequestKind::ListActiveTimes,
+                b"215 information follows\r\nalt.test 1715907600 \r\n.\r\n".as_slice(),
+            ),
+            (
+                RequestKind::ListActiveTimes,
+                b"215 information follows\r\nalt.test 1715907600 \tadmin@test\r\n.\r\n".as_slice(),
             ),
             (
                 RequestKind::ListNewsgroups,
