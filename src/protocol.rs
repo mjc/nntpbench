@@ -2829,10 +2829,10 @@ fn validate_overview_optional_field(field: &[u8]) -> bool {
 }
 
 fn validate_header_response_line(line: &[u8]) -> bool {
-    let Some(space) = memchr::memchr(b' ', line) else {
-        return false;
-    };
-    validate_response_article_number(&line[..space])
+    memchr::memchr(b' ', line).map_or_else(
+        || validate_response_article_number(line),
+        |space| validate_response_article_number(&line[..space]),
+    )
 }
 
 fn validate_capabilities_response_content(content: &[u8]) -> bool {
@@ -5658,6 +5658,10 @@ mod tests {
             (
                 RequestKind::Hdr,
                 b"225 headers follow\r\n1 value\r\n0 \r\n.\r\n".as_slice(),
+            ),
+            (
+                RequestKind::Hdr,
+                b"225 headers follow\r\n1\r\n2 value\r\n.\r\n".as_slice(),
             ),
             (
                 RequestKind::Hdr,

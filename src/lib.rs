@@ -5412,6 +5412,25 @@ mod tests {
             );
         }
 
+        fn assert_red_response_frame_valid_cases(cases: &[ResponseFrameCase]) {
+            let failures = cases
+                .iter()
+                .filter(|case| {
+                    !matches!(
+                        protocol::ResponseFrame::parse(case.kind, case.frame),
+                        protocol::ResponseFrameParse::Complete(_)
+                    )
+                })
+                .map(|case| format!("{}: {}", case.name, case.reference))
+                .collect::<Vec<_>>();
+
+            assert!(
+                failures.is_empty(),
+                "expected response frames to be valid; rejected unexpectedly:\n{}",
+                failures.join("\n")
+            );
+        }
+
         #[test]
         fn rfc3977_red_article_parser_unstuffs_dot_prefixed_body_lines() {
             // RFC 3977 section 3.1.1 requires clients to remove one leading dot
@@ -8306,6 +8325,16 @@ mod tests {
 
         mod response_frame_validation {
             use super::*;
+
+            #[test]
+            fn rfc3977_red_response_frame_valid_shape_matrix() {
+                assert_red_response_frame_valid_cases(&[ResponseFrameCase {
+                    name: "HDR accepts omitted space for empty field content",
+                    reference: "RFC 3977 section 8.5.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.2",
+                    kind: RequestKind::Hdr,
+                    frame: b"225 headers follow\r\n1\r\n2 value\r\n.\r\n",
+                }]);
+            }
 
             #[test]
             fn rfc3977_red_response_frame_validation_matrix() {
