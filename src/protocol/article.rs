@@ -2,7 +2,7 @@
 
 use std::{borrow::Cow, fmt};
 
-use super::{InvalidMessageId, MessageId, StatusCode};
+use super::{InvalidMessageId, MAX_ARTICLE_NUMBER, MessageId, StatusCode};
 use crate::terminator::{
     DOT_TERMINATOR, find_terminator_content_end, strict_crlf_line_content_end_from,
 };
@@ -431,6 +431,35 @@ mod proptests {
             }
             let body = format!("{}\r\n", body_lines.join("\r\n"));
             let first_line = format!("{overflowing_number} {message_id}");
+            let article_frame = format!("220 {first_line}\r\n{header_block}\r\n{body}.\r\n");
+            let head_frame = format!("221 {first_line}\r\n{header_block}.\r\n");
+            let body_frame = format!("222 {first_line}\r\n{body}.\r\n");
+            let stat_frame = format!("223 {first_line}\r\n");
+
+            for frame in [article_frame, head_frame, body_frame, stat_frame] {
+                prop_assert_eq!(
+                    Article::parse(frame.as_bytes()).unwrap_err(),
+                    ArticleParseError::InvalidArticleNumber
+                );
+            }
+        }
+
+        #[test]
+        fn generated_response_first_lines_reject_article_numbers_over_rfc_maximum(
+            message_id in message_id_strategy(),
+            article_number in (MAX_ARTICLE_NUMBER + 1)..=(MAX_ARTICLE_NUMBER + 1_000),
+            headers in header_pairs_strategy(),
+            body_lines in vec(body_line_strategy(), 1..=3),
+        ) {
+            let mut header_block = String::new();
+            for (name, value) in &headers {
+                header_block.push_str(name);
+                header_block.push_str(": ");
+                header_block.push_str(value);
+                header_block.push_str("\r\n");
+            }
+            let body = format!("{}\r\n", body_lines.join("\r\n"));
+            let first_line = format!("{article_number} {message_id}");
             let article_frame = format!("220 {first_line}\r\n{header_block}\r\n{body}.\r\n");
             let head_frame = format!("221 {first_line}\r\n{header_block}.\r\n");
             let body_frame = format!("222 {first_line}\r\n{body}.\r\n");
@@ -1429,6 +1458,9 @@ fn parse_response_article_number(value: &[u8]) -> Result<ArticleNumber, ArticleP
         .map_err(|_| ArticleParseError::InvalidArticleNumber)?
         .parse::<u64>()
         .map_err(|_| ArticleParseError::InvalidArticleNumber)?;
+    if number > MAX_ARTICLE_NUMBER {
+        return Err(ArticleParseError::InvalidArticleNumber);
+    }
     Ok(ArticleNumber::from(number))
 }
 

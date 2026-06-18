@@ -5501,6 +5501,11 @@ mod tests {
                     b"222 999999999999999999999999 <overflow@test>\r\nbody\r\n.\r\n".as_slice(),
                 ),
                 (
+                    "ARTICLE article number over RFC maximum",
+                    b"220 2147483648 <over-max@test>\r\nSubject: bad\r\n\r\nbody\r\n.\r\n"
+                        .as_slice(),
+                ),
+                (
                     "STAT message-id not separated from text",
                     b"223 1 <bad-space@test>extra\r\n".as_slice(),
                 ),
