@@ -169,7 +169,8 @@ const HDR_SUBJECT_MESSAGE_ID_RESPONSE: &[u8] = b"225 headers follow\r\n0 example
 const HDR_SUBJECT_1_RESPONSE: &[u8] = b"225 headers follow\r\n1 example one\r\n.\r\n";
 const HDR_SUBJECT_2_RESPONSE: &[u8] = b"225 headers follow\r\n2 example two\r\n.\r\n";
 pub const XHDR_RESPONSE: &[u8] = b"221 headers follow\r\n1 example one\r\n2 example two\r\n.\r\n";
-const XHDR_SUBJECT_MESSAGE_ID_RESPONSE: &[u8] = b"221 headers follow\r\n0 example one\r\n.\r\n";
+const XHDR_SUBJECT_MESSAGE_ID_RESPONSE: &[u8] =
+    b"221 headers follow\r\n<one@example.com> example one\r\n.\r\n";
 const XHDR_SUBJECT_1_RESPONSE: &[u8] = b"221 headers follow\r\n1 example one\r\n.\r\n";
 const XHDR_SUBJECT_2_RESPONSE: &[u8] = b"221 headers follow\r\n2 example two\r\n.\r\n";
 const HDR_MESSAGE_ID_RESPONSE: &[u8] =
@@ -189,15 +190,16 @@ const HDR_LINES_2_RESPONSE: &[u8] = b"225 headers follow\r\n2 8\r\n.\r\n";
 const XHDR_MESSAGE_ID_RESPONSE: &[u8] =
     b"221 headers follow\r\n1 <one@example.com>\r\n2 <two@example.com>\r\n.\r\n";
 const XHDR_MESSAGE_ID_MESSAGE_ID_RESPONSE: &[u8] =
-    b"221 headers follow\r\n0 <one@example.com>\r\n.\r\n";
+    b"221 headers follow\r\n<one@example.com> <one@example.com>\r\n.\r\n";
 const XHDR_MESSAGE_ID_1_RESPONSE: &[u8] = b"221 headers follow\r\n1 <one@example.com>\r\n.\r\n";
 const XHDR_MESSAGE_ID_2_RESPONSE: &[u8] = b"221 headers follow\r\n2 <two@example.com>\r\n.\r\n";
 const XHDR_BYTES_RESPONSE: &[u8] = b"221 headers follow\r\n1 123\r\n2 456\r\n.\r\n";
-const XHDR_BYTES_MESSAGE_ID_RESPONSE: &[u8] = b"221 headers follow\r\n0 123\r\n.\r\n";
+const XHDR_BYTES_MESSAGE_ID_RESPONSE: &[u8] =
+    b"221 headers follow\r\n<one@example.com> 123\r\n.\r\n";
 const XHDR_BYTES_1_RESPONSE: &[u8] = b"221 headers follow\r\n1 123\r\n.\r\n";
 const XHDR_BYTES_2_RESPONSE: &[u8] = b"221 headers follow\r\n2 456\r\n.\r\n";
 const XHDR_LINES_RESPONSE: &[u8] = b"221 headers follow\r\n1 4\r\n2 8\r\n.\r\n";
-const XHDR_LINES_MESSAGE_ID_RESPONSE: &[u8] = b"221 headers follow\r\n0 4\r\n.\r\n";
+const XHDR_LINES_MESSAGE_ID_RESPONSE: &[u8] = b"221 headers follow\r\n<one@example.com> 4\r\n.\r\n";
 const XHDR_LINES_1_RESPONSE: &[u8] = b"221 headers follow\r\n1 4\r\n.\r\n";
 const XHDR_LINES_2_RESPONSE: &[u8] = b"221 headers follow\r\n2 8\r\n.\r\n";
 pub const HEAD_RESPONSE: &[u8] = b"221 1 <article.1@nntpbench.local> article retrieved\r\nPath: nntpbench.local!mock\r\nFrom: Bench User <bench@nntpbench.local>\r\nNewsgroups: alt.binaries.bench\r\nSubject: nntpbench synthetic article\r\nMessage-ID: <article.1@nntpbench.local>\r\nDate: Fri, 15 May 2026 00:00:00 +0000\r\n.\r\n";
@@ -6561,9 +6563,9 @@ mod tests {
 
         #[tokio::test]
         async fn rfc2980_red_xhdr_uses_221_response_code() {
-            // RFC 2980 section 2.1.6 specifies XHDR responses with response code
+            // RFC 2980 section 2.6 specifies XHDR responses with response code
             // 221, not the RFC 3977 HDR 225 code:
-            // https://www.rfc-editor.org/rfc/rfc2980#section-2.1.6
+            // https://www.rfc-editor.org/rfc/rfc2980#section-2.6
             let (output, _) =
                 run_session_with_input(test_config(), b"GROUP alt.test\r\nXHDR Subject 1\r\n")
                     .await;
@@ -7276,9 +7278,9 @@ mod tests {
 
         #[tokio::test]
         async fn rfc2980_red_xhdr_invalid_header_name_returns_501() {
-            // RFC 2980 section 2.1.6 requires XHDR to name a header field. A
+            // RFC 2980 section 2.6 requires XHDR to name a header field. A
             // trailing colon is not part of the field-name token:
-            // https://www.rfc-editor.org/rfc/rfc2980#section-2.1.6
+            // https://www.rfc-editor.org/rfc/rfc2980#section-2.6
             let input = b"XHDR Subject: 1\r\n";
             let (output, _) = run_session_with_input(test_config(), input).await;
             assert_single_response(input, b"501 command syntax error\r\n", &output, "RFC 2980");
@@ -7372,7 +7374,7 @@ mod tests {
                 },
                 ServerResponseCase {
                     name: "XHDR range selector before GROUP",
-                    reference: "RFC 2980 section 2.1.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.6",
+                    reference: "RFC 2980 section 2.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.6",
                     input: b"XHDR Subject 1-3\r\n",
                     expected: b"412 no newsgroup selected\r\n",
                 },
@@ -7429,13 +7431,13 @@ mod tests {
                 },
                 ServerResponseCase {
                     name: "XHDR unsupported header field",
-                    reference: "RFC 2980 section 2.1.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.6",
+                    reference: "RFC 2980 section 2.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.6",
                     input: b"GROUP alt.test\r\nXHDR Content-Type 1\r\n",
                     expected: b"503 HDR field unavailable\r\n",
                 },
                 ServerResponseCase {
                     name: "XHDR unsupported metadata field",
-                    reference: "RFC 2980 section 2.1.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.6",
+                    reference: "RFC 2980 section 2.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.6",
                     input: b"GROUP alt.test\r\nXHDR :unknown 1\r\n",
                     expected: b"503 HDR field unavailable\r\n",
                 },
@@ -7478,13 +7480,13 @@ mod tests {
                 },
                 ServerResponseCase {
                     name: "XHDR :bytes numeric selector",
-                    reference: "RFC 2980 section 2.1.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.6",
+                    reference: "RFC 2980 section 2.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.6",
                     input: b"GROUP alt.test\r\nXHDR :bytes 1\r\n",
                     expected: XHDR_BYTES_1_RESPONSE,
                 },
                 ServerResponseCase {
                     name: "XHDR :lines message-id selector",
-                    reference: "RFC 2980 section 2.1.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.6",
+                    reference: "RFC 2980 section 2.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.6",
                     input: b"XHDR :lines <one@example.com>\r\n",
                     expected: XHDR_LINES_MESSAGE_ID_RESPONSE,
                 },
@@ -7524,13 +7526,13 @@ mod tests {
                 },
                 ServerResponseCase {
                     name: "XHDR numeric selector 1",
-                    reference: "RFC 2980 section 2.1.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.6",
+                    reference: "RFC 2980 section 2.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.6",
                     input: b"GROUP alt.test\r\nXHDR Subject 1\r\n",
                     expected: XHDR_SUBJECT_1_RESPONSE,
                 },
                 ServerResponseCase {
                     name: "XHDR numeric selector 2",
-                    reference: "RFC 2980 section 2.1.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.6",
+                    reference: "RFC 2980 section 2.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.6",
                     input: b"GROUP alt.test\r\nXHDR Subject 2\r\n",
                     expected: XHDR_SUBJECT_2_RESPONSE,
                 },
@@ -7632,13 +7634,13 @@ mod tests {
                 },
                 ServerResponseCase {
                     name: "XHDR Subject range selector 2-",
-                    reference: "RFC 2980 section 2.1.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.6",
+                    reference: "RFC 2980 section 2.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.6",
                     input: b"GROUP alt.test\r\nXHDR Subject 2-\r\n",
                     expected: XHDR_SUBJECT_2_RESPONSE,
                 },
                 ServerResponseCase {
                     name: "XHDR Message-ID range selector 2-",
-                    reference: "RFC 2980 section 2.1.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.6",
+                    reference: "RFC 2980 section 2.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.6",
                     input: b"GROUP alt.test\r\nXHDR Message-ID 2-\r\n",
                     expected: XHDR_MESSAGE_ID_2_RESPONSE,
                 },
@@ -7686,19 +7688,19 @@ mod tests {
                 },
                 ServerResponseCase {
                     name: "XHDR Subject empty range returns 423",
-                    reference: "RFC 2980 section 2.1.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.6",
+                    reference: "RFC 2980 section 2.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.6",
                     input: b"GROUP alt.test\r\nXHDR Subject 4-5\r\n",
                     expected: b"423 no articles in that range\r\n",
                 },
                 ServerResponseCase {
                     name: "XHDR Subject reversed range returns 423",
-                    reference: "RFC 3977 section 6.1.2 and RFC 2980 section 2.1.6 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.2",
+                    reference: "RFC 3977 section 6.1.2 and RFC 2980 section 2.6 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.2",
                     input: b"GROUP alt.test\r\nXHDR Subject 3-1\r\n",
                     expected: b"423 no articles in that range\r\n",
                 },
                 ServerResponseCase {
                     name: "XHDR metadata empty range returns 423",
-                    reference: "RFC 2980 section 2.1.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.6",
+                    reference: "RFC 2980 section 2.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.6",
                     input: b"GROUP alt.test\r\nXHDR :lines 4-\r\n",
                     expected: b"423 no articles in that range\r\n",
                 },
@@ -7733,14 +7735,14 @@ mod tests {
                     expected: HDR_MESSAGE_ID_MESSAGE_ID_RESPONSE,
                 },
                 ServerResponseCase {
-                    name: "XHDR Subject message-id selector uses article number 0",
-                    reference: "RFC 2980 section 2.1.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.6",
+                    name: "XHDR Subject message-id selector uses message-id row key",
+                    reference: "RFC 2980 section 2.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.6",
                     input: b"XHDR Subject <one@example.com>\r\n",
                     expected: XHDR_SUBJECT_MESSAGE_ID_RESPONSE,
                 },
                 ServerResponseCase {
-                    name: "XHDR Message-ID message-id selector uses article number 0",
-                    reference: "RFC 2980 section 2.1.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.6",
+                    name: "XHDR Message-ID message-id selector uses message-id row key",
+                    reference: "RFC 2980 section 2.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.6",
                     input: b"XHDR Message-ID <one@example.com>\r\n",
                     expected: XHDR_MESSAGE_ID_MESSAGE_ID_RESPONSE,
                 },
@@ -7750,9 +7752,9 @@ mod tests {
 
         #[tokio::test]
         async fn rfc2980_red_xhdr_subject_returns_subject_values_not_message_ids() {
-            // RFC 2980 section 2.1.6 returns values for the requested header.
+            // RFC 2980 section 2.6 returns values for the requested header.
             // XHDR Subject must not return Message-ID-shaped values:
-            // https://www.rfc-editor.org/rfc/rfc2980#section-2.1.6
+            // https://www.rfc-editor.org/rfc/rfc2980#section-2.6
             let input = b"GROUP alt.test\r\nXHDR Subject 1\r\n";
             let (output, _) = run_session_with_input(test_config(), input).await;
             let text = String::from_utf8_lossy(without_greeting(&output));
@@ -7766,9 +7768,9 @@ mod tests {
 
         #[tokio::test]
         async fn rfc2980_red_xhdr_message_id_returns_valid_message_id_values() {
-            // RFC 2980 section 2.1.6 returns values for the requested header.
+            // RFC 2980 section 2.6 returns values for the requested header.
             // Message-ID values should still satisfy the RFC 3977 message-id grammar:
-            // https://www.rfc-editor.org/rfc/rfc2980#section-2.1.6
+            // https://www.rfc-editor.org/rfc/rfc2980#section-2.6
             let input = b"GROUP alt.test\r\nXHDR Message-ID 1\r\n";
             let (output, _) = run_session_with_input(test_config(), input).await;
             let text = String::from_utf8_lossy(without_greeting(&output));
@@ -8132,7 +8134,7 @@ mod tests {
                 },
                 ServerResponseCase {
                     name: "XHDR current before GROUP",
-                    reference: "RFC 2980 section 2.1.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.6",
+                    reference: "RFC 2980 section 2.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.6",
                     input: b"XHDR Subject\r\n",
                     expected: b"412 no newsgroup selected\r\n",
                 },
@@ -8178,7 +8180,7 @@ mod tests {
                 },
                 ServerResponseCase {
                     name: "XHDR after GROUP uses first article",
-                    reference: "RFC 2980 section 2.1.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.6",
+                    reference: "RFC 2980 section 2.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.6",
                     input: b"GROUP alt.test\r\nXHDR Subject\r\n",
                     expected: XHDR_SUBJECT_1_RESPONSE,
                 },
@@ -8208,13 +8210,13 @@ mod tests {
                 },
                 ServerResponseCase {
                     name: "XHDR current article follows ARTICLE 2",
-                    reference: "RFC 2980 section 2.1.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.6",
+                    reference: "RFC 2980 section 2.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.6",
                     input: b"GROUP alt.test\r\nARTICLE 2\r\nXHDR Subject\r\n",
                     expected: XHDR_SUBJECT_2_RESPONSE,
                 },
                 ServerResponseCase {
                     name: "XHDR metadata current article follows ARTICLE 2",
-                    reference: "RFC 2980 section 2.1.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.6",
+                    reference: "RFC 2980 section 2.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.6",
                     input: b"GROUP alt.test\r\nARTICLE 2\r\nXHDR :bytes\r\n",
                     expected: XHDR_BYTES_2_RESPONSE,
                 },
@@ -9036,7 +9038,7 @@ mod tests {
                     },
                     ServerResponseCase {
                         name: "XHDR extra argument",
-                        reference: "RFC 2980 section 2.1.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.6",
+                        reference: "RFC 2980 section 2.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.6",
                         input: b"XHDR Subject 1 extra\r\n",
                         expected: b"501 command syntax error\r\n",
                     },
@@ -9949,7 +9951,7 @@ mod tests {
                     },
                     ResponseFrameCase {
                         name: "XHDR rejects body row without numeric article number",
-                        reference: "RFC 2980 section 2.1.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.6",
+                        reference: "RFC 2980 section 2.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.6",
                         kind: RequestKind::Xhdr,
                         frame: b"221 headers follow\r\none value\r\n.\r\n",
                     },
@@ -10027,7 +10029,7 @@ mod tests {
                     },
                     ResponseFrameCase {
                         name: "XHDR rejects HDR response code",
-                        reference: "RFC 2980 section 2.1.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.6",
+                        reference: "RFC 2980 section 2.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.6",
                         kind: RequestKind::Xhdr,
                         frame: b"225 headers follow\r\n1 subject\r\n.\r\n",
                     },

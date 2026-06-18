@@ -3505,7 +3505,7 @@ mod tests {
 
     #[test]
     fn decoder_treats_rfc2980_xhdr_221_as_multiline() {
-        // RFC 2980 section 2.1.6 specifies XHDR as a 221 multiline response.
+        // RFC 2980 section 2.6 specifies XHDR as a 221 multiline response.
         // The decoder must consume through the dot line so pipelined reads do
         // not leave XHDR payload bytes in the socket buffer.
         let mut decoder = ResponseDecoder::new(RequestKind::Xhdr);

@@ -2352,7 +2352,7 @@ static RESPONSE_DESCRIPTORS: &[ResponseDescriptor] = &[
     response_descriptor(RequestKind::Over, 224, ResponseFraming::Multiline),
     response_descriptor(RequestKind::Xover, 224, ResponseFraming::Multiline),
     response_descriptor(RequestKind::Hdr, 225, ResponseFraming::Multiline),
-    // RFC 2980 section 2.1.6 specifies XHDR as returning 221 with multiline
+    // RFC 2980 section 2.6 specifies XHDR as returning 221 with multiline
     // data. RFC 3977 standardized HDR as 225, but real servers still expose
     // the deployed XHDR 221 form.
     response_descriptor(RequestKind::Xhdr, 221, ResponseFraming::Multiline),
