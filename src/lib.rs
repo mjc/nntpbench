@@ -5653,14 +5653,21 @@ mod tests {
             // optional base64 initial response. Unsupported mechanisms still
             // fail as 503, not as command syntax errors:
             // https://www.rfc-editor.org/rfc/rfc4643#section-2.4.1
-            let input = b"AUTHINFO SASL made-up-mechanism =\r\n";
-            let (output, _) = run_session_with_input(test_config(), input).await;
-            assert_single_response(
-                input,
-                b"503 unsupported authentication mechanism\r\n",
-                &output,
-                "RFC 4643",
-            );
+            assert_red_server_response_cases(&[
+                ServerResponseCase {
+                    name: "SASL zero-length initial response marker",
+                    reference: "RFC 4643 section 2.4.1 https://www.rfc-editor.org/rfc/rfc4643#section-2.4.1",
+                    input: b"AUTHINFO SASL made-up-mechanism =\r\n",
+                    expected: b"503 unsupported authentication mechanism\r\n",
+                },
+                ServerResponseCase {
+                    name: "SASL padded base64 initial response",
+                    reference: "RFC 4643 section 2.4.1 https://www.rfc-editor.org/rfc/rfc4643#section-2.4.1",
+                    input: b"AUTHINFO SASL made-up-mechanism YQ==\r\n",
+                    expected: b"503 unsupported authentication mechanism\r\n",
+                },
+            ])
+            .await;
         }
 
         #[tokio::test]
@@ -5668,9 +5675,27 @@ mod tests {
             // RFC 4643 section 2.4.2 requires SASL initial responses to use
             // valid base64 syntax; padding cannot appear in the middle:
             // https://www.rfc-editor.org/rfc/rfc4643#section-2.4.2
-            let input = b"AUTHINFO SASL made-up-mechanism AAA=BBB\r\n";
-            let (output, _) = run_session_with_input(test_config(), input).await;
-            assert_single_response(input, b"501 command syntax error\r\n", &output, "RFC 4643");
+            assert_red_server_response_cases(&[
+                ServerResponseCase {
+                    name: "SASL padding in middle",
+                    reference: "RFC 4643 section 2.4.2 https://www.rfc-editor.org/rfc/rfc4643#section-2.4.2",
+                    input: b"AUTHINFO SASL made-up-mechanism AAA=BBB\r\n",
+                    expected: b"501 command syntax error\r\n",
+                },
+                ServerResponseCase {
+                    name: "SASL excessive padding",
+                    reference: "RFC 4643 section 2.4.2 https://www.rfc-editor.org/rfc/rfc4643#section-2.4.2",
+                    input: b"AUTHINFO SASL made-up-mechanism Y===\r\n",
+                    expected: b"501 command syntax error\r\n",
+                },
+                ServerResponseCase {
+                    name: "SASL non-quad base64 length",
+                    reference: "RFC 4643 section 2.4.2 https://www.rfc-editor.org/rfc/rfc4643#section-2.4.2",
+                    input: b"AUTHINFO SASL made-up-mechanism Y\r\n",
+                    expected: b"501 command syntax error\r\n",
+                },
+            ])
+            .await;
         }
 
         #[tokio::test]

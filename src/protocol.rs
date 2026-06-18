@@ -3750,15 +3750,19 @@ fn validate_sasl_initial_response(value: &[u8]) -> Result<(), ()> {
     if value == b"=" {
         return Ok(());
     }
-    if value.is_empty() {
+    if value.is_empty() || !value.len().is_multiple_of(4) {
         return Err(());
     }
 
-    let mut seen_padding = false;
-    for byte in value {
-        match *byte {
-            b'=' => seen_padding = true,
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/' if !seen_padding => {}
+    let padding = value.iter().rev().take_while(|byte| **byte == b'=').count();
+    if padding > 2 {
+        return Err(());
+    }
+    let data_len = value.len() - padding;
+    for (index, byte) in value.iter().enumerate() {
+        match (*byte, index >= data_len) {
+            (b'=', true) => {}
+            (b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/', false) => {}
             _ => return Err(()),
         }
     }
