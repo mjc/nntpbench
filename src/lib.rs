@@ -8352,6 +8352,30 @@ mod tests {
                         frame: b"231 list of new newsgroups follows\r\nalt.test 3 1 open\r\n.\r\n",
                     },
                     ResponseFrameCase {
+                        name: "LIST OVERVIEW.FMT rejects invalid overview field name",
+                        reference: "RFC 3977 sections 8.4 and 8.6.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.4",
+                        kind: RequestKind::ListOverviewFmt,
+                        frame: b"215 overview format follows\r\nBad Header:\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "LIST HEADERS rejects overview field colon suffix",
+                        reference: "RFC 3977 section 8.6.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.6.2",
+                        kind: RequestKind::ListHeaders,
+                        frame: b"215 headers supported\r\nSubject:\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "LIST DISTRIB.PATS rejects non-numeric priority",
+                        reference: "RFC 3977 sections 7.6.5 and 9.6 https://www.rfc-editor.org/rfc/rfc3977#section-9.6",
+                        kind: RequestKind::ListDistribPats,
+                        frame: b"215 distribution patterns\r\nfirst:*:world\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "CAPABILITIES rejects empty capability token",
+                        reference: "RFC 3977 sections 5.2 and 9.5 https://www.rfc-editor.org/rfc/rfc3977#section-5.2",
+                        kind: RequestKind::Capabilities,
+                        frame: b"101 Capability list:\r\nVERSION 2\r\nBAD  TOKEN\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "OVER rejects body row without tab-separated overview fields",
                         reference: "RFC 3977 section 8.3.1 https://www.rfc-editor.org/rfc/rfc3977#section-8.3.1",
                         kind: RequestKind::Over,

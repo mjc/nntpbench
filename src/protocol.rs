@@ -2451,6 +2451,15 @@ fn validate_multiline_response_content(kind: RequestKind, content: &[u8]) -> boo
         RequestKind::ListNewsgroups => {
             validate_crlf_lines(content, validate_newsgroups_response_line)
         }
+        RequestKind::ListOverviewFmt => {
+            validate_crlf_lines(content, validate_overview_fmt_response_line)
+        }
+        RequestKind::ListHeaders => {
+            validate_crlf_lines(content, validate_header_list_response_line)
+        }
+        RequestKind::ListDistribPats => {
+            validate_crlf_lines(content, validate_distrib_pats_response_line)
+        }
         RequestKind::ListGroup => validate_crlf_lines(content, is_response_decimal_token),
         RequestKind::NewNews => validate_crlf_lines(content, |line| {
             std::str::from_utf8(line)
@@ -2462,6 +2471,9 @@ fn validate_multiline_response_content(kind: RequestKind, content: &[u8]) -> boo
         }
         RequestKind::Hdr | RequestKind::Xhdr => {
             validate_crlf_lines(content, validate_header_response_line)
+        }
+        RequestKind::Capabilities => {
+            validate_crlf_lines(content, validate_capability_response_line)
         }
         _ => true,
     }
@@ -2527,6 +2539,36 @@ fn validate_newsgroups_response_line(line: &[u8]) -> bool {
         .is_some_and(|group| GroupName::from_borrowed(group).is_ok())
 }
 
+fn validate_overview_fmt_response_line(line: &[u8]) -> bool {
+    let field = line.strip_suffix(b":").unwrap_or(line);
+    validate_header_name_bytes(field)
+}
+
+fn validate_header_list_response_line(line: &[u8]) -> bool {
+    validate_header_name_bytes(line)
+}
+
+fn validate_header_name_bytes(value: &[u8]) -> bool {
+    std::str::from_utf8(value)
+        .ok()
+        .is_some_and(|header| HeaderName::from_borrowed(header).is_ok())
+}
+
+fn validate_distrib_pats_response_line(line: &[u8]) -> bool {
+    let mut fields = line.splitn(3, |byte| *byte == b':');
+    let Some(priority) = fields.next() else {
+        return false;
+    };
+    let Some(wildmat) = fields.next() else {
+        return false;
+    };
+    let Some(distribution) = fields.next() else {
+        return false;
+    };
+
+    is_response_decimal_token(priority) && !wildmat.is_empty() && !distribution.is_empty()
+}
+
 fn validate_overview_response_line(line: &[u8]) -> bool {
     let Some(tab) = memchr::memchr(b'\t', line) else {
         return false;
@@ -2539,6 +2581,25 @@ fn validate_header_response_line(line: &[u8]) -> bool {
         return false;
     };
     is_response_decimal_token(&line[..space])
+}
+
+fn validate_capability_response_line(line: &[u8]) -> bool {
+    let mut tokens = line.split(|byte| *byte == b' ');
+    let Some(label) = tokens.next() else {
+        return false;
+    };
+    validate_ascii_token(label, validate_keyword) && tokens.all(validate_capability_argument_token)
+}
+
+fn validate_capability_argument_token(token: &[u8]) -> bool {
+    !token.is_empty()
+        && token
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'.' | b'-' | b'_'))
+}
+
+fn validate_ascii_token(token: &[u8], validate: impl FnOnce(&str) -> Result<(), ()>) -> bool {
+    std::str::from_utf8(token).is_ok_and(|value| validate(value).is_ok())
 }
 
 /// Client client request for the current client NNTP surface.
@@ -5115,6 +5176,22 @@ mod tests {
                 b"231 new groups follow\r\nalt.test 3 1 y\r\n.\r\n".as_slice(),
             ),
             (
+                RequestKind::ListOverviewFmt,
+                b"215 overview format follows\r\nSubject:\r\n:bytes\r\n.\r\n".as_slice(),
+            ),
+            (
+                RequestKind::ListHeaders,
+                b"215 headers follow\r\nSubject\r\n:lines\r\n.\r\n".as_slice(),
+            ),
+            (
+                RequestKind::ListDistribPats,
+                b"215 distrib pats follow\r\n1:*:world\r\n.\r\n".as_slice(),
+            ),
+            (
+                RequestKind::Capabilities,
+                b"101 capabilities follow\r\nVERSION 2\r\nREADER\r\nOVER MSGID\r\n.\r\n".as_slice(),
+            ),
+            (
                 RequestKind::NewNews,
                 b"230 articles follow\r\n<one@test>\r\n<two@test>\r\n.\r\n".as_slice(),
             ),
@@ -5167,6 +5244,22 @@ mod tests {
             (
                 RequestKind::NewGroups,
                 b"231 new groups follow\r\nalt.test 3 1 open\r\n.\r\n".as_slice(),
+            ),
+            (
+                RequestKind::ListOverviewFmt,
+                b"215 overview format follows\r\nBad Header:\r\n.\r\n".as_slice(),
+            ),
+            (
+                RequestKind::ListHeaders,
+                b"215 headers follow\r\nSubject:\r\n.\r\n".as_slice(),
+            ),
+            (
+                RequestKind::ListDistribPats,
+                b"215 distrib pats follow\r\nfirst:*:world\r\n.\r\n".as_slice(),
+            ),
+            (
+                RequestKind::Capabilities,
+                b"101 capabilities follow\r\nVERSION 2\r\nBAD  TOKEN\r\n.\r\n".as_slice(),
             ),
             (
                 RequestKind::NewNews,
