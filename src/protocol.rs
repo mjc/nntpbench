@@ -337,7 +337,7 @@ mod proptests {
         prop_oneof![
             message_id_strategy(),
             article_number_token_strategy(),
-            listgroup_range_strategy(),
+            article_range_strategy(),
         ]
         .boxed()
     }
@@ -352,7 +352,7 @@ mod proptests {
         .boxed()
     }
 
-    fn listgroup_range_strategy() -> BoxedStrategy<String> {
+    fn article_range_strategy() -> BoxedStrategy<String> {
         prop_oneof![
             article_number_token_strategy(),
             (
@@ -369,6 +369,19 @@ mod proptests {
                     };
                     format!("{start}-{end}")
                 }),
+            article_number_token_strategy().prop_map(|start| format!("{start}-")),
+        ]
+        .boxed()
+    }
+
+    fn listgroup_range_strategy() -> BoxedStrategy<String> {
+        prop_oneof![
+            article_number_token_strategy(),
+            (
+                article_number_token_strategy(),
+                article_number_token_strategy()
+            )
+                .prop_map(|(start, end)| format!("{start}-{end}")),
             article_number_token_strategy().prop_map(|start| format!("{start}-")),
         ]
         .boxed()
@@ -1742,12 +1755,9 @@ fn validate_listgroup_range(value: &str) -> Result<(), InvalidListGroupRange> {
     }
 
     if let Some((start, end)) = value.split_once('-') {
-        let start = article_number_token_value(start).map_err(|_| InvalidListGroupRange)?;
+        article_number_token_value(start).map_err(|_| InvalidListGroupRange)?;
         if !end.is_empty() {
-            let end = article_number_token_value(end).map_err(|_| InvalidListGroupRange)?;
-            if start > end {
-                return Err(InvalidListGroupRange);
-            }
+            article_number_token_value(end).map_err(|_| InvalidListGroupRange)?;
         }
         return Ok(());
     }

@@ -136,6 +136,7 @@ const GROUP_COMP_RESPONSE: &[u8] = b"211 1 1 1 comp.lang.rust\r\n";
 pub const LISTGROUP_RESPONSE: &[u8] = b"211 3 1 3 alt.test\r\n1\r\n2\r\n3\r\n.\r\n";
 const LISTGROUP_COMP_RESPONSE: &[u8] = b"211 1 1 1 comp.lang.rust\r\n1\r\n.\r\n";
 const LISTGROUP_COMP_EMPTY_RESPONSE: &[u8] = b"211 1 1 1 comp.lang.rust\r\n.\r\n";
+const LISTGROUP_EMPTY_RESPONSE: &[u8] = b"211 3 1 3 alt.test\r\n.\r\n";
 const LISTGROUP_2_3_RESPONSE: &[u8] = b"211 3 1 3 alt.test\r\n2\r\n3\r\n.\r\n";
 pub const LAST_RESPONSE: &[u8] =
     b"223 1 <prev@alt.test> article retrieved - request text separately\r\n";
@@ -4377,22 +4378,58 @@ fn listgroup_response_for_args(args: &[u8], current_group: Option<FixtureGroup>)
         return b"411 no such newsgroup\r\n";
     }
     let group = listgroup_selected_group(args, current_group).unwrap_or(FixtureGroup::AltTest);
+    let range = listgroup_range_arg(args);
     if group == FixtureGroup::CompLangRust {
-        if args
-            .split(|byte| *byte == b' ')
-            .any(|part| part == b"2-3" || part == b"2-")
-        {
+        if range.is_some_and(|range| !listgroup_range_selects_articles(range, group)) {
             return LISTGROUP_COMP_EMPTY_RESPONSE;
         }
         return LISTGROUP_COMP_RESPONSE;
     }
-    if args
-        .split(|byte| *byte == b' ')
-        .any(|part| part == b"2-3" || part == b"2-")
-    {
-        return LISTGROUP_2_3_RESPONSE;
+    if let Some(range) = range {
+        if !listgroup_range_selects_articles(range, group) {
+            return LISTGROUP_EMPTY_RESPONSE;
+        }
+        if listgroup_range_starts_at_second(range) {
+            return LISTGROUP_2_3_RESPONSE;
+        }
     }
     LISTGROUP_RESPONSE
+}
+
+fn listgroup_range_arg(args: &[u8]) -> Option<&[u8]> {
+    let mut parts = args.split(|byte| *byte == b' ');
+    let first = parts.next().filter(|part| !part.is_empty())?;
+    if listgroup_explicit_group_arg(args).is_some() {
+        parts.next()
+    } else if listgroup_uses_current_group(args) {
+        Some(first)
+    } else {
+        None
+    }
+}
+
+fn listgroup_range_selects_articles(range: &[u8], group: FixtureGroup) -> bool {
+    let Some((start, end)) = listgroup_range_bounds(range) else {
+        return false;
+    };
+    let high = group.article_count();
+    let end = end.unwrap_or(high).min(high);
+    start <= end && start <= high
+}
+
+fn listgroup_range_starts_at_second(range: &[u8]) -> bool {
+    listgroup_range_bounds(range).is_some_and(|(start, _)| start == 2)
+}
+
+fn listgroup_range_bounds(range: &[u8]) -> Option<(u64, Option<u64>)> {
+    let value = std::str::from_utf8(range).ok()?;
+    if let Some((start, end)) = value.split_once('-') {
+        let start = start.parse::<u64>().ok()?;
+        let end = (!end.is_empty()).then(|| end.parse::<u64>().ok()).flatten();
+        Some((start, end))
+    } else {
+        value.parse::<u64>().ok().map(|value| (value, Some(value)))
+    }
 }
 
 fn header_query_name_from_args(args: &[u8]) -> Option<&[u8]> {
@@ -6224,11 +6261,37 @@ mod tests {
         #[tokio::test]
         async fn rfc3977_red_listgroup_range_filters_article_numbers() {
             // RFC 3977 section 6.1.2 says LISTGROUP's optional range limits the
-            // article numbers returned in the multi-line body:
+            // article numbers returned in the multi-line body. If the end is
+            // less than the start, or the range is beyond the selected group,
+            // the command still succeeds with an empty list:
             // https://www.rfc-editor.org/rfc/rfc3977#section-6.1.2
-            let input = b"LISTGROUP alt.test 2-3\r\n";
-            let (output, _) = run_session_with_input(test_config(), input).await;
-            assert_single_response(input, LISTGROUP_2_3_RESPONSE, &output, "RFC 3977");
+            assert_red_server_response_cases(&[
+                ServerResponseCase {
+                    name: "LISTGROUP explicit group range filters article numbers",
+                    reference: "RFC 3977 section 6.1.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.2",
+                    input: b"LISTGROUP alt.test 2-3\r\n",
+                    expected: LISTGROUP_2_3_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "LISTGROUP reversed range is valid and empty",
+                    reference: "RFC 3977 section 6.1.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.2",
+                    input: b"LISTGROUP alt.test 3-2\r\n",
+                    expected: LISTGROUP_EMPTY_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "LISTGROUP range above high water is valid and empty",
+                    reference: "RFC 3977 section 6.1.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.2",
+                    input: b"LISTGROUP alt.test 4-\r\n",
+                    expected: LISTGROUP_EMPTY_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "LISTGROUP current group reversed range is valid and empty",
+                    reference: "RFC 3977 section 6.1.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.2",
+                    input: b"GROUP alt.test\r\nLISTGROUP 3-2\r\n",
+                    expected: b"211 3 1 3 alt.test\r\n211 3 1 3 alt.test\r\n.\r\n",
+                },
+            ])
+            .await;
         }
 
         #[tokio::test]
@@ -7545,9 +7608,9 @@ mod tests {
                         ArticleSelector::from_borrowed("2147483648").is_err(),
                     ),
                     (
-                        "LISTGROUP range rejects reversed range",
+                        "LISTGROUP range accepts reversed range as empty",
                         "RFC 3977 section 6.1.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.2",
-                        ListGroupRange::from_borrowed("10-1").is_err(),
+                        ListGroupRange::from_borrowed("10-1").is_ok(),
                     ),
                     (
                         "LISTGROUP range rejects leading-zero number",
