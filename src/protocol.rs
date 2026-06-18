@@ -1883,15 +1883,18 @@ impl<'a> AuthInfoValue<'a> {
 pub struct InvalidAuthInfoValue;
 
 fn validate_auth_info_value(value: &str) -> Result<(), InvalidAuthInfoValue> {
-    if value.is_empty()
-        || value
-            .bytes()
-            .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
-    {
+    if !validate_auth_info_value_bytes(value.as_bytes()) {
         return Err(InvalidAuthInfoValue);
     }
 
     Ok(())
+}
+
+fn validate_auth_info_value_bytes(value: &[u8]) -> bool {
+    !value.is_empty()
+        && value
+            .iter()
+            .all(|byte| !matches!(*byte, b'\0' | b'\r' | b'\n'))
 }
 
 /// AUTHINFO command families currently supported by the client surface.
@@ -4402,20 +4405,30 @@ fn validate_newnews_args(args: &[u8]) -> Result<(), ()> {
 }
 
 fn classify_authinfo_command(args: &[u8]) -> RequestKind {
+    let Some((subcommand, value)) = split_authinfo_subcommand_value(args) else {
+        return classify_authinfo_sasl_command(args);
+    };
+
+    if eq_ignore_ascii_case_const(subcommand, b"USER") && validate_auth_info_value_bytes(value) {
+        return RequestKind::AuthInfoUser;
+    }
+    if eq_ignore_ascii_case_const(subcommand, b"PASS") && validate_auth_info_value_bytes(value) {
+        return RequestKind::AuthInfoPass;
+    }
+
+    classify_authinfo_sasl_command(args)
+}
+
+fn split_authinfo_subcommand_value(args: &[u8]) -> Option<(&[u8], &[u8])> {
+    let split = args.iter().position(|byte| is_command_ws(*byte))?;
+    let subcommand = &args[..split];
+    let value = skip_command_ws(&args[split..]);
+    (!subcommand.is_empty() && !value.is_empty()).then_some((subcommand, value))
+}
+
+fn classify_authinfo_sasl_command(args: &[u8]) -> RequestKind {
     let mut parts = command_tokens(args);
     match (parts.next(), parts.next(), parts.next(), parts.next()) {
-        (Some(subcommand), Some(value), None, None)
-            if eq_ignore_ascii_case_const(subcommand, b"USER")
-                && validate_utf8_arg(value, AuthInfoValue::from_borrowed).is_ok() =>
-        {
-            RequestKind::AuthInfoUser
-        }
-        (Some(subcommand), Some(value), None, None)
-            if eq_ignore_ascii_case_const(subcommand, b"PASS")
-                && validate_utf8_arg(value, AuthInfoValue::from_borrowed).is_ok() =>
-        {
-            RequestKind::AuthInfoPass
-        }
         (Some(subcommand), Some(value), None, None)
             if eq_ignore_ascii_case_const(subcommand, b"SASL")
                 && validate_sasl_mechanism(value).is_ok() =>
@@ -4930,9 +4943,22 @@ mod tests {
             AuthInfoValue::from_borrowed("pass-word").unwrap().as_str(),
             "pass-word"
         );
+        assert_eq!(
+            AuthInfoValue::from_borrowed("user name").unwrap().as_str(),
+            "user name"
+        );
+        assert_eq!(
+            AuthInfoValue::from_borrowed("pass\tword").unwrap().as_str(),
+            "pass\tword"
+        );
+        assert_eq!(
+            AuthInfoValue::from_borrowed("user\x01name")
+                .unwrap()
+                .as_str(),
+            "user\x01name"
+        );
         assert!(AuthInfoValue::from_borrowed("").is_err());
-        assert!(AuthInfoValue::from_borrowed("user name").is_err());
-        assert!(AuthInfoValue::from_borrowed("pass\tword").is_err());
+        assert!(AuthInfoValue::from_borrowed("bad\0value").is_err());
         assert!(AuthInfoValue::from_borrowed("bad\rvalue").is_err());
         assert!(AuthInfoValue::from_borrowed("bad\nvalue").is_err());
     }
@@ -6681,8 +6707,20 @@ mod tests {
         assert!(Request::newnews("", "20260101", "000000", false).is_err());
         assert!(Request::list_active_wildmat("").is_err());
         assert!(Request::authinfo_user("").is_err());
-        assert!(Request::authinfo_user("user name").is_err());
-        assert!(Request::authinfo_pass("pass\tword").is_err());
+        assert_eq!(
+            Request::authinfo_user("user name")
+                .unwrap()
+                .auth_info()
+                .map(|(_, value)| value.as_str()),
+            Some("user name")
+        );
+        assert_eq!(
+            Request::authinfo_pass("pass\tword")
+                .unwrap()
+                .auth_info()
+                .map(|(_, value)| value.as_str()),
+            Some("pass\tword")
+        );
         assert!(Request::authinfo_pass("bad\nvalue").is_err());
     }
 

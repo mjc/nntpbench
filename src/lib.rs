@@ -7560,6 +7560,24 @@ mod tests {
                     RequestKind::AuthInfoUser,
                     "RFC 4643 section 2 and RFC 3977 section 9.2 https://www.rfc-editor.org/rfc/rfc4643#section-2",
                 ),
+                (
+                    "AUTHINFO USER accepts space inside username",
+                    b"AUTHINFO USER bench user\r\n",
+                    RequestKind::AuthInfoUser,
+                    "RFC 4643 sections 2.3 and 3.1 https://www.rfc-editor.org/rfc/rfc4643#section-3.1",
+                ),
+                (
+                    "AUTHINFO PASS accepts tab inside password",
+                    b"AUTHINFO PASS bench\tpass\r\n",
+                    RequestKind::AuthInfoPass,
+                    "RFC 4643 sections 2.3 and 3.1 https://www.rfc-editor.org/rfc/rfc4643#section-3.1",
+                ),
+                (
+                    "AUTHINFO USER accepts byte-oriented B-CHAR value",
+                    b"AUTHINFO USER bench\xffuser\r\n",
+                    RequestKind::AuthInfoUser,
+                    "RFC 4643 section 3.1 and RFC 3977 section 9.8 https://www.rfc-editor.org/rfc/rfc4643#section-3.1",
+                ),
             ]);
         }
 
@@ -7615,11 +7633,6 @@ mod tests {
                     "LIST ACTIVE extra argument",
                     b"LIST ACTIVE comp.* extra\r\n",
                     "RFC 3977 section 7.6.3 https://www.rfc-editor.org/rfc/rfc3977#section-7.6.3",
-                ),
-                (
-                    "AUTHINFO USER extra argument",
-                    b"AUTHINFO USER bench extra\r\n",
-                    "RFC 4643 section 2.1 https://www.rfc-editor.org/rfc/rfc4643#section-2.1",
                 ),
             ]);
         }
@@ -7874,22 +7887,35 @@ mod tests {
                     expected: b"501 command syntax error\r\n",
                 },
                 ServerResponseCase {
-                    name: "AUTHINFO USER extra argument",
-                    reference: "RFC 4643 section 2.1 https://www.rfc-editor.org/rfc/rfc4643#section-2.1",
-                    input: b"AUTHINFO USER bench extra\r\n",
-                    expected: b"501 command syntax error\r\n",
-                },
-                ServerResponseCase {
-                    name: "AUTHINFO PASS extra argument",
-                    reference: "RFC 4643 section 2.1 https://www.rfc-editor.org/rfc/rfc4643#section-2.1",
-                    input: b"AUTHINFO PASS bench extra\r\n",
-                    expected: b"501 command syntax error\r\n",
-                },
-                ServerResponseCase {
                     name: "AUTHINFO unknown subcommand",
                     reference: "RFC 4643 sections 2.1 and 2.2 https://www.rfc-editor.org/rfc/rfc4643#section-2",
                     input: b"AUTHINFO FROBNICATE bench\r\n",
                     expected: b"501 command syntax error\r\n",
+                },
+            ])
+            .await;
+        }
+
+        #[tokio::test]
+        async fn rfc4643_red_authinfo_user_pass_accept_b_char_values() {
+            assert_red_server_response_cases(&[
+                ServerResponseCase {
+                    name: "AUTHINFO USER value with space",
+                    reference: "RFC 4643 sections 2.3 and 3.1 https://www.rfc-editor.org/rfc/rfc4643#section-3.1",
+                    input: b"AUTHINFO USER bench user\r\n",
+                    expected: b"483 command unavailable until TLS has been negotiated\r\n",
+                },
+                ServerResponseCase {
+                    name: "AUTHINFO PASS value with tab",
+                    reference: "RFC 4643 sections 2.3 and 3.1 https://www.rfc-editor.org/rfc/rfc4643#section-3.1",
+                    input: b"AUTHINFO PASS bench\tpass\r\n",
+                    expected: b"483 command unavailable until TLS has been negotiated\r\n",
+                },
+                ServerResponseCase {
+                    name: "AUTHINFO USER non-UTF-8 B-CHAR value",
+                    reference: "RFC 4643 section 3.1 and RFC 3977 section 9.8 https://www.rfc-editor.org/rfc/rfc4643#section-3.1",
+                    input: b"AUTHINFO USER bench\xffuser\r\n",
+                    expected: b"483 command unavailable until TLS has been negotiated\r\n",
                 },
             ])
             .await;
@@ -7955,16 +7981,6 @@ mod tests {
                         "HDR metadata name rejects bare colon",
                         "RFC 3977 section 8.5.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.2",
                         HeaderName::from_borrowed(":").is_err(),
-                    ),
-                    (
-                        "AUTHINFO value rejects space",
-                        "RFC 4643 section 2.3 https://www.rfc-editor.org/rfc/rfc4643#section-2.3",
-                        AuthInfoValue::from_borrowed("bench user").is_err(),
-                    ),
-                    (
-                        "AUTHINFO value rejects tab",
-                        "RFC 4643 section 2.3 https://www.rfc-editor.org/rfc/rfc4643#section-2.3",
-                        AuthInfoValue::from_borrowed("bench\tuser").is_err(),
                     ),
                     (
                         "group name rejects comma separator",
@@ -8198,6 +8214,18 @@ mod tests {
                         b"AUTHINFO\tUSER bench\r\n",
                         RequestKind::AuthInfoUser,
                         "RFC 4643 section 2 and RFC 3977 section 9.2 https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
+                    ),
+                    (
+                        "AUTHINFO USER space in value",
+                        b"AUTHINFO USER bench user\r\n",
+                        RequestKind::AuthInfoUser,
+                        "RFC 4643 section 3.1 https://www.rfc-editor.org/rfc/rfc4643#section-3.1",
+                    ),
+                    (
+                        "AUTHINFO PASS non-UTF-8 B-CHAR value",
+                        b"AUTHINFO PASS pass\xffword\r\n",
+                        RequestKind::AuthInfoPass,
+                        "RFC 4643 section 3.1 and RFC 3977 section 9.8 https://www.rfc-editor.org/rfc/rfc4643#section-3.1",
                     ),
                 ]);
             }
@@ -11720,7 +11748,7 @@ mod tests {
             ClientError::MissingAuthInfoValue
         ));
 
-        auth_args.auth_value = Some("bench user".to_string());
+        auth_args.auth_value = Some("bad\nvalue".to_string());
         assert!(matches!(
             fetch_response(&auth_args).await.unwrap_err(),
             ClientError::InvalidAuthInfoValue
