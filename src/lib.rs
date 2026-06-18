@@ -2693,17 +2693,6 @@ where
             Ok(false)
         }
         RequestKind::Ihave => {
-            if command.has_transfer_body {
-                write_response(writer, pending_write, IHAVE_RESPONSE, session_stats).await?;
-                write_response(
-                    writer,
-                    pending_write,
-                    b"235 article transferred ok\r\n",
-                    session_stats,
-                )
-                .await?;
-                return Ok(false);
-            }
             write_response(
                 writer,
                 pending_write,
@@ -3239,7 +3228,7 @@ where
         RequestKind::NewGroups => NEWGROUPS_RESPONSE,
         RequestKind::NewNews => NEWNEWS_RESPONSE,
         RequestKind::Post => b"440 posting not permitted\r\n",
-        RequestKind::Ihave => IHAVE_RESPONSE,
+        RequestKind::Ihave => b"435 article not wanted\r\n",
         RequestKind::Check | RequestKind::TakeThis | RequestKind::StartTls => {
             b"502 command unavailable\r\n"
         }
@@ -5281,16 +5270,17 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc3977_red_ihave_continuation_is_consumed_before_next_command() {
-            // RFC 3977 sections 3.1.1 and 6.3.2 require IHAVE to read the
-            // dot-terminated article data block after a 335 continuation:
+        async fn rfc3977_red_ihave_rejection_consumes_pipelined_body_before_next_command() {
+            // RFC 3977 section 6.3.2 permits 435 when an article is not wanted.
+            // The mock server may discard an already-sent body to recover the
+            // next command, but it must not emit 335/235 when rejecting:
             // https://www.rfc-editor.org/rfc/rfc3977#section-6.3.2
             let input = b"IHAVE <article@test>\r\nSubject: one\r\n\r\nbody\r\n.\r\nQUIT\r\n";
             let (output, _) = run_session_with_input(test_config(), input).await;
             assert_eq!(
                 without_greeting(&output),
-                b"335 send article to be transferred\r\n235 article transferred ok\r\n205 closing connection\r\n",
-                "RFC 3977 IHAVE continuation should consume the article before QUIT"
+                b"435 article not wanted\r\n205 closing connection\r\n",
+                "RFC 3977 rejected IHAVE should not invite transfer and should recover QUIT"
             );
         }
 
@@ -10206,7 +10196,7 @@ mod tests {
             output,
             [
                 b"440 posting not permitted\r\n".as_slice(),
-                IHAVE_RESPONSE,
+                b"435 article not wanted\r\n".as_slice(),
                 b"502 command unavailable\r\n",
                 b"502 command unavailable\r\n",
                 AUTHINFO_USER_RESPONSE,
