@@ -2935,6 +2935,9 @@ fn validate_overview_optional_field(field: &[u8]) -> bool {
 }
 
 fn validate_header_response_line(line: &[u8]) -> bool {
+    if validate_response_article_number(line) {
+        return true;
+    }
     validate_header_response_line_with_key(line, validate_response_article_number)
 }
 

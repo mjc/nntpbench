@@ -9203,6 +9203,12 @@ mod tests {
                         frame: b"225 headers follow\r\n1 \r\n2 value\r\n.\r\n",
                     },
                     ResponseFrameCase {
+                        name: "HDR accepts omitted space for empty hdr-content",
+                        reference: "RFC 3977 section 8.5.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.2",
+                        kind: RequestKind::Hdr,
+                        frame: b"225 headers follow\r\n1\r\n2 value\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "XHDR accepts message-id response row key",
                         reference: "RFC 2980 section 2.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.6",
                         kind: RequestKind::Xhdr,
@@ -9910,12 +9916,6 @@ mod tests {
                         reference: "RFC 3977 section 8.5.1 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.1",
                         kind: RequestKind::Hdr,
                         frame: b"225 headers follow\r\n1\tvalue\r\n.\r\n",
-                    },
-                    ResponseFrameCase {
-                        name: "HDR rejects missing space before empty hdr-content",
-                        reference: "RFC 3977 sections 8.5.1 and 9.4.3 https://www.rfc-editor.org/rfc/rfc3977#section-9.4.3",
-                        kind: RequestKind::Hdr,
-                        frame: b"225 headers follow\r\n1\r\n.\r\n",
                     },
                     ResponseFrameCase {
                         name: "HDR rejects TAB inside hdr-content",
