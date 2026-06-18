@@ -8486,10 +8486,10 @@ mod tests {
                         frame: b"100 help follows\r\nCommands include CAPABILITIES\r\nUTF-8 caf\xc3\xa9\r\n.\r\n",
                     },
                     ResponseFrameCase {
-                        name: "HDR accepts omitted space for empty field content",
-                        reference: "RFC 3977 section 8.5.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.2",
+                        name: "HDR accepts empty hdr-content after required space",
+                        reference: "RFC 3977 sections 8.5.1 and 9.4.3 https://www.rfc-editor.org/rfc/rfc3977#section-9.4.3",
                         kind: RequestKind::Hdr,
-                        frame: b"225 headers follow\r\n1\r\n2 value\r\n.\r\n",
+                        frame: b"225 headers follow\r\n1 \r\n2 value\r\n.\r\n",
                     },
                 ]);
             }
@@ -8925,6 +8925,12 @@ mod tests {
                         frame: b"225 headers follow\r\n1\tvalue\r\n.\r\n",
                     },
                     ResponseFrameCase {
+                        name: "HDR rejects missing space before empty hdr-content",
+                        reference: "RFC 3977 sections 8.5.1 and 9.4.3 https://www.rfc-editor.org/rfc/rfc3977#section-9.4.3",
+                        kind: RequestKind::Hdr,
+                        frame: b"225 headers follow\r\n1\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "HDR rejects TAB inside hdr-content",
                         reference: "RFC 3977 sections 8.5.1 and 9.4.3 https://www.rfc-editor.org/rfc/rfc3977#section-9.4.3",
                         kind: RequestKind::Hdr,
@@ -8947,6 +8953,12 @@ mod tests {
                         reference: "RFC 2980 section 2.1.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.6",
                         kind: RequestKind::Xhdr,
                         frame: b"221 headers follow\r\none value\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "XHDR rejects missing space before header value",
+                        reference: "RFC 2980 section 2.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.6",
+                        kind: RequestKind::Xhdr,
+                        frame: b"221 headers follow\r\n1\r\n.\r\n",
                     },
                     ResponseFrameCase {
                         name: "CHECK rejects success response without message-id",
