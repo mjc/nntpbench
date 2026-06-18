@@ -8788,6 +8788,12 @@ mod tests {
                         frame: b"101 capability list follows\r\nVERSION 2\r\nIMPLEMENTATION caf\xc3\xa9 build!\r\n.\r\n",
                     },
                     ResponseFrameCase {
+                        name: "CAPABILITIES accepts RFC extension capability shapes",
+                        reference: "RFC 4642 section 3.2, RFC 4643 section 3.4, and RFC 4644 section 3.4 https://www.rfc-editor.org/rfc/rfc4643#section-3.4",
+                        kind: RequestKind::Capabilities,
+                        frame: b"101 capability list follows\r\nVERSION 2\r\nSTARTTLS\r\nSTREAMING\r\nAUTHINFO USER SASL\r\nSASL CRAM-MD5 DIGEST-MD5 GSSAPI PLAIN EXTERNAL\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "HELP accepts UTF-8 multiline text",
                         reference: "RFC 3977 section 7.2 https://www.rfc-editor.org/rfc/rfc3977#section-7.2",
                         kind: RequestKind::Help,
@@ -9195,6 +9201,36 @@ mod tests {
                         reference: "RFC 3977 section 9.5 https://www.rfc-editor.org/rfc/rfc3977#section-9.5",
                         kind: RequestKind::Capabilities,
                         frame: b"101 Capability list:\r\nVERSION 2\r\nOVER RANGE\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "CAPABILITIES rejects STARTTLS capability argument",
+                        reference: "RFC 4642 sections 3.2 and 6 https://www.rfc-editor.org/rfc/rfc4642#section-3.2",
+                        kind: RequestKind::Capabilities,
+                        frame: b"101 Capability list:\r\nVERSION 2\r\nSTARTTLS available\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "CAPABILITIES rejects STREAMING capability argument",
+                        reference: "RFC 4644 sections 3.4 and 6 https://www.rfc-editor.org/rfc/rfc4644#section-3.4",
+                        kind: RequestKind::Capabilities,
+                        frame: b"101 Capability list:\r\nVERSION 2\r\nSTREAMING feed\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "CAPABILITIES rejects AUTHINFO unknown variant",
+                        reference: "RFC 4643 section 3.4 https://www.rfc-editor.org/rfc/rfc4643#section-3.4",
+                        kind: RequestKind::Capabilities,
+                        frame: b"101 Capability list:\r\nVERSION 2\r\nAUTHINFO USER PASS\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "CAPABILITIES rejects SASL without mechanisms",
+                        reference: "RFC 4643 sections 3.4 and 3.5 https://www.rfc-editor.org/rfc/rfc4643#section-3.4",
+                        kind: RequestKind::Capabilities,
+                        frame: b"101 Capability list:\r\nVERSION 2\r\nSASL\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "CAPABILITIES rejects malformed SASL mechanism",
+                        reference: "RFC 4643 sections 3.4 and 3.5 https://www.rfc-editor.org/rfc/rfc4643#section-3.5",
+                        kind: RequestKind::Capabilities,
+                        frame: b"101 Capability list:\r\nVERSION 2\r\nSASL plain PLAIN.TEST ABCDEFGHIJKLMNOPQRSTU\r\n.\r\n",
                     },
                     ResponseFrameCase {
                         name: "OVER rejects body row without tab-separated overview fields",

@@ -2978,6 +2978,8 @@ fn validate_known_capability_response_line(label: &[u8], mut rest: &[u8]) -> Opt
         b"NEWNEWS".as_slice(),
         b"POST".as_slice(),
         b"READER".as_slice(),
+        b"STARTTLS".as_slice(),
+        b"STREAMING".as_slice(),
     ]
     .iter()
     .any(|known| label.eq_ignore_ascii_case(known))
@@ -3021,6 +3023,37 @@ fn validate_known_capability_response_line(label: &[u8], mut rest: &[u8]) -> Opt
             return Some(false);
         };
         return Some(next.is_empty() && token.eq_ignore_ascii_case(b"MSGID"));
+    }
+
+    if label.eq_ignore_ascii_case(b"AUTHINFO") {
+        while !rest.is_empty() {
+            let Some((token, next)) = split_response_ws_token(rest) else {
+                return Some(false);
+            };
+            if ![b"USER".as_slice(), b"SASL".as_slice()]
+                .iter()
+                .any(|known| token.eq_ignore_ascii_case(known))
+            {
+                return Some(false);
+            }
+            rest = next;
+        }
+        return Some(true);
+    }
+
+    if label.eq_ignore_ascii_case(b"SASL") {
+        let mut seen_mechanism = false;
+        while !rest.is_empty() {
+            let Some((token, next)) = split_response_ws_token(rest) else {
+                return Some(false);
+            };
+            if validate_sasl_mechanism(token).is_err() {
+                return Some(false);
+            }
+            seen_mechanism = true;
+            rest = next;
+        }
+        return Some(seen_mechanism);
     }
 
     None
