@@ -7614,6 +7614,12 @@ mod tests {
                     expected: b"501 command syntax error\r\n",
                 },
                 ServerResponseCase {
+                    name: "NEWGROUPS accepts leap second",
+                    reference: "RFC 3977 section 7.3.2 https://www.rfc-editor.org/rfc/rfc3977#section-7.3.2",
+                    input: b"NEWGROUPS 20260101 235960 GMT\r\n",
+                    expected: NEWGROUPS_RESPONSE,
+                },
+                ServerResponseCase {
                     name: "NEWNEWS invalid date",
                     reference: "RFC 3977 sections 7.4.1 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-7.4.1",
                     input: b"NEWNEWS comp.lang.* 20260230 000000 GMT\r\n",
@@ -7624,6 +7630,12 @@ mod tests {
                     reference: "RFC 3977 sections 7.4.1 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-7.4.1",
                     input: b"NEWNEWS comp.lang.* 20260101 246060 GMT\r\n",
                     expected: b"501 command syntax error\r\n",
+                },
+                ServerResponseCase {
+                    name: "NEWNEWS accepts leap second",
+                    reference: "RFC 3977 sections 7.3.2 and 7.4.2 https://www.rfc-editor.org/rfc/rfc3977#section-7.3.2",
+                    input: b"NEWNEWS comp.lang.* 20260101 235960 GMT\r\n",
+                    expected: NEWNEWS_EMPTY_RESPONSE,
                 },
                 ServerResponseCase {
                     name: "NEWNEWS invalid timezone",
@@ -7901,14 +7913,14 @@ mod tests {
                         NntpDate::from_borrowed("20261131").is_err(),
                     ),
                     (
-                        "time rejects leap second before midnight",
-                        "RFC 3977 section 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
-                        NntpTime::from_borrowed("235960").is_err(),
+                        "time accepts leap second before midnight",
+                        "RFC 3977 section 7.3.2 https://www.rfc-editor.org/rfc/rfc3977#section-7.3.2",
+                        NntpTime::from_borrowed("235960").is_ok(),
                     ),
                     (
-                        "time rejects leap second",
-                        "RFC 3977 section 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
-                        NntpTime::from_borrowed("000060").is_err(),
+                        "time accepts leap second",
+                        "RFC 3977 section 7.3.2 https://www.rfc-editor.org/rfc/rfc3977#section-7.3.2",
+                        NntpTime::from_borrowed("000060").is_ok(),
                     ),
                     (
                         "wildmat rejects ! outside negation marker",

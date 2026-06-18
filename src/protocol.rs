@@ -2050,7 +2050,7 @@ fn validate_nntp_time(value: &str) -> Result<(), InvalidNntpTime> {
     let hour = parse_two_digits(&bytes[..2]).ok_or(InvalidNntpTime)?;
     let minute = parse_two_digits(&bytes[2..4]).ok_or(InvalidNntpTime)?;
     let second = parse_two_digits(&bytes[4..]).ok_or(InvalidNntpTime)?;
-    if hour > 23 || minute > 59 || second > 59 {
+    if hour > 23 || minute > 59 || second > 60 {
         return Err(InvalidNntpTime);
     }
 
@@ -4241,6 +4241,10 @@ mod tests {
         assert_eq!(
             NntpTime::from_borrowed("235959").unwrap().as_str(),
             "235959"
+        );
+        assert_eq!(
+            NntpTime::from_borrowed("235960").unwrap().as_str(),
+            "235960"
         );
         assert_eq!(
             Wildmat::from_borrowed("comp.lang.*,alt.test")
