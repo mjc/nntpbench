@@ -159,9 +159,7 @@ pub const STAT_RESPONSE: &[u8] = b"223 1 <article.1@nntpbench.local> article ret
 pub const HELP_RESPONSE: &[u8] =
     b"100 help text follows\r\nARTICLE\r\nHEAD\r\nBODY\r\nSTAT\r\nLIST\r\nCAPABILITIES\r\nDATE\r\nMODE READER\r\nQUIT\r\n.\r\n";
 pub const CAPABILITIES_RESPONSE: &[u8] =
-    b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nAUTHINFO USER\r\n.\r\n";
-const AUTHENTICATED_CAPABILITIES_RESPONSE: &[u8] =
-    b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n";
+    b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nAUTHINFO\r\n.\r\n";
 pub const QUIT_RESPONSE: &[u8] = b"205 closing connection\r\n";
 pub const ARTICLE_NOT_FOUND_RESPONSE: &[u8] = b"430 no article with that number\r\n";
 const BODY_RESPONSE_PREFIX: &[u8] = b"222 1 <article.1@nntpbench.local> body follows\r\n";
@@ -2282,8 +2280,6 @@ enum BatchOutcome {
 struct SessionState {
     group_selected: bool,
     current_article: Option<u64>,
-    authinfo_user_pending: bool,
-    authenticated: bool,
 }
 
 impl BatchOutcome {
@@ -2723,57 +2719,26 @@ where
             Ok(false)
         }
         RequestKind::AuthInfoUser => {
-            if session_state.authenticated {
-                write_response(
-                    writer,
-                    pending_write,
-                    b"502 command unavailable\r\n",
-                    session_stats,
-                )
-                .await?;
-                return Ok(false);
-            }
-            session_state.authinfo_user_pending = true;
-            write_response(writer, pending_write, AUTHINFO_USER_RESPONSE, session_stats).await?;
-            Ok(false)
-        }
-        RequestKind::AuthInfoPass => {
-            if session_state.authenticated {
-                write_response(
-                    writer,
-                    pending_write,
-                    b"502 command unavailable\r\n",
-                    session_stats,
-                )
-                .await?;
-                return Ok(false);
-            }
-            if session_state.authinfo_user_pending {
-                session_state.authinfo_user_pending = false;
-                session_state.authenticated = true;
-                write_response(writer, pending_write, AUTHINFO_RESPONSE, session_stats).await?;
-                return Ok(false);
-            }
             write_response(
                 writer,
                 pending_write,
-                b"482 authentication commands issued out of sequence\r\n",
+                b"483 command unavailable until TLS has been negotiated\r\n",
+                session_stats,
+            )
+            .await?;
+            Ok(false)
+        }
+        RequestKind::AuthInfoPass => {
+            write_response(
+                writer,
+                pending_write,
+                b"483 command unavailable until TLS has been negotiated\r\n",
                 session_stats,
             )
             .await?;
             Ok(false)
         }
         RequestKind::AuthInfo => {
-            if session_state.authenticated {
-                write_response(
-                    writer,
-                    pending_write,
-                    b"502 command unavailable\r\n",
-                    session_stats,
-                )
-                .await?;
-                return Ok(false);
-            }
             write_response(
                 writer,
                 pending_write,
@@ -2838,12 +2803,7 @@ where
             Ok(false)
         }
         RequestKind::Capabilities => {
-            let response = if session_state.authenticated {
-                AUTHENTICATED_CAPABILITIES_RESPONSE
-            } else {
-                CAPABILITIES_RESPONSE
-            };
-            write_response(writer, pending_write, response, session_stats).await?;
+            write_response(writer, pending_write, CAPABILITIES_RESPONSE, session_stats).await?;
             Ok(false)
         }
         RequestKind::Help => {
@@ -3279,8 +3239,9 @@ where
         RequestKind::Check | RequestKind::TakeThis | RequestKind::StartTls => {
             b"502 command unavailable\r\n"
         }
-        RequestKind::AuthInfoUser => AUTHINFO_USER_RESPONSE,
-        RequestKind::AuthInfoPass => AUTHINFO_RESPONSE,
+        RequestKind::AuthInfoUser | RequestKind::AuthInfoPass => {
+            b"483 command unavailable until TLS has been negotiated\r\n"
+        }
         RequestKind::AuthInfo => b"504 unsupported authentication mechanism\r\n",
         RequestKind::Over => OVER_RESPONSE,
         RequestKind::Xover => XOVER_RESPONSE,
@@ -5302,45 +5263,43 @@ mod tests {
                 "missing required RFC 3977 base capabilities, got {text:?}"
             );
             assert!(
-                text.contains("AUTHINFO USER"),
-                "missing supported RFC 4643 AUTHINFO USER capability, got {text:?}"
+                text.contains("AUTHINFO\r\n"),
+                "missing RFC 4643 AUTHINFO capability marker, got {text:?}"
             );
             assert!(
-                !text.contains("STARTTLS") && !text.contains("SASL") && !text.contains("STREAMING"),
+                !text.contains("AUTHINFO USER")
+                    && !text.contains("STARTTLS")
+                    && !text.contains("SASL")
+                    && !text.contains("STREAMING"),
                 "advertised unavailable extension capability, got {text:?}"
             );
         }
 
         #[tokio::test]
-        async fn rfc4643_red_authenticated_sessions_reject_authinfo_and_hide_capability() {
-            // RFC 4643 section 2 requires a server, after successful
-            // authentication, to stop advertising AUTHINFO and reject subsequent
-            // AUTHINFO commands with 502:
-            // https://www.rfc-editor.org/rfc/rfc4643#section-2
+        async fn rfc4643_red_plaintext_user_pass_not_advertised_or_accepted() {
+            // RFC 4643 sections 2.1 and 2.3.2 say AUTHINFO USER/PASS should
+            // not be advertised without an active strong encryption layer, and
+            // PASS must not be implemented without TLS support. RFC 3977 section
+            // 3.2.1 defines 483 for insufficient security:
+            // https://www.rfc-editor.org/rfc/rfc4643#section-2.3.2
             assert_red_server_response_cases(&[
                 ServerResponseCase {
-                    name: "CAPABILITIES after AUTHINFO PASS omits AUTHINFO",
-                    reference: "RFC 4643 section 2 https://www.rfc-editor.org/rfc/rfc4643#section-2",
-                    input: b"AUTHINFO USER bench\r\nAUTHINFO PASS pass\r\nCAPABILITIES\r\n",
-                    expected: b"381 more authentication information required\r\n281 authentication accepted\r\n101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n",
+                    name: "AUTHINFO USER rejected before TLS",
+                    reference: "RFC 4643 section 2.3.2 https://www.rfc-editor.org/rfc/rfc4643#section-2.3.2",
+                    input: b"AUTHINFO USER bench\r\n",
+                    expected: b"483 command unavailable until TLS has been negotiated\r\n",
                 },
                 ServerResponseCase {
-                    name: "AUTHINFO USER after authentication returns 502",
-                    reference: "RFC 4643 section 2 https://www.rfc-editor.org/rfc/rfc4643#section-2",
-                    input: b"AUTHINFO USER bench\r\nAUTHINFO PASS pass\r\nAUTHINFO USER again\r\n",
-                    expected: b"381 more authentication information required\r\n281 authentication accepted\r\n502 command unavailable\r\n",
+                    name: "AUTHINFO PASS rejected before TLS",
+                    reference: "RFC 4643 section 2.3.2 https://www.rfc-editor.org/rfc/rfc4643#section-2.3.2",
+                    input: b"AUTHINFO PASS pass\r\n",
+                    expected: b"483 command unavailable until TLS has been negotiated\r\n",
                 },
                 ServerResponseCase {
-                    name: "AUTHINFO PASS after authentication returns 502",
-                    reference: "RFC 4643 section 2 https://www.rfc-editor.org/rfc/rfc4643#section-2",
-                    input: b"AUTHINFO USER bench\r\nAUTHINFO PASS pass\r\nAUTHINFO PASS again\r\n",
-                    expected: b"381 more authentication information required\r\n281 authentication accepted\r\n502 command unavailable\r\n",
-                },
-                ServerResponseCase {
-                    name: "AUTHINFO SASL after authentication returns 502",
-                    reference: "RFC 4643 section 2 https://www.rfc-editor.org/rfc/rfc4643#section-2",
-                    input: b"AUTHINFO USER bench\r\nAUTHINFO PASS pass\r\nAUTHINFO SASL PLAIN\r\n",
-                    expected: b"381 more authentication information required\r\n281 authentication accepted\r\n502 command unavailable\r\n",
+                    name: "AUTHINFO USER does not enable PASS without TLS",
+                    reference: "RFC 4643 section 2.3.2 https://www.rfc-editor.org/rfc/rfc4643#section-2.3.2",
+                    input: b"AUTHINFO USER bench\r\nAUTHINFO PASS pass\r\n",
+                    expected: b"483 command unavailable until TLS has been negotiated\r\n483 command unavailable until TLS has been negotiated\r\n",
                 },
             ])
             .await;
@@ -5357,15 +5316,16 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc4643_red_authinfo_pass_before_user_is_rejected() {
-            // RFC 4643 section 2 defines AUTHINFO stateful authentication. PASS
-            // before a USER challenge must not authenticate the session:
-            // https://www.rfc-editor.org/rfc/rfc4643#section-2
+        async fn rfc4643_red_authinfo_pass_before_tls_is_rejected() {
+            // RFC 4643 section 2.3.2 says AUTHINFO PASS must not be
+            // implemented without TLS support, and 483 reports an insufficiently
+            // secure datastream:
+            // https://www.rfc-editor.org/rfc/rfc4643#section-2.3.2
             let input = b"AUTHINFO PASS bench-pass\r\n";
             let (output, _) = run_session_with_input(test_config(), input).await;
             assert_single_response(
                 input,
-                b"482 authentication commands issued out of sequence\r\n",
+                b"483 command unavailable until TLS has been negotiated\r\n",
                 &output,
                 "RFC 4643",
             );
@@ -6928,8 +6888,6 @@ mod tests {
         let mut session_state = SessionState {
             group_selected: true,
             current_article: Some(1),
-            authinfo_user_pending: false,
-            authenticated: false,
         };
         let mut writer = FailingWriter;
         let command = ParsedCommand {
@@ -10096,8 +10054,8 @@ mod tests {
                 b"435 article not wanted\r\n",
                 b"502 command unavailable\r\n",
                 b"502 command unavailable\r\n",
-                AUTHINFO_USER_RESPONSE,
-                AUTHINFO_RESPONSE,
+                b"483 command unavailable until TLS has been negotiated\r\n",
+                b"483 command unavailable until TLS has been negotiated\r\n",
                 b"502 command unavailable\r\n",
             ]
             .concat()
@@ -10566,8 +10524,8 @@ mod tests {
                 b"435 article not wanted\r\n".as_slice(),
                 b"502 command unavailable\r\n",
                 b"502 command unavailable\r\n",
-                AUTHINFO_USER_RESPONSE,
-                AUTHINFO_RESPONSE,
+                b"483 command unavailable until TLS has been negotiated\r\n",
+                b"483 command unavailable until TLS has been negotiated\r\n",
                 b"504 unsupported authentication mechanism\r\n",
                 b"502 command unavailable\r\n",
             ]
