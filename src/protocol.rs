@@ -1873,7 +1873,7 @@ fn validate_auth_info_value(value: &str) -> Result<(), InvalidAuthInfoValue> {
     if value.is_empty()
         || value
             .bytes()
-            .any(|byte| matches!(byte, b'\0' | b'\r' | b'\n'))
+            .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
     {
         return Err(InvalidAuthInfoValue);
     }
@@ -4172,14 +4172,16 @@ mod tests {
     #[test]
     fn auth_info_values_validate() {
         assert_eq!(
-            AuthInfoValue::from_borrowed("user name").unwrap().as_str(),
-            "user name"
+            AuthInfoValue::from_borrowed("user-name").unwrap().as_str(),
+            "user-name"
         );
         assert_eq!(
-            AuthInfoValue::from_borrowed("pass\tword").unwrap().as_str(),
-            "pass\tword"
+            AuthInfoValue::from_borrowed("pass-word").unwrap().as_str(),
+            "pass-word"
         );
         assert!(AuthInfoValue::from_borrowed("").is_err());
+        assert!(AuthInfoValue::from_borrowed("user name").is_err());
+        assert!(AuthInfoValue::from_borrowed("pass\tword").is_err());
         assert!(AuthInfoValue::from_borrowed("bad\rvalue").is_err());
         assert!(AuthInfoValue::from_borrowed("bad\nvalue").is_err());
     }
@@ -4703,11 +4705,11 @@ mod tests {
         };
         let authinfo_user = Request::AuthInfo {
             kind: AuthInfoKind::User,
-            value: AuthInfoValue::from_borrowed("user name").unwrap(),
+            value: AuthInfoValue::from_borrowed("user-name").unwrap(),
         };
         let authinfo_pass = Request::AuthInfo {
             kind: AuthInfoKind::Pass,
-            value: AuthInfoValue::from_borrowed("pass word").unwrap(),
+            value: AuthInfoValue::from_borrowed("pass-word").unwrap(),
         };
         let starttls = Request::StartTls;
         let list = Request::List;
@@ -4852,12 +4854,12 @@ mod tests {
         wire.clear();
         authinfo_user.write_wire_to(&mut wire);
         assert_eq!(authinfo_user.kind(), RequestKind::AuthInfoUser);
-        assert_eq!(wire, b"AUTHINFO USER user name\r\n");
+        assert_eq!(wire, b"AUTHINFO USER user-name\r\n");
 
         wire.clear();
         authinfo_pass.write_wire_to(&mut wire);
         assert_eq!(authinfo_pass.kind(), RequestKind::AuthInfoPass);
-        assert_eq!(wire, b"AUTHINFO PASS pass word\r\n");
+        assert_eq!(wire, b"AUTHINFO PASS pass-word\r\n");
 
         wire.clear();
         starttls.write_wire_to(&mut wire);
@@ -4957,8 +4959,8 @@ mod tests {
         let ihave = Request::ihave("ihave@test").unwrap();
         let check = Request::check("check@test").unwrap();
         let takethis = Request::takethis("take@test", b"Subject: one\r\n\r\nbody").unwrap();
-        let authinfo_user = Request::authinfo_user("user name").unwrap();
-        let authinfo_pass = Request::authinfo_pass("pass\tword").unwrap();
+        let authinfo_user = Request::authinfo_user("user-name").unwrap();
+        let authinfo_pass = Request::authinfo_pass("pass-word").unwrap();
         let starttls = Request::starttls();
         let list = Request::list();
         let list_active = Request::list_active();
@@ -5091,14 +5093,14 @@ mod tests {
             authinfo_user
                 .auth_info()
                 .map(|(kind, value)| (kind, value.as_str())),
-            Some((AuthInfoKind::User, "user name"))
+            Some((AuthInfoKind::User, "user-name"))
         );
         assert_eq!(authinfo_pass.kind(), RequestKind::AuthInfoPass);
         assert_eq!(
             authinfo_pass
                 .auth_info()
                 .map(|(kind, value)| (kind, value.as_str())),
-            Some((AuthInfoKind::Pass, "pass\tword"))
+            Some((AuthInfoKind::Pass, "pass-word"))
         );
         assert_eq!(starttls.kind(), RequestKind::StartTls);
         assert!(starttls.message_id().is_none());
@@ -5164,6 +5166,8 @@ mod tests {
         assert!(Request::newnews("", "20260101", "000000", false).is_err());
         assert!(Request::list_active_wildmat("").is_err());
         assert!(Request::authinfo_user("").is_err());
+        assert!(Request::authinfo_user("user name").is_err());
+        assert!(Request::authinfo_pass("pass\tword").is_err());
         assert!(Request::authinfo_pass("bad\nvalue").is_err());
     }
 

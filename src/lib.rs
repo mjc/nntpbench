@@ -6939,6 +6939,16 @@ mod tests {
                         HeaderName::from_borrowed(":").is_err(),
                     ),
                     (
+                        "AUTHINFO value rejects space",
+                        "RFC 4643 section 2.3 https://www.rfc-editor.org/rfc/rfc4643#section-2.3",
+                        AuthInfoValue::from_borrowed("bench user").is_err(),
+                    ),
+                    (
+                        "AUTHINFO value rejects tab",
+                        "RFC 4643 section 2.3 https://www.rfc-editor.org/rfc/rfc4643#section-2.3",
+                        AuthInfoValue::from_borrowed("bench\tuser").is_err(),
+                    ),
+                    (
                         "group name rejects comma separator",
                         "RFC 3977 section 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
                         GroupName::from_borrowed("alt.test,comp.test").is_err(),
@@ -9888,13 +9898,13 @@ mod tests {
             let (mut fifth, _) = listener.accept().await.unwrap();
             fifth.write_all(b"201 fetch ready\r\n").await.unwrap();
             let read = fifth.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"AUTHINFO USER bench user\r\n");
+            assert_eq!(&request[..read], b"AUTHINFO USER bench-user\r\n");
             fifth.write_all(AUTHINFO_RESPONSE).await.unwrap();
 
             let (mut sixth, _) = listener.accept().await.unwrap();
             sixth.write_all(b"201 fetch ready\r\n").await.unwrap();
             let read = sixth.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"AUTHINFO PASS bench pass\r\n");
+            assert_eq!(&request[..read], b"AUTHINFO PASS bench-pass\r\n");
             sixth.write_all(AUTHINFO_RESPONSE).await.unwrap();
 
             let (mut seventh, _) = listener.accept().await.unwrap();
@@ -9941,7 +9951,7 @@ mod tests {
         auth_user_args.connect = addr;
         auth_user_args.request = FetchRequestKind::AuthinfoUser;
         auth_user_args.message_id = None;
-        auth_user_args.auth_value = Some("bench user".to_string());
+        auth_user_args.auth_value = Some("bench-user".to_string());
         let auth_user = fetch_response(&auth_user_args).await.unwrap();
         assert_eq!(auth_user.kind(), RequestKind::AuthInfoUser);
         assert_eq!(auth_user.status().as_u16(), 281);
@@ -9950,7 +9960,7 @@ mod tests {
         auth_pass_args.connect = addr;
         auth_pass_args.request = FetchRequestKind::AuthinfoPass;
         auth_pass_args.message_id = None;
-        auth_pass_args.auth_value = Some("bench pass".to_string());
+        auth_pass_args.auth_value = Some("bench-pass".to_string());
         let auth_pass = fetch_response(&auth_pass_args).await.unwrap();
         assert_eq!(auth_pass.kind(), RequestKind::AuthInfoPass);
         assert_eq!(auth_pass.status().as_u16(), 281);
@@ -10145,6 +10155,12 @@ mod tests {
         assert!(matches!(
             fetch_response(&auth_args).await.unwrap_err(),
             ClientError::MissingAuthInfoValue
+        ));
+
+        auth_args.auth_value = Some("bench user".to_string());
+        assert!(matches!(
+            fetch_response(&auth_args).await.unwrap_err(),
+            ClientError::InvalidAuthInfoValue
         ));
     }
 

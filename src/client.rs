@@ -4681,9 +4681,9 @@ mod tests {
             )
             .await;
             stream.write_all(crate::TAKETHIS_RESPONSE).await.unwrap();
-            assert_read_request(&mut stream, b"AUTHINFO USER bench user\r\n").await;
+            assert_read_request(&mut stream, b"AUTHINFO USER bench-user\r\n").await;
             stream.write_all(crate::AUTHINFO_RESPONSE).await.unwrap();
-            assert_read_request(&mut stream, b"AUTHINFO PASS bench pass\r\n").await;
+            assert_read_request(&mut stream, b"AUTHINFO PASS bench-pass\r\n").await;
             stream.write_all(crate::AUTHINFO_RESPONSE).await.unwrap();
             assert_read_request(&mut stream, b"STARTTLS\r\n").await;
             stream.write_all(crate::STARTTLS_RESPONSE).await.unwrap();
@@ -4707,11 +4707,11 @@ mod tests {
             .await
             .unwrap();
         let auth_user = connection
-            .authinfo_user(AuthInfoValue::from_owned("bench user").unwrap())
+            .authinfo_user(AuthInfoValue::from_owned("bench-user").unwrap())
             .await
             .unwrap();
         let auth_pass = connection
-            .authinfo_pass(AuthInfoValue::from_owned("bench pass").unwrap())
+            .authinfo_pass(AuthInfoValue::from_owned("bench-pass").unwrap())
             .await
             .unwrap();
         let starttls = connection.starttls().await.unwrap();
@@ -5208,9 +5208,9 @@ mod tests {
             )
             .await;
             stream.write_all(crate::TAKETHIS_RESPONSE).await.unwrap();
-            assert_read_request(&mut stream, b"AUTHINFO USER bench user\r\n").await;
+            assert_read_request(&mut stream, b"AUTHINFO USER bench-user\r\n").await;
             stream.write_all(crate::AUTHINFO_RESPONSE).await.unwrap();
-            assert_read_request(&mut stream, b"AUTHINFO PASS bench pass\r\n").await;
+            assert_read_request(&mut stream, b"AUTHINFO PASS bench-pass\r\n").await;
             stream.write_all(crate::AUTHINFO_RESPONSE).await.unwrap();
             assert_read_request(&mut stream, b"STARTTLS\r\n").await;
             stream.write_all(crate::STARTTLS_RESPONSE).await.unwrap();
@@ -5227,8 +5227,8 @@ mod tests {
             )
             .await
             .unwrap();
-        let auth_user = client.authinfo_user("bench user").await.unwrap();
-        let auth_pass = client.authinfo_pass("bench pass").await.unwrap();
+        let auth_user = client.authinfo_user("bench-user").await.unwrap();
+        let auth_pass = client.authinfo_pass("bench-pass").await.unwrap();
         let starttls = client.starttls_exchange().await.unwrap();
 
         assert_eq!(post.kind(), RequestKind::Post);
