@@ -4087,19 +4087,38 @@ fn list_info_response_for_groups(
 }
 
 fn wildmat_matches(patterns: &[u8], group: &[u8]) -> bool {
-    patterns
-        .split(|byte| *byte == b',')
-        .any(|pattern| wildmat_pattern_matches(pattern, group))
+    let mut matched = None;
+    for pattern in patterns.split(|byte| *byte == b',') {
+        let (negated, pattern) = pattern
+            .strip_prefix(b"!")
+            .map_or((false, pattern), |pattern| (true, pattern));
+        if wildmat_pattern_matches(pattern, group) {
+            matched = Some(!negated);
+        }
+    }
+    matched.unwrap_or(false)
 }
 
 fn wildmat_pattern_matches(pattern: &[u8], group: &[u8]) -> bool {
-    if pattern == b"*" {
-        return true;
+    fn matches_from(pattern: &[u8], group: &[u8]) -> bool {
+        match (pattern.split_first(), group.split_first()) {
+            (None, None) => true,
+            (None, Some(_)) => false,
+            (Some((&b'*', rest)), _) => {
+                matches_from(rest, group)
+                    || group
+                        .split_first()
+                        .is_some_and(|(_, group_rest)| matches_from(pattern, group_rest))
+            }
+            (Some((&b'?', rest)), Some((_, group_rest))) => matches_from(rest, group_rest),
+            (Some((&expected, rest)), Some((&actual, group_rest))) if expected == actual => {
+                matches_from(rest, group_rest)
+            }
+            _ => false,
+        }
     }
-    if let Some(prefix) = pattern.strip_suffix(b"*") {
-        return group.starts_with(prefix);
-    }
-    pattern == group
+
+    matches_from(pattern, group)
 }
 
 fn newnews_response(args: &[u8]) -> &'static [u8] {
@@ -5812,6 +5831,18 @@ mod tests {
                     input: b"NEWNEWS comp.lang.rust 20260101 000000 GMT\r\n",
                     expected: NEWNEWS_EMPTY_RESPONSE,
                 },
+                ServerResponseCase {
+                    name: "NEWNEWS rightmost negated wildmat excludes alt",
+                    reference: "RFC 3977 sections 4.2 and 7.4 https://www.rfc-editor.org/rfc/rfc3977#section-4.2",
+                    input: b"NEWNEWS *,!alt.* 20260101 000000 GMT\r\n",
+                    expected: NEWNEWS_EMPTY_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "NEWNEWS question wildcard matches alt",
+                    reference: "RFC 3977 sections 4.2 and 7.4 https://www.rfc-editor.org/rfc/rfc3977#section-4.2",
+                    input: b"NEWNEWS alt.?est 20260101 000000 GMT\r\n",
+                    expected: NEWNEWS_RESPONSE,
+                },
             ])
             .await;
         }
@@ -6096,6 +6127,24 @@ mod tests {
                     expected: LIST_ACTIVE_ALT_RESPONSE,
                 },
                 ServerResponseCase {
+                    name: "LIST ACTIVE rightmost negated wildmat excludes alt",
+                    reference: "RFC 3977 sections 4.2 and 7.6.3 https://www.rfc-editor.org/rfc/rfc3977#section-4.2",
+                    input: b"LIST ACTIVE *,!alt.*\r\n",
+                    expected: LIST_ACTIVE_COMP_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "LIST ACTIVE rightmost positive wildmat re-includes alt",
+                    reference: "RFC 3977 sections 4.2 and 7.6.3 https://www.rfc-editor.org/rfc/rfc3977#section-4.2",
+                    input: b"LIST ACTIVE !alt.*,alt.*\r\n",
+                    expected: LIST_ACTIVE_ALT_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "LIST ACTIVE question wildcard matches comp",
+                    reference: "RFC 3977 sections 4.2 and 7.6.3 https://www.rfc-editor.org/rfc/rfc3977#section-4.2",
+                    input: b"LIST ACTIVE comp.lang.rus?\r\n",
+                    expected: LIST_ACTIVE_COMP_RESPONSE,
+                },
+                ServerResponseCase {
                     name: "LIST ACTIVE.TIMES comp wildmat",
                     reference: "RFC 3977 section 7.6.4 https://www.rfc-editor.org/rfc/rfc3977#section-7.6.4",
                     input: b"LIST ACTIVE.TIMES comp.lang.*\r\n",
@@ -6112,6 +6161,12 @@ mod tests {
                     reference: "RFC 3977 section 7.6.6 https://www.rfc-editor.org/rfc/rfc3977#section-7.6.6",
                     input: b"LIST NEWSGROUPS comp.lang.*\r\n",
                     expected: LIST_NEWSGROUPS_COMP_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "LIST NEWSGROUPS rightmost negated wildmat excludes comp",
+                    reference: "RFC 3977 sections 4.2 and 7.6.6 https://www.rfc-editor.org/rfc/rfc3977#section-4.2",
+                    input: b"LIST NEWSGROUPS *,!comp.*\r\n",
+                    expected: LIST_NEWSGROUPS_ALT_RESPONSE,
                 },
                 ServerResponseCase {
                     name: "LIST NEWSGROUPS alt wildmat",
