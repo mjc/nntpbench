@@ -1845,6 +1845,8 @@ where
         RequestKind::Unknown if command.syntax_error => {
             let response = if command.line_too_long {
                 b"501 command line too long\r\n".as_slice()
+            } else if command.authinfo_sasl_base64_error {
+                b"504 base64 encoding error\r\n".as_slice()
             } else {
                 b"501 command syntax error\r\n".as_slice()
             };
@@ -2271,7 +2273,11 @@ where
         RequestKind::ModeReader => MODE_READER_RESPONSE,
         RequestKind::Quit => QUIT_RESPONSE,
         RequestKind::Unknown if is_known_request_syntax_error(request) => {
-            b"501 command syntax error\r\n"
+            if authinfo_sasl_initial_response_base64_error(request.verb(), request.args()) {
+                b"504 base64 encoding error\r\n".as_slice()
+            } else {
+                b"501 command syntax error\r\n".as_slice()
+            }
         }
         _ => b"500 unknown command\r\n",
     };
@@ -2714,6 +2720,7 @@ struct ParsedCommand {
     line_slot: u16,
     message_id: Option<ParsedMessageId>,
     syntax_error: bool,
+    authinfo_sasl_base64_error: bool,
     has_transfer_body: bool,
     line_too_long: bool,
 }
@@ -2892,9 +2899,28 @@ fn parse_command_line(line: &[u8], line_slot: usize) -> ParsedCommand {
         line_slot: line_slot.try_into().unwrap_or(u16::MAX),
         message_id: parsed_message_id_range(line, request.message_id()),
         syntax_error: matches!(request.kind(), RequestKind::Unknown) && is_known_command_line(line),
+        authinfo_sasl_base64_error: authinfo_sasl_initial_response_base64_error(
+            request.verb(),
+            request.args(),
+        ),
         has_transfer_body: false,
         line_too_long: command_line_is_too_long(line),
     }
+}
+
+fn authinfo_sasl_initial_response_base64_error(verb: &[u8], args: &[u8]) -> bool {
+    if !verb.eq_ignore_ascii_case(b"AUTHINFO") {
+        return false;
+    }
+    let mut parts = command_tokens(args);
+    let (Some(subcommand), Some(mechanism), Some(initial_response), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    subcommand.eq_ignore_ascii_case(b"SASL")
+        && protocol::validate_sasl_mechanism(mechanism).is_ok()
+        && protocol::validate_sasl_base64(initial_response).is_err()
 }
 
 fn command_line_is_too_long(line: &[u8]) -> bool {
@@ -5266,19 +5292,19 @@ mod tests {
                     name: "SASL padding in middle",
                     reference: "RFC 4643 section 2.4.2 https://www.rfc-editor.org/rfc/rfc4643#section-2.4.2",
                     input: b"AUTHINFO SASL MADE-UP-MECHANISM AAA=BBB\r\n",
-                    expected: b"501 command syntax error\r\n",
+                    expected: b"504 base64 encoding error\r\n",
                 },
                 ServerResponseCase {
                     name: "SASL excessive padding",
                     reference: "RFC 4643 section 2.4.2 https://www.rfc-editor.org/rfc/rfc4643#section-2.4.2",
                     input: b"AUTHINFO SASL MADE-UP-MECHANISM Y===\r\n",
-                    expected: b"501 command syntax error\r\n",
+                    expected: b"504 base64 encoding error\r\n",
                 },
                 ServerResponseCase {
                     name: "SASL non-quad base64 length",
                     reference: "RFC 4643 section 2.4.2 https://www.rfc-editor.org/rfc/rfc4643#section-2.4.2",
                     input: b"AUTHINFO SASL MADE-UP-MECHANISM Y\r\n",
-                    expected: b"501 command syntax error\r\n",
+                    expected: b"504 base64 encoding error\r\n",
                 },
             ])
             .await;
@@ -8956,6 +8982,7 @@ mod tests {
             line_slot: 0,
             message_id: None,
             syntax_error: false,
+            authinfo_sasl_base64_error: false,
             has_transfer_body: false,
             line_too_long: false,
         };
@@ -11549,6 +11576,12 @@ mod tests {
             &mut output,
         ));
         assert!(!process_request_to_buffer(
+            RequestLine::parse(b"AUTHINFO SASL BENCH AAA=BBB\r\n"),
+            &config,
+            &stats,
+            &mut output,
+        ));
+        assert!(!process_request_to_buffer(
             RequestLine::parse(b"STARTTLS\r\n"),
             &config,
             &stats,
@@ -11565,11 +11598,12 @@ mod tests {
                 b"483 command unavailable until TLS has been negotiated\r\n",
                 b"483 command unavailable until TLS has been negotiated\r\n",
                 b"502 command unavailable\r\n",
+                b"504 base64 encoding error\r\n",
                 b"502 command unavailable\r\n",
             ]
             .concat()
         );
-        assert_eq!(stats.snapshot().commands, 8);
+        assert_eq!(stats.snapshot().commands, 9);
     }
 
     #[test]

@@ -4786,7 +4786,7 @@ fn classify_authinfo_sasl_command(args: &[u8]) -> RequestKind {
     }
 }
 
-fn validate_sasl_mechanism(value: &[u8]) -> Result<(), ()> {
+pub(crate) fn validate_sasl_mechanism(value: &[u8]) -> Result<(), ()> {
     if value.is_empty() || value.len() > 20 {
         return Err(());
     }
@@ -4806,7 +4806,7 @@ fn validate_sasl_initial_response(value: &[u8]) -> Result<(), ()> {
     validate_sasl_base64(value)
 }
 
-fn validate_sasl_base64(value: &[u8]) -> Result<(), ()> {
+pub(crate) fn validate_sasl_base64(value: &[u8]) -> Result<(), ()> {
     if value.is_empty() || !value.len().is_multiple_of(4) {
         return Err(());
     }
