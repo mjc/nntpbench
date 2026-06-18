@@ -2392,12 +2392,12 @@ fn validate_response_initial_line(kind: RequestKind, status: StatusCode, line: &
         }
         (RequestKind::AuthInfo, 283) => validate_sasl_response_argument(arguments, false),
         (RequestKind::AuthInfo, 383) => validate_sasl_response_argument(arguments, true),
-        _ => true,
+        _ => validate_generic_response_arguments(arguments),
     }
 }
 
 fn validate_date_response_argument(value: &[u8]) -> bool {
-    let Some((tokens, _trailing_text)) = split_required_response_tokens::<1>(value) else {
+    let Some((tokens, trailing_text)) = split_required_response_tokens::<1>(value) else {
         return false;
     };
     let timestamp = tokens[0];
@@ -2412,11 +2412,13 @@ fn validate_date_response_argument(value: &[u8]) -> bool {
         return false;
     };
 
-    NntpDate::from_borrowed(date).is_ok() && NntpTime::from_borrowed(time).is_ok()
+    NntpDate::from_borrowed(date).is_ok()
+        && NntpTime::from_borrowed(time).is_ok()
+        && validate_optional_trailing_comment(trailing_text)
 }
 
 fn validate_group_response_arguments(value: &[u8]) -> bool {
-    let Some((tokens, _trailing_text)) = split_required_response_tokens::<4>(value) else {
+    let Some((tokens, trailing_text)) = split_required_response_tokens::<4>(value) else {
         return false;
     };
 
@@ -2426,6 +2428,7 @@ fn validate_group_response_arguments(value: &[u8]) -> bool {
         && std::str::from_utf8(tokens[3])
             .ok()
             .is_some_and(|group| GroupName::from_borrowed(group).is_ok())
+        && validate_optional_trailing_comment(trailing_text)
 }
 
 fn split_required_response_tokens<const N: usize>(mut value: &[u8]) -> Option<([&[u8]; N], &[u8])> {
@@ -2463,7 +2466,7 @@ fn validate_response_article_number(value: &[u8]) -> bool {
 }
 
 fn validate_article_status_response_arguments(value: &[u8]) -> bool {
-    let Some((tokens, _trailing_text)) = split_required_response_tokens::<2>(value) else {
+    let Some((tokens, trailing_text)) = split_required_response_tokens::<2>(value) else {
         return false;
     };
 
@@ -2471,23 +2474,26 @@ fn validate_article_status_response_arguments(value: &[u8]) -> bool {
         && std::str::from_utf8(tokens[1])
             .ok()
             .is_some_and(|message_id| MessageId::from_borrowed(message_id).is_ok())
+        && validate_optional_trailing_comment(trailing_text)
 }
 
 fn validate_message_id_response_argument(value: &[u8]) -> bool {
-    let Some((tokens, _trailing_text)) = split_required_response_tokens::<1>(value) else {
+    let Some((tokens, trailing_text)) = split_required_response_tokens::<1>(value) else {
         return false;
     };
 
     std::str::from_utf8(tokens[0])
         .ok()
         .is_some_and(|message_id| MessageId::from_borrowed(message_id).is_ok())
+        && validate_optional_trailing_comment(trailing_text)
 }
 
 fn validate_capability_label_response_argument(value: &[u8]) -> bool {
-    let Some((tokens, _trailing_text)) = split_required_response_tokens::<1>(value) else {
+    let Some((tokens, trailing_text)) = split_required_response_tokens::<1>(value) else {
         return false;
     };
     validate_ascii_token(tokens[0], validate_keyword)
+        && validate_optional_trailing_comment(trailing_text)
 }
 
 fn validate_sasl_response_argument(value: &[u8], allow_zero_length: bool) -> bool {
@@ -2502,6 +2508,14 @@ fn validate_sasl_response_argument(value: &[u8], allow_zero_length: bool) -> boo
         return true;
     }
     validate_sasl_base64(tokens[0]).is_ok()
+}
+
+fn validate_generic_response_arguments(value: &[u8]) -> bool {
+    value.is_empty() || validate_u_chars(value)
+}
+
+fn validate_optional_trailing_comment(value: &[u8]) -> bool {
+    value.is_empty() || value.strip_prefix(b" ").is_some_and(validate_u_chars)
 }
 
 fn validate_multiline_response_content(kind: RequestKind, content: &[u8]) -> bool {
@@ -2637,6 +2651,11 @@ fn validate_u_text(value: &[u8]) -> bool {
         let mut chars = text.chars();
         chars.next().is_some_and(is_p_char) && chars.all(|ch| !matches!(ch, '\0' | '\r' | '\n'))
     })
+}
+
+fn validate_u_chars(value: &[u8]) -> bool {
+    std::str::from_utf8(value)
+        .is_ok_and(|text| text.chars().all(|ch| !matches!(ch, '\0' | '\r' | '\n')))
 }
 
 fn is_p_char(ch: char) -> bool {

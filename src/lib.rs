@@ -8431,6 +8431,18 @@ mod tests {
                         frame: b"440\r\n",
                     },
                     ResponseFrameCase {
+                        name: "QUIT accepts UTF-8 trailing comment text",
+                        reference: "RFC 3977 sections 9.4.1 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.4.1",
+                        kind: RequestKind::Quit,
+                        frame: b"205 closing caf\xc3\xa9\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "DATE accepts UTF-8 trailing comment text",
+                        reference: "RFC 3977 sections 7.1, 9.4.1, and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.4.1",
+                        kind: RequestKind::Date,
+                        frame: b"111 20260602120000 clock caf\xc3\xa9\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "LIST ACTIVE accepts private status token",
                         reference: "RFC 3977 sections 7.6.3 and 9.4.3 https://www.rfc-editor.org/rfc/rfc3977#section-9.4.3",
                         kind: RequestKind::ListActive,
@@ -8599,6 +8611,24 @@ mod tests {
                         reference: "RFC 3977 sections 7.1 and 9.4.2 https://www.rfc-editor.org/rfc/rfc3977#section-9.4.2",
                         kind: RequestKind::Date,
                         frame: b"111  20260602120000\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "DATE rejects non-UTF-8 trailing comment",
+                        reference: "RFC 3977 sections 9.4.1 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.4.1",
+                        kind: RequestKind::Date,
+                        frame: b"111 20260602120000 invalid caf\xe9\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "QUIT rejects NUL in trailing comment",
+                        reference: "RFC 3977 sections 9.4.1 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.4.1",
+                        kind: RequestKind::Quit,
+                        frame: b"205 closing\0now\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "generic error rejects non-UTF-8 trailing comment",
+                        reference: "RFC 3977 sections 3.2.1, 9.4.1, and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.4.1",
+                        kind: RequestKind::Article,
+                        frame: b"430 missing caf\xe9\r\n",
                     },
                     ResponseFrameCase {
                         name: "generic 401 rejects missing capability label",
