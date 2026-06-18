@@ -9179,6 +9179,24 @@ mod tests {
                         frame: b"101 Capability list:\r\nVERSION 0\r\nREADER\r\n.\r\n",
                     },
                     ResponseFrameCase {
+                        name: "CAPABILITIES rejects READER capability argument",
+                        reference: "RFC 3977 section 9.5 https://www.rfc-editor.org/rfc/rfc3977#section-9.5",
+                        kind: RequestKind::Capabilities,
+                        frame: b"101 Capability list:\r\nVERSION 2\r\nREADER extra\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "CAPABILITIES rejects LIST without keyword arguments",
+                        reference: "RFC 3977 section 9.5 https://www.rfc-editor.org/rfc/rfc3977#section-9.5",
+                        kind: RequestKind::Capabilities,
+                        frame: b"101 Capability list:\r\nVERSION 2\r\nLIST\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "CAPABILITIES rejects OVER unknown argument",
+                        reference: "RFC 3977 section 9.5 https://www.rfc-editor.org/rfc/rfc3977#section-9.5",
+                        kind: RequestKind::Capabilities,
+                        frame: b"101 Capability list:\r\nVERSION 2\r\nOVER RANGE\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "OVER rejects body row without tab-separated overview fields",
                         reference: "RFC 3977 section 8.3.1 https://www.rfc-editor.org/rfc/rfc3977#section-8.3.1",
                         kind: RequestKind::Over,

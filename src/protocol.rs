@@ -2953,6 +2953,10 @@ fn validate_capability_response_line(line: &[u8]) -> bool {
         return false;
     }
 
+    if let Some(valid) = validate_known_capability_response_line(label, rest) {
+        return valid;
+    }
+
     while !rest.is_empty() {
         let Some((token, next)) = split_response_ws_token(rest) else {
             return false;
@@ -2964,6 +2968,62 @@ fn validate_capability_response_line(line: &[u8]) -> bool {
     }
 
     true
+}
+
+fn validate_known_capability_response_line(label: &[u8], mut rest: &[u8]) -> Option<bool> {
+    if [
+        b"HDR".as_slice(),
+        b"IHAVE".as_slice(),
+        b"MODE-READER".as_slice(),
+        b"NEWNEWS".as_slice(),
+        b"POST".as_slice(),
+        b"READER".as_slice(),
+    ]
+    .iter()
+    .any(|known| label.eq_ignore_ascii_case(known))
+    {
+        return Some(rest.is_empty());
+    }
+
+    if label.eq_ignore_ascii_case(b"IMPLEMENTATION") {
+        while !rest.is_empty() {
+            let Some((token, next)) = split_response_ws_token(rest) else {
+                return Some(false);
+            };
+            if !validate_capability_argument_token(token) {
+                return Some(false);
+            }
+            rest = next;
+        }
+        return Some(true);
+    }
+
+    if label.eq_ignore_ascii_case(b"LIST") {
+        let mut seen_keyword = false;
+        while !rest.is_empty() {
+            let Some((token, next)) = split_response_ws_token(rest) else {
+                return Some(false);
+            };
+            if !validate_ascii_token(token, validate_keyword) {
+                return Some(false);
+            }
+            seen_keyword = true;
+            rest = next;
+        }
+        return Some(seen_keyword);
+    }
+
+    if label.eq_ignore_ascii_case(b"OVER") {
+        if rest.is_empty() {
+            return Some(true);
+        }
+        let Some((token, next)) = split_response_ws_token(rest) else {
+            return Some(false);
+        };
+        return Some(next.is_empty() && token.eq_ignore_ascii_case(b"MSGID"));
+    }
+
+    None
 }
 
 fn validate_capability_argument_token(token: &[u8]) -> bool {
@@ -5996,6 +6056,18 @@ mod tests {
             (
                 RequestKind::Capabilities,
                 b"101 capabilities follow\r\nVERSION 1234567\r\nREADER\r\n.\r\n".as_slice(),
+            ),
+            (
+                RequestKind::Capabilities,
+                b"101 capabilities follow\r\nVERSION 2\r\nREADER extra\r\n.\r\n".as_slice(),
+            ),
+            (
+                RequestKind::Capabilities,
+                b"101 capabilities follow\r\nVERSION 2\r\nLIST\r\n.\r\n".as_slice(),
+            ),
+            (
+                RequestKind::Capabilities,
+                b"101 capabilities follow\r\nVERSION 2\r\nOVER RANGE\r\n.\r\n".as_slice(),
             ),
             (
                 RequestKind::NewNews,
