@@ -3826,7 +3826,17 @@ fn classify_subcommand(
             }
             _ => RequestKind::Unknown,
         },
-        RequestKind::ListOverviewFmt | RequestKind::ListHeaders | RequestKind::ListDistribPats => {
+        RequestKind::ListHeaders => match (parts.next(), parts.next()) {
+            (None, None) => kind,
+            (Some(selector), None)
+                if eq_ignore_ascii_case_const(selector, b"MSGID")
+                    || eq_ignore_ascii_case_const(selector, b"RANGE") =>
+            {
+                kind
+            }
+            _ => RequestKind::Unknown,
+        },
+        RequestKind::ListOverviewFmt | RequestKind::ListDistribPats => {
             if parts.next().is_none() {
                 kind
             } else {
@@ -4355,6 +4365,8 @@ mod tests {
                 RequestKind::ListOverviewFmt,
             ),
             (b"LIST HEADERS".as_slice(), RequestKind::ListHeaders),
+            (b"LIST HEADERS MSGID".as_slice(), RequestKind::ListHeaders),
+            (b"LIST HEADERS RANGE".as_slice(), RequestKind::ListHeaders),
             (
                 b"LIST DISTRIB.PATS".as_slice(),
                 RequestKind::ListDistribPats,

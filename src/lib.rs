@@ -6600,12 +6600,42 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc3977_red_list_headers_with_arguments_returns_501() {
-            // RFC 3977 section 8.6 defines LIST HEADERS without arguments:
+        async fn rfc3977_red_list_headers_invalid_argument_returns_501() {
+            // RFC 3977 section 8.6.1 only permits the MSGID and RANGE
+            // arguments for LIST HEADERS:
             // https://www.rfc-editor.org/rfc/rfc3977#section-8.6
             let input = b"LIST HEADERS Subject\r\n";
             let (output, _) = run_session_with_input(test_config(), input).await;
             assert_single_response(input, b"501 command syntax error\r\n", &output, "RFC 3977");
+        }
+
+        #[tokio::test]
+        async fn rfc3977_red_list_headers_accepts_msgid_and_range_arguments() {
+            // RFC 3977 section 8.6.1 defines LIST HEADERS [MSGID|RANGE].
+            // Section 8.6.2 says servers that do not vary HDR fields by form
+            // must ignore either argument and return the same results:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-8.6
+            assert_red_server_response_cases(&[
+                ServerResponseCase {
+                    name: "LIST HEADERS MSGID accepted",
+                    reference: "RFC 3977 section 8.6.1 https://www.rfc-editor.org/rfc/rfc3977#section-8.6.1",
+                    input: b"LIST HEADERS MSGID\r\n",
+                    expected: LIST_HEADERS_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "LIST HEADERS RANGE accepted",
+                    reference: "RFC 3977 section 8.6.1 https://www.rfc-editor.org/rfc/rfc3977#section-8.6.1",
+                    input: b"LIST HEADERS RANGE\r\n",
+                    expected: LIST_HEADERS_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "LIST HEADERS lower-case MSGID accepted",
+                    reference: "RFC 3977 section 9.1 https://www.rfc-editor.org/rfc/rfc3977#section-9.1",
+                    input: b"LIST HEADERS msgid\r\n",
+                    expected: LIST_HEADERS_RESPONSE,
+                },
+            ])
+            .await;
         }
 
         #[tokio::test]
