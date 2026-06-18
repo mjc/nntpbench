@@ -22,6 +22,9 @@ pub const MAX_ARTICLE_NUMBER: u64 = 2_147_483_647;
 /// RFC 3977 section 3.1 command lines and response initial lines are limited
 /// to 512 octets, including the terminating CRLF pair.
 pub(crate) const MAX_INITIAL_RESPONSE_LINE_BYTES: usize = 512;
+/// RFC 3977 section 3.1 separately limits the argument portion of base NNTP
+/// commands to 497 octets.
+pub(crate) const MAX_COMMAND_ARGUMENT_BYTES: usize = 497;
 /// RFC 4643 section 2.4.1 permits AUTHINFO SASL command lines to exceed the
 /// RFC 3977 base command-line limit when carrying an initial response.
 pub(crate) const MAX_AUTHINFO_SASL_COMMAND_LINE_BYTES: usize = 4096;
@@ -4245,7 +4248,9 @@ impl<'a> RequestLine<'a> {
         };
 
         let kind = classify_request_kind(verb, args);
-        if raw_len > MAX_INITIAL_RESPONSE_LINE_BYTES && kind != RequestKind::AuthInfo {
+        if (raw_len > MAX_INITIAL_RESPONSE_LINE_BYTES || args.len() > MAX_COMMAND_ARGUMENT_BYTES)
+            && kind != RequestKind::AuthInfo
+        {
             Self {
                 kind: RequestKind::Unknown,
                 verb,

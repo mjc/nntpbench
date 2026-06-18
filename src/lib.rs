@@ -3953,7 +3953,10 @@ fn parse_command_line(line: &[u8], line_slot: usize) -> ParsedCommand {
 
 fn command_line_is_too_long(line: &[u8]) -> bool {
     line == b"DATE too-long\n"
-        || (line.len() > protocol::MAX_INITIAL_RESPONSE_LINE_BYTES && !line_is_authinfo_sasl(line))
+        || ((line.len() > protocol::MAX_INITIAL_RESPONSE_LINE_BYTES
+            || command_argument_len(line)
+                .is_some_and(|len| len > protocol::MAX_COMMAND_ARGUMENT_BYTES))
+            && !line_is_authinfo_sasl(line))
 }
 
 fn line_is_authinfo_sasl(line: &[u8]) -> bool {
@@ -3966,6 +3969,13 @@ fn line_is_authinfo_sasl(line: &[u8]) -> bool {
             if command.eq_ignore_ascii_case(b"AUTHINFO")
                 && subcommand.eq_ignore_ascii_case(b"SASL")
     )
+}
+
+fn command_argument_len(line: &[u8]) -> Option<usize> {
+    let line = strip_complete_crlf_line(line).unwrap_or(line);
+    let line = trim_command_eol_ws(line);
+    let split = line.iter().position(|byte| is_command_ws(*byte))?;
+    Some(skip_command_ws(&line[split..]).len())
 }
 
 fn is_known_command_line(line: &[u8]) -> bool {
@@ -7781,22 +7791,37 @@ mod tests {
         #[tokio::test]
         async fn rfc3977_red_too_long_command_line_returns_501() {
             // RFC 3977 section 3.1 limits command lines to 512 octets including
-            // CRLF. An overlong line should get a 501 response, not a silent close:
+            // CRLF and separately limits command arguments to 497 octets. An
+            // overlong command should get a 501 response, not a silent close:
             // https://www.rfc-editor.org/rfc/rfc3977#section-3.1
-            let mut input = b"DATE ".to_vec();
-            input.extend(std::iter::repeat_n(
+            let mut overlong_line = b"DATE ".to_vec();
+            overlong_line.extend(std::iter::repeat_n(
                 b'x',
                 protocol::MAX_INITIAL_RESPONSE_LINE_BYTES + 1,
             ));
-            input.extend_from_slice(b"\r\n");
-            let (output, error) =
-                run_session_with_input_allowing_server_error(test_config(), &input).await;
-            assert!(
-                error.is_none() && without_greeting(&output) == b"501 command line too long\r\n",
-                "RFC 3977 overlong command should produce a 501 response, got error {:?} and output {:?}",
-                error,
-                String::from_utf8_lossy(&output)
-            );
+            overlong_line.extend_from_slice(b"\r\n");
+
+            let mut overlong_args = b"HDR ".to_vec();
+            overlong_args.extend(std::iter::repeat_n(
+                b'X',
+                protocol::MAX_COMMAND_ARGUMENT_BYTES + 1,
+            ));
+            overlong_args.extend_from_slice(b"\r\n");
+
+            for (name, input) in [
+                ("overlong command line", overlong_line),
+                ("overlong argument portion", overlong_args),
+            ] {
+                let (output, error) =
+                    run_session_with_input_allowing_server_error(test_config(), &input).await;
+                assert!(
+                    error.is_none()
+                        && without_greeting(&output) == b"501 command line too long\r\n",
+                    "{name}: RFC 3977 overlong command should produce a 501 response, got error {:?} and output {:?}",
+                    error,
+                    String::from_utf8_lossy(&output)
+                );
+            }
         }
 
         #[tokio::test]
@@ -7944,7 +7969,7 @@ mod tests {
         #[test]
         fn rfc3977_red_request_line_length_limit_matrix() {
             // RFC 3977 section 3.1 limits command lines to 512 octets,
-            // including the terminating CRLF:
+            // including the terminating CRLF, and command arguments to 497 octets:
             // https://www.rfc-editor.org/rfc/rfc3977#section-3.1
             let mut exact = b"QUIT".to_vec();
             exact.resize(
@@ -7967,6 +7992,34 @@ mod tests {
                 RequestLine::parse(&overlong).kind(),
                 RequestKind::Unknown,
                 "RFC 3977 command lines over 512 octets must not parse as valid commands"
+            );
+
+            let mut exact_args = b"HDR ".to_vec();
+            exact_args.extend(std::iter::repeat_n(
+                b'X',
+                protocol::MAX_COMMAND_ARGUMENT_BYTES,
+            ));
+            exact_args.extend_from_slice(crate::CRLF);
+            assert_eq!(
+                RequestLine::parse(&exact_args).kind(),
+                RequestKind::Hdr,
+                "RFC 3977 permits command arguments at the 497-octet boundary"
+            );
+
+            let mut overlong_args = b"HDR ".to_vec();
+            overlong_args.extend(std::iter::repeat_n(
+                b'X',
+                protocol::MAX_COMMAND_ARGUMENT_BYTES + 1,
+            ));
+            overlong_args.extend_from_slice(crate::CRLF);
+            assert!(
+                overlong_args.len() <= protocol::MAX_INITIAL_RESPONSE_LINE_BYTES,
+                "test case must isolate the argument-length bound"
+            );
+            assert_eq!(
+                RequestLine::parse(&overlong_args).kind(),
+                RequestKind::Unknown,
+                "RFC 3977 command arguments over 497 octets must not parse as valid commands"
             );
 
             let mut long_sasl = b"AUTHINFO SASL BENCH ".to_vec();
