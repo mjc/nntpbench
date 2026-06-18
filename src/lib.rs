@@ -162,8 +162,10 @@ pub const XHDR_RESPONSE: &[u8] = b"221 headers follow\r\n1 example one\r\n2 exam
 const XHDR_SUBJECT_2_RESPONSE: &[u8] = b"221 headers follow\r\n2 example two\r\n.\r\n";
 const HDR_MESSAGE_ID_RESPONSE: &[u8] =
     b"225 headers follow\r\n1 <one@example.com>\r\n2 <two@example.com>\r\n.\r\n";
+const HDR_MESSAGE_ID_2_RESPONSE: &[u8] = b"225 headers follow\r\n2 <two@example.com>\r\n.\r\n";
 const XHDR_MESSAGE_ID_RESPONSE: &[u8] =
     b"221 headers follow\r\n1 <one@example.com>\r\n2 <two@example.com>\r\n.\r\n";
+const XHDR_MESSAGE_ID_2_RESPONSE: &[u8] = b"221 headers follow\r\n2 <two@example.com>\r\n.\r\n";
 pub const HEAD_RESPONSE: &[u8] = b"221 1 <article.1@nntpbench.local> article retrieved\r\nPath: nntpbench.local!mock\r\nFrom: Bench User <bench@nntpbench.local>\r\nNewsgroups: alt.binaries.bench\r\nSubject: nntpbench synthetic article\r\nMessage-ID: <article.1@nntpbench.local>\r\nDate: Fri, 15 May 2026 00:00:00 +0000\r\n.\r\n";
 pub const STAT_RESPONSE: &[u8] = b"223 1 <article.1@nntpbench.local> article retrieved\r\n";
 pub const HELP_RESPONSE: &[u8] =
@@ -4203,7 +4205,7 @@ fn overview_selector_arg(kind: RequestKind, args: &[u8]) -> Option<&[u8]> {
 }
 
 fn over_response_for_args(args: &[u8]) -> &'static [u8] {
-    if args == b"2" {
+    if overview_selector_starts_at_second(args) {
         OVER_2_RESPONSE
     } else {
         OVER_RESPONSE
@@ -4211,11 +4213,15 @@ fn over_response_for_args(args: &[u8]) -> &'static [u8] {
 }
 
 fn xover_response_for_args(args: &[u8]) -> &'static [u8] {
-    if args == b"2" {
+    if overview_selector_starts_at_second(args) {
         OVER_2_RESPONSE
     } else {
         XOVER_RESPONSE
     }
+}
+
+fn overview_selector_starts_at_second(selector: &[u8]) -> bool {
+    selector == b"2" || selector.starts_with(b"2-")
 }
 
 fn listgroup_state_error(args: &[u8], session_state: &SessionState) -> Option<&'static [u8]> {
@@ -4329,9 +4335,12 @@ fn hdr_response_for_args(args: &[u8]) -> &'static [u8] {
     if header_query_name_from_args(args)
         .is_some_and(|header| header.eq_ignore_ascii_case(b"Message-ID"))
     {
+        if selector.is_some_and(overview_selector_starts_at_second) {
+            return HDR_MESSAGE_ID_2_RESPONSE;
+        }
         return HDR_MESSAGE_ID_RESPONSE;
     }
-    if selector == Some(b"2".as_slice()) {
+    if selector.is_some_and(overview_selector_starts_at_second) {
         return HDR_SUBJECT_2_RESPONSE;
     }
     HDR_RESPONSE
@@ -4342,9 +4351,12 @@ fn xhdr_response_for_args(args: &[u8]) -> &'static [u8] {
     if header_query_name_from_args(args)
         .is_some_and(|header| header.eq_ignore_ascii_case(b"Message-ID"))
     {
+        if selector.is_some_and(overview_selector_starts_at_second) {
+            return XHDR_MESSAGE_ID_2_RESPONSE;
+        }
         return XHDR_MESSAGE_ID_RESPONSE;
     }
-    if selector == Some(b"2".as_slice()) {
+    if selector.is_some_and(overview_selector_starts_at_second) {
         return XHDR_SUBJECT_2_RESPONSE;
     }
     XHDR_RESPONSE
@@ -6321,6 +6333,53 @@ mod tests {
                     reference: "RFC 2980 section 2.1.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.6",
                     input: b"GROUP alt.test\r\nXHDR Subject 2\r\n",
                     expected: XHDR_SUBJECT_2_RESPONSE,
+                },
+            ])
+            .await;
+        }
+
+        #[tokio::test]
+        async fn rfc3977_red_overview_and_header_range_selectors_filter_results() {
+            // RFC 3977 sections 8.3.2 and 8.5.2 apply article-range selectors
+            // to overview and header metadata. A lower bound of 2 must not
+            // return article 1 rows:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-8.3.2
+            assert_red_server_response_tail_cases(&[
+                ServerResponseCase {
+                    name: "OVER range selector 2-",
+                    reference: "RFC 3977 section 8.3.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.3.2",
+                    input: b"GROUP alt.test\r\nOVER 2-\r\n",
+                    expected: OVER_2_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "XOVER range selector 2-",
+                    reference: "RFC 2980 section 2.1.7 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.7",
+                    input: b"GROUP alt.test\r\nXOVER 2-\r\n",
+                    expected: OVER_2_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "HDR Subject range selector 2-",
+                    reference: "RFC 3977 section 8.5.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.2",
+                    input: b"GROUP alt.test\r\nHDR Subject 2-\r\n",
+                    expected: HDR_SUBJECT_2_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "HDR Message-ID range selector 2-",
+                    reference: "RFC 3977 section 8.5.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.2",
+                    input: b"GROUP alt.test\r\nHDR Message-ID 2-\r\n",
+                    expected: HDR_MESSAGE_ID_2_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "XHDR Subject range selector 2-",
+                    reference: "RFC 2980 section 2.1.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.6",
+                    input: b"GROUP alt.test\r\nXHDR Subject 2-\r\n",
+                    expected: XHDR_SUBJECT_2_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "XHDR Message-ID range selector 2-",
+                    reference: "RFC 2980 section 2.1.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.6",
+                    input: b"GROUP alt.test\r\nXHDR Message-ID 2-\r\n",
+                    expected: XHDR_MESSAGE_ID_2_RESPONSE,
                 },
             ])
             .await;
