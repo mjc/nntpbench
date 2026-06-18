@@ -8919,6 +8919,18 @@ mod tests {
                         frame: b"224 overview follows\r\n1\tSubject only\r\n.\r\n",
                     },
                     ResponseFrameCase {
+                        name: "OVER accepts empty bytes and lines metadata fields",
+                        reference: "RFC 3977 sections 8.3.2 and 9.4.3 https://www.rfc-editor.org/rfc/rfc3977#section-8.3.2",
+                        kind: RequestKind::Over,
+                        frame: b"224 overview follows\r\n1\tSubject\tfrom@test\tdate\t<one@test>\t\t\t\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "XOVER accepts empty bytes metadata with numeric lines",
+                        reference: "RFC 2980 section 2.1.7 and RFC 3977 section 8.3.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.3.2",
+                        kind: RequestKind::Xover,
+                        frame: b"224 overview follows\r\n1\tSubject\tfrom@test\tdate\t<one@test>\t\t\t1\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "AUTHINFO SASL 283 accepts trailing comment after challenge",
                         reference: "RFC 3977 section 9.4.1 and RFC 4643 section 3.3 https://www.rfc-editor.org/rfc/rfc3977#section-9.4.1",
                         kind: RequestKind::AuthInfo,

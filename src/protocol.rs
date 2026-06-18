@@ -2874,7 +2874,7 @@ fn validate_overview_response_line(line: &[u8]) -> bool {
         if !validate_hdr_content(field) {
             return false;
         }
-        if matches!(field_count, 6 | 7) && !is_response_decimal_token(field) {
+        if matches!(field_count, 6 | 7) && !field.is_empty() && !is_response_decimal_token(field) {
             return false;
         }
         if field_count > 7 && !field.is_empty() && !validate_overview_optional_field(field) {
@@ -6038,6 +6038,11 @@ mod tests {
                     .as_slice(),
             ),
             (
+                RequestKind::Over,
+                b"224 overview follows\r\n1\tSubject\tfrom@test\tdate\t<one@test>\t\t\t\r\n.\r\n"
+                    .as_slice(),
+            ),
+            (
                 RequestKind::Xover,
                 b"224 overview follows\r\n1\tSubject\tfrom@test\tdate\t<one@test>\t\t1\t1\r\n.\r\n"
                     .as_slice(),
@@ -6045,6 +6050,11 @@ mod tests {
             (
                 RequestKind::Xover,
                 b"224 overview follows\r\n1\tSubject\r\n.\r\n".as_slice(),
+            ),
+            (
+                RequestKind::Xover,
+                b"224 overview follows\r\n1\tSubject\tfrom@test\tdate\t<one@test>\t\t\t1\r\n.\r\n"
+                    .as_slice(),
             ),
             (
                 RequestKind::Hdr,
