@@ -196,7 +196,7 @@ const XHDR_LINES_2_RESPONSE: &[u8] = b"221 headers follow\r\n2 8\r\n.\r\n";
 pub const HEAD_RESPONSE: &[u8] = b"221 1 <article.1@nntpbench.local> article retrieved\r\nPath: nntpbench.local!mock\r\nFrom: Bench User <bench@nntpbench.local>\r\nNewsgroups: alt.binaries.bench\r\nSubject: nntpbench synthetic article\r\nMessage-ID: <article.1@nntpbench.local>\r\nDate: Fri, 15 May 2026 00:00:00 +0000\r\n.\r\n";
 pub const STAT_RESPONSE: &[u8] = b"223 1 <article.1@nntpbench.local> article retrieved\r\n";
 pub const HELP_RESPONSE: &[u8] =
-    b"100 help text follows\r\nARTICLE\r\nHEAD\r\nBODY\r\nSTAT\r\nLIST\r\nCAPABILITIES\r\nDATE\r\nMODE READER\r\nQUIT\r\n.\r\n";
+    b"100 help text follows\r\nARTICLE\r\nAUTHINFO\r\nBODY\r\nCAPABILITIES\r\nCHECK\r\nDATE\r\nGROUP\r\nHDR\r\nHEAD\r\nHELP\r\nIHAVE\r\nLAST\r\nLIST\r\nLISTGROUP\r\nMODE READER\r\nNEWGROUPS\r\nNEWNEWS\r\nNEXT\r\nOVER\r\nPOST\r\nQUIT\r\nSTARTTLS\r\nSTAT\r\nTAKETHIS\r\nXHDR\r\nXOVER\r\n.\r\n";
 pub const CAPABILITIES_RESPONSE: &[u8] =
     b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nMODE-READER\r\nLIST ACTIVE ACTIVE.TIMES DISTRIB.PATS NEWSGROUPS OVERVIEW.FMT HEADERS\r\nOVER MSGID\r\nHDR\r\nNEWNEWS\r\nAUTHINFO\r\n.\r\n";
 pub const QUIT_RESPONSE: &[u8] = b"205 closing connection\r\n";
@@ -6091,14 +6091,39 @@ mod tests {
             // https://www.rfc-editor.org/rfc/rfc3977#section-7.2
             let (output, _) = run_session_with_input(test_config(), b"HELP\r\n").await;
             let text = String::from_utf8_lossy(without_greeting(&output));
-            assert!(
-                text.contains("MODE READER"),
-                "RFC 3977 HELP should spell the MODE READER command, got {text:?}"
-            );
-            assert!(
-                text.contains("ARTICLE") && text.contains("HEAD") && text.contains("BODY"),
-                "RFC 3977 HELP should list supported retrieval commands, got {text:?}"
-            );
+            for command in [
+                "ARTICLE",
+                "AUTHINFO",
+                "BODY",
+                "CAPABILITIES",
+                "CHECK",
+                "DATE",
+                "GROUP",
+                "HDR",
+                "HEAD",
+                "HELP",
+                "IHAVE",
+                "LAST",
+                "LIST",
+                "LISTGROUP",
+                "MODE READER",
+                "NEWGROUPS",
+                "NEWNEWS",
+                "NEXT",
+                "OVER",
+                "POST",
+                "QUIT",
+                "STARTTLS",
+                "STAT",
+                "TAKETHIS",
+                "XHDR",
+                "XOVER",
+            ] {
+                assert!(
+                    text.contains(command),
+                    "RFC 3977 HELP should list understood command {command}, got {text:?}"
+                );
+            }
         }
 
         #[tokio::test]
