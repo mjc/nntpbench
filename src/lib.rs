@@ -2812,7 +2812,7 @@ where
             write_response(
                 writer,
                 pending_write,
-                over_response(command, command_lines),
+                over_response(command, command_lines, session_state),
                 session_stats,
             )
             .await?;
@@ -2826,7 +2826,7 @@ where
             write_response(
                 writer,
                 pending_write,
-                xover_response(command, command_lines),
+                xover_response(command, command_lines, session_state),
                 session_stats,
             )
             .await?;
@@ -2840,7 +2840,7 @@ where
             write_response(
                 writer,
                 pending_write,
-                hdr_response(command, command_lines),
+                hdr_response(command, command_lines, session_state),
                 session_stats,
             )
             .await?;
@@ -2854,7 +2854,7 @@ where
             write_response(
                 writer,
                 pending_write,
-                xhdr_response(command, command_lines),
+                xhdr_response(command, command_lines, session_state),
                 session_stats,
             )
             .await?;
@@ -4587,33 +4587,82 @@ fn xhdr_response_for_args(args: &[u8]) -> &'static [u8] {
 fn over_response(
     command: &ParsedCommand,
     command_lines: Option<&CommandLineBatch>,
+    session_state: &SessionState,
 ) -> &'static [u8] {
     let args = command_args(command, command_lines).unwrap_or_default();
-    over_response_for_args(args)
+    over_response_for_args(current_overview_args(args, session_state).unwrap_or(args))
 }
 
 fn xover_response(
     command: &ParsedCommand,
     command_lines: Option<&CommandLineBatch>,
+    session_state: &SessionState,
 ) -> &'static [u8] {
     let args = command_args(command, command_lines).unwrap_or_default();
-    xover_response_for_args(args)
+    xover_response_for_args(current_overview_args(args, session_state).unwrap_or(args))
 }
 
 fn hdr_response(
     command: &ParsedCommand,
     command_lines: Option<&CommandLineBatch>,
+    session_state: &SessionState,
 ) -> &'static [u8] {
     let args = command_args(command, command_lines).unwrap_or_default();
-    hdr_response_for_args(args)
+    hdr_response_for_args(current_header_args(args, session_state).unwrap_or(args))
 }
 
 fn xhdr_response(
     command: &ParsedCommand,
     command_lines: Option<&CommandLineBatch>,
+    session_state: &SessionState,
 ) -> &'static [u8] {
     let args = command_args(command, command_lines).unwrap_or_default();
-    xhdr_response_for_args(args)
+    xhdr_response_for_args(current_header_args(args, session_state).unwrap_or(args))
+}
+
+fn current_overview_args(args: &[u8], session_state: &SessionState) -> Option<&'static [u8]> {
+    if args.is_empty() {
+        return current_article_selector_args(session_state);
+    }
+    None
+}
+
+fn current_header_args(args: &[u8], session_state: &SessionState) -> Option<&'static [u8]> {
+    if args.split(|byte| *byte == b' ').count() != 1 {
+        return None;
+    }
+    let current = current_article_selector_args(session_state)?;
+    match args {
+        b"Subject" => match current {
+            b"1" => Some(b"Subject 1"),
+            b"2" => Some(b"Subject 2"),
+            _ => None,
+        },
+        b"Message-ID" => match current {
+            b"1" => Some(b"Message-ID 1"),
+            b"2" => Some(b"Message-ID 2"),
+            _ => None,
+        },
+        b":bytes" => match current {
+            b"1" => Some(b":bytes 1"),
+            b"2" => Some(b":bytes 2"),
+            _ => None,
+        },
+        b":lines" => match current {
+            b"1" => Some(b":lines 1"),
+            b"2" => Some(b":lines 2"),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn current_article_selector_args(session_state: &SessionState) -> Option<&'static [u8]> {
+    match session_state.current_article {
+        Some(1) => Some(b"1"),
+        Some(2) => Some(b"2"),
+        _ => None,
+    }
 }
 
 fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
@@ -7356,7 +7405,49 @@ mod tests {
                     name: "HDR after GROUP uses first article",
                     reference: "RFC 3977 section 8.5.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.2",
                     input: b"GROUP alt.test\r\nHDR Subject\r\n",
-                    expected: HDR_RESPONSE,
+                    expected: HDR_SUBJECT_1_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "XHDR after GROUP uses first article",
+                    reference: "RFC 2980 section 2.1.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.6",
+                    input: b"GROUP alt.test\r\nXHDR Subject\r\n",
+                    expected: XHDR_SUBJECT_1_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "OVER current article follows ARTICLE 2",
+                    reference: "RFC 3977 section 8.3.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.3.2",
+                    input: b"GROUP alt.test\r\nARTICLE 2\r\nOVER\r\n",
+                    expected: OVER_2_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "XOVER current article follows ARTICLE 2",
+                    reference: "RFC 2980 section 2.1.7 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.7",
+                    input: b"GROUP alt.test\r\nARTICLE 2\r\nXOVER\r\n",
+                    expected: OVER_2_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "HDR current article follows ARTICLE 2",
+                    reference: "RFC 3977 section 8.5.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.2",
+                    input: b"GROUP alt.test\r\nARTICLE 2\r\nHDR Subject\r\n",
+                    expected: HDR_SUBJECT_2_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "HDR metadata current article follows ARTICLE 2",
+                    reference: "RFC 3977 section 8.5.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.2",
+                    input: b"GROUP alt.test\r\nARTICLE 2\r\nHDR :bytes\r\n",
+                    expected: HDR_BYTES_2_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "XHDR current article follows ARTICLE 2",
+                    reference: "RFC 2980 section 2.1.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.6",
+                    input: b"GROUP alt.test\r\nARTICLE 2\r\nXHDR Subject\r\n",
+                    expected: XHDR_SUBJECT_2_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "XHDR metadata current article follows ARTICLE 2",
+                    reference: "RFC 2980 section 2.1.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.6",
+                    input: b"GROUP alt.test\r\nARTICLE 2\r\nXHDR :bytes\r\n",
+                    expected: XHDR_BYTES_2_RESPONSE,
                 },
             ])
             .await;
