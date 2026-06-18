@@ -8403,6 +8403,19 @@ mod tests {
                         frame: b"440\r\n",
                     },
                     ResponseFrameCase {
+                        name: "LIST ACTIVE accepts private status token",
+                        reference: "RFC 3977 sections 7.6.3 and 9.4.3 https://www.rfc-editor.org/rfc/rfc3977#section-9.4.3",
+                        kind: RequestKind::ListActive,
+                        frame: b"215 list of newsgroups follows\r\nalt.test 3 1 archived\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "NEWGROUPS accepts private status token",
+                        reference: "RFC 3977 sections 7.3 and 9.4.3 https://www.rfc-editor.org/rfc/rfc3977#section-9.4.3",
+                        kind: RequestKind::NewGroups,
+                        frame:
+                            b"231 list of new newsgroups follows\r\nalt.test 3 1 archived\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "HDR accepts omitted space for empty field content",
                         reference: "RFC 3977 section 8.5.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.2",
                         kind: RequestKind::Hdr,
@@ -8599,7 +8612,7 @@ mod tests {
                         name: "LIST ACTIVE rejects invalid posting status token",
                         reference: "RFC 3977 sections 7.6.3 and 9.7 https://www.rfc-editor.org/rfc/rfc3977#section-7.6.3",
                         kind: RequestKind::ListActive,
-                        frame: b"215 list of newsgroups follows\r\nalt.test 3 1 open\r\n.\r\n",
+                        frame: b"215 list of newsgroups follows\r\nalt.test 3 1 bad\tstatus\r\n.\r\n",
                     },
                     ResponseFrameCase {
                         name: "LIST ACTIVE rejects overlong high-water article number",
@@ -8659,7 +8672,7 @@ mod tests {
                         name: "NEWGROUPS rejects malformed active row",
                         reference: "RFC 3977 sections 7.3 and 7.6.3 https://www.rfc-editor.org/rfc/rfc3977#section-7.3",
                         kind: RequestKind::NewGroups,
-                        frame: b"231 list of new newsgroups follows\r\nalt.test 3 1 open\r\n.\r\n",
+                        frame: b"231 list of new newsgroups follows\r\nalt.test 3 1 bad\tstatus\r\n.\r\n",
                     },
                     ResponseFrameCase {
                         name: "NEWGROUPS rejects extra active row field",

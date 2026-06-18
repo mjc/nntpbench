@@ -2586,12 +2586,7 @@ fn split_spa_field(value: &[u8]) -> Option<(&[u8], &[u8])> {
 }
 
 fn validate_active_status_token(token: &[u8]) -> bool {
-    matches!(token, b"y" | b"m" | b"n" | b"j" | b"x")
-        || token.strip_prefix(b"=").is_some_and(|group| {
-            std::str::from_utf8(group)
-                .ok()
-                .is_some_and(|group| GroupName::from_borrowed(group).is_ok())
-        })
+    matches!(token, b"y" | b"m" | b"n") || validate_p_char_token(token)
 }
 
 fn validate_active_times_response_line(line: &[u8]) -> bool {
@@ -5816,7 +5811,7 @@ mod tests {
             ),
             (
                 RequestKind::NewGroups,
-                b"231 new groups follow\r\nalt.test 3 1 open\r\n.\r\n".as_slice(),
+                b"231 new groups follow\r\nalt.test 3 1 bad\tstatus\r\n.\r\n".as_slice(),
             ),
             (
                 RequestKind::NewGroups,
