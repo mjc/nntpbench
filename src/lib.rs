@@ -2569,7 +2569,7 @@ where
                 return Ok(false);
             }
             session_state.group_selected = true;
-            session_state.current_article = None;
+            session_state.current_article = Some(1);
             write_response(writer, pending_write, GROUP_RESPONSE, session_stats).await?;
             Ok(false)
         }
@@ -2580,7 +2580,7 @@ where
                 return Ok(false);
             }
             session_state.group_selected = true;
-            session_state.current_article = None;
+            session_state.current_article = Some(1);
             write_response(
                 writer,
                 pending_write,
@@ -4836,23 +4836,23 @@ mod tests {
 
         #[tokio::test]
         async fn rfc3977_red_last_next_current_article_state_matrix() {
-            // RFC 3977 sections 6.1.3 and 6.1.4 require LAST/NEXT to reject an
-            // invalid current article pointer with 420, and group edge movement
-            // with 422/421 respectively:
+            // RFC 3977 sections 6.1.1, 6.1.3, and 6.1.4 require GROUP to set
+            // the current article to the first article, then LAST/NEXT must
+            // apply first/last article edge responses:
             // https://www.rfc-editor.org/rfc/rfc3977#section-6.1.3
             // https://www.rfc-editor.org/rfc/rfc3977#section-6.1.4
             assert_red_server_response_tail_cases(&[
                 ServerResponseCase {
-                    name: "LAST after GROUP without current article",
+                    name: "LAST after GROUP at first article",
                     reference: "RFC 3977 section 6.1.3",
                     input: b"GROUP alt.test\r\nLAST\r\n",
-                    expected: b"420 no current article selected\r\n",
+                    expected: b"422 no previous article in this group\r\n",
                 },
                 ServerResponseCase {
-                    name: "NEXT after GROUP without current article",
+                    name: "NEXT after GROUP advances from first article",
                     reference: "RFC 3977 section 6.1.4",
                     input: b"GROUP alt.test\r\nNEXT\r\n",
-                    expected: b"420 no current article selected\r\n",
+                    expected: NEXT_RESPONSE,
                 },
                 ServerResponseCase {
                     name: "LAST at first article",
@@ -5196,15 +5196,18 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc3977_red_article_current_after_group_without_article_returns_420() {
-            // RFC 3977 section 6.2.1 defines 420 when a group is selected but
-            // there is no current article pointer:
-            // https://www.rfc-editor.org/rfc/rfc3977#section-6.2.1
+        async fn rfc3977_red_group_sets_current_article_to_first_article() {
+            // RFC 3977 section 6.1.1 requires GROUP to set the current article
+            // number to the first article in a non-empty group:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-6.1.1
             let input = b"GROUP alt.test\r\nARTICLE\r\n";
             let (output, _) = run_session_with_input(test_config(), input).await;
+            let expected = b"220 1 <article.1@nntpbench.local> article follows\r\n";
             assert!(
-                without_greeting(&output).ends_with(b"420 no current article selected\r\n"),
-                "RFC 3977 current ARTICLE after GROUP should end with 420, got {:?}",
+                without_greeting(&output)
+                    .windows(expected.len())
+                    .any(|window| window == expected),
+                "RFC 3977 current ARTICLE after GROUP should return article 1, got {:?}",
                 String::from_utf8_lossy(without_greeting(&output))
             );
         }
@@ -5923,16 +5926,16 @@ mod tests {
 
             assert_red_server_response_tail_cases(&[
                 ServerResponseCase {
-                    name: "OVER after GROUP without current article",
+                    name: "OVER after GROUP uses first article",
                     reference: "RFC 3977 section 8.3.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.3.2",
                     input: b"GROUP alt.test\r\nOVER\r\n",
-                    expected: b"420 no current article selected\r\n",
+                    expected: OVER_RESPONSE,
                 },
                 ServerResponseCase {
-                    name: "HDR after GROUP without current article",
+                    name: "HDR after GROUP uses first article",
                     reference: "RFC 3977 section 8.5.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.2",
                     input: b"GROUP alt.test\r\nHDR Subject\r\n",
-                    expected: b"420 no current article selected\r\n",
+                    expected: HDR_RESPONSE,
                 },
             ])
             .await;
