@@ -8268,6 +8268,30 @@ mod tests {
                         frame: b"211 3 1 3 alt.test\r\n1\r\n2\r\n.\r\n",
                     },
                     ResponseFrameCase {
+                        name: "GROUP rejects missing count/low/high/group arguments",
+                        reference: "RFC 3977 section 6.1.1 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.1",
+                        kind: RequestKind::Group,
+                        frame: b"211 group selected\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "GROUP rejects invalid group name argument",
+                        reference: "RFC 3977 sections 6.1.1 and 9.4.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.1",
+                        kind: RequestKind::Group,
+                        frame: b"211 3 1 3 alt!test\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "LISTGROUP rejects invalid article count argument",
+                        reference: "RFC 3977 sections 6.1.2 and 9.4.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.2",
+                        kind: RequestKind::ListGroup,
+                        frame: b"211 three 1 3 alt.test\r\n1\r\n2\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "LISTGROUP rejects extra space between required arguments",
+                        reference: "RFC 3977 sections 3.2 and 6.1.2 https://www.rfc-editor.org/rfc/rfc3977#section-3.2",
+                        kind: RequestKind::ListGroup,
+                        frame: b"211 3  1 3 alt.test\r\n1\r\n2\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "POST rejects IHAVE continuation",
                         reference: "RFC 3977 sections 6.3.1 and 6.3.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.3",
                         kind: RequestKind::Post,

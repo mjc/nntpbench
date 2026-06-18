@@ -238,13 +238,13 @@ impl ResponseInitial {
     #[must_use]
     pub(crate) fn parse(kind: RequestKind, buffer: &[u8]) -> ResponseInitialParse {
         match detect_bounded_response_line_end(buffer, MAX_INITIAL_RESPONSE_LINE_BYTES) {
-            BoundedResponseLineStatus::CompleteAt(_) => {
+            BoundedResponseLineStatus::CompleteAt(line_end) => {
                 let Some(status) = StatusCode::parse(buffer) else {
                     return ResponseInitialParse::Invalid;
                 };
                 let descriptor = ResponseDescriptor::for_request_status(kind, status);
                 if matches!(descriptor.framing(), ResponseFraming::Unexpected)
-                    || !validate_response_initial_line(kind, status, buffer)
+                    || !validate_response_initial_line(kind, status, &buffer[..line_end])
                 {
                     return ResponseInitialParse::Invalid;
                 }
@@ -2357,6 +2357,9 @@ fn validate_response_initial_line(kind: RequestKind, status: StatusCode, line: &
 
     match (kind, status.as_u16()) {
         (RequestKind::Date, 111) => validate_date_response_argument(&line[4..line.len() - 2]),
+        (RequestKind::Group | RequestKind::ListGroup, 211) => {
+            validate_group_response_arguments(&line[4..line.len() - 2])
+        }
         _ => true,
     }
 }
@@ -2374,6 +2377,49 @@ fn validate_date_response_argument(value: &[u8]) -> bool {
     };
 
     NntpDate::from_borrowed(date).is_ok() && NntpTime::from_borrowed(time).is_ok()
+}
+
+fn validate_group_response_arguments(value: &[u8]) -> bool {
+    let Some((tokens, _trailing_text)) = split_required_response_tokens::<4>(value) else {
+        return false;
+    };
+
+    tokens[..3]
+        .iter()
+        .all(|token| is_response_decimal_token(token))
+        && std::str::from_utf8(tokens[3])
+            .ok()
+            .is_some_and(|group| GroupName::from_borrowed(group).is_ok())
+}
+
+fn split_required_response_tokens<const N: usize>(mut value: &[u8]) -> Option<([&[u8]; N], &[u8])> {
+    let mut tokens = [b"".as_slice(); N];
+    for (index, token) in tokens.iter_mut().enumerate() {
+        if value.is_empty() || value.first() == Some(&b' ') {
+            return None;
+        }
+
+        let end = memchr::memchr(b' ', value).unwrap_or(value.len());
+        *token = &value[..end];
+        value = &value[end..];
+
+        if index + 1 == N {
+            break;
+        }
+        if !value.starts_with(b" ") || value.get(1) == Some(&b' ') {
+            return None;
+        }
+        value = &value[1..];
+    }
+
+    if !value.is_empty() && !value.starts_with(b" ") {
+        return None;
+    }
+    Some((tokens, value))
+}
+
+fn is_response_decimal_token(value: &[u8]) -> bool {
+    !value.is_empty() && value.iter().all(u8::is_ascii_digit)
 }
 
 /// Client client request for the current client NNTP surface.
@@ -4785,6 +4831,68 @@ mod tests {
                     ResponseInitialParse::Invalid
                 ),
                 "{input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn group_response_frame_validates_rfc_status_line_arguments() {
+        // RFC 3977 sections 6.1.1, 6.1.2, and 9.4.2 define GROUP and
+        // LISTGROUP 211 response initial lines as count, low, high, and group.
+        for (kind, input) in [
+            (RequestKind::Group, b"211 3 1 3 alt.test\r\n".as_slice()),
+            (
+                RequestKind::Group,
+                b"211 0 0 0 alt.empty group selected\r\n".as_slice(),
+            ),
+            (
+                RequestKind::ListGroup,
+                b"211 3 1 3 alt.test\r\n1\r\n2\r\n3\r\n.\r\n".as_slice(),
+            ),
+        ] {
+            assert!(
+                matches!(
+                    ResponseFrame::parse(kind, input),
+                    ResponseFrameParse::Complete(response)
+                        if response.status() == StatusCode(211)
+                ),
+                "{kind:?} {input:?}"
+            );
+            assert!(
+                matches!(
+                    ResponseInitial::parse(kind, input),
+                    ResponseInitialParse::Complete(initial) if initial.status() == StatusCode(211)
+                ),
+                "{kind:?} {input:?}"
+            );
+        }
+
+        for (kind, input) in [
+            (RequestKind::Group, b"211 group selected\r\n".as_slice()),
+            (RequestKind::Group, b"211 3 1 3 alt!test\r\n".as_slice()),
+            (RequestKind::Group, b"211 3  1 3 alt.test\r\n".as_slice()),
+            (
+                RequestKind::ListGroup,
+                b"211 three 1 3 alt.test\r\n.\r\n".as_slice(),
+            ),
+            (
+                RequestKind::ListGroup,
+                b"211 3 1 3 alt.test extra\nbad\r\n.\r\n".as_slice(),
+            ),
+        ] {
+            assert!(
+                matches!(
+                    ResponseFrame::parse(kind, input),
+                    ResponseFrameParse::Invalid
+                ),
+                "{kind:?} {input:?}"
+            );
+            assert!(
+                matches!(
+                    ResponseInitial::parse(kind, input),
+                    ResponseInitialParse::Invalid
+                ),
+                "{kind:?} {input:?}"
             );
         }
     }
