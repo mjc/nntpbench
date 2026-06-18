@@ -1630,6 +1630,7 @@ impl<'a> HeaderName<'a> {
 pub struct InvalidHeaderName;
 
 fn validate_header_name(value: &str) -> Result<(), InvalidHeaderName> {
+    let value = value.strip_prefix(':').unwrap_or(value);
     if value.is_empty() {
         return Err(InvalidHeaderName);
     }
@@ -4116,6 +4117,10 @@ mod tests {
             "Subject"
         );
         assert_eq!(
+            HeaderName::from_borrowed(":bytes").unwrap().as_str(),
+            ":bytes"
+        );
+        assert_eq!(
             ArticleSelector::from_borrowed("1-10").unwrap().as_str(),
             "1-10"
         );
@@ -4125,6 +4130,7 @@ mod tests {
         );
         assert!(HeaderName::from_borrowed("Bad Header").is_err());
         assert!(HeaderName::from_borrowed("Subject:").is_err());
+        assert!(HeaderName::from_borrowed(":").is_err());
         assert!(ArticleSelector::from_borrowed("1 10").is_err());
         assert!(ArticleSelector::from_borrowed("1\r\nQUIT").is_err());
     }

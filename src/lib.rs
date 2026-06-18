@@ -157,14 +157,18 @@ pub const OVER_RESPONSE: &[u8] = b"224 Overview information follows\r\n1\tSubjec
 const OVER_2_RESPONSE: &[u8] = b"224 Overview information follows\r\n2\tSubject two\ttwo@example.com\tFri, 16 May 2026 12:00:01 +0000\t<two@example.com>\t<ref@example.com>\t456\t8\r\n.\r\n";
 pub const XOVER_RESPONSE: &[u8] = b"224 Overview information follows\r\n2\tSubject two\ttwo@example.com\tFri, 16 May 2026 12:00:01 +0000\t<two@example.com>\t<ref@example.com>\t456\t8\r\n.\r\n";
 pub const HDR_RESPONSE: &[u8] = b"225 headers follow\r\n1 example one\r\n2 example two\r\n.\r\n";
+const HDR_SUBJECT_1_RESPONSE: &[u8] = b"225 headers follow\r\n1 example one\r\n.\r\n";
 const HDR_SUBJECT_2_RESPONSE: &[u8] = b"225 headers follow\r\n2 example two\r\n.\r\n";
 pub const XHDR_RESPONSE: &[u8] = b"221 headers follow\r\n1 example one\r\n2 example two\r\n.\r\n";
+const XHDR_SUBJECT_1_RESPONSE: &[u8] = b"221 headers follow\r\n1 example one\r\n.\r\n";
 const XHDR_SUBJECT_2_RESPONSE: &[u8] = b"221 headers follow\r\n2 example two\r\n.\r\n";
 const HDR_MESSAGE_ID_RESPONSE: &[u8] =
     b"225 headers follow\r\n1 <one@example.com>\r\n2 <two@example.com>\r\n.\r\n";
+const HDR_MESSAGE_ID_1_RESPONSE: &[u8] = b"225 headers follow\r\n1 <one@example.com>\r\n.\r\n";
 const HDR_MESSAGE_ID_2_RESPONSE: &[u8] = b"225 headers follow\r\n2 <two@example.com>\r\n.\r\n";
 const XHDR_MESSAGE_ID_RESPONSE: &[u8] =
     b"221 headers follow\r\n1 <one@example.com>\r\n2 <two@example.com>\r\n.\r\n";
+const XHDR_MESSAGE_ID_1_RESPONSE: &[u8] = b"221 headers follow\r\n1 <one@example.com>\r\n.\r\n";
 const XHDR_MESSAGE_ID_2_RESPONSE: &[u8] = b"221 headers follow\r\n2 <two@example.com>\r\n.\r\n";
 pub const HEAD_RESPONSE: &[u8] = b"221 1 <article.1@nntpbench.local> article retrieved\r\nPath: nntpbench.local!mock\r\nFrom: Bench User <bench@nntpbench.local>\r\nNewsgroups: alt.binaries.bench\r\nSubject: nntpbench synthetic article\r\nMessage-ID: <article.1@nntpbench.local>\r\nDate: Fri, 15 May 2026 00:00:00 +0000\r\n.\r\n";
 pub const STAT_RESPONSE: &[u8] = b"223 1 <article.1@nntpbench.local> article retrieved\r\n";
@@ -4216,6 +4220,10 @@ fn overview_selector_starts_at_second(selector: &[u8]) -> bool {
     selector == b"2" || selector.starts_with(b"2-")
 }
 
+fn overview_selector_selects_first_only(selector: &[u8]) -> bool {
+    selector == b"1"
+}
+
 fn listgroup_state_error(args: &[u8], session_state: &SessionState) -> Option<&'static [u8]> {
     if listgroup_explicit_group_arg(args)
         .is_some_and(|group| fixture_group_from_name(group).is_none())
@@ -4327,10 +4335,16 @@ fn hdr_response_for_args(args: &[u8]) -> &'static [u8] {
     if header_query_name_from_args(args)
         .is_some_and(|header| header.eq_ignore_ascii_case(b"Message-ID"))
     {
+        if selector.is_some_and(overview_selector_selects_first_only) {
+            return HDR_MESSAGE_ID_1_RESPONSE;
+        }
         if selector.is_some_and(overview_selector_starts_at_second) {
             return HDR_MESSAGE_ID_2_RESPONSE;
         }
         return HDR_MESSAGE_ID_RESPONSE;
+    }
+    if selector.is_some_and(overview_selector_selects_first_only) {
+        return HDR_SUBJECT_1_RESPONSE;
     }
     if selector.is_some_and(overview_selector_starts_at_second) {
         return HDR_SUBJECT_2_RESPONSE;
@@ -4343,10 +4357,16 @@ fn xhdr_response_for_args(args: &[u8]) -> &'static [u8] {
     if header_query_name_from_args(args)
         .is_some_and(|header| header.eq_ignore_ascii_case(b"Message-ID"))
     {
+        if selector.is_some_and(overview_selector_selects_first_only) {
+            return XHDR_MESSAGE_ID_1_RESPONSE;
+        }
         if selector.is_some_and(overview_selector_starts_at_second) {
             return XHDR_MESSAGE_ID_2_RESPONSE;
         }
         return XHDR_MESSAGE_ID_RESPONSE;
+    }
+    if selector.is_some_and(overview_selector_selects_first_only) {
+        return XHDR_SUBJECT_1_RESPONSE;
     }
     if selector.is_some_and(overview_selector_starts_at_second) {
         return XHDR_SUBJECT_2_RESPONSE;
@@ -5510,11 +5530,25 @@ mod tests {
         #[tokio::test]
         async fn rfc3977_red_hdr_invalid_header_name_returns_501() {
             // RFC 3977 section 8.5.1 requires a valid header field name.
-            // A colon is not part of the field-name token:
+            // A trailing colon is not part of the field-name token:
             // https://www.rfc-editor.org/rfc/rfc3977#section-8.5.1
             let input = b"HDR Subject: 1\r\n";
             let (output, _) = run_session_with_input(test_config(), input).await;
             assert_single_response(input, b"501 command syntax error\r\n", &output, "RFC 3977");
+        }
+
+        #[tokio::test]
+        async fn rfc3977_red_hdr_accepts_metadata_names_with_leading_colon() {
+            // RFC 3977 section 8.5.2 permits metadata item names with a leading
+            // colon, such as ":bytes":
+            // https://www.rfc-editor.org/rfc/rfc3977#section-8.5.2
+            let input = b"GROUP alt.test\r\nHDR :bytes 1\r\n";
+            let (output, _) = run_session_with_input(test_config(), input).await;
+            let text = String::from_utf8_lossy(without_greeting(&output));
+            assert!(
+                text.ends_with("\r\n225 headers follow\r\n1 example one\r\n.\r\n"),
+                "RFC 3977 HDR metadata names must be accepted, got {text:?}"
+            );
         }
 
         #[tokio::test]
@@ -6213,7 +6247,7 @@ mod tests {
         #[tokio::test]
         async fn rfc2980_red_xhdr_invalid_header_name_returns_501() {
             // RFC 2980 section 2.1.6 requires XHDR to name a header field. A
-            // colon is not part of the field-name token:
+            // trailing colon is not part of the field-name token:
             // https://www.rfc-editor.org/rfc/rfc2980#section-2.1.6
             let input = b"XHDR Subject: 1\r\n";
             let (output, _) = run_session_with_input(test_config(), input).await;
@@ -6339,9 +6373,8 @@ mod tests {
             let (output, _) = run_session_with_input(test_config(), input).await;
             let text = String::from_utf8_lossy(without_greeting(&output));
             assert!(
-                text.contains("1 <one@example.com>\r\n")
-                    && text.contains("2 <two@example.com>\r\n"),
-                "RFC 3977 HDR Message-ID should return valid message-id values, got {text:?}"
+                text.ends_with("\r\n225 headers follow\r\n1 <one@example.com>\r\n.\r\n"),
+                "RFC 3977 HDR Message-ID should return valid selected message-id values, got {text:?}"
             );
         }
 
@@ -6364,10 +6397,22 @@ mod tests {
                     expected: OVER_2_RESPONSE,
                 },
                 ServerResponseCase {
+                    name: "HDR numeric selector 1",
+                    reference: "RFC 3977 section 8.5.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.2",
+                    input: b"GROUP alt.test\r\nHDR Subject 1\r\n",
+                    expected: HDR_SUBJECT_1_RESPONSE,
+                },
+                ServerResponseCase {
                     name: "HDR numeric selector 2",
                     reference: "RFC 3977 section 8.5.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.2",
                     input: b"GROUP alt.test\r\nHDR Subject 2\r\n",
                     expected: HDR_SUBJECT_2_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "XHDR numeric selector 1",
+                    reference: "RFC 2980 section 2.1.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.6",
+                    input: b"GROUP alt.test\r\nXHDR Subject 1\r\n",
+                    expected: XHDR_SUBJECT_1_RESPONSE,
                 },
                 ServerResponseCase {
                     name: "XHDR numeric selector 2",
@@ -6453,8 +6498,8 @@ mod tests {
             assert!(
                 text.contains("\r\n221 ")
                     && text.contains("1 <one@example.com>\r\n")
-                    && text.contains("2 <two@example.com>\r\n"),
-                "RFC 2980 XHDR Message-ID should return valid message-id values, got {text:?}"
+                    && !text.contains("2 <two@example.com>\r\n"),
+                "RFC 2980 XHDR Message-ID should return valid selected message-id values, got {text:?}"
             );
         }
 
@@ -6882,6 +6927,16 @@ mod tests {
                         "wrapped message-id rejects invalid unbracketed value",
                         "RFC 3977 section 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
                         MessageId::from_str_or_wrap("@example.com").is_err(),
+                    ),
+                    (
+                        "HDR metadata name accepts leading colon",
+                        "RFC 3977 section 8.5.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.2",
+                        HeaderName::from_borrowed(":bytes").is_ok(),
+                    ),
+                    (
+                        "HDR metadata name rejects bare colon",
+                        "RFC 3977 section 8.5.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.2",
+                        HeaderName::from_borrowed(":").is_err(),
                     ),
                     (
                         "group name rejects comma separator",
@@ -9512,6 +9567,12 @@ mod tests {
             let read = fourth.read(&mut request).await.unwrap();
             assert_eq!(&request[..read], b"XHDR Message-ID <headers@test>\r\n");
             fourth.write_all(XHDR_RESPONSE).await.unwrap();
+
+            let (mut fifth, _) = listener.accept().await.unwrap();
+            fifth.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = fifth.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"HDR :bytes 1\r\n");
+            fifth.write_all(HDR_RESPONSE).await.unwrap();
         });
 
         let mut hdr_range_args = test_fetch_args();
@@ -9553,6 +9614,16 @@ mod tests {
         let xhdr_message_id = fetch_response(&xhdr_message_id_args).await.unwrap();
         assert_eq!(xhdr_message_id.kind(), RequestKind::Xhdr);
         assert_eq!(xhdr_message_id.status().as_u16(), 221);
+
+        let mut hdr_metadata_args = test_fetch_args();
+        hdr_metadata_args.connect = addr;
+        hdr_metadata_args.request = FetchRequestKind::Hdr;
+        hdr_metadata_args.message_id = None;
+        hdr_metadata_args.header = Some(":bytes".to_string());
+        hdr_metadata_args.selector = Some("1".to_string());
+        let hdr_metadata = fetch_response(&hdr_metadata_args).await.unwrap();
+        assert_eq!(hdr_metadata.kind(), RequestKind::Hdr);
+        assert_eq!(hdr_metadata.status().as_u16(), 225);
 
         server.await.unwrap();
     }
@@ -11104,10 +11175,10 @@ mod tests {
                 OVER_RESPONSE,
                 XOVER_RESPONSE,
                 XOVER_RESPONSE,
-                HDR_RESPONSE,
-                HDR_MESSAGE_ID_RESPONSE,
-                XHDR_RESPONSE,
-                XHDR_MESSAGE_ID_RESPONSE,
+                HDR_SUBJECT_1_RESPONSE,
+                HDR_MESSAGE_ID_1_RESPONSE,
+                XHDR_SUBJECT_1_RESPONSE,
+                XHDR_MESSAGE_ID_1_RESPONSE,
             ]
             .concat()
         );
