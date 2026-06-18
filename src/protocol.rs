@@ -116,6 +116,9 @@ impl<'a> ResponseFrame<'a> {
         if matches!(descriptor.framing(), ResponseFraming::Unexpected) {
             return ResponseFrameParse::Invalid;
         }
+        if !validate_response_initial_line(kind, status, &buffer[..status_line_end]) {
+            return ResponseFrameParse::Invalid;
+        }
 
         let (consumed, content, terminator) = if descriptor.framing().is_multiline() {
             let Some(block) = find_dot_terminated_block(buffer, status_line_end) else {
@@ -239,10 +242,13 @@ impl ResponseInitial {
                 let Some(status) = StatusCode::parse(buffer) else {
                     return ResponseInitialParse::Invalid;
                 };
-                ResponseInitialParse::Complete(Self {
-                    status,
-                    descriptor: ResponseDescriptor::for_request_status(kind, status),
-                })
+                let descriptor = ResponseDescriptor::for_request_status(kind, status);
+                if matches!(descriptor.framing(), ResponseFraming::Unexpected)
+                    || !validate_response_initial_line(kind, status, buffer)
+                {
+                    return ResponseInitialParse::Invalid;
+                }
+                ResponseInitialParse::Complete(Self { status, descriptor })
             }
             BoundedResponseLineStatus::NeedMore => ResponseInitialParse::NeedMore,
             BoundedResponseLineStatus::Invalid | BoundedResponseLineStatus::TooLong => {
@@ -2342,6 +2348,32 @@ fn responses_for_request(kind: RequestKind) -> impl Iterator<Item = ResponseDesc
         .iter()
         .copied()
         .filter(move |descriptor| descriptor.kind == kind)
+}
+
+fn validate_response_initial_line(kind: RequestKind, status: StatusCode, line: &[u8]) -> bool {
+    if line.len() < 5 || line.get(3) != Some(&b' ') || !line.ends_with(b"\r\n") {
+        return false;
+    }
+
+    match (kind, status.as_u16()) {
+        (RequestKind::Date, 111) => validate_date_response_argument(&line[4..line.len() - 2]),
+        _ => true,
+    }
+}
+
+fn validate_date_response_argument(value: &[u8]) -> bool {
+    if value.len() != 14 || !value.iter().all(u8::is_ascii_digit) {
+        return false;
+    }
+
+    let Ok(date) = std::str::from_utf8(&value[..8]) else {
+        return false;
+    };
+    let Ok(time) = std::str::from_utf8(&value[8..]) else {
+        return false;
+    };
+
+    NntpDate::from_borrowed(date).is_ok() && NntpTime::from_borrowed(time).is_ok()
 }
 
 /// Client client request for the current client NNTP surface.
@@ -4707,6 +4739,54 @@ mod tests {
         crate::COUNT_TEST_ALLOCATIONS.with(|enabled| enabled.set(false));
         let allocations = crate::TEST_ALLOCATIONS.load(std::sync::atomic::Ordering::Relaxed);
         assert_eq!(allocations, 0, "borrowed response frame parsing allocated");
+    }
+
+    #[test]
+    fn date_response_frame_validates_rfc_timestamp_argument() {
+        // RFC 3977 sections 7.1 and 7.5 define the DATE response as
+        // 111 followed by yyyymmddhhmmss.
+        for input in [
+            b"111 20260602120000\r\n".as_slice(),
+            b"111 20261231235960\r\n".as_slice(),
+        ] {
+            assert!(
+                matches!(
+                    ResponseFrame::parse(RequestKind::Date, input),
+                    ResponseFrameParse::Complete(response)
+                        if response.status() == StatusCode(111)
+                            && response.status_line() == input
+                ),
+                "{input:?}"
+            );
+            assert!(matches!(
+                ResponseInitial::parse(RequestKind::Date, input),
+                ResponseInitialParse::Complete(initial) if initial.status() == StatusCode(111)
+            ));
+        }
+
+        for input in [
+            b"111 20260230000000\r\n".as_slice(),
+            b"111 20260602240000\r\n".as_slice(),
+            b"111 2026060212000\r\n".as_slice(),
+            b"111 202606021200000\r\n".as_slice(),
+            b"111 2026060212000x\r\n".as_slice(),
+            b"111 server date follows\r\n".as_slice(),
+        ] {
+            assert!(
+                matches!(
+                    ResponseFrame::parse(RequestKind::Date, input),
+                    ResponseFrameParse::Invalid
+                ),
+                "{input:?}"
+            );
+            assert!(
+                matches!(
+                    ResponseInitial::parse(RequestKind::Date, input),
+                    ResponseInitialParse::Invalid
+                ),
+                "{input:?}"
+            );
+        }
     }
 
     #[test]

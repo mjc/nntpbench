@@ -8219,6 +8219,18 @@ mod tests {
                         frame: b"111 20260602120000\r\nextra\r\n.\r\n",
                     },
                     ResponseFrameCase {
+                        name: "DATE rejects malformed timestamp",
+                        reference: "RFC 3977 sections 7.1 and 7.5 https://www.rfc-editor.org/rfc/rfc3977#section-7.1",
+                        kind: RequestKind::Date,
+                        frame: b"111 20260230000000\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "DATE rejects non-timestamp response text",
+                        reference: "RFC 3977 sections 7.1 and 9.4.2 https://www.rfc-editor.org/rfc/rfc3977#section-7.1",
+                        kind: RequestKind::Date,
+                        frame: b"111 server date follows\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "GROUP rejects multiline payload",
                         reference: "RFC 3977 section 6.1.1 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.1",
                         kind: RequestKind::Group,
