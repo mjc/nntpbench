@@ -198,7 +198,7 @@ pub const STAT_RESPONSE: &[u8] = b"223 1 <article.1@nntpbench.local> article ret
 pub const HELP_RESPONSE: &[u8] =
     b"100 help text follows\r\nARTICLE\r\nHEAD\r\nBODY\r\nSTAT\r\nLIST\r\nCAPABILITIES\r\nDATE\r\nMODE READER\r\nQUIT\r\n.\r\n";
 pub const CAPABILITIES_RESPONSE: &[u8] =
-    b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nLIST ACTIVE ACTIVE.TIMES DISTRIB.PATS NEWSGROUPS OVERVIEW.FMT HEADERS\r\nOVER MSGID\r\nHDR\r\nNEWNEWS\r\nAUTHINFO\r\n.\r\n";
+    b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nMODE-READER\r\nLIST ACTIVE ACTIVE.TIMES DISTRIB.PATS NEWSGROUPS OVERVIEW.FMT HEADERS\r\nOVER MSGID\r\nHDR\r\nNEWNEWS\r\nAUTHINFO\r\n.\r\n";
 pub const QUIT_RESPONSE: &[u8] = b"205 closing connection\r\n";
 pub const ARTICLE_NOT_FOUND_RESPONSE: &[u8] = b"430 no article with that number\r\n";
 const BODY_RESPONSE_PREFIX: &[u8] = b"222 1 <article.1@nntpbench.local> body follows\r\n";
@@ -5670,8 +5670,10 @@ mod tests {
             let (output, _) = run_session_with_input(test_config(), b"CAPABILITIES\r\n").await;
             let text = String::from_utf8_lossy(without_greeting(&output));
             assert!(
-                text.contains("VERSION 2") && text.contains("READER"),
-                "missing required RFC 3977 base capabilities, got {text:?}"
+                text.contains("VERSION 2")
+                    && text.contains("READER\r\n")
+                    && text.contains("MODE-READER\r\n"),
+                "missing required RFC 3977 base/reader capabilities, got {text:?}"
             );
             assert!(
                 text.contains("AUTHINFO\r\n"),
