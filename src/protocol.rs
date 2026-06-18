@@ -2694,7 +2694,32 @@ fn validate_overview_response_line(line: &[u8]) -> bool {
     let Some(tab) = memchr::memchr(b'\t', line) else {
         return false;
     };
-    is_response_decimal_token(&line[..tab])
+    if !is_response_decimal_token(&line[..tab]) {
+        return false;
+    }
+
+    let mut field_count = 0usize;
+    for field in line[tab + 1..].split(|byte| *byte == b'\t') {
+        field_count += 1;
+        if field_count > 7 && !field.is_empty() && !validate_overview_optional_field(field) {
+            return false;
+        }
+    }
+
+    field_count > 0
+}
+
+fn validate_overview_optional_field(field: &[u8]) -> bool {
+    let Some(space) = memchr::memchr(b' ', field) else {
+        return false;
+    };
+    let label = &field[..space];
+    if validate_metadata_name_abnf_bytes(label) {
+        return true;
+    }
+    label
+        .strip_suffix(b":")
+        .is_some_and(validate_header_name_abnf_bytes)
 }
 
 fn validate_header_response_line(line: &[u8]) -> bool {
@@ -5496,6 +5521,11 @@ mod tests {
                     .as_slice(),
             ),
             (
+                RequestKind::Over,
+                b"224 overview follows\r\n1\tSubject\tfrom@test\tdate\t<one@test>\t\t1\t1\tXref: news.example alt.test:1\t:x-article-number 1\r\n.\r\n"
+                    .as_slice(),
+            ),
+            (
                 RequestKind::Xover,
                 b"224 overview follows\r\n1\tSubject\tfrom@test\tdate\t<one@test>\t\t1\t1\r\n.\r\n"
                     .as_slice(),
@@ -5597,8 +5627,18 @@ mod tests {
                 b"224 overview follows\r\n1 Subject without tab\r\n.\r\n".as_slice(),
             ),
             (
+                RequestKind::Over,
+                b"224 overview follows\r\n1\tSubject\tfrom@test\tdate\t<one@test>\t\t1\t1\toptional without label\r\n.\r\n"
+                    .as_slice(),
+            ),
+            (
                 RequestKind::Xover,
                 b"224 overview follows\r\none\tSubject\tfrom@test\r\n.\r\n".as_slice(),
+            ),
+            (
+                RequestKind::Xover,
+                b"224 overview follows\r\n1\tSubject\tfrom@test\tdate\t<one@test>\t\t1\t1\tXref:missing-space\r\n.\r\n"
+                    .as_slice(),
             ),
             (
                 RequestKind::Hdr,

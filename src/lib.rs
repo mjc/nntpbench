@@ -8454,10 +8454,22 @@ mod tests {
                         frame: b"224 overview follows\r\n1 Subject without tabs\r\n.\r\n",
                     },
                     ResponseFrameCase {
+                        name: "OVER rejects unlabeled optional overview field",
+                        reference: "RFC 3977 sections 8.3.2 and 9.4.3 https://www.rfc-editor.org/rfc/rfc3977#section-9.4.3",
+                        kind: RequestKind::Over,
+                        frame: b"224 overview follows\r\n1\tSubject\tfrom@test\tdate\t<one@test>\t\t1\t1\toptional without label\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "XOVER rejects body row without numeric article number",
                         reference: "RFC 2980 section 2.1.7 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.7",
                         kind: RequestKind::Xover,
                         frame: b"224 overview follows\r\none\tSubject\tfrom@test\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "XOVER rejects optional overview field without label separator",
+                        reference: "RFC 3977 sections 8.3.2 and 9.4.3 https://www.rfc-editor.org/rfc/rfc3977#section-9.4.3",
+                        kind: RequestKind::Xover,
+                        frame: b"224 overview follows\r\n1\tSubject\tfrom@test\tdate\t<one@test>\t\t1\t1\tXref:missing-space\r\n.\r\n",
                     },
                     ResponseFrameCase {
                         name: "HDR rejects tab separator before header value",
