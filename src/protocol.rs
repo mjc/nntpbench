@@ -1818,7 +1818,17 @@ fn validate_group_name(value: &str) -> Result<(), InvalidGroupName> {
                 || byte.is_ascii_control()
                 || matches!(
                     byte,
-                    b'<' | b'>' | b'*' | b'?' | b'[' | b']' | b'\\' | b',' | b':' | b'/' | b'@'
+                    b'<' | b'>'
+                        | b'!'
+                        | b'*'
+                        | b'?'
+                        | b'['
+                        | b']'
+                        | b'\\'
+                        | b','
+                        | b':'
+                        | b'/'
+                        | b'@'
                 )
         })
     {
@@ -2083,7 +2093,12 @@ fn validate_wildmat(value: &str) -> Result<(), InvalidWildmat> {
     }
 
     for pattern in value.split(',') {
-        if pattern.is_empty() || pattern == "!" {
+        let pattern = pattern.strip_prefix('!').unwrap_or(pattern);
+        if pattern.is_empty()
+            || pattern
+                .bytes()
+                .any(|byte| matches!(byte, b'!' | b',' | b'[' | b'\\' | b']'))
+        {
             return Err(InvalidWildmat);
         }
     }

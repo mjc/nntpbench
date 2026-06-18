@@ -6880,6 +6880,11 @@ mod tests {
                         GroupName::from_borrowed("alt@test").is_err(),
                     ),
                     (
+                        "group name rejects !",
+                        "RFC 3977 sections 4.1 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-4.1",
+                        GroupName::from_borrowed("alt!test").is_err(),
+                    ),
+                    (
                         "article selector rejects zero",
                         "RFC 3977 section 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
                         ArticleSelector::from_borrowed("0").is_err(),
@@ -6974,6 +6979,31 @@ mod tests {
                         "RFC 3977 section 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
                         NntpTime::from_borrowed("000060").is_err(),
                     ),
+                    (
+                        "wildmat rejects ! outside negation marker",
+                        "RFC 3977 section 4.1 https://www.rfc-editor.org/rfc/rfc3977#section-4.1",
+                        Wildmat::from_borrowed("alt!test").is_err(),
+                    ),
+                    (
+                        "wildmat rejects [",
+                        "RFC 3977 section 4.1 https://www.rfc-editor.org/rfc/rfc3977#section-4.1",
+                        Wildmat::from_borrowed("alt[test").is_err(),
+                    ),
+                    (
+                        "wildmat rejects \\",
+                        "RFC 3977 section 4.1 https://www.rfc-editor.org/rfc/rfc3977#section-4.1",
+                        Wildmat::from_borrowed(r"alt\test").is_err(),
+                    ),
+                    (
+                        "wildmat rejects ]",
+                        "RFC 3977 section 4.1 https://www.rfc-editor.org/rfc/rfc3977#section-4.1",
+                        Wildmat::from_borrowed("alt]test").is_err(),
+                    ),
+                    (
+                        "wildmat accepts ! as comma pattern negation marker",
+                        "RFC 3977 sections 4.1 and 4.2 https://www.rfc-editor.org/rfc/rfc3977#section-4.1",
+                        Wildmat::from_borrowed("alt.*,!alt.test").is_ok(),
+                    ),
                 ]);
             }
         }
@@ -7050,6 +7080,21 @@ mod tests {
                         "RFC 3977 sections 7.4.1 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-7.4.1",
                     ),
                     (
+                        "GROUP excludes ! from newsgroup-name",
+                        b"GROUP alt!test\r\n",
+                        "RFC 3977 sections 4.1 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-4.1",
+                    ),
+                    (
+                        "LIST ACTIVE excludes [ from wildmat",
+                        b"LIST ACTIVE alt[test\r\n",
+                        "RFC 3977 sections 4.1 and 7.6.3 https://www.rfc-editor.org/rfc/rfc3977#section-4.1",
+                    ),
+                    (
+                        "NEWNEWS excludes \\ from wildmat",
+                        b"NEWNEWS alt\\test 20260101 000000\r\n",
+                        "RFC 3977 sections 4.1 and 7.4.1 https://www.rfc-editor.org/rfc/rfc3977#section-4.1",
+                    ),
+                    (
                         "NEWGROUPS extra argument",
                         b"NEWGROUPS 20260101 000000 GMT extra\r\n",
                         "RFC 3977 section 7.3.1 https://www.rfc-editor.org/rfc/rfc3977#section-7.3.1",
@@ -7091,6 +7136,24 @@ mod tests {
                         name: "NEWNEWS non-UTF-8 wildmat",
                         reference: "RFC 3977 sections 7.4.1 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-7.4.1",
                         input: b"NEWNEWS alt.\xff 20260101 000000\r\n",
+                        expected: b"501 command syntax error\r\n",
+                    },
+                    ServerResponseCase {
+                        name: "GROUP excludes ! from newsgroup-name",
+                        reference: "RFC 3977 sections 4.1 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-4.1",
+                        input: b"GROUP alt!test\r\n",
+                        expected: b"501 command syntax error\r\n",
+                    },
+                    ServerResponseCase {
+                        name: "LIST ACTIVE excludes [ from wildmat",
+                        reference: "RFC 3977 sections 4.1 and 7.6.3 https://www.rfc-editor.org/rfc/rfc3977#section-4.1",
+                        input: b"LIST ACTIVE alt[test\r\n",
+                        expected: b"501 command syntax error\r\n",
+                    },
+                    ServerResponseCase {
+                        name: "NEWNEWS excludes \\ from wildmat",
+                        reference: "RFC 3977 sections 4.1 and 7.4.1 https://www.rfc-editor.org/rfc/rfc3977#section-4.1",
+                        input: b"NEWNEWS alt\\test 20260101 000000\r\n",
                         expected: b"501 command syntax error\r\n",
                     },
                     ServerResponseCase {
