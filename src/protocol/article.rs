@@ -25,6 +25,7 @@ pub enum ArticleParseError {
 pub enum InvalidHeaderReason {
     LeadingFold,
     MissingColon,
+    MissingSpaceAfterColon,
     EmptyName,
     InvalidName,
 }
@@ -941,6 +942,7 @@ impl fmt::Display for InvalidHeaderReason {
         match self {
             Self::LeadingFold => write!(f, "header cannot start with folding whitespace"),
             Self::MissingColon => write!(f, "header missing colon"),
+            Self::MissingSpaceAfterColon => write!(f, "header missing space after colon"),
             Self::EmptyName => write!(f, "empty header name"),
             Self::InvalidName => write!(f, "invalid character in header name"),
         }
@@ -1452,6 +1454,11 @@ fn validate_headers(data: &[u8]) -> Result<(), ArticleParseError> {
                 ));
             }
         }
+        if line.get(colon_pos + 1) != Some(&b' ') {
+            return Err(ArticleParseError::InvalidHeader(
+                InvalidHeaderReason::MissingSpaceAfterColon,
+            ));
+        }
 
         pos = line_end + 2;
     }
@@ -1585,6 +1592,7 @@ Actual body content\r\n\
     fn article_header_parsing_does_not_allocate() {
         let valid = b"Subject: Test\r\nFrom: user@example.com\r\n";
         let missing_colon = b"Invalid Header\r\n";
+        let missing_space = b"Subject:Test\r\n";
         let invalid_name = b"Invalid Header: value\r\n";
         let leading_fold = b" folded\r\nSubject: Test\r\n";
 
@@ -1598,6 +1606,10 @@ Actual body content\r\n\
         assert_eq!(
             Headers::parse(missing_colon).unwrap_err(),
             ArticleParseError::InvalidHeader(InvalidHeaderReason::MissingColon)
+        );
+        assert_eq!(
+            Headers::parse(missing_space).unwrap_err(),
+            ArticleParseError::InvalidHeader(InvalidHeaderReason::MissingSpaceAfterColon)
         );
         assert_eq!(
             Headers::parse(invalid_name).unwrap_err(),
@@ -1716,6 +1728,11 @@ Actual body content\r\n\
                 b"220 12345 <test@example.com>\r\nSubject: Valid\r\nInvalidHeaderNoColon\r\n\r\nBody\r\n.\r\n"
                     .as_slice(),
                 ArticleParseError::InvalidHeader(InvalidHeaderReason::MissingColon),
+            ),
+            (
+                b"220 12345 <test@example.com>\r\nSubject:No space\r\n\r\nBody\r\n.\r\n"
+                    .as_slice(),
+                ArticleParseError::InvalidHeader(InvalidHeaderReason::MissingSpaceAfterColon),
             ),
             (
                 b"221 12345 <test@example.com>\r\nSubject: Test\r\n\r\nThis body should not be here\r\n.\r\n"

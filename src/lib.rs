@@ -5512,6 +5512,28 @@ mod tests {
             }
         }
 
+        #[test]
+        fn rfc3977_red_article_parser_rejects_header_without_required_space() {
+            // RFC 3977 section 3.6 defines article header lines as a header
+            // name, colon, space, header content, and CRLF in that order:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-3.6
+            for (name, input) in [
+                (
+                    "ARTICLE header field",
+                    b"220 1 <space@test>\r\nSubject:good\r\n\r\nbody\r\n.\r\n".as_slice(),
+                ),
+                (
+                    "HEAD header field",
+                    b"221 1 <space@test>\r\nSubject:good\r\n.\r\n".as_slice(),
+                ),
+            ] {
+                assert!(
+                    Article::parse(input).is_err(),
+                    "{name}: RFC 3977 article header field should require SP after colon"
+                );
+            }
+        }
+
         #[tokio::test]
         async fn rfc3977_red_server_returns_501_for_syntax_error_not_article_body() {
             // RFC 3977 sections 3.2.1 and 6.2.1 reserve 501 for command syntax
