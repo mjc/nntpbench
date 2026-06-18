@@ -8219,6 +8219,11 @@ mod tests {
                         GroupName::from_borrowed("alt?test").is_err(),
                     ),
                     (
+                        "group name rejects UTF-8 BOM",
+                        "RFC 3977 section 3.1 https://www.rfc-editor.org/rfc/rfc3977#section-3.1",
+                        GroupName::from_borrowed("alt.\u{feff}test").is_err(),
+                    ),
+                    (
                         "article selector rejects zero",
                         "RFC 3977 section 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
                         ArticleSelector::from_borrowed("0").is_err(),
@@ -8369,6 +8374,11 @@ mod tests {
                         Wildmat::from_borrowed("alt]test").is_err(),
                     ),
                     (
+                        "wildmat rejects UTF-8 BOM",
+                        "RFC 3977 section 3.1 https://www.rfc-editor.org/rfc/rfc3977#section-3.1",
+                        Wildmat::from_borrowed("comp.\u{feff}*").is_err(),
+                    ),
+                    (
                         "wildmat accepts ! as comma pattern negation marker",
                         "RFC 3977 sections 4.1 and 4.2 https://www.rfc-editor.org/rfc/rfc3977#section-4.1",
                         Wildmat::from_borrowed("alt.*,!alt.test").is_ok(),
@@ -8503,6 +8513,11 @@ mod tests {
                         "RFC 3977 sections 4.1 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-4.1",
                     ),
                     (
+                        "GROUP rejects UTF-8 BOM in newsgroup-name",
+                        b"GROUP alt.\xef\xbb\xbftest\r\n",
+                        "RFC 3977 section 3.1 https://www.rfc-editor.org/rfc/rfc3977#section-3.1",
+                    ),
+                    (
                         "LIST ACTIVE rejects leading wildmat negation",
                         b"LIST ACTIVE !alt.*\r\n",
                         "RFC 3977 sections 4.1 and 7.6.3 https://www.rfc-editor.org/rfc/rfc3977#section-4.1",
@@ -8531,6 +8546,16 @@ mod tests {
                         "NEWNEWS excludes \\ from wildmat",
                         b"NEWNEWS alt\\test 20260101 000000\r\n",
                         "RFC 3977 sections 4.1 and 7.4.1 https://www.rfc-editor.org/rfc/rfc3977#section-4.1",
+                    ),
+                    (
+                        "LIST ACTIVE rejects UTF-8 BOM in wildmat",
+                        b"LIST ACTIVE comp.\xef\xbb\xbf*\r\n",
+                        "RFC 3977 section 3.1 and section 7.6.3 https://www.rfc-editor.org/rfc/rfc3977#section-3.1",
+                    ),
+                    (
+                        "NEWNEWS rejects UTF-8 BOM in wildmat",
+                        b"NEWNEWS comp.\xef\xbb\xbf* 20260101 000000\r\n",
+                        "RFC 3977 section 3.1 and section 7.4.1 https://www.rfc-editor.org/rfc/rfc3977#section-3.1",
                     ),
                     (
                         "NEWGROUPS extra argument",
@@ -8583,6 +8608,12 @@ mod tests {
                         expected: b"501 command syntax error\r\n",
                     },
                     ServerResponseCase {
+                        name: "GROUP rejects UTF-8 BOM in newsgroup-name",
+                        reference: "RFC 3977 section 3.1 https://www.rfc-editor.org/rfc/rfc3977#section-3.1",
+                        input: b"GROUP alt.\xef\xbb\xbftest\r\n",
+                        expected: b"501 command syntax error\r\n",
+                    },
+                    ServerResponseCase {
                         name: "LIST ACTIVE rejects leading wildmat negation",
                         reference: "RFC 3977 sections 4.1 and 7.6.3 https://www.rfc-editor.org/rfc/rfc3977#section-4.1",
                         input: b"LIST ACTIVE !alt.*\r\n",
@@ -8616,6 +8647,18 @@ mod tests {
                         name: "NEWNEWS excludes \\ from wildmat",
                         reference: "RFC 3977 sections 4.1 and 7.4.1 https://www.rfc-editor.org/rfc/rfc3977#section-4.1",
                         input: b"NEWNEWS alt\\test 20260101 000000\r\n",
+                        expected: b"501 command syntax error\r\n",
+                    },
+                    ServerResponseCase {
+                        name: "LIST ACTIVE rejects UTF-8 BOM in wildmat",
+                        reference: "RFC 3977 section 3.1 and section 7.6.3 https://www.rfc-editor.org/rfc/rfc3977#section-3.1",
+                        input: b"LIST ACTIVE comp.\xef\xbb\xbf*\r\n",
+                        expected: b"501 command syntax error\r\n",
+                    },
+                    ServerResponseCase {
+                        name: "NEWNEWS rejects UTF-8 BOM in wildmat",
+                        reference: "RFC 3977 section 3.1 and section 7.4.1 https://www.rfc-editor.org/rfc/rfc3977#section-3.1",
+                        input: b"NEWNEWS comp.\xef\xbb\xbf* 20260101 000000\r\n",
                         expected: b"501 command syntax error\r\n",
                     },
                     ServerResponseCase {

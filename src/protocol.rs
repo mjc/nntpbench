@@ -1816,6 +1816,7 @@ pub struct InvalidGroupName;
 
 fn validate_group_name(value: &str) -> Result<(), InvalidGroupName> {
     if value.is_empty()
+        || contains_utf8_bom(value)
         || value
             .bytes()
             .any(|byte| !is_wildmat_exact_or_utf8_non_ascii(byte))
@@ -2091,6 +2092,7 @@ pub struct InvalidWildmat;
 
 fn validate_wildmat(value: &str) -> Result<(), InvalidWildmat> {
     if value.is_empty()
+        || contains_utf8_bom(value)
         || value
             .chars()
             .any(|ch| ch.is_ascii() && !(('\x21'..='\x7e').contains(&ch)))
@@ -2114,6 +2116,10 @@ fn validate_wildmat(value: &str) -> Result<(), InvalidWildmat> {
     }
 
     Ok(())
+}
+
+fn contains_utf8_bom(value: &str) -> bool {
+    value.contains('\u{feff}')
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
