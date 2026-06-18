@@ -2373,6 +2373,12 @@ fn validate_response_initial_line(kind: RequestKind, status: StatusCode, line: &
         (RequestKind::Check, 238 | 431 | 438) | (RequestKind::TakeThis, 239 | 439) => {
             validate_message_id_response_argument(&line[4..line.len() - 2])
         }
+        (RequestKind::AuthInfo, 283) => {
+            validate_sasl_response_argument(&line[4..line.len() - 2], false)
+        }
+        (RequestKind::AuthInfo, 383) => {
+            validate_sasl_response_argument(&line[4..line.len() - 2], true)
+        }
         _ => true,
     }
 }
@@ -2454,6 +2460,20 @@ fn validate_message_id_response_argument(value: &[u8]) -> bool {
     std::str::from_utf8(tokens[0])
         .ok()
         .is_some_and(|message_id| MessageId::from_borrowed(message_id).is_ok())
+}
+
+fn validate_sasl_response_argument(value: &[u8], allow_zero_length: bool) -> bool {
+    let Some((tokens, trailing_text)) = split_required_response_tokens::<1>(value) else {
+        return false;
+    };
+    if !trailing_text.is_empty() {
+        return false;
+    }
+
+    if allow_zero_length && tokens[0] == b"=" {
+        return true;
+    }
+    validate_sasl_base64(tokens[0]).is_ok()
 }
 
 fn validate_multiline_response_content(kind: RequestKind, content: &[u8]) -> bool {
@@ -4074,6 +4094,10 @@ fn validate_sasl_initial_response(value: &[u8]) -> Result<(), ()> {
     if value == b"=" {
         return Ok(());
     }
+    validate_sasl_base64(value)
+}
+
+fn validate_sasl_base64(value: &[u8]) -> Result<(), ()> {
     if value.is_empty() || !value.len().is_multiple_of(4) {
         return Err(());
     }
@@ -4852,8 +4876,10 @@ mod tests {
 
     #[test]
     fn authinfo_sasl_response_frames_follow_rfc4643_codes() {
-        // RFC 4643 section 4 defines AUTHINFO SASL 281, 283, and 383 as
-        // single-line responses; 283 and 383 carry one challenge argument.
+        // RFC 4643 sections 3.3 and 4 define AUTHINFO SASL 281, 283, and
+        // 383 as single-line responses. 283 carries a base64 challenge, while
+        // 383 carries base64-opt: either base64 or "=" for a zero-length
+        // challenge.
         for (wire, status) in [
             (
                 b"281 authentication accepted\r\n".as_slice(),
@@ -4867,7 +4893,7 @@ mod tests {
                 b"383 c2VydmVyLWNoYWxsZW5nZQ==\r\n".as_slice(),
                 StatusCode(383),
             ),
-            (b"383 \r\n".as_slice(), StatusCode(383)),
+            (b"383 =\r\n".as_slice(), StatusCode(383)),
         ] {
             let ResponseFrameParse::Complete(frame) =
                 ResponseFrame::parse(RequestKind::AuthInfo, wire)
@@ -4878,6 +4904,29 @@ mod tests {
             assert_eq!(frame.status(), status);
             assert_eq!(frame.bytes(), wire);
             assert!(frame.content().is_empty());
+        }
+
+        for wire in [
+            b"283 =\r\n".as_slice(),
+            b"283 c2VydmVy final data\r\n".as_slice(),
+            b"383 \r\n".as_slice(),
+            b"383 c2VydmVy final data\r\n".as_slice(),
+            b"383 A===\r\n".as_slice(),
+        ] {
+            assert!(
+                matches!(
+                    ResponseFrame::parse(RequestKind::AuthInfo, wire),
+                    ResponseFrameParse::Invalid
+                ),
+                "{wire:?}"
+            );
+            assert!(
+                matches!(
+                    ResponseInitial::parse(RequestKind::AuthInfo, wire),
+                    ResponseInitialParse::Invalid
+                ),
+                "{wire:?}"
+            );
         }
     }
 

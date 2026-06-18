@@ -8466,6 +8466,24 @@ mod tests {
                         frame: b"381 password required\r\n",
                     },
                     ResponseFrameCase {
+                        name: "AUTHINFO SASL 283 rejects zero-length challenge marker",
+                        reference: "RFC 4643 sections 3.3 and 4 https://www.rfc-editor.org/rfc/rfc4643#section-3.3",
+                        kind: RequestKind::AuthInfo,
+                        frame: b"283 =\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "AUTHINFO SASL 383 rejects missing challenge argument",
+                        reference: "RFC 4643 sections 3.3 and 4 https://www.rfc-editor.org/rfc/rfc4643#section-3.3",
+                        kind: RequestKind::AuthInfo,
+                        frame: b"383 \r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "AUTHINFO SASL rejects whitespace inside challenge",
+                        reference: "RFC 4643 sections 3.3 and 3.5 https://www.rfc-editor.org/rfc/rfc4643#section-3.3",
+                        kind: RequestKind::AuthInfo,
+                        frame: b"383 c2VydmVy challenge\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "XHDR rejects HDR response code",
                         reference: "RFC 2980 section 2.1.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.6",
                         kind: RequestKind::Xhdr,
