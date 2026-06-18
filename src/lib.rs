@@ -778,9 +778,7 @@ fn fetch_listgroup_request(args: &FetchArgs) -> Result<Request<'static>, ClientE
             Request::listgroup_group_range(group, range).map_err(ClientError::from)
         }
         (Some(group), None) => Request::listgroup(group).map_err(|_| ClientError::InvalidGroupName),
-        (None, Some(range)) => {
-            Request::listgroup_range(range).map_err(|_| ClientError::InvalidListGroupRange)
-        }
+        (None, Some(_)) => Err(ClientError::MissingGroupName),
         (None, None) => Ok(Request::listgroup_current()),
     }
 }
@@ -3453,29 +3451,14 @@ fn listgroup_state_error(args: &[u8], session_state: &SessionState) -> Option<&'
     {
         return Some(b"411 no such newsgroup\r\n");
     }
-    if !session_state.group_selected && listgroup_uses_current_group(args) {
+    if !session_state.group_selected && args.is_empty() {
         return Some(b"412 no newsgroup selected\r\n");
     }
     None
 }
 
-fn listgroup_uses_current_group(args: &[u8]) -> bool {
-    if args.is_empty() {
-        return true;
-    }
-    let Some(first) = first_command_arg(args) else {
-        return true;
-    };
-    first.iter().all(|byte| byte.is_ascii_digit()) || first.contains(&b'-')
-}
-
 fn listgroup_explicit_group_arg(args: &[u8]) -> Option<&[u8]> {
-    let first = first_command_arg(args)?;
-    if first.iter().all(|byte| byte.is_ascii_digit()) || first.contains(&b'-') {
-        None
-    } else {
-        Some(first)
-    }
+    first_command_arg(args)
 }
 
 fn fixture_group_from_name(name: &[u8]) -> Option<FixtureGroup> {
@@ -3561,11 +3544,8 @@ fn listgroup_response_for_args(args: &[u8], current_group: Option<FixtureGroup>)
 }
 
 fn listgroup_range_arg(args: &[u8]) -> Option<&[u8]> {
-    let first = first_command_arg(args)?;
     if listgroup_explicit_group_arg(args).is_some() {
         nth_command_arg(args, 1)
-    } else if listgroup_uses_current_group(args) {
-        Some(first)
     } else {
         None
     }
@@ -4741,9 +4721,9 @@ mod tests {
                     expected: b"423 no article with that number\r\n",
                 },
                 ServerResponseCase {
-                    name: "LISTGROUP range outside one-article group",
+                    name: "LISTGROUP explicit range outside one-article group",
                     reference: "RFC 3977 section 6.1.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.2",
-                    input: b"GROUP comp.lang.rust\r\nLISTGROUP 2-3\r\n",
+                    input: b"LISTGROUP comp.lang.rust 2-3\r\n",
                     expected: LISTGROUP_COMP_EMPTY_RESPONSE,
                 },
             ])
@@ -5593,10 +5573,10 @@ mod tests {
                     expected: LISTGROUP_EMPTY_RESPONSE,
                 },
                 ServerResponseCase {
-                    name: "LISTGROUP current group reversed range is valid and empty",
+                    name: "LISTGROUP single numeric-looking argument is a group name",
                     reference: "RFC 3977 section 6.1.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.2",
                     input: b"GROUP alt.test\r\nLISTGROUP 3-2\r\n",
-                    expected: b"211 3 1 3 alt.test\r\n211 3 1 3 alt.test\r\n.\r\n",
+                    expected: b"211 3 1 3 alt.test\r\n411 no such newsgroup\r\n",
                 },
             ])
             .await;
@@ -6013,9 +5993,9 @@ mod tests {
                     expected: GROUP_COMP_RESPONSE,
                 },
                 ServerResponseCase {
-                    name: "LISTGROUP tab range filters selected group",
+                    name: "LISTGROUP tab group and range filters selected group",
                     reference: "RFC 3977 sections 3.1 and 6.1.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.2",
-                    input: b"GROUP\talt.test\r\nLISTGROUP\t2-\r\n",
+                    input: b"LISTGROUP\talt.test\t2-\r\n",
                     expected: LISTGROUP_2_3_RESPONSE,
                 },
                 ServerResponseCase {
@@ -6621,10 +6601,10 @@ mod tests {
                     expected: b"412 no newsgroup selected\r\n",
                 },
                 ServerResponseCase {
-                    name: "LISTGROUP current range before GROUP",
+                    name: "LISTGROUP single numeric-looking argument before GROUP is a group name",
                     reference: "RFC 3977 section 6.1.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.2",
                     input: b"LISTGROUP 2-3\r\n",
-                    expected: b"412 no newsgroup selected\r\n",
+                    expected: b"411 no such newsgroup\r\n",
                 },
                 ServerResponseCase {
                     name: "OVER current before GROUP",
@@ -6962,10 +6942,16 @@ mod tests {
                     expected: b"501 command syntax error\r\n",
                 },
                 ServerResponseCase {
-                    name: "LISTGROUP zero range",
+                    name: "LISTGROUP hyphenated unknown group name",
                     reference: "RFC 3977 sections 6.1.2 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.2",
+                    input: b"LISTGROUP alt-test\r\n",
+                    expected: b"411 no such newsgroup\r\n",
+                },
+                ServerResponseCase {
+                    name: "LISTGROUP zero-like group name",
+                    reference: "RFC 3977 sections 6.1.2 and 9.8 define the first argument as a newsgroup-name https://www.rfc-editor.org/rfc/rfc3977#section-6.1.2",
                     input: b"LISTGROUP 0\r\n",
-                    expected: b"501 command syntax error\r\n",
+                    expected: b"411 no such newsgroup\r\n",
                 },
                 ServerResponseCase {
                     name: "XOVER zero range",
@@ -10199,7 +10185,7 @@ mod tests {
             let (mut third, _) = listener.accept().await.unwrap();
             third.write_all(b"201 fetch ready\r\n").await.unwrap();
             let read = third.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"LISTGROUP 1-\r\n");
+            assert_eq!(&request[..read], b"LISTGROUP comp.lang.rust 1-\r\n");
             third.write_all(LISTGROUP_RESPONSE).await.unwrap();
 
             let (mut fourth, _) = listener.accept().await.unwrap();
@@ -10258,7 +10244,7 @@ mod tests {
         listgroup_range_args.connect = addr;
         listgroup_range_args.request = FetchRequestKind::Listgroup;
         listgroup_range_args.message_id = None;
-        listgroup_range_args.group = None;
+        listgroup_range_args.group = Some("comp.lang.rust".to_string());
         listgroup_range_args.selector = Some("1-".to_string());
         let listgroup_range = fetch_response(&listgroup_range_args).await.unwrap();
         assert_eq!(listgroup_range.kind(), RequestKind::ListGroup);
@@ -10540,6 +10526,13 @@ mod tests {
         args.message_id = None;
         args.group = None;
 
+        assert!(matches!(
+            fetch_response(&args).await.unwrap_err(),
+            ClientError::MissingGroupName
+        ));
+
+        args.request = FetchRequestKind::Listgroup;
+        args.selector = Some("1-".to_string());
         assert!(matches!(
             fetch_response(&args).await.unwrap_err(),
             ClientError::MissingGroupName
@@ -11078,8 +11071,8 @@ mod tests {
         expected.extend_from_slice(GROUP_RESPONSE);
         expected.extend_from_slice(LISTGROUP_RESPONSE);
         expected.extend_from_slice(LISTGROUP_RESPONSE);
-        expected.extend_from_slice(LISTGROUP_RESPONSE);
-        expected.extend_from_slice(LISTGROUP_2_3_RESPONSE);
+        expected.extend_from_slice(b"411 no such newsgroup\r\n");
+        expected.extend_from_slice(b"411 no such newsgroup\r\n");
         expected.extend_from_slice(LISTGROUP_RESPONSE);
         expected.extend_from_slice(&article_response);
         expected.extend_from_slice(LAST_RESPONSE);
@@ -11732,8 +11725,8 @@ mod tests {
                 GROUP_RESPONSE,
                 LISTGROUP_RESPONSE,
                 LISTGROUP_COMP_RESPONSE,
-                LISTGROUP_RESPONSE,
-                LISTGROUP_2_3_RESPONSE,
+                b"411 no such newsgroup\r\n".as_slice(),
+                b"411 no such newsgroup\r\n".as_slice(),
                 b"411 no such newsgroup\r\n".as_slice(),
                 LAST_RESPONSE,
                 NEXT_RESPONSE

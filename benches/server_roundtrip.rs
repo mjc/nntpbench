@@ -182,7 +182,7 @@ CAPABILITIES\r\n\
 DATE\r\n\
 MODE READER\r\n\
 HEAD <head@nntpbench.local>\r\n\
-LISTGROUP 1-\r\n\
+LISTGROUP alt.test 1-\r\n\
 QUIT\r\n";
 
     bencher

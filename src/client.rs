@@ -310,16 +310,6 @@ impl Client {
         self.execute_raw(Request::listgroup_current()).await
     }
 
-    /// Send a LISTGROUP request for the current selected group with a range filter and return the owned raw response frame.
-    pub async fn listgroup_range(
-        &self,
-        range: impl AsRef<str>,
-    ) -> Result<OwnedResponse, ClientError> {
-        let request =
-            Request::listgroup_range(range).map_err(|_| ClientError::InvalidListGroupRange)?;
-        self.execute_raw(request).await
-    }
-
     /// Send a LISTGROUP request with explicit group and range arguments and return the owned raw response frame.
     pub async fn listgroup_group_range(
         &self,
@@ -343,16 +333,6 @@ impl Client {
     pub async fn listgroup_current_exchange(&self) -> Result<OwnedExchange, ClientError> {
         self.execute_raw_exchange(Request::listgroup_current())
             .await
-    }
-
-    /// Send a LISTGROUP request for the current selected group with a range filter and return the completed raw request/response pair.
-    pub async fn listgroup_range_exchange(
-        &self,
-        range: impl AsRef<str>,
-    ) -> Result<OwnedExchange, ClientError> {
-        let request =
-            Request::listgroup_range(range).map_err(|_| ClientError::InvalidListGroupRange)?;
-        self.execute_raw_exchange(request).await
     }
 
     /// Send a LISTGROUP request with explicit group and range arguments and return the completed raw request/response pair.
@@ -1084,18 +1064,6 @@ impl ClientConnection {
         self.execute(Request::listgroup_current()).await
     }
 
-    /// Send a LISTGROUP request for the current selected group with a range filter and return the owned response frame.
-    pub async fn listgroup_range(
-        &self,
-        range: ListGroupRange<'static>,
-    ) -> Result<OwnedResponse, ClientError> {
-        self.execute(
-            Request::listgroup_range(range.as_str())
-                .map_err(|_| ClientError::InvalidListGroupRange)?,
-        )
-        .await
-    }
-
     /// Send a LISTGROUP request with explicit group and range arguments and return the owned response frame.
     pub async fn listgroup_group_range(
         &self,
@@ -1123,18 +1091,6 @@ impl ClientConnection {
     /// Send a LISTGROUP request for the current selected group and return the completed request/response pair.
     pub async fn listgroup_current_exchange(&self) -> Result<OwnedExchange, ClientError> {
         self.execute_exchange(Request::listgroup_current()).await
-    }
-
-    /// Send a LISTGROUP request for the current selected group with a range filter and return the completed request/response pair.
-    pub async fn listgroup_range_exchange(
-        &self,
-        range: ListGroupRange<'static>,
-    ) -> Result<OwnedExchange, ClientError> {
-        self.execute_exchange(
-            Request::listgroup_range(range.as_str())
-                .map_err(|_| ClientError::InvalidListGroupRange)?,
-        )
-        .await
     }
 
     /// Send a LISTGROUP request with explicit group and range arguments and return the completed request/response pair.
@@ -2499,9 +2455,7 @@ where
         (Some(group), None) => {
             write_one_arg_request_wire(writer, b"LISTGROUP ", group.as_str()).await
         }
-        (None, Some(range)) => {
-            write_one_arg_request_wire(writer, b"LISTGROUP ", range.as_str()).await
-        }
+        (None, Some(_)) => write_simple_request_wire(writer, b"LISTGROUP").await,
         (Some(group), Some(range)) => {
             write_two_arg_request_wire(writer, b"LISTGROUP ", group.as_str(), range.as_str()).await
         }
@@ -4238,7 +4192,7 @@ mod tests {
             stream.write_all(crate::GROUP_RESPONSE).await.unwrap();
             assert_read_request(&mut stream, b"LISTGROUP\r\n").await;
             stream.write_all(crate::LISTGROUP_RESPONSE).await.unwrap();
-            assert_read_request(&mut stream, b"LISTGROUP 1-\r\n").await;
+            assert_read_request(&mut stream, b"LISTGROUP comp.lang.rust 1-\r\n").await;
             stream.write_all(crate::LISTGROUP_RESPONSE).await.unwrap();
             assert_read_request(&mut stream, b"LISTGROUP alt.test 1-10\r\n").await;
             stream.write_all(crate::LISTGROUP_RESPONSE).await.unwrap();
@@ -4255,7 +4209,10 @@ mod tests {
             .unwrap();
         let listgroup_current = connection.listgroup_current().await.unwrap();
         let listgroup_range = connection
-            .listgroup_range(ListGroupRange::from_owned("1-").unwrap())
+            .listgroup_group_range(
+                GroupName::from_owned("comp.lang.rust").unwrap(),
+                ListGroupRange::from_owned("1-").unwrap(),
+            )
             .await
             .unwrap();
         let listgroup = connection
@@ -4773,7 +4730,7 @@ mod tests {
             stream.write_all(crate::GROUP_RESPONSE).await.unwrap();
             assert_read_request(&mut stream, b"LISTGROUP\r\n").await;
             stream.write_all(crate::LISTGROUP_RESPONSE).await.unwrap();
-            assert_read_request(&mut stream, b"LISTGROUP 1-\r\n").await;
+            assert_read_request(&mut stream, b"LISTGROUP comp.lang.rust 1-\r\n").await;
             stream.write_all(crate::LISTGROUP_RESPONSE).await.unwrap();
             assert_read_request(&mut stream, b"LISTGROUP alt.test 1-10\r\n").await;
             stream.write_all(crate::LISTGROUP_RESPONSE).await.unwrap();
@@ -4786,7 +4743,10 @@ mod tests {
         let client = Client::connect(addr).await.unwrap();
         let group = client.group("alt.test").await.unwrap();
         let listgroup_current = client.listgroup_current().await.unwrap();
-        let listgroup_range = client.listgroup_range("1-").await.unwrap();
+        let listgroup_range = client
+            .listgroup_group_range("comp.lang.rust", "1-")
+            .await
+            .unwrap();
         let listgroup = client
             .listgroup_group_range("alt.test", "1-10")
             .await

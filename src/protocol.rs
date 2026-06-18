@@ -1206,10 +1206,6 @@ mod proptests {
                     format!("LISTGROUP {group}\r\n"),
                 ),
                 (
-                    Request::listgroup_range(&range).unwrap(),
-                    format!("LISTGROUP {range}\r\n"),
-                ),
-                (
                     Request::listgroup_group_range(&group, &range).unwrap(),
                     format!("LISTGROUP {group} {range}\r\n"),
                 ),
@@ -4009,14 +4005,6 @@ impl Request<'static> {
         }
     }
 
-    /// Build a LISTGROUP request targeting the current selected group with a range filter.
-    pub fn listgroup_range(range: impl AsRef<str>) -> Result<Self, InvalidListGroupRange> {
-        Ok(Self::ListGroup {
-            group: None,
-            range: Some(ListGroupRange::from_owned(range)?),
-        })
-    }
-
     /// Build a LISTGROUP request with explicit group and range arguments.
     pub fn listgroup_group_range(
         group: impl AsRef<str>,
@@ -4578,18 +4566,7 @@ fn classify_direct_command(kind: RequestKind, args: &[u8]) -> RequestKind {
             let mut parts = command_tokens(args);
             match (parts.next(), parts.next(), parts.next()) {
                 (Some(one), None, None) => {
-                    let one = std::str::from_utf8(one).ok();
-                    let Some(value) = one else {
-                        return RequestKind::Unknown;
-                    };
-                    if (value.contains('-') || value.bytes().all(|byte| byte.is_ascii_digit()))
-                        && ListGroupRange::from_borrowed(value).is_err()
-                    {
-                        return RequestKind::Unknown;
-                    }
-                    if ListGroupRange::from_borrowed(value).is_ok()
-                        || GroupName::from_borrowed(value).is_ok()
-                    {
+                    if validate_utf8_arg(one, GroupName::from_borrowed).is_ok() {
                         kind
                     } else {
                         RequestKind::Unknown
@@ -5014,7 +4991,7 @@ fn write_listgroup_request_wire<W>(
         write_bytes(output, b" ");
         write_bytes(output, group.as_str().as_bytes());
     }
-    if let Some(range) = range {
+    if let (Some(_), Some(range)) = (group, range) {
         write_bytes(output, b" ");
         write_bytes(output, range.as_str().as_bytes());
     }
@@ -6612,7 +6589,7 @@ mod tests {
             group: None,
             range: None,
         };
-        let listgroup_current_range = Request::ListGroup {
+        let listgroup_invalid_current_range = Request::ListGroup {
             group: None,
             range: Some(ListGroupRange::from_borrowed("1-").unwrap()),
         };
@@ -6736,9 +6713,12 @@ mod tests {
         assert_eq!(wire, b"LISTGROUP\r\n");
 
         wire.clear();
-        listgroup_current_range.write_wire_to(&mut wire);
-        assert_eq!(listgroup_current_range.kind(), RequestKind::ListGroup);
-        assert_eq!(wire, b"LISTGROUP 1-\r\n");
+        listgroup_invalid_current_range.write_wire_to(&mut wire);
+        assert_eq!(
+            listgroup_invalid_current_range.kind(),
+            RequestKind::ListGroup
+        );
+        assert_eq!(wire, b"LISTGROUP\r\n");
 
         wire.clear();
         listgroup_group_range.write_wire_to(&mut wire);
@@ -6901,7 +6881,6 @@ mod tests {
         let group = Request::group("alt.test").unwrap();
         let listgroup = Request::listgroup("alt.test").unwrap();
         let listgroup_current = Request::listgroup_current();
-        let listgroup_range = Request::listgroup_range("1-").unwrap();
         let listgroup_group_range = Request::listgroup_group_range("alt.test", "1-10").unwrap();
         let last = Request::last();
         let next = Request::next();
@@ -6959,12 +6938,6 @@ mod tests {
         );
         assert_eq!(listgroup_current.kind(), RequestKind::ListGroup);
         assert!(listgroup_current.group_name().is_none());
-        assert_eq!(
-            listgroup_range
-                .listgroup_range_arg()
-                .map(ListGroupRange::as_str),
-            Some("1-")
-        );
         assert_eq!(
             listgroup_group_range.group_name().map(GroupName::as_str),
             Some("alt.test")
@@ -7109,9 +7082,6 @@ mod tests {
         assert!(Request::body_selector("1-10").is_err());
         assert!(Request::group("").is_err());
         assert!(Request::listgroup("alt!test").is_err());
-        assert!(Request::listgroup_range("0").is_err());
-        assert!(Request::listgroup_range("-10").is_err());
-        assert!(Request::listgroup_range("1-10-20").is_err());
         assert!(Request::over("1 2").is_err());
         assert!(Request::xover("").is_err());
         assert!(Request::hdr("Bad Header", "1").is_err());
@@ -7185,7 +7155,6 @@ mod tests {
             Request::group("alt.test").unwrap(),
             Request::listgroup("alt.test").unwrap(),
             Request::listgroup_current(),
-            Request::listgroup_range("1-").unwrap(),
             Request::listgroup_group_range("alt.test", "1-10").unwrap(),
             Request::last(),
             Request::next(),
