@@ -429,7 +429,7 @@ mod proptests {
                     (Just(year), Just(month), 1_u8..=max_day)
                 })
                 .prop_map(|(year, month, day)| format!("{year:02}{month:02}{day:02}")),
-            (2000_u16..=2099, 1_u8..=12)
+            (1900_u16..=9999, 1_u8..=12)
                 .prop_flat_map(|(year, month)| {
                     let max_day = valid_days_in_month(year, month);
                     (Just(year), Just(month), 1_u8..=max_day)
@@ -455,6 +455,8 @@ mod proptests {
             Just("20260132".to_string()),
             Just("2026010".to_string()),
             Just("20ab0101".to_string()),
+            Just("18991231".to_string()),
+            Just("00010101".to_string()),
         ]
         .boxed()
     }
@@ -2001,10 +2003,14 @@ fn validate_nntp_date(value: &str) -> Result<(), InvalidNntpDate> {
         return Err(InvalidNntpDate);
     }
     let year = if bytes.len() == 8 {
-        std::str::from_utf8(&bytes[..4])
+        let year = std::str::from_utf8(&bytes[..4])
             .ok()
             .and_then(|value| value.parse::<u16>().ok())
-            .ok_or(InvalidNntpDate)?
+            .ok_or(InvalidNntpDate)?;
+        if !(1900..=9999).contains(&year) {
+            return Err(InvalidNntpDate);
+        }
+        year
     } else {
         let short_year = parse_two_digits(&bytes[..2]).ok_or(InvalidNntpDate)?;
         u16::from(short_year) + 2000

@@ -223,6 +223,7 @@ const DEFAULT_SOCKET_BUFFER: usize = 1024 * 1024;
 const DEFAULT_SOCKET_BUFFER: usize = HIGH_THROUGHPUT_SOCKET_BUFFER;
 const PROCESS_CLOCK_TICK: Duration = Duration::from_millis(10);
 const TCP_LINGER_TIMEOUT: Duration = Duration::from_secs(5);
+const FAR_FUTURE_DATE_KEY: u32 = 99_991_231;
 #[cfg(target_os = "linux")]
 const TCP_USER_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -250,6 +251,16 @@ fn date_response_for_unix_seconds(seconds: u64) -> [u8; 20] {
     write_two_digits(&mut response[14..16], minute as u32);
     write_two_digits(&mut response[16..18], second as u32);
     response
+}
+
+fn current_utc_year() -> u16 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_secs();
+    let days = (now / 86_400) as i64;
+    let (year, _, _) = civil_from_unix_days(days);
+    year as u16
 }
 
 fn civil_from_unix_days(days_since_epoch: i64) -> (i32, u32, u32) {
@@ -2712,7 +2723,8 @@ where
         }
         RequestKind::NewGroups => {
             let response = if command_args(command, command_lines)
-                .is_some_and(|args| args.starts_with(b"991231"))
+                .and_then(newgroups_date_key)
+                .is_some_and(|date| date >= FAR_FUTURE_DATE_KEY)
             {
                 NEWGROUPS_EMPTY_RESPONSE
             } else {
@@ -4146,7 +4158,7 @@ fn wildmat_pattern_matches(pattern: &str, group: &str) -> bool {
 }
 
 fn newnews_response(args: &[u8]) -> &'static [u8] {
-    if contains_subslice(args, b"991231") {
+    if newnews_date_key(args).is_some_and(|date| date >= FAR_FUTURE_DATE_KEY) {
         return NEWNEWS_EMPTY_RESPONSE;
     }
     let wildmat = args.split(|byte| *byte == b' ').next().unwrap_or_default();
@@ -4155,6 +4167,52 @@ fn newnews_response(args: &[u8]) -> &'static [u8] {
     } else {
         NEWNEWS_EMPTY_RESPONSE
     }
+}
+
+fn newgroups_date_key(args: &[u8]) -> Option<u32> {
+    let date = args.split(|byte| *byte == b' ').next()?;
+    normalized_nntp_date_key(date, current_utc_year())
+}
+
+fn newnews_date_key(args: &[u8]) -> Option<u32> {
+    let date = args.split(|byte| *byte == b' ').nth(1)?;
+    normalized_nntp_date_key(date, current_utc_year())
+}
+
+fn normalized_nntp_date_key(date: &[u8], current_year: u16) -> Option<u32> {
+    if !matches!(date.len(), 6 | 8) || !date.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+
+    let (year, month, day) = if date.len() == 8 {
+        (
+            parse_ascii_decimal(&date[..4])?,
+            parse_ascii_decimal(&date[4..6])?,
+            parse_ascii_decimal(&date[6..])?,
+        )
+    } else {
+        let short_year = parse_ascii_decimal(&date[..2])?;
+        let current_century = current_year / 100 * 100;
+        let current_short_year = current_year % 100;
+        let year = if short_year <= current_short_year {
+            current_century + short_year
+        } else {
+            current_century.saturating_sub(100) + short_year
+        };
+        (
+            year,
+            parse_ascii_decimal(&date[2..4])?,
+            parse_ascii_decimal(&date[4..])?,
+        )
+    };
+
+    Some(u32::from(year) * 10_000 + u32::from(month) * 100 + u32::from(day))
+}
+
+fn parse_ascii_decimal(value: &[u8]) -> Option<u16> {
+    value.iter().try_fold(0_u16, |acc, byte| {
+        Some(acc * 10 + u16::from(byte.checked_sub(b'0')?))
+    })
 }
 
 fn article_selector_error(
@@ -6300,8 +6358,16 @@ mod tests {
             // https://www.rfc-editor.org/rfc/rfc3977#section-7.4
             let (old_output, _) =
                 run_session_with_input(test_config(), b"NEWNEWS alt.* 700101 000000 GMT\r\n").await;
-            let (future_output, _) =
+            let (previous_century_output, _) =
                 run_session_with_input(test_config(), b"NEWNEWS alt.* 991231 235959 GMT\r\n").await;
+            let (future_output, _) =
+                run_session_with_input(test_config(), b"NEWNEWS alt.* 99991231 235959 GMT\r\n")
+                    .await;
+            assert_eq!(
+                without_greeting(&old_output),
+                without_greeting(&previous_century_output),
+                "RFC 3977 six-digit 99 date should map to the previous century"
+            );
             assert_ne!(
                 without_greeting(&old_output),
                 without_greeting(&future_output),
@@ -6752,7 +6818,7 @@ mod tests {
             let (old_output, _) =
                 run_session_with_input(test_config(), b"NEWGROUPS 700101 000000 GMT\r\n").await;
             let (future_output, _) =
-                run_session_with_input(test_config(), b"NEWGROUPS 991231 235959 GMT\r\n").await;
+                run_session_with_input(test_config(), b"NEWGROUPS 99991231 235959 GMT\r\n").await;
             assert_ne!(
                 without_greeting(&old_output),
                 without_greeting(&future_output),
@@ -6775,9 +6841,15 @@ mod tests {
                     expected: NEWGROUPS_RESPONSE,
                 },
                 ServerResponseCase {
-                    name: "NEWGROUPS empty list after future timestamp",
+                    name: "NEWGROUPS six-digit 99 maps to previous century",
                     reference: "RFC 3977 section 7.3.2 https://www.rfc-editor.org/rfc/rfc3977#section-7.3.2",
                     input: b"NEWGROUPS 991231 235959 GMT\r\n",
+                    expected: NEWGROUPS_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "NEWGROUPS empty list after explicit future timestamp",
+                    reference: "RFC 3977 section 7.3.2 https://www.rfc-editor.org/rfc/rfc3977#section-7.3.2",
+                    input: b"NEWGROUPS 99991231 235959 GMT\r\n",
                     expected: NEWGROUPS_EMPTY_RESPONSE,
                 },
             ])
@@ -6792,6 +6864,18 @@ mod tests {
             let input = b"NEWGROUPS 20260101 000000 LOCAL\r\n";
             let (output, _) = run_session_with_input(test_config(), input).await;
             assert_single_response(input, b"501 command syntax error\r\n", &output, "RFC 3977");
+        }
+
+        #[test]
+        fn rfc3977_red_short_date_century_mapping_matrix() {
+            // RFC 3977 section 7.3.2 maps six-digit dates to the current
+            // century when yy is <= the current year, and the previous
+            // century otherwise:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-7.3.2
+            assert_eq!(normalized_nntp_date_key(b"991231", 2026), Some(19991231));
+            assert_eq!(normalized_nntp_date_key(b"260101", 2026), Some(20260101));
+            assert_eq!(normalized_nntp_date_key(b"270101", 2026), Some(19270101));
+            assert_eq!(normalized_nntp_date_key(b"20260101", 2026), Some(20260101));
         }
 
         #[tokio::test]
@@ -7917,6 +8001,26 @@ mod tests {
                         "LISTGROUP range rejects leading-zero endpoint",
                         "RFC 3977 section 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
                         ListGroupRange::from_borrowed("1-0002").is_err(),
+                    ),
+                    (
+                        "date accepts earliest RFC 3977 four-digit year",
+                        "RFC 3977 section 7.3.2 https://www.rfc-editor.org/rfc/rfc3977#section-7.3.2",
+                        NntpDate::from_borrowed("19000101").is_ok(),
+                    ),
+                    (
+                        "date accepts far-future RFC 3977 four-digit year",
+                        "RFC 3977 section 7.3.2 https://www.rfc-editor.org/rfc/rfc3977#section-7.3.2",
+                        NntpDate::from_borrowed("99991231").is_ok(),
+                    ),
+                    (
+                        "date rejects pre-1900 four-digit year",
+                        "RFC 3977 section 7.3.2 https://www.rfc-editor.org/rfc/rfc3977#section-7.3.2",
+                        NntpDate::from_borrowed("18991231").is_err(),
+                    ),
+                    (
+                        "date rejects zero four-digit year",
+                        "RFC 3977 section 7.3.2 https://www.rfc-editor.org/rfc/rfc3977#section-7.3.2",
+                        NntpDate::from_borrowed("00010101").is_err(),
                     ),
                     (
                         "date rejects impossible February day",
