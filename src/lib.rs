@@ -8244,6 +8244,12 @@ mod tests {
                         frame: b"223 next <stat@test> article exists\r\n",
                     },
                     ResponseFrameCase {
+                        name: "NEXT rejects overlong article number",
+                        reference: "RFC 3977 section 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
+                        kind: RequestKind::Next,
+                        frame: b"223 12345678901234567 <stat@test> article exists\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "ARTICLE rejects STAT success code",
                         reference: "RFC 3977 sections 6.2.1 and 6.2.4 https://www.rfc-editor.org/rfc/rfc3977#section-6.2",
                         kind: RequestKind::Article,
@@ -8254,6 +8260,12 @@ mod tests {
                         reference: "RFC 3977 section 6.2.1 https://www.rfc-editor.org/rfc/rfc3977#section-6.2.1",
                         kind: RequestKind::Article,
                         frame: b"220 <a@test> article follows\r\nSubject: bad\r\n\r\nbody\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "ARTICLE rejects overlong article number",
+                        reference: "RFC 3977 sections 6.2.1 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
+                        kind: RequestKind::Article,
+                        frame: b"220 12345678901234567 <a@test> article follows\r\nSubject: bad\r\n\r\nbody\r\n.\r\n",
                     },
                     ResponseFrameCase {
                         name: "HEAD rejects non-numeric article number",
@@ -8328,6 +8340,12 @@ mod tests {
                         frame: b"211 3 1 3 alt!test\r\n",
                     },
                     ResponseFrameCase {
+                        name: "GROUP rejects overlong high-water article number",
+                        reference: "RFC 3977 sections 6.1.1 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
+                        kind: RequestKind::Group,
+                        frame: b"211 3 1 12345678901234567 alt.test\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "LISTGROUP rejects invalid article count argument",
                         reference: "RFC 3977 sections 6.1.2 and 9.4.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.2",
                         kind: RequestKind::ListGroup,
@@ -8346,6 +8364,12 @@ mod tests {
                         frame: b"211 3 1 3 alt.test\r\none\r\n.\r\n",
                     },
                     ResponseFrameCase {
+                        name: "LISTGROUP rejects overlong article number line",
+                        reference: "RFC 3977 sections 6.1.2 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
+                        kind: RequestKind::ListGroup,
+                        frame: b"211 3 1 3 alt.test\r\n12345678901234567\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "NEWNEWS rejects non-message-id article line",
                         reference: "RFC 3977 sections 7.4 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-7.4",
                         kind: RequestKind::NewNews,
@@ -8362,6 +8386,12 @@ mod tests {
                         reference: "RFC 3977 sections 7.6.3 and 9.7 https://www.rfc-editor.org/rfc/rfc3977#section-7.6.3",
                         kind: RequestKind::ListActive,
                         frame: b"215 list of newsgroups follows\r\nalt.test 3 1 open\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "LIST ACTIVE rejects overlong high-water article number",
+                        reference: "RFC 3977 sections 7.6.3 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
+                        kind: RequestKind::ListActive,
+                        frame: b"215 list of newsgroups follows\r\nalt.test 12345678901234567 1 y\r\n.\r\n",
                     },
                     ResponseFrameCase {
                         name: "LIST ACTIVE.TIMES rejects non-numeric timestamp",
@@ -8496,6 +8526,12 @@ mod tests {
                         frame: b"224 overview follows\r\n1\tSubject\tfrom@test\tdate\t<one@test>\t\t1\t1\toptional without label\r\n.\r\n",
                     },
                     ResponseFrameCase {
+                        name: "OVER rejects overlong article number",
+                        reference: "RFC 3977 sections 8.3.1 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
+                        kind: RequestKind::Over,
+                        frame: b"224 overview follows\r\n12345678901234567\tSubject\tfrom@test\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "XOVER rejects body row without numeric article number",
                         reference: "RFC 2980 section 2.1.7 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.7",
                         kind: RequestKind::Xover,
@@ -8512,6 +8548,12 @@ mod tests {
                         reference: "RFC 3977 section 8.5.1 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.1",
                         kind: RequestKind::Hdr,
                         frame: b"225 headers follow\r\n1\tvalue\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "HDR rejects overlong article number",
+                        reference: "RFC 3977 sections 8.5.1 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
+                        kind: RequestKind::Hdr,
+                        frame: b"225 headers follow\r\n12345678901234567 value\r\n.\r\n",
                     },
                     ResponseFrameCase {
                         name: "XHDR rejects body row without numeric article number",

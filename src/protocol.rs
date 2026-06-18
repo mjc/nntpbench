@@ -2404,9 +2404,9 @@ fn validate_group_response_arguments(value: &[u8]) -> bool {
         return false;
     };
 
-    tokens[..3]
-        .iter()
-        .all(|token| is_response_decimal_token(token))
+    is_response_decimal_token(tokens[0])
+        && validate_response_article_number(tokens[1])
+        && validate_response_article_number(tokens[2])
         && std::str::from_utf8(tokens[3])
             .ok()
             .is_some_and(|group| GroupName::from_borrowed(group).is_ok())
@@ -2442,12 +2442,16 @@ fn is_response_decimal_token(value: &[u8]) -> bool {
     !value.is_empty() && value.iter().all(u8::is_ascii_digit)
 }
 
+fn validate_response_article_number(value: &[u8]) -> bool {
+    !value.is_empty() && value.len() <= 16 && value.iter().all(u8::is_ascii_digit)
+}
+
 fn validate_article_status_response_arguments(value: &[u8]) -> bool {
     let Some((tokens, _trailing_text)) = split_required_response_tokens::<2>(value) else {
         return false;
     };
 
-    is_response_decimal_token(tokens[0])
+    validate_response_article_number(tokens[0])
         && std::str::from_utf8(tokens[1])
             .ok()
             .is_some_and(|message_id| MessageId::from_borrowed(message_id).is_ok())
@@ -2500,7 +2504,7 @@ fn validate_multiline_response_content(kind: RequestKind, content: &[u8]) -> boo
         RequestKind::ListDistribPats => {
             validate_crlf_lines(content, validate_distrib_pats_response_line)
         }
-        RequestKind::ListGroup => validate_crlf_lines(content, is_response_decimal_token),
+        RequestKind::ListGroup => validate_crlf_lines(content, validate_response_article_number),
         RequestKind::NewNews => validate_crlf_lines(content, |line| {
             std::str::from_utf8(line)
                 .ok()
@@ -2540,8 +2544,8 @@ fn validate_active_response_line(line: &[u8]) -> bool {
         && std::str::from_utf8(tokens[0])
             .ok()
             .is_some_and(|group| GroupName::from_borrowed(group).is_ok())
-        && is_response_decimal_token(tokens[1])
-        && is_response_decimal_token(tokens[2])
+        && validate_response_article_number(tokens[1])
+        && validate_response_article_number(tokens[2])
         && validate_active_status_token(tokens[3])
 }
 
@@ -2764,7 +2768,7 @@ fn validate_overview_response_line(line: &[u8]) -> bool {
     let Some(tab) = memchr::memchr(b'\t', line) else {
         return false;
     };
-    if !is_response_decimal_token(&line[..tab]) {
+    if !validate_response_article_number(&line[..tab]) {
         return false;
     }
 
@@ -2796,7 +2800,7 @@ fn validate_header_response_line(line: &[u8]) -> bool {
     let Some(space) = memchr::memchr(b' ', line) else {
         return false;
     };
-    is_response_decimal_token(&line[..space])
+    validate_response_article_number(&line[..space])
 }
 
 fn validate_capabilities_response_content(content: &[u8]) -> bool {
@@ -5537,6 +5541,10 @@ mod tests {
                 b"211 2 1 2 alt.test\r\n1\r\n2\r\n.\r\n".as_slice(),
             ),
             (
+                RequestKind::ListGroup,
+                b"211 1 1 9999999999999999 alt.test\r\n9999999999999999\r\n.\r\n".as_slice(),
+            ),
+            (
                 RequestKind::List,
                 b"215 list follows\r\nalt.test 3 1 y\r\nredirect.test 0 0 =alt.test\r\n.\r\n"
                     .as_slice(),
@@ -5620,6 +5628,10 @@ mod tests {
                 b"225 headers follow\r\n1 value\r\n0 \r\n.\r\n".as_slice(),
             ),
             (
+                RequestKind::Hdr,
+                b"225 headers follow\r\n9999999999999999 value\r\n.\r\n".as_slice(),
+            ),
+            (
                 RequestKind::Xhdr,
                 b"221 headers follow\r\n1 value\r\n0 \r\n.\r\n".as_slice(),
             ),
@@ -5640,8 +5652,16 @@ mod tests {
                 b"211 2 1 2 alt.test\r\none\r\n.\r\n".as_slice(),
             ),
             (
+                RequestKind::ListGroup,
+                b"211 1 1 1 alt.test\r\n12345678901234567\r\n.\r\n".as_slice(),
+            ),
+            (
                 RequestKind::ListActive,
                 b"215 list follows\r\nalt.* 3 1 y\r\n.\r\n".as_slice(),
+            ),
+            (
+                RequestKind::ListActive,
+                b"215 list follows\r\nalt.test 12345678901234567 1 y\r\n.\r\n".as_slice(),
             ),
             (
                 RequestKind::ListActiveTimes,
@@ -5737,6 +5757,11 @@ mod tests {
             ),
             (
                 RequestKind::Over,
+                b"224 overview follows\r\n12345678901234567\tSubject\tfrom@test\r\n.\r\n"
+                    .as_slice(),
+            ),
+            (
+                RequestKind::Over,
                 b"224 overview follows\r\n1\tSubject\tfrom@test\tdate\t<one@test>\t\t1\t1\toptional without label\r\n.\r\n"
                     .as_slice(),
             ),
@@ -5752,6 +5777,10 @@ mod tests {
             (
                 RequestKind::Hdr,
                 b"225 headers follow\r\n1\tvalue\r\n.\r\n".as_slice(),
+            ),
+            (
+                RequestKind::Hdr,
+                b"225 headers follow\r\n12345678901234567 value\r\n.\r\n".as_slice(),
             ),
             (
                 RequestKind::Xhdr,
