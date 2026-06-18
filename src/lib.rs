@@ -8776,6 +8776,12 @@ mod tests {
                         frame: b"224 overview follows\r\n1\tSubject\tfrom@test\tdate\t<one@test>\t\tbytes 1\t1\r\n.\r\n",
                     },
                     ResponseFrameCase {
+                        name: "OVER rejects NUL in mandatory hdr-content",
+                        reference: "RFC 3977 sections 8.3.2, 9.4.3, and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.4.3",
+                        kind: RequestKind::Over,
+                        frame: b"224 overview follows\r\n1\tSubject\0bad\tfrom@test\tdate\t<one@test>\t\t1\t1\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "XOVER rejects missing required overview fields",
                         reference: "RFC 2980 section 2.1.7 and RFC 3977 section 9.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.7",
                         kind: RequestKind::Xover,
@@ -8800,10 +8806,28 @@ mod tests {
                         frame: b"224 overview follows\r\n1\tSubject\tfrom@test\tdate\t<one@test>\t\t1\t1\tXref:missing-space\r\n.\r\n",
                     },
                     ResponseFrameCase {
+                        name: "XOVER rejects NUL in optional hdr-content",
+                        reference: "RFC 3977 sections 8.3.2, 9.4.3, and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.4.3",
+                        kind: RequestKind::Xover,
+                        frame: b"224 overview follows\r\n1\tSubject\tfrom@test\tdate\t<one@test>\t\t1\t1\tXref: value\0bad\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "HDR rejects tab separator before header value",
                         reference: "RFC 3977 section 8.5.1 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.1",
                         kind: RequestKind::Hdr,
                         frame: b"225 headers follow\r\n1\tvalue\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "HDR rejects TAB inside hdr-content",
+                        reference: "RFC 3977 sections 8.5.1 and 9.4.3 https://www.rfc-editor.org/rfc/rfc3977#section-9.4.3",
+                        kind: RequestKind::Hdr,
+                        frame: b"225 headers follow\r\n1 value\tbad\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "HDR rejects NUL inside hdr-content",
+                        reference: "RFC 3977 sections 8.5.1, 9.4.3, and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.4.3",
+                        kind: RequestKind::Hdr,
+                        frame: b"225 headers follow\r\n1 value\0bad\r\n.\r\n",
                     },
                     ResponseFrameCase {
                         name: "HDR rejects overlong article number",

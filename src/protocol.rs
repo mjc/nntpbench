@@ -2811,6 +2811,9 @@ fn validate_overview_response_line(line: &[u8]) -> bool {
     let mut field_count = 0usize;
     for field in line[tab + 1..].split(|byte| *byte == b'\t') {
         field_count += 1;
+        if !validate_hdr_content(field) {
+            return false;
+        }
         if matches!(field_count, 6 | 7) && !is_response_decimal_token(field) {
             return false;
         }
@@ -2827,19 +2830,26 @@ fn validate_overview_optional_field(field: &[u8]) -> bool {
         return false;
     };
     let label = &field[..space];
-    if validate_metadata_name_abnf_bytes(label) {
-        return true;
-    }
-    label
-        .strip_suffix(b":")
-        .is_some_and(validate_header_name_abnf_bytes)
+    let content = &field[space + 1..];
+    validate_hdr_content(content)
+        && (validate_metadata_name_abnf_bytes(label)
+            || label
+                .strip_suffix(b":")
+                .is_some_and(validate_header_name_abnf_bytes))
 }
 
 fn validate_header_response_line(line: &[u8]) -> bool {
     memchr::memchr(b' ', line).map_or_else(
         || validate_response_article_number(line),
-        |space| validate_response_article_number(&line[..space]),
+        |space| {
+            validate_response_article_number(&line[..space])
+                && validate_hdr_content(&line[space + 1..])
+        },
     )
+}
+
+fn validate_hdr_content(value: &[u8]) -> bool {
+    value.iter().all(|byte| !matches!(*byte, b'\0' | b'\t'))
 }
 
 fn validate_capabilities_response_content(content: &[u8]) -> bool {
