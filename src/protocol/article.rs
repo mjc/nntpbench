@@ -15,6 +15,7 @@ pub enum ArticleParseError {
     MissingSeparator,
     MissingTerminator,
     InvalidHeader(InvalidHeaderReason),
+    InvalidBody,
     UnexpectedBody,
     BufferTooShort,
     InvalidArticleNumber,
@@ -30,6 +31,7 @@ pub enum InvalidHeaderReason {
     MissingSpaceAfterColon,
     EmptyName,
     InvalidName,
+    InvalidContent,
 }
 
 #[cfg(test)]
@@ -931,6 +933,7 @@ impl fmt::Display for ArticleParseError {
             }
             Self::MissingTerminator => write!(f, "missing multiline terminator"),
             Self::InvalidHeader(reason) => write!(f, "invalid header: {reason}"),
+            Self::InvalidBody => write!(f, "invalid body content"),
             Self::UnexpectedBody => write!(f, "response contains unexpected body"),
             Self::BufferTooShort => write!(f, "buffer too short to contain valid response"),
             Self::InvalidArticleNumber => write!(f, "invalid article number"),
@@ -951,6 +954,7 @@ impl fmt::Display for InvalidHeaderReason {
             Self::MissingSpaceAfterColon => write!(f, "header missing space after colon"),
             Self::EmptyName => write!(f, "empty header name"),
             Self::InvalidName => write!(f, "invalid character in header name"),
+            Self::InvalidContent => write!(f, "invalid character in header content"),
         }
     }
 }
@@ -1165,6 +1169,7 @@ impl<'a> Article<'a> {
         let body_start = separator_pos + 4;
         let body_end = find_article_content_end(buf, body_start)
             .ok_or(ArticleParseError::MissingTerminator)?;
+        validate_body_content(&buf[body_start..body_end])?;
 
         Ok(Self {
             message_id,
@@ -1200,6 +1205,7 @@ impl<'a> Article<'a> {
         let body_start = first_line_end + 2;
         let body_end = find_article_content_end(buf, body_start)
             .ok_or(ArticleParseError::MissingTerminator)?;
+        validate_body_content(&buf[body_start..body_end])?;
 
         Ok(Self {
             message_id,
@@ -1239,6 +1245,7 @@ impl<'a> Article<'a> {
         if body_start > content_end {
             return Err(ArticleParseError::BufferTooShort);
         }
+        validate_body_content(&buf[body_start..content_end])?;
 
         Ok(Self {
             message_id,
@@ -1274,6 +1281,7 @@ impl<'a> Article<'a> {
         content_end: usize,
     ) -> Result<Self, ArticleParseError> {
         let (message_id, article_number) = parse_first_line(&buf[..first_line_end])?;
+        validate_body_content(&buf[content_start..content_end])?;
 
         Ok(Self {
             message_id,
@@ -1310,6 +1318,14 @@ fn find_article_content_end(buf: &[u8], start: usize) -> Option<usize> {
     }
 
     find_terminator_content_end(buf, start)
+}
+
+fn validate_body_content(buf: &[u8]) -> Result<(), ArticleParseError> {
+    if buf.contains(&b'\0') {
+        return Err(ArticleParseError::InvalidBody);
+    }
+
+    Ok(())
 }
 
 fn unfold_header_continuations(buf: &[u8]) -> Cow<'_, [u8]> {
@@ -1472,6 +1488,11 @@ fn validate_headers(data: &[u8]) -> Result<(), ArticleParseError> {
                 InvalidHeaderReason::MissingSpaceAfterColon,
             ));
         }
+        if line[colon_pos + 2..].contains(&b'\0') {
+            return Err(ArticleParseError::InvalidHeader(
+                InvalidHeaderReason::InvalidContent,
+            ));
+        }
 
         pos = line_end + 2;
     }
@@ -1614,6 +1635,7 @@ Actual body content\r\n\
         let missing_colon = b"Invalid Header\r\n";
         let missing_space = b"Subject:Test\r\n";
         let invalid_name = b"Invalid Header: value\r\n";
+        let invalid_content = b"Subject: bad\0value\r\n";
         let leading_fold = b" folded\r\nSubject: Test\r\n";
         let empty_fold = b"Subject: Test\r\n \t\r\n";
 
@@ -1639,6 +1661,10 @@ Actual body content\r\n\
         assert_eq!(
             Headers::parse(invalid_name).unwrap_err(),
             ArticleParseError::InvalidHeader(InvalidHeaderReason::InvalidName)
+        );
+        assert_eq!(
+            Headers::parse(invalid_content).unwrap_err(),
+            ArticleParseError::InvalidHeader(InvalidHeaderReason::InvalidContent)
         );
         assert_eq!(
             Headers::parse(leading_fold).unwrap_err(),
@@ -1767,6 +1793,20 @@ Actual body content\r\n\
                 b"220 12345 <test@example.com>\r\nSubject: Test\r\n \t\r\n\r\nBody\r\n.\r\n"
                     .as_slice(),
                 ArticleParseError::InvalidHeader(InvalidHeaderReason::EmptyFold),
+            ),
+            (
+                b"220 12345 <test@example.com>\r\nSubject: bad\0value\r\n\r\nBody\r\n.\r\n"
+                    .as_slice(),
+                ArticleParseError::InvalidHeader(InvalidHeaderReason::InvalidContent),
+            ),
+            (
+                b"220 12345 <test@example.com>\r\nSubject: Test\r\n\r\nBody\0bad\r\n.\r\n"
+                    .as_slice(),
+                ArticleParseError::InvalidBody,
+            ),
+            (
+                b"222 12345 <test@example.com>\r\nBody\0bad\r\n.\r\n".as_slice(),
+                ArticleParseError::InvalidBody,
             ),
             (
                 b"220 12345 <test@example.com>\r\n\r\nBody\r\n.\r\n".as_slice(),

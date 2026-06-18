@@ -5579,6 +5579,32 @@ mod tests {
             }
         }
 
+        #[test]
+        fn rfc3977_red_article_parser_rejects_nul_octets() {
+            // RFC 3977 section 3.6 says an article MUST NOT include NUL, and
+            // section 9.8 excludes NUL from B-CHAR multiline data:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-3.6
+            for (name, input) in [
+                (
+                    "ARTICLE header content NUL",
+                    b"220 1 <nul@test>\r\nSubject: bad\0value\r\n\r\nbody\r\n.\r\n".as_slice(),
+                ),
+                (
+                    "ARTICLE body NUL",
+                    b"220 1 <nul@test>\r\nSubject: ok\r\n\r\nbad\0body\r\n.\r\n".as_slice(),
+                ),
+                (
+                    "BODY content NUL",
+                    b"222 1 <nul@test>\r\nbad\0body\r\n.\r\n".as_slice(),
+                ),
+            ] {
+                assert!(
+                    Article::parse(input).is_err(),
+                    "{name}: RFC 3977 article-family response should reject NUL octets"
+                );
+            }
+        }
+
         #[tokio::test]
         async fn rfc3977_red_server_returns_501_for_syntax_error_not_article_body() {
             // RFC 3977 sections 3.2.1 and 6.2.1 reserve 501 for command syntax
