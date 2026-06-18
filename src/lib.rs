@@ -8385,6 +8385,12 @@ mod tests {
                         frame: b"205\r\n",
                     },
                     ResponseFrameCase {
+                        name: "DATE accepts timestamp plus trailing comment",
+                        reference: "RFC 3977 sections 7.1 and 9.4.1 https://www.rfc-editor.org/rfc/rfc3977#section-9.4.1",
+                        kind: RequestKind::Date,
+                        frame: b"111 20260602120000 server clock\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "ARTICLE missing message-id error accepts bare generic status line",
                         reference: "RFC 3977 sections 3.2.1 and 9.4.1 https://www.rfc-editor.org/rfc/rfc3977#section-9.4.1",
                         kind: RequestKind::Article,
@@ -8510,6 +8516,12 @@ mod tests {
                         reference: "RFC 3977 sections 7.1 and 9.4.2 https://www.rfc-editor.org/rfc/rfc3977#section-7.1",
                         kind: RequestKind::Date,
                         frame: b"111 server date follows\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "DATE rejects empty timestamp response argument",
+                        reference: "RFC 3977 sections 7.1 and 9.4.2 https://www.rfc-editor.org/rfc/rfc3977#section-9.4.2",
+                        kind: RequestKind::Date,
+                        frame: b"111  20260602120000\r\n",
                     },
                     ResponseFrameCase {
                         name: "generic 401 rejects missing capability label",

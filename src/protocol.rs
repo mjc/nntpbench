@@ -2394,14 +2394,18 @@ fn validate_response_initial_line(kind: RequestKind, status: StatusCode, line: &
 }
 
 fn validate_date_response_argument(value: &[u8]) -> bool {
-    if value.len() != 14 || !value.iter().all(u8::is_ascii_digit) {
+    let Some((tokens, _trailing_text)) = split_required_response_tokens::<1>(value) else {
+        return false;
+    };
+    let timestamp = tokens[0];
+    if timestamp.len() != 14 || !timestamp.iter().all(u8::is_ascii_digit) {
         return false;
     }
 
-    let Ok(date) = std::str::from_utf8(&value[..8]) else {
+    let Ok(date) = std::str::from_utf8(&timestamp[..8]) else {
         return false;
     };
-    let Ok(time) = std::str::from_utf8(&value[8..]) else {
+    let Ok(time) = std::str::from_utf8(&timestamp[8..]) else {
         return false;
     };
 
@@ -5367,6 +5371,7 @@ mod tests {
         // 111 followed by yyyymmddhhmmss.
         for input in [
             b"111 20260602120000\r\n".as_slice(),
+            b"111 20260602120000 server clock\r\n".as_slice(),
             b"111 20261231235960\r\n".as_slice(),
         ] {
             assert!(
@@ -5389,6 +5394,7 @@ mod tests {
             b"111 20260602240000\r\n".as_slice(),
             b"111 2026060212000\r\n".as_slice(),
             b"111 202606021200000\r\n".as_slice(),
+            b"111  20260602120000\r\n".as_slice(),
             b"111 2026060212000x\r\n".as_slice(),
             b"111 server date follows\r\n".as_slice(),
         ] {
