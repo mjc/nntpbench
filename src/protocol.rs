@@ -2687,7 +2687,22 @@ fn validate_distrib_pats_response_line(line: &[u8]) -> bool {
         return false;
     };
 
-    is_response_decimal_token(priority) && !wildmat.is_empty() && !distribution.is_empty()
+    is_response_decimal_token(priority)
+        && validate_wildmat_response_field(wildmat)
+        && validate_p_char_token(distribution)
+}
+
+fn validate_wildmat_response_field(value: &[u8]) -> bool {
+    std::str::from_utf8(value).is_ok_and(|wildmat| validate_wildmat(wildmat).is_ok())
+}
+
+fn validate_p_char_token(value: &[u8]) -> bool {
+    std::str::from_utf8(value).is_ok_and(|token| {
+        !token.is_empty()
+            && token
+                .chars()
+                .all(|ch| !ch.is_ascii() || ('\x21'..='\x7e').contains(&ch))
+    })
 }
 
 fn validate_overview_response_line(line: &[u8]) -> bool {
@@ -5504,6 +5519,11 @@ mod tests {
                 b"215 distrib pats follow\r\n1:*:world\r\n.\r\n".as_slice(),
             ),
             (
+                RequestKind::ListDistribPats,
+                b"215 distrib pats follow\r\n10:local.*:local\r\n5:comp.lang.?:world\r\n.\r\n"
+                    .as_slice(),
+            ),
+            (
                 RequestKind::Capabilities,
                 b"101 capabilities follow\r\nVERSION 2\r\nREADER\r\nOVER MSGID\r\n.\r\n".as_slice(),
             ),
@@ -5601,6 +5621,14 @@ mod tests {
             (
                 RequestKind::ListDistribPats,
                 b"215 distrib pats follow\r\nfirst:*:world\r\n.\r\n".as_slice(),
+            ),
+            (
+                RequestKind::ListDistribPats,
+                b"215 distrib pats follow\r\n1:alt[0-9].*:world\r\n.\r\n".as_slice(),
+            ),
+            (
+                RequestKind::ListDistribPats,
+                b"215 distrib pats follow\r\n1:*:local world\r\n.\r\n".as_slice(),
             ),
             (
                 RequestKind::Capabilities,

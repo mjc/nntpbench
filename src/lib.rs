@@ -8430,6 +8430,18 @@ mod tests {
                         frame: b"215 distribution patterns\r\nfirst:*:world\r\n.\r\n",
                     },
                     ResponseFrameCase {
+                        name: "LIST DISTRIB.PATS rejects invalid wildmat field",
+                        reference: "RFC 3977 sections 4.1 and 9.6 https://www.rfc-editor.org/rfc/rfc3977#section-9.6",
+                        kind: RequestKind::ListDistribPats,
+                        frame: b"215 distribution patterns\r\n1:alt[0-9].*:world\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "LIST DISTRIB.PATS rejects distribution token with space",
+                        reference: "RFC 3977 sections 7.6.5 and 9.6 https://www.rfc-editor.org/rfc/rfc3977#section-9.6",
+                        kind: RequestKind::ListDistribPats,
+                        frame: b"215 distribution patterns\r\n1:*:local world\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "CAPABILITIES rejects empty capability token",
                         reference: "RFC 3977 sections 5.2 and 9.5 https://www.rfc-editor.org/rfc/rfc3977#section-5.2",
                         kind: RequestKind::Capabilities,
