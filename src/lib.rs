@@ -2403,6 +2403,9 @@ where
                 )
                 .await?
                 {
+                    if let Some(article_id) = command.article_id {
+                        session_state.current_article = Some(article_id);
+                    }
                     return Ok(false);
                 }
                 write_response(
@@ -5657,10 +5660,22 @@ mod tests {
             .await;
 
             let (output, _) =
-                run_session_with_input(config, b"GROUP alt.test\r\nARTICLE 3\r\n").await;
+                run_session_with_input(config.clone(), b"GROUP alt.test\r\nARTICLE 3\r\n").await;
             assert!(
                 without_greeting(&output).ends_with(b"423 no article with that number\r\n"),
                 "RFC 3977 missing stored numeric ARTICLE should end with 423, got {:?}",
+                String::from_utf8_lossy(without_greeting(&output))
+            );
+
+            let (output, _) = run_session_with_input(
+                config,
+                b"GROUP alt.test\r\nARTICLE 2\r\nARTICLE <stored@ngPost>\r\nSTAT\r\n",
+            )
+            .await;
+            assert!(
+                without_greeting(&output)
+                    .ends_with(b"223 2 <article.2@nntpbench.local> article retrieved\r\n"),
+                "RFC 3977 stored numeric ARTICLE must set current article, while message-id ARTICLE must not change it, got {:?}",
                 String::from_utf8_lossy(without_greeting(&output))
             );
 
