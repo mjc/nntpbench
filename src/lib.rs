@@ -2753,10 +2753,6 @@ where
             Ok(false)
         }
         RequestKind::StartTls => {
-            if command.has_following_data {
-                write_response(writer, pending_write, STARTTLS_RESPONSE, session_stats).await?;
-                return Ok(true);
-            }
             write_response(
                 writer,
                 pending_write,
@@ -3696,7 +3692,6 @@ struct ParsedCommand {
     message_id: Option<ParsedMessageId>,
     syntax_error: bool,
     has_transfer_body: bool,
-    has_following_data: bool,
     line_too_long: bool,
 }
 
@@ -3827,9 +3822,6 @@ where
         read_dot_terminated_body(reader).await?;
         command.has_transfer_body = true;
     }
-    if matches!(command.kind, RequestKind::StartTls) && !reader.fill_buf().await?.is_empty() {
-        command.has_following_data = true;
-    }
     command_batch.push(command);
     Ok(())
 }
@@ -3878,7 +3870,6 @@ fn parse_command_line(line: &[u8], line_slot: usize) -> ParsedCommand {
         message_id: parsed_message_id_range(line, request.message_id()),
         syntax_error: matches!(request.kind(), RequestKind::Unknown) && is_known_command_line(line),
         has_transfer_body: false,
-        has_following_data: false,
         line_too_long: line == b"DATE too-long\n",
     }
 }
@@ -6236,16 +6227,17 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc4642_red_starttls_rejects_following_plaintext_commands() {
-            // RFC 4642 section 2.2 switches the connection to TLS after 382.
-            // Further cleartext commands must not be processed on that channel:
+        async fn rfc4642_red_starttls_with_buffered_plaintext_still_returns_502() {
+            // RFC 4642 section 2.2 requires a 382 response to begin actual TLS
+            // negotiation. A server without TLS support must not emit 382 just
+            // because another plaintext command is already buffered:
             // https://www.rfc-editor.org/rfc/rfc4642#section-2.2
-            let input = b"STARTTLS\r\nDATE\r\n";
+            let input = b"STARTTLS\r\nQUIT\r\n";
             let (output, _) = run_session_with_input(test_config(), input).await;
             assert_eq!(
                 without_greeting(&output),
-                b"382 continue with TLS negotiation\r\n",
-                "RFC 4642 STARTTLS should not process following cleartext DATE"
+                b"502 command unavailable\r\n205 closing connection\r\n",
+                "RFC 4642 unavailable STARTTLS must not emit 382 without TLS support"
             );
         }
 
@@ -6709,7 +6701,6 @@ mod tests {
             message_id: None,
             syntax_error: false,
             has_transfer_body: false,
-            has_following_data: false,
             line_too_long: false,
         };
         let command_lines = CommandLineBatch::default();
