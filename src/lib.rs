@@ -210,7 +210,7 @@ pub const QUIT_RESPONSE: &[u8] = b"205 closing connection\r\n";
 pub const ARTICLE_NOT_FOUND_RESPONSE: &[u8] = b"430 no article with that number\r\n";
 const BODY_RESPONSE_PREFIX: &[u8] = b"222 1 <article.1@nntpbench.local> body follows\r\n";
 const ARTICLE_RESPONSE_PREFIX: &[u8] = b"220 1 <article.1@nntpbench.local> article follows\r\nPath: nntpbench.local!mock\r\nFrom: Bench User <bench@nntpbench.local>\r\nNewsgroups: alt.binaries.bench\r\nSubject: nntpbench synthetic article\r\nMessage-ID: <article.1@nntpbench.local>\r\nDate: Fri, 15 May 2026 00:00:00 +0000\r\n\r\n";
-const MAX_COMMAND_LINE_BYTES: usize = protocol::MAX_INITIAL_RESPONSE_LINE_BYTES;
+const MAX_COMMAND_LINE_BYTES: usize = protocol::MAX_AUTHINFO_SASL_COMMAND_LINE_BYTES;
 const MAX_SERVER_PIPELINE_DEPTH: usize = 1024;
 const SERVER_READER_CAPACITY: usize = 256 * 1024;
 const CLIENT_READER_CAPACITY: usize = 256 * 1024;
@@ -3947,8 +3947,25 @@ fn parse_command_line(line: &[u8], line_slot: usize) -> ParsedCommand {
         message_id: parsed_message_id_range(line, request.message_id()),
         syntax_error: matches!(request.kind(), RequestKind::Unknown) && is_known_command_line(line),
         has_transfer_body: false,
-        line_too_long: line == b"DATE too-long\n",
+        line_too_long: command_line_is_too_long(line),
     }
+}
+
+fn command_line_is_too_long(line: &[u8]) -> bool {
+    line == b"DATE too-long\n"
+        || (line.len() > protocol::MAX_INITIAL_RESPONSE_LINE_BYTES && !line_is_authinfo_sasl(line))
+}
+
+fn line_is_authinfo_sasl(line: &[u8]) -> bool {
+    let line = strip_complete_crlf_line(line).unwrap_or(line);
+    let line = trim_command_eol_ws(line);
+    let mut parts = command_tokens(line);
+    matches!(
+        (parts.next(), parts.next()),
+        (Some(command), Some(subcommand))
+            if command.eq_ignore_ascii_case(b"AUTHINFO")
+                && subcommand.eq_ignore_ascii_case(b"SASL")
+    )
 }
 
 fn is_known_command_line(line: &[u8]) -> bool {
@@ -4037,6 +4054,14 @@ fn skip_command_ws(line: &[u8]) -> &[u8] {
         .position(|byte| !is_command_ws(*byte))
         .unwrap_or(line.len());
     &line[start..]
+}
+
+fn trim_command_eol_ws(line: &[u8]) -> &[u8] {
+    let end = line
+        .iter()
+        .rposition(|byte| !is_command_ws(*byte))
+        .map_or(0, |index| index + 1);
+    &line[..end]
 }
 
 fn command_tokens(args: &[u8]) -> impl Iterator<Item = &[u8]> {
@@ -6350,6 +6375,27 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn rfc4643_red_authinfo_sasl_initial_response_may_exceed_512_octets() {
+            // RFC 4643 section 2.4.1 raises the AUTHINFO SASL command-line
+            // limit above RFC 3977's 512-octet base limit when an initial
+            // response is present:
+            // https://www.rfc-editor.org/rfc/rfc4643#section-2.4.1
+            let mut input = b"AUTHINFO SASL BENCH ".to_vec();
+            input.extend(std::iter::repeat_n(b"QUJD".as_slice(), 130).flatten());
+            input.extend_from_slice(crate::CRLF);
+            assert!(input.len() > protocol::MAX_INITIAL_RESPONSE_LINE_BYTES);
+
+            let (output, error) =
+                run_session_with_input_allowing_server_error(test_config(), &input).await;
+            assert!(
+                error.is_none() && without_greeting(&output) == b"502 command unavailable\r\n",
+                "RFC 4643 long AUTHINFO SASL should parse before unsupported-command handling, got error {:?} and output {:?}",
+                error,
+                String::from_utf8_lossy(&output)
+            );
+        }
+
+        #[tokio::test]
         async fn rfc4643_red_authinfo_sasl_rejects_malformed_initial_response() {
             // RFC 4643 section 2.4.2 requires SASL initial responses to use
             // valid base64 syntax; padding cannot appear in the middle:
@@ -7738,7 +7784,10 @@ mod tests {
             // CRLF. An overlong line should get a 501 response, not a silent close:
             // https://www.rfc-editor.org/rfc/rfc3977#section-3.1
             let mut input = b"DATE ".to_vec();
-            input.extend(std::iter::repeat_n(b'x', MAX_COMMAND_LINE_BYTES + 1));
+            input.extend(std::iter::repeat_n(
+                b'x',
+                protocol::MAX_INITIAL_RESPONSE_LINE_BYTES + 1,
+            ));
             input.extend_from_slice(b"\r\n");
             let (output, error) =
                 run_session_with_input_allowing_server_error(test_config(), &input).await;
@@ -7898,7 +7947,10 @@ mod tests {
             // including the terminating CRLF:
             // https://www.rfc-editor.org/rfc/rfc3977#section-3.1
             let mut exact = b"QUIT".to_vec();
-            exact.resize(MAX_COMMAND_LINE_BYTES - crate::CRLF.len(), b' ');
+            exact.resize(
+                protocol::MAX_INITIAL_RESPONSE_LINE_BYTES - crate::CRLF.len(),
+                b' ',
+            );
             exact.extend_from_slice(crate::CRLF);
             assert_eq!(
                 RequestLine::parse(&exact).kind(),
@@ -7907,11 +7959,24 @@ mod tests {
             );
 
             let mut overlong = exact;
-            overlong.insert(MAX_COMMAND_LINE_BYTES - crate::CRLF.len(), b' ');
+            overlong.insert(
+                protocol::MAX_INITIAL_RESPONSE_LINE_BYTES - crate::CRLF.len(),
+                b' ',
+            );
             assert_eq!(
                 RequestLine::parse(&overlong).kind(),
                 RequestKind::Unknown,
                 "RFC 3977 command lines over 512 octets must not parse as valid commands"
+            );
+
+            let mut long_sasl = b"AUTHINFO SASL BENCH ".to_vec();
+            long_sasl.extend(std::iter::repeat_n(b"QUJD".as_slice(), 130).flatten());
+            long_sasl.extend_from_slice(crate::CRLF);
+            assert!(long_sasl.len() > protocol::MAX_INITIAL_RESPONSE_LINE_BYTES);
+            assert_eq!(
+                RequestLine::parse(&long_sasl).kind(),
+                RequestKind::AuthInfo,
+                "RFC 4643 permits AUTHINFO SASL command lines over 512 octets"
             );
         }
 
@@ -12816,7 +12881,10 @@ mod tests {
         // 512-octet command-line bound.
         let (mut client, server) = tokio::io::duplex(2048);
         let mut wire = b"TAKETHIS <take@test>\r\nHeader: value\r\n".to_vec();
-        wire.extend(std::iter::repeat_n(b'x', MAX_COMMAND_LINE_BYTES + 128));
+        wire.extend(std::iter::repeat_n(
+            b'x',
+            protocol::MAX_INITIAL_RESPONSE_LINE_BYTES + 128,
+        ));
         wire.extend_from_slice(b"\r\n.\r\nQUIT\r\n");
         client.write_all(&wire).await.unwrap();
 
