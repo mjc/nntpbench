@@ -2647,7 +2647,7 @@ fn validate_newsgroups_response_line(line: &[u8]) -> bool {
     std::str::from_utf8(group)
         .ok()
         .is_some_and(|group| GroupName::from_borrowed(group).is_ok())
-        && validate_u_text(description)
+        && validate_s_text(description)
 }
 
 fn split_newsgroups_response_line(line: &[u8]) -> Option<(&[u8], &[u8])> {
@@ -2845,6 +2845,20 @@ fn validate_header_response_line(line: &[u8]) -> bool {
 
 fn validate_hdr_content(value: &[u8]) -> bool {
     value.iter().all(|byte| !matches!(*byte, b'\0' | b'\t'))
+}
+
+fn validate_s_text(value: &[u8]) -> bool {
+    let Some((first, rest)) = value.split_first() else {
+        return false;
+    };
+    is_s_text_initial_byte(*first)
+        && rest
+            .iter()
+            .all(|byte| !matches!(*byte, b'\0' | b'\r' | b'\n'))
+}
+
+fn is_s_text_initial_byte(byte: u8) -> bool {
+    matches!(byte, 0x01..=0x08 | 0x0b..=0x0c | 0x0e..=0xff)
 }
 
 fn validate_capabilities_response_content(content: &[u8]) -> bool {

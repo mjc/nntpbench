@@ -8416,6 +8416,18 @@ mod tests {
                             b"231 list of new newsgroups follows\r\nalt.test 3 1 archived\r\n.\r\n",
                     },
                     ResponseFrameCase {
+                        name: "LIST NEWSGROUPS accepts byte-oriented S-TEXT description",
+                        reference: "RFC 3977 sections 7.6.6 and 9.6 https://www.rfc-editor.org/rfc/rfc3977#section-9.6",
+                        kind: RequestKind::ListNewsgroups,
+                        frame: b"215 information follows\r\nalt.test caf\xe9 group\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "LIST NEWSGROUPS accepts S-TEXT description starting with CTRL",
+                        reference: "RFC 3977 sections 7.6.6 and 9.6 https://www.rfc-editor.org/rfc/rfc3977#section-9.6",
+                        kind: RequestKind::ListNewsgroups,
+                        frame: b"215 information follows\r\nalt.test \x01control-prefixed\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "HDR accepts omitted space for empty field content",
                         reference: "RFC 3977 section 8.5.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.2",
                         kind: RequestKind::Hdr,
