@@ -27,7 +27,7 @@ use crate::{
 };
 
 const OWNED_RESPONSE_PREALLOC_BYTES: usize = 8 * 1024 * 1024;
-const STREAMING_STATUS_LINE_BYTES: usize = crate::protocol::MAX_INITIAL_RESPONSE_LINE_BYTES;
+const STREAMING_STATUS_LINE_BYTES: usize = crate::protocol::MAX_AUTHINFO_SASL_RESPONSE_LINE_BYTES;
 
 /// Options for the client one-connection client prototype.
 #[derive(Debug, Clone, Copy)]
@@ -3178,6 +3178,36 @@ mod tests {
             ResponseDecoder::new(RequestKind::Stat).push(&too_long_incomplete),
             Err(ClientError::InvalidStatusLine)
         ));
+    }
+
+    #[test]
+    fn decoder_accepts_rfc4643_long_authinfo_sasl_response_lines() {
+        // RFC 4643 sections 2.4.1 and 7.2 allow AUTHINFO SASL 283 and 383
+        // challenge response lines to exceed RFC 3977's base 512-octet response
+        // initial-line limit:
+        // https://www.rfc-editor.org/rfc/rfc4643#section-2.4.1
+        let challenge = "A".repeat(crate::protocol::MAX_INITIAL_RESPONSE_LINE_BYTES);
+        for (status, expected) in [("283", 283), ("383", 383)] {
+            let wire = format!("{status} {challenge}\r\n");
+            assert!(wire.len() > crate::protocol::MAX_INITIAL_RESPONSE_LINE_BYTES);
+
+            assert!(matches!(
+                ResponseDecoder::new(RequestKind::AuthInfo).push(wire.as_bytes()),
+                Ok(DecodeProgress::Complete { status, .. }) if status.as_u16() == expected
+            ));
+
+            let split = crate::protocol::MAX_INITIAL_RESPONSE_LINE_BYTES;
+            let mut decoder = StreamingResponseDecoder::new(RequestKind::AuthInfo);
+            assert!(matches!(
+                decoder.push(&wire.as_bytes()[..split]),
+                Ok(StreamingDecodeProgress::NeedMore { consumed }) if consumed == split
+            ));
+            assert!(matches!(
+                decoder.push(&wire.as_bytes()[split..]),
+                Ok(StreamingDecodeProgress::Complete { status, consumed, .. })
+                    if status.as_u16() == expected && consumed == wire.len() - split
+            ));
+        }
     }
 
     #[test]

@@ -7958,6 +7958,48 @@ mod tests {
             }
 
             #[test]
+            fn rfc4643_red_authinfo_sasl_long_response_line_matrix() {
+                // RFC 4643 sections 2.4.1 and 7.2 allow AUTHINFO SASL 283 and
+                // 383 response lines to exceed the RFC 3977 512-octet response
+                // initial-line limit when carrying SASL challenge data:
+                // https://www.rfc-editor.org/rfc/rfc4643#section-2.4.1
+                // https://www.rfc-editor.org/rfc/rfc4643#section-7.2
+                let challenge = "A".repeat(protocol::MAX_INITIAL_RESPONSE_LINE_BYTES);
+                for (name, status) in [
+                    ("AUTHINFO SASL 283 long success data", "283"),
+                    ("AUTHINFO SASL 383 long challenge", "383"),
+                ] {
+                    let frame = format!("{status} {challenge}\r\n");
+                    assert!(
+                        frame.len() > protocol::MAX_INITIAL_RESPONSE_LINE_BYTES,
+                        "{name}: generated frame should exceed the base NNTP line limit"
+                    );
+                    assert!(
+                        frame.len() <= protocol::MAX_AUTHINFO_SASL_RESPONSE_LINE_BYTES,
+                        "{name}: generated frame should remain inside the implementation SASL line limit"
+                    );
+
+                    assert!(
+                        matches!(
+                            protocol::ResponseFrame::parse(RequestKind::AuthInfo, frame.as_bytes()),
+                            protocol::ResponseFrameParse::Complete(_)
+                        ),
+                        "{name}: long AUTHINFO SASL frame should parse"
+                    );
+                    assert!(
+                        matches!(
+                            protocol::ResponseInitial::parse(
+                                RequestKind::AuthInfo,
+                                frame.as_bytes()
+                            ),
+                            protocol::ResponseInitialParse::Complete(_)
+                        ),
+                        "{name}: long AUTHINFO SASL initial response should parse"
+                    );
+                }
+            }
+
+            #[test]
             fn rfc3977_red_single_line_response_consumes_only_initial_line() {
                 // RFC 3977 sections 3.1 and 9.4 define single-line responses
                 // as complete at the response initial-line CRLF. Extra bytes

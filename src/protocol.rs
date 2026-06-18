@@ -28,6 +28,9 @@ pub(crate) const MAX_COMMAND_ARGUMENT_BYTES: usize = 497;
 /// RFC 4643 section 2.4.1 permits AUTHINFO SASL command lines to exceed the
 /// RFC 3977 base command-line limit when carrying an initial response.
 pub(crate) const MAX_AUTHINFO_SASL_COMMAND_LINE_BYTES: usize = 4096;
+/// RFC 4643 sections 2.4.1 and 7.2 permit AUTHINFO SASL challenge responses
+/// to exceed the RFC 3977 base response-line limit.
+pub(crate) const MAX_AUTHINFO_SASL_RESPONSE_LINE_BYTES: usize = 4096;
 
 /// NNTP response status code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -107,16 +110,17 @@ impl<'a> ResponseFrame<'a> {
     /// line plus a dot-terminated data block from section 3.1.1.
     #[must_use]
     pub fn parse(kind: RequestKind, buffer: &'a [u8]) -> ResponseFrameParse<'a> {
-        let status_line_end =
-            match detect_bounded_response_line_end(buffer, MAX_INITIAL_RESPONSE_LINE_BYTES) {
-                BoundedResponseLineStatus::CompleteAt(end) => end,
-                BoundedResponseLineStatus::NeedMore => return ResponseFrameParse::NeedMore,
-                BoundedResponseLineStatus::Invalid | BoundedResponseLineStatus::TooLong => {
-                    return ResponseFrameParse::Invalid;
-                }
-            };
+        let status = StatusCode::parse(buffer);
+        let status_line_limit = response_initial_line_limit(kind, status);
+        let status_line_end = match detect_bounded_response_line_end(buffer, status_line_limit) {
+            BoundedResponseLineStatus::CompleteAt(end) => end,
+            BoundedResponseLineStatus::NeedMore => return ResponseFrameParse::NeedMore,
+            BoundedResponseLineStatus::Invalid | BoundedResponseLineStatus::TooLong => {
+                return ResponseFrameParse::Invalid;
+            }
+        };
 
-        let Some(status) = StatusCode::parse(buffer) else {
+        let Some(status) = status else {
             return ResponseFrameParse::Invalid;
         };
         if status_line_end < 5 {
@@ -253,9 +257,11 @@ pub(crate) struct ResponseInitial {
 impl ResponseInitial {
     #[must_use]
     pub(crate) fn parse(kind: RequestKind, buffer: &[u8]) -> ResponseInitialParse {
-        match detect_bounded_response_line_end(buffer, MAX_INITIAL_RESPONSE_LINE_BYTES) {
+        let status = StatusCode::parse(buffer);
+        let status_line_limit = response_initial_line_limit(kind, status);
+        match detect_bounded_response_line_end(buffer, status_line_limit) {
             BoundedResponseLineStatus::CompleteAt(line_end) => {
-                let Some(status) = StatusCode::parse(buffer) else {
+                let Some(status) = status else {
                     return ResponseInitialParse::Invalid;
                 };
                 let descriptor = ResponseDescriptor::for_request_status(kind, status);
@@ -2297,6 +2303,16 @@ fn is_generic_error_status_for_request(kind: RequestKind, code: u16) -> bool {
                 480
             )
     ) && is_generic_error_status(code)
+}
+
+fn response_initial_line_limit(kind: RequestKind, status: Option<StatusCode>) -> usize {
+    if matches!(kind, RequestKind::AuthInfo)
+        && status.is_some_and(|status| matches!(status.as_u16(), 283 | 383))
+    {
+        MAX_AUTHINFO_SASL_RESPONSE_LINE_BYTES
+    } else {
+        MAX_INITIAL_RESPONSE_LINE_BYTES
+    }
 }
 
 fn is_specific_error_status_for_request(kind: RequestKind, code: u16) -> bool {
