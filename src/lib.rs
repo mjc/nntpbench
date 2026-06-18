@@ -5506,6 +5506,15 @@ mod tests {
                         .as_slice(),
                 ),
                 (
+                    "ARTICLE overlong leading-zero article number",
+                    b"220 00000000000000001 <overlong-leading-zero@test>\r\nSubject: bad\r\n\r\nbody\r\n.\r\n"
+                        .as_slice(),
+                ),
+                (
+                    "BODY overlong zero article number",
+                    b"222 00000000000000000 <overlong-zero@test>\r\nbody\r\n.\r\n".as_slice(),
+                ),
+                (
                     "STAT message-id not separated from text",
                     b"223 1 <bad-space@test>extra\r\n".as_slice(),
                 ),

@@ -1474,7 +1474,7 @@ fn parse_first_line(
 }
 
 fn parse_response_article_number(value: &[u8]) -> Result<ArticleNumber, ArticleParseError> {
-    if value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
+    if value.is_empty() || value.len() > 16 || !value.iter().all(u8::is_ascii_digit) {
         return Err(ArticleParseError::InvalidArticleNumber);
     }
 
