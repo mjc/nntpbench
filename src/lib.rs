@@ -4003,6 +4003,9 @@ fn overview_selector_error(
         return None;
     }
     let selector = overview_selector_arg(command.kind, args);
+    if selector.is_some_and(overview_selector_requires_group) && !session_state.group_selected {
+        return Some(b"412 no newsgroup selected\r\n");
+    }
     if selector.is_some_and(|selector| {
         selector.iter().all(|byte| byte.is_ascii_digit())
             && std::str::from_utf8(selector)
@@ -4019,6 +4022,10 @@ fn overview_selector_error(
         return Some(b"430 no article with that message-id\r\n");
     }
     None
+}
+
+fn overview_selector_requires_group(selector: &[u8]) -> bool {
+    !selector.starts_with(b"<")
 }
 
 fn overview_selector_arg(kind: RequestKind, args: &[u8]) -> Option<&[u8]> {
@@ -5162,9 +5169,13 @@ mod tests {
             // RFC 2980 section 2.1.6 specifies XHDR responses with response code
             // 221, not the RFC 3977 HDR 225 code:
             // https://www.rfc-editor.org/rfc/rfc2980#section-2.1.6
-            let (output, _) = run_session_with_input(test_config(), b"XHDR Subject 1\r\n").await;
+            let (output, _) =
+                run_session_with_input(test_config(), b"GROUP alt.test\r\nXHDR Subject 1\r\n")
+                    .await;
             assert!(
-                without_greeting(&output).starts_with(b"221 "),
+                without_greeting(&output)
+                    .windows(b"\r\n221 ".len())
+                    .any(|window| window == b"\r\n221 "),
                 "RFC 2980 XHDR should use 221, got {:?}",
                 String::from_utf8_lossy(without_greeting(&output))
             );
@@ -5518,13 +5529,12 @@ mod tests {
             // RFC 3977 section 8.5.2 defines 423 for an HDR article-number
             // selector that does not exist:
             // https://www.rfc-editor.org/rfc/rfc3977#section-8.5.2
-            let input = b"HDR Subject 999999\r\n";
+            let input = b"GROUP alt.test\r\nHDR Subject 999999\r\n";
             let (output, _) = run_session_with_input(test_config(), input).await;
-            assert_single_response(
-                input,
-                b"423 no article with that number\r\n",
-                &output,
-                "RFC 3977",
+            assert!(
+                without_greeting(&output).ends_with(b"423 no article with that number\r\n"),
+                "RFC 3977 missing numeric HDR should end with 423, got {:?}",
+                String::from_utf8_lossy(without_greeting(&output))
             );
         }
 
@@ -5665,15 +5675,61 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn rfc3977_red_overview_group_scoped_selectors_before_group_return_412() {
+            // RFC 3977 sections 8.3.2 and 8.5.2 define numeric and range
+            // overview/header selectors against the currently selected group:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-8.3.2
+            assert_red_server_response_cases(&[
+                ServerResponseCase {
+                    name: "OVER numeric selector before GROUP",
+                    reference: "RFC 3977 section 8.3.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.3.2",
+                    input: b"OVER 1\r\n",
+                    expected: b"412 no newsgroup selected\r\n",
+                },
+                ServerResponseCase {
+                    name: "OVER range selector before GROUP",
+                    reference: "RFC 3977 section 8.3.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.3.2",
+                    input: b"OVER 1-3\r\n",
+                    expected: b"412 no newsgroup selected\r\n",
+                },
+                ServerResponseCase {
+                    name: "XOVER range selector before GROUP",
+                    reference: "RFC 2980 section 2.1.7 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.7",
+                    input: b"XOVER 1-3\r\n",
+                    expected: b"412 no newsgroup selected\r\n",
+                },
+                ServerResponseCase {
+                    name: "HDR numeric selector before GROUP",
+                    reference: "RFC 3977 section 8.5.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.2",
+                    input: b"HDR Subject 1\r\n",
+                    expected: b"412 no newsgroup selected\r\n",
+                },
+                ServerResponseCase {
+                    name: "HDR range selector before GROUP",
+                    reference: "RFC 3977 section 8.5.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.2",
+                    input: b"HDR Subject 1-3\r\n",
+                    expected: b"412 no newsgroup selected\r\n",
+                },
+                ServerResponseCase {
+                    name: "XHDR range selector before GROUP",
+                    reference: "RFC 2980 section 2.1.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.6",
+                    input: b"XHDR Subject 1-3\r\n",
+                    expected: b"412 no newsgroup selected\r\n",
+                },
+            ])
+            .await;
+        }
+
+        #[tokio::test]
         async fn rfc3977_red_hdr_subject_omits_header_name_from_values() {
             // RFC 3977 section 8.5 returns the requested header metadata value,
             // not a repeated "Header-Name:" prefix in each result line:
             // https://www.rfc-editor.org/rfc/rfc3977#section-8.5
-            let input = b"HDR Subject 1\r\n";
+            let input = b"GROUP alt.test\r\nHDR Subject 1\r\n";
             let (output, _) = run_session_with_input(test_config(), input).await;
             let text = String::from_utf8_lossy(without_greeting(&output));
             assert!(
-                text.starts_with("225 ") && !text.contains(" Subject:"),
+                text.contains("\r\n225 ") && !text.contains(" Subject:"),
                 "RFC 3977 HDR Subject should return header values without field names, got {text:?}"
             );
         }
@@ -5683,7 +5739,7 @@ mod tests {
             // RFC 3977 section 8.5 returns the requested header metadata. When
             // Message-ID is requested, each value should use the message-id grammar:
             // https://www.rfc-editor.org/rfc/rfc3977#section-8.5
-            let input = b"HDR Message-ID 1\r\n";
+            let input = b"GROUP alt.test\r\nHDR Message-ID 1\r\n";
             let (output, _) = run_session_with_input(test_config(), input).await;
             let text = String::from_utf8_lossy(without_greeting(&output));
             assert!(
@@ -5698,11 +5754,11 @@ mod tests {
             // RFC 2980 section 2.1.6 returns values for the requested header.
             // XHDR Subject must not return Message-ID-shaped values:
             // https://www.rfc-editor.org/rfc/rfc2980#section-2.1.6
-            let input = b"XHDR Subject 1\r\n";
+            let input = b"GROUP alt.test\r\nXHDR Subject 1\r\n";
             let (output, _) = run_session_with_input(test_config(), input).await;
             let text = String::from_utf8_lossy(without_greeting(&output));
             assert!(
-                text.starts_with("221 ")
+                text.contains("\r\n221 ")
                     && text.contains("1 example one\r\n")
                     && !text.contains("<one@example"),
                 "RFC 2980 XHDR Subject should return subject values, got {text:?}"
@@ -5714,11 +5770,11 @@ mod tests {
             // RFC 2980 section 2.1.6 returns values for the requested header.
             // Message-ID values should still satisfy the RFC 3977 message-id grammar:
             // https://www.rfc-editor.org/rfc/rfc2980#section-2.1.6
-            let input = b"XHDR Message-ID 1\r\n";
+            let input = b"GROUP alt.test\r\nXHDR Message-ID 1\r\n";
             let (output, _) = run_session_with_input(test_config(), input).await;
             let text = String::from_utf8_lossy(without_greeting(&output));
             assert!(
-                text.starts_with("221 ")
+                text.contains("\r\n221 ")
                     && text.contains("1 <one@example.com>\r\n")
                     && text.contains("2 <two@example.com>\r\n"),
                 "RFC 2980 XHDR Message-ID should return valid message-id values, got {text:?}"
@@ -9655,7 +9711,7 @@ mod tests {
     async fn serve_session_supports_overview_commands() {
         let (output, stats) = run_session_with_input(
             test_config(),
-            b"OVER 1-10\r\nOVER <overview@test>\r\nXOVER 1-10\r\nXOVER <overview@test>\r\n",
+            b"GROUP alt.test\r\nOVER 1-10\r\nOVER <overview@test>\r\nXOVER 1-10\r\nXOVER <overview@test>\r\n",
         )
         .await;
 
@@ -9663,6 +9719,7 @@ mod tests {
             output,
             [
                 GREETING,
+                GROUP_RESPONSE,
                 OVER_RESPONSE,
                 OVER_RESPONSE,
                 XOVER_RESPONSE,
@@ -9670,7 +9727,7 @@ mod tests {
             ]
             .concat()
         );
-        assert_eq!(stats.snapshot().commands, 4);
+        assert_eq!(stats.snapshot().commands, 5);
     }
 
     #[tokio::test]
