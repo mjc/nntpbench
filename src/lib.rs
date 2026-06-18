@@ -9172,10 +9172,22 @@ mod tests {
                         frame: b"211 3 1 2147483648 alt.test\r\n",
                     },
                     ResponseFrameCase {
+                        name: "GROUP rejects article count over RFC maximum",
+                        reference: "RFC 3977 sections 3.6 and 6.1.1 https://www.rfc-editor.org/rfc/rfc3977#section-3.6",
+                        kind: RequestKind::Group,
+                        frame: b"211 2147483648 1 3 alt.test\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "LISTGROUP rejects invalid article count argument",
                         reference: "RFC 3977 sections 6.1.2 and 9.4.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.2",
                         kind: RequestKind::ListGroup,
                         frame: b"211 three 1 3 alt.test\r\n1\r\n2\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "LISTGROUP rejects overlong article count",
+                        reference: "RFC 3977 sections 6.1.2 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
+                        kind: RequestKind::ListGroup,
+                        frame: b"211 12345678901234567 1 3 alt.test\r\n1\r\n2\r\n.\r\n",
                     },
                     ResponseFrameCase {
                         name: "LISTGROUP rejects extra space between required arguments",

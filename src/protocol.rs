@@ -2453,7 +2453,7 @@ fn validate_group_response_arguments(value: &[u8]) -> bool {
         return false;
     };
 
-    is_response_decimal_token(tokens[0])
+    validate_response_article_number(tokens[0])
         && validate_response_article_number(tokens[1])
         && validate_response_article_number(tokens[2])
         && std::str::from_utf8(tokens[3])
@@ -5761,8 +5761,16 @@ mod tests {
             (RequestKind::Group, b"211 3 1 3 alt!test\r\n".as_slice()),
             (RequestKind::Group, b"211 3  1 3 alt.test\r\n".as_slice()),
             (
+                RequestKind::Group,
+                b"211 2147483648 1 3 alt.test\r\n".as_slice(),
+            ),
+            (
                 RequestKind::ListGroup,
                 b"211 three 1 3 alt.test\r\n.\r\n".as_slice(),
+            ),
+            (
+                RequestKind::ListGroup,
+                b"211 12345678901234567 1 3 alt.test\r\n.\r\n".as_slice(),
             ),
             (
                 RequestKind::ListGroup,
