@@ -135,6 +135,7 @@ pub const GROUP_RESPONSE: &[u8] = b"211 3 1 3 alt.test\r\n";
 const GROUP_COMP_RESPONSE: &[u8] = b"211 1 1 1 comp.lang.rust\r\n";
 pub const LISTGROUP_RESPONSE: &[u8] = b"211 3 1 3 alt.test\r\n1\r\n2\r\n3\r\n.\r\n";
 const LISTGROUP_COMP_RESPONSE: &[u8] = b"211 1 1 1 comp.lang.rust\r\n1\r\n.\r\n";
+const LISTGROUP_COMP_EMPTY_RESPONSE: &[u8] = b"211 1 1 1 comp.lang.rust\r\n.\r\n";
 const LISTGROUP_2_3_RESPONSE: &[u8] = b"211 3 1 3 alt.test\r\n2\r\n3\r\n.\r\n";
 pub const LAST_RESPONSE: &[u8] =
     b"223 1 <prev@alt.test> article retrieved - request text separately\r\n";
@@ -2298,6 +2299,14 @@ struct SessionState {
     current_article: Option<u64>,
 }
 
+impl SessionState {
+    fn article_count(&self) -> u64 {
+        self.selected_group
+            .map(FixtureGroup::article_count)
+            .unwrap_or(FixtureGroup::AltTest.article_count())
+    }
+}
+
 impl BatchOutcome {
     const fn should_close(self) -> bool {
         matches!(self, Self::Close)
@@ -2672,7 +2681,7 @@ where
                 .await?;
                 return Ok(false);
             };
-            if current_article >= 3 {
+            if current_article >= session_state.article_count() {
                 write_response(
                     writer,
                     pending_write,
@@ -4122,7 +4131,10 @@ fn article_selector_error(
     if command.article_id.is_some() && !session_state.group_selected {
         return Some(b"412 no newsgroup selected\r\n");
     }
-    if command.article_id.is_some_and(|article_id| article_id > 3) {
+    if command
+        .article_id
+        .is_some_and(|article_id| article_id > session_state.article_count())
+    {
         return Some(b"423 no article with that number\r\n");
     }
     if command.message_id.is_some() && contains_subslice(args, b"missing") {
@@ -4160,8 +4172,10 @@ fn overview_selector_error(
             && std::str::from_utf8(selector)
                 .ok()
                 .and_then(|value| value.parse::<u64>().ok())
-                .is_some_and(|article_id| article_id > 3)
-    }) || command.article_id.is_some_and(|article_id| article_id > 3)
+                .is_some_and(|article_id| article_id > session_state.article_count())
+    }) || command
+        .article_id
+        .is_some_and(|article_id| article_id > session_state.article_count())
     {
         return Some(b"423 no article with that number\r\n");
     }
@@ -4248,6 +4262,15 @@ fn fixture_group_from_name(name: &[u8]) -> Option<FixtureGroup> {
     }
 }
 
+impl FixtureGroup {
+    const fn article_count(self) -> u64 {
+        match self {
+            Self::AltTest => 3,
+            Self::CompLangRust => 1,
+        }
+    }
+}
+
 fn listgroup_selected_group(
     args: &[u8],
     current_group: Option<FixtureGroup>,
@@ -4278,6 +4301,12 @@ fn listgroup_response_for_args(args: &[u8], current_group: Option<FixtureGroup>)
     }
     let group = listgroup_selected_group(args, current_group).unwrap_or(FixtureGroup::AltTest);
     if group == FixtureGroup::CompLangRust {
+        if args
+            .split(|byte| *byte == b' ')
+            .any(|part| part == b"2-3" || part == b"2-")
+        {
+            return LISTGROUP_COMP_EMPTY_RESPONSE;
+        }
         return LISTGROUP_COMP_RESPONSE;
     }
     if args
@@ -5086,6 +5115,64 @@ mod tests {
                     reference: "RFC 3977 section 6.1.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.2",
                     input: b"GROUP comp.lang.rust\r\nLISTGROUP\r\n",
                     expected: b"211 1 1 1 comp.lang.rust\r\n211 1 1 1 comp.lang.rust\r\n1\r\n.\r\n",
+                },
+            ])
+            .await;
+        }
+
+        #[tokio::test]
+        async fn rfc3977_red_selected_group_article_bounds_are_enforced() {
+            // RFC 3977 sections 6.1, 6.2, and 8 require article-number
+            // selectors and navigation to be scoped to the selected group:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-6.1
+            assert_red_server_response_tail_cases(&[
+                ServerResponseCase {
+                    name: "NEXT at end of one-article group",
+                    reference: "RFC 3977 section 6.1.4 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.4",
+                    input: b"GROUP comp.lang.rust\r\nNEXT\r\n",
+                    expected: b"421 no next article in this group\r\n",
+                },
+                ServerResponseCase {
+                    name: "ARTICLE outside one-article group",
+                    reference: "RFC 3977 section 6.2.1 https://www.rfc-editor.org/rfc/rfc3977#section-6.2.1",
+                    input: b"GROUP comp.lang.rust\r\nARTICLE 2\r\n",
+                    expected: b"423 no article with that number\r\n",
+                },
+                ServerResponseCase {
+                    name: "HEAD outside one-article group",
+                    reference: "RFC 3977 section 6.2.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.2.2",
+                    input: b"GROUP comp.lang.rust\r\nHEAD 2\r\n",
+                    expected: b"423 no article with that number\r\n",
+                },
+                ServerResponseCase {
+                    name: "BODY outside one-article group",
+                    reference: "RFC 3977 section 6.2.3 https://www.rfc-editor.org/rfc/rfc3977#section-6.2.3",
+                    input: b"GROUP comp.lang.rust\r\nBODY 2\r\n",
+                    expected: b"423 no article with that number\r\n",
+                },
+                ServerResponseCase {
+                    name: "STAT outside one-article group",
+                    reference: "RFC 3977 section 6.2.4 https://www.rfc-editor.org/rfc/rfc3977#section-6.2.4",
+                    input: b"GROUP comp.lang.rust\r\nSTAT 2\r\n",
+                    expected: b"423 no article with that number\r\n",
+                },
+                ServerResponseCase {
+                    name: "OVER outside one-article group",
+                    reference: "RFC 3977 section 8.3.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.3.2",
+                    input: b"GROUP comp.lang.rust\r\nOVER 2\r\n",
+                    expected: b"423 no article with that number\r\n",
+                },
+                ServerResponseCase {
+                    name: "HDR outside one-article group",
+                    reference: "RFC 3977 section 8.5.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.2",
+                    input: b"GROUP comp.lang.rust\r\nHDR Subject 2\r\n",
+                    expected: b"423 no article with that number\r\n",
+                },
+                ServerResponseCase {
+                    name: "LISTGROUP range outside one-article group",
+                    reference: "RFC 3977 section 6.1.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.2",
+                    input: b"GROUP comp.lang.rust\r\nLISTGROUP 2-3\r\n",
+                    expected: LISTGROUP_COMP_EMPTY_RESPONSE,
                 },
             ])
             .await;
