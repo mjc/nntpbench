@@ -8942,6 +8942,24 @@ mod tests {
                         kind: RequestKind::AuthInfo,
                         frame: b"383 = continue exchange\r\n",
                     },
+                    ResponseFrameCase {
+                        name: "ARTICLE accepts RFC article multiline content",
+                        reference: "RFC 3977 sections 3.6 and 9.4.3 https://www.rfc-editor.org/rfc/rfc3977#section-9.4.3",
+                        kind: RequestKind::Article,
+                        frame: b"220 1 <article@test> article follows\r\nSubject: ok\r\n\r\nbody\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "HEAD accepts RFC header multiline content",
+                        reference: "RFC 3977 sections 3.6 and 9.4.3 https://www.rfc-editor.org/rfc/rfc3977#section-9.4.3",
+                        kind: RequestKind::Head,
+                        frame: b"221 1 <head@test> headers follow\r\nSubject: ok\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "BODY accepts RFC body multiline content",
+                        reference: "RFC 3977 sections 3.6 and 9.4.3 https://www.rfc-editor.org/rfc/rfc3977#section-9.4.3",
+                        kind: RequestKind::Body,
+                        frame: b"222 1 <body@test> body follows\r\nbody\r\n.\r\n",
+                    },
                 ]);
             }
 
@@ -9016,16 +9034,46 @@ mod tests {
                         frame: b"220 12345678901234567 <a@test> article follows\r\nSubject: bad\r\n\r\nbody\r\n.\r\n",
                     },
                     ResponseFrameCase {
+                        name: "ARTICLE rejects missing header block",
+                        reference: "RFC 3977 sections 3.6 and 9.4.3 https://www.rfc-editor.org/rfc/rfc3977#section-9.4.3",
+                        kind: RequestKind::Article,
+                        frame: b"220 1 <a@test> article follows\r\n\r\nbody\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "ARTICLE rejects header without required space",
+                        reference: "RFC 3977 sections 3.6 and 9.7 https://www.rfc-editor.org/rfc/rfc3977#section-9.7",
+                        kind: RequestKind::Article,
+                        frame: b"220 1 <a@test> article follows\r\nSubject:bad\r\n\r\nbody\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "HEAD rejects non-numeric article number",
                         reference: "RFC 3977 section 6.2.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.2.2",
                         kind: RequestKind::Head,
                         frame: b"221 one <a@test> article retrieved\r\nSubject: bad\r\n.\r\n",
                     },
                     ResponseFrameCase {
+                        name: "HEAD rejects article body separator",
+                        reference: "RFC 3977 sections 6.2.2 and 9.4.3 https://www.rfc-editor.org/rfc/rfc3977#section-9.4.3",
+                        kind: RequestKind::Head,
+                        frame: b"221 1 <head@test> headers follow\r\nSubject: bad\r\n\r\nbody\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "HEAD rejects missing header block",
+                        reference: "RFC 3977 sections 3.6 and 9.4.3 https://www.rfc-editor.org/rfc/rfc3977#section-9.4.3",
+                        kind: RequestKind::Head,
+                        frame: b"221 1 <head@test> headers follow\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "BODY rejects malformed message-id argument",
                         reference: "RFC 3977 section 6.2.3 https://www.rfc-editor.org/rfc/rfc3977#section-6.2.3",
                         kind: RequestKind::Body,
                         frame: b"222 1 a@test body follows\r\nbody\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "BODY rejects NUL body octet",
+                        reference: "RFC 3977 sections 3.6 and 9.7 https://www.rfc-editor.org/rfc/rfc3977#section-9.7",
+                        kind: RequestKind::Body,
+                        frame: b"222 1 <body@test> body follows\r\nbad\0body\r\n.\r\n",
                     },
                     ResponseFrameCase {
                         name: "HELP rejects LIST success code",

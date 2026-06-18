@@ -125,7 +125,12 @@ impl<'a> ResponseFrame<'a> {
             let Some(block) = find_dot_terminated_block(buffer, status_line_end) else {
                 return ResponseFrameParse::NeedMore;
             };
-            if !validate_multiline_response_content(kind, block.content()) {
+            if !validate_multiline_response_content(
+                kind,
+                buffer,
+                status_line_end,
+                block.content_end(),
+            ) {
                 return ResponseFrameParse::Invalid;
             }
             (block.block_end(), block.content(), block.terminator())
@@ -2557,8 +2562,20 @@ fn validate_optional_trailing_comment(value: &[u8]) -> bool {
     value.is_empty() || value.strip_prefix(b" ").is_some_and(validate_u_chars)
 }
 
-fn validate_multiline_response_content(kind: RequestKind, content: &[u8]) -> bool {
+fn validate_multiline_response_content(
+    kind: RequestKind,
+    frame: &[u8],
+    content_start: usize,
+    content_end: usize,
+) -> bool {
+    let Some(content) = frame.get(content_start..content_end) else {
+        return false;
+    };
+
     match kind {
+        RequestKind::Article | RequestKind::Head | RequestKind::Body => {
+            Article::parse_framed(frame, content_start, content_end).is_ok()
+        }
         RequestKind::List | RequestKind::ListActive | RequestKind::NewGroups => {
             validate_crlf_lines(content, validate_active_response_line)
         }
