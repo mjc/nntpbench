@@ -8045,6 +8045,24 @@ mod tests {
                         frame: b"483 command unavailable until TLS has been negotiated\r\n",
                     },
                     ResponseFrameCase {
+                        name: "AUTHINFO USER rejects authentication required 480",
+                        reference: "RFC 4643 section 2.3 https://www.rfc-editor.org/rfc/rfc4643#section-2.3",
+                        kind: RequestKind::AuthInfoUser,
+                        frame: b"480 authentication required\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "AUTHINFO PASS rejects authentication required 480",
+                        reference: "RFC 4643 section 2.3 https://www.rfc-editor.org/rfc/rfc4643#section-2.3",
+                        kind: RequestKind::AuthInfoPass,
+                        frame: b"480 authentication required\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "AUTHINFO SASL rejects authentication required 480",
+                        reference: "RFC 4643 section 2.3 https://www.rfc-editor.org/rfc/rfc4643#section-2.3",
+                        kind: RequestKind::AuthInfo,
+                        frame: b"480 authentication required\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "STAT rejects ARTICLE success code",
                         reference: "RFC 3977 sections 6.2.1 and 6.2.4 https://www.rfc-editor.org/rfc/rfc3977#section-6.2",
                         kind: RequestKind::Stat,

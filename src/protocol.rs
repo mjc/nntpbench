@@ -2287,9 +2287,16 @@ fn is_generic_error_status(code: u16) -> bool {
 }
 
 fn is_generic_error_status_for_request(kind: RequestKind, code: u16) -> bool {
-    // RFC 4642 section 2.2 explicitly forbids STARTTLS from returning the
-    // generic 480 and 483 states because those codes are resolved by STARTTLS.
-    !matches!((kind, code), (RequestKind::StartTls, 480 | 483)) && is_generic_error_status(code)
+    // RFC 4642 section 2.2 and RFC 4643 section 2.3 explicitly forbid some
+    // otherwise-generic authentication/security states for these commands.
+    !matches!(
+        (kind, code),
+        (RequestKind::StartTls, 480 | 483)
+            | (
+                RequestKind::AuthInfoUser | RequestKind::AuthInfoPass | RequestKind::AuthInfo,
+                480
+            )
+    ) && is_generic_error_status(code)
 }
 
 fn is_specific_error_status_for_request(kind: RequestKind, code: u16) -> bool {
