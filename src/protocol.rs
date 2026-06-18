@@ -137,6 +137,7 @@ impl<'a> ResponseFrame<'a> {
             if !validate_multiline_response_content(
                 kind,
                 buffer,
+                &buffer[..status_line_end],
                 status_line_end,
                 block.content_end(),
             ) {
@@ -2467,25 +2468,34 @@ fn validate_date_response_argument(value: &[u8]) -> bool {
 }
 
 fn validate_group_response_arguments(value: &[u8]) -> bool {
-    let Some((tokens, trailing_text)) = split_required_response_tokens::<4>(value) else {
+    let Some(arguments) = parse_group_response_arguments(value) else {
         return false;
     };
 
-    let Some(count) = parse_response_article_number(tokens[0]) else {
-        return false;
-    };
-    let Some(low) = parse_response_article_number(tokens[1]) else {
-        return false;
-    };
-    let Some(high) = parse_response_article_number(tokens[2]) else {
-        return false;
-    };
-
-    validate_group_watermarks(count, low, high)
-        && std::str::from_utf8(tokens[3])
+    validate_group_watermarks(arguments.count, arguments.low, arguments.high)
+        && std::str::from_utf8(arguments.group)
             .ok()
             .is_some_and(|group| GroupName::from_borrowed(group).is_ok())
-        && validate_optional_trailing_comment(trailing_text)
+        && validate_optional_trailing_comment(arguments.trailing_text)
+}
+
+struct GroupResponseArguments<'a> {
+    count: u64,
+    low: u64,
+    high: u64,
+    group: &'a [u8],
+    trailing_text: &'a [u8],
+}
+
+fn parse_group_response_arguments(value: &[u8]) -> Option<GroupResponseArguments<'_>> {
+    let (tokens, trailing_text) = split_required_response_tokens::<4>(value)?;
+    Some(GroupResponseArguments {
+        count: parse_response_article_number(tokens[0])?,
+        low: parse_response_article_number(tokens[1])?,
+        high: parse_response_article_number(tokens[2])?,
+        group: tokens[3],
+        trailing_text,
+    })
 }
 
 fn split_required_response_tokens<const N: usize>(mut value: &[u8]) -> Option<([&[u8]; N], &[u8])> {
@@ -2548,10 +2558,6 @@ fn validate_group_watermarks(count: u64, low: u64, high: u64) -> bool {
             .is_some_and(|maximum_count| count <= maximum_count)
 }
 
-fn validate_nonzero_response_article_number(value: &[u8]) -> bool {
-    validate_response_article_number(value) && value.iter().any(|byte| *byte != b'0')
-}
-
 fn validate_article_status_response_arguments(value: &[u8]) -> bool {
     let Some((tokens, trailing_text)) = split_required_response_tokens::<2>(value) else {
         return false;
@@ -2603,6 +2609,7 @@ fn validate_optional_trailing_comment(value: &[u8]) -> bool {
 fn validate_multiline_response_content(
     kind: RequestKind,
     frame: &[u8],
+    status_line: &[u8],
     content_start: usize,
     content_end: usize,
 ) -> bool {
@@ -2628,9 +2635,7 @@ fn validate_multiline_response_content(
         RequestKind::ListDistribPats => {
             validate_crlf_lines(content, validate_distrib_pats_response_line)
         }
-        RequestKind::ListGroup => {
-            validate_crlf_lines(content, validate_nonzero_response_article_number)
-        }
+        RequestKind::ListGroup => validate_listgroup_response_content(status_line, content),
         RequestKind::NewNews => validate_crlf_lines(content, |line| {
             std::str::from_utf8(line)
                 .ok()
@@ -2645,6 +2650,41 @@ fn validate_multiline_response_content(
         RequestKind::Help => validate_crlf_lines(content, validate_help_text_line),
         _ => true,
     }
+}
+
+fn validate_listgroup_response_content(status_line: &[u8], content: &[u8]) -> bool {
+    let Some(arguments) = status_line
+        .strip_suffix(crate::CRLF)
+        .and_then(|line| line.get(4..))
+    else {
+        return false;
+    };
+    let Some(arguments) = parse_group_response_arguments(arguments) else {
+        return false;
+    };
+
+    let mut previous = None;
+    let mut actual = 0_u64;
+    if !validate_crlf_lines(content, |line| {
+        let Some(article_number) = parse_response_article_number(line) else {
+            return false;
+        };
+        if article_number == 0
+            || arguments.low > arguments.high
+            || article_number < arguments.low
+            || article_number > arguments.high
+            || previous.is_some_and(|last| article_number <= last)
+        {
+            return false;
+        }
+        previous = Some(article_number);
+        actual += 1;
+        true
+    }) {
+        return false;
+    }
+
+    actual <= arguments.count || actual == 0
 }
 
 fn validate_crlf_lines(content: &[u8], mut validate: impl FnMut(&[u8]) -> bool) -> bool {

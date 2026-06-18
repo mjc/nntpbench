@@ -8493,6 +8493,36 @@ mod tests {
                         frame: b"211 3 1 3 alt.test\r\n12345678901234567\r\n.\r\n",
                     },
                     ResponseFrameCase {
+                        name: "LISTGROUP rejects out-of-order article number list",
+                        reference: "RFC 3977 section 6.1.2.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.2.2",
+                        kind: RequestKind::ListGroup,
+                        frame: b"211 3 1 3 alt.test\r\n2\r\n1\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "LISTGROUP rejects duplicate article number list row",
+                        reference: "RFC 3977 section 6.1.2.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.2.2",
+                        kind: RequestKind::ListGroup,
+                        frame: b"211 3 1 3 alt.test\r\n1\r\n1\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "LISTGROUP rejects body article below reported low water mark",
+                        reference: "RFC 3977 sections 6.1.1.2 and 6.1.2.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.2.2",
+                        kind: RequestKind::ListGroup,
+                        frame: b"211 3 2 4 alt.test\r\n1\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "LISTGROUP rejects body article above reported high water mark",
+                        reference: "RFC 3977 sections 6.1.1.2 and 6.1.2.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.2.2",
+                        kind: RequestKind::ListGroup,
+                        frame: b"211 3 1 3 alt.test\r\n4\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "LISTGROUP rejects more body rows than estimated available articles",
+                        reference: "RFC 3977 sections 6.1.1.2 and 6.1.2.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.2.2",
+                        kind: RequestKind::ListGroup,
+                        frame: b"211 1 1 3 alt.test\r\n1\r\n2\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "NEWNEWS rejects non-message-id article line",
                         reference: "RFC 3977 sections 7.4 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-7.4",
                         kind: RequestKind::NewNews,
