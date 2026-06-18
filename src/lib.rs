@@ -8859,6 +8859,12 @@ mod tests {
                         frame: b"101 capability list follows\r\nVERSION 2\r\nIMPLEMENTATION caf\xc3\xa9 build!\r\n.\r\n",
                     },
                     ResponseFrameCase {
+                        name: "CAPABILITIES accepts reserved non-keyword extension line",
+                        reference: "RFC 3977 section 3.3.1 https://www.rfc-editor.org/rfc/rfc3977#section-3.3.1",
+                        kind: RequestKind::Capabilities,
+                        frame: b"101 capability list follows\r\nVERSION 2\r\n1RESERVED future-token\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "CAPABILITIES accepts RFC extension capability shapes",
                         reference: "RFC 4642 section 3.2, RFC 4643 section 3.4, and RFC 4644 section 3.4 https://www.rfc-editor.org/rfc/rfc4643#section-3.4",
                         kind: RequestKind::Capabilities,
@@ -9290,6 +9296,12 @@ mod tests {
                         reference: "RFC 3977 sections 5.2 and 9.5 https://www.rfc-editor.org/rfc/rfc3977#section-5.2",
                         kind: RequestKind::Capabilities,
                         frame: b"101 Capability list:\r\nVERSION 2\r\nBAD \0TOKEN\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "CAPABILITIES rejects reserved line with invalid token",
+                        reference: "RFC 3977 sections 3.3.1 and 9.5 https://www.rfc-editor.org/rfc/rfc3977#section-3.3.1",
+                        kind: RequestKind::Capabilities,
+                        frame: b"101 Capability list:\r\nVERSION 2\r\n1RESERVED bad\0token\r\n.\r\n",
                     },
                     ResponseFrameCase {
                         name: "CAPABILITIES rejects missing first VERSION line",

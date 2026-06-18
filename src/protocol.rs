@@ -2969,6 +2969,10 @@ fn validate_capabilities_response_content(content: &[u8]) -> bool {
         let Some((label, _)) = split_response_ws_token(line) else {
             return false;
         };
+        if !validate_ascii_token(label, validate_keyword) {
+            offset = line_end + crate::CRLF.len();
+            continue;
+        }
         if label.eq_ignore_ascii_case(b"VERSION")
             || capability_label_seen(content, version_line_end + crate::CRLF.len(), offset, label)
         {
@@ -3026,17 +3030,22 @@ fn validate_version_number_token(token: &[u8]) -> bool {
 }
 
 fn validate_capability_response_line(line: &[u8]) -> bool {
-    let Some((label, mut rest)) = split_response_ws_token(line) else {
+    let Some((label, rest)) = split_response_ws_token(line) else {
         return false;
     };
     if !validate_ascii_token(label, validate_keyword) {
-        return false;
+        return validate_capability_argument_token(label)
+            && validate_capability_argument_tokens(rest);
     }
 
     if let Some(valid) = validate_known_capability_response_line(label, rest) {
         return valid;
     }
 
+    validate_capability_argument_tokens(rest)
+}
+
+fn validate_capability_argument_tokens(mut rest: &[u8]) -> bool {
     while !rest.is_empty() {
         let Some((token, next)) = split_response_ws_token(rest) else {
             return false;
