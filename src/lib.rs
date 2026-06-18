@@ -2381,14 +2381,23 @@ where
                 write_response(writer, pending_write, response, session_stats).await?;
                 return Ok(false);
             }
-            session_state.current_article = Some(command.article_id.unwrap_or(1));
-            write_response(
-                writer,
-                pending_write,
-                config.article_response(),
-                session_stats,
-            )
-            .await?;
+            let article_id = command
+                .article_id
+                .or(session_state.current_article)
+                .unwrap_or(1);
+            session_state.current_article = Some(article_id);
+            if article_id == 1 {
+                write_response(
+                    writer,
+                    pending_write,
+                    config.article_response(),
+                    session_stats,
+                )
+                .await?;
+            } else {
+                let response = build_selected_article_response(article_id, config.article_bytes);
+                write_response(writer, pending_write, &response, session_stats).await?;
+            }
             Ok(false)
         }
         RequestKind::Head => {
@@ -2399,8 +2408,18 @@ where
                 write_response(writer, pending_write, response, session_stats).await?;
                 return Ok(false);
             }
-            session_state.current_article = Some(command.article_id.unwrap_or(1));
-            write_response(writer, pending_write, config.head_response(), session_stats).await?;
+            let article_id = command
+                .article_id
+                .or(session_state.current_article)
+                .unwrap_or(1);
+            session_state.current_article = Some(article_id);
+            if article_id == 1 {
+                write_response(writer, pending_write, config.head_response(), session_stats)
+                    .await?;
+            } else {
+                let response = build_selected_head_response(article_id);
+                write_response(writer, pending_write, &response, session_stats).await?;
+            }
             Ok(false)
         }
         RequestKind::Stat => {
@@ -2411,8 +2430,18 @@ where
                 write_response(writer, pending_write, response, session_stats).await?;
                 return Ok(false);
             }
-            session_state.current_article = Some(command.article_id.unwrap_or(1));
-            write_response(writer, pending_write, config.stat_response(), session_stats).await?;
+            let article_id = command
+                .article_id
+                .or(session_state.current_article)
+                .unwrap_or(1);
+            session_state.current_article = Some(article_id);
+            if article_id == 1 {
+                write_response(writer, pending_write, config.stat_response(), session_stats)
+                    .await?;
+            } else {
+                let response = build_selected_stat_response(article_id);
+                write_response(writer, pending_write, &response, session_stats).await?;
+            }
             Ok(false)
         }
         RequestKind::Body => {
@@ -2423,8 +2452,18 @@ where
                 write_response(writer, pending_write, response, session_stats).await?;
                 return Ok(false);
             }
-            session_state.current_article = Some(command.article_id.unwrap_or(1));
-            write_response(writer, pending_write, config.body_response(), session_stats).await?;
+            let article_id = command
+                .article_id
+                .or(session_state.current_article)
+                .unwrap_or(1);
+            session_state.current_article = Some(article_id);
+            if article_id == 1 {
+                write_response(writer, pending_write, config.body_response(), session_stats)
+                    .await?;
+            } else {
+                let response = build_selected_body_response(article_id, config.body_bytes);
+                write_response(writer, pending_write, &response, session_stats).await?;
+            }
             Ok(false)
         }
         RequestKind::List => {
@@ -2844,6 +2883,68 @@ fn build_generated_response(prefix: &[u8], target_bytes: usize) -> Box<[u8]> {
     buffer.into_boxed_slice()
 }
 
+fn append_synthetic_article_headers(buffer: &mut Vec<u8>, article_id: u64) {
+    write!(
+        buffer,
+        "Path: nntpbench.local!mock\r\nFrom: Bench User <bench@nntpbench.local>\r\nNewsgroups: alt.binaries.bench\r\nSubject: nntpbench synthetic article\r\nMessage-ID: <article.{article_id}@nntpbench.local>\r\nDate: Fri, 15 May 2026 00:00:00 +0000\r\n"
+    )
+    .expect("write to Vec cannot fail");
+}
+
+fn build_selected_article_response(article_id: u64, target_bytes: usize) -> Box<[u8]> {
+    let mut buffer = Vec::with_capacity(target_bytes.max(ARTICLE_RESPONSE_PREFIX.len()));
+    write!(
+        buffer,
+        "220 {article_id} <article.{article_id}@nntpbench.local> article follows\r\n"
+    )
+    .expect("write to Vec cannot fail");
+    append_synthetic_article_headers(&mut buffer, article_id);
+    buffer.extend_from_slice(CRLF);
+
+    if buffer.len() < target_bytes {
+        let missing = target_bytes - buffer.len();
+        append_repeated_payload_at_least(&mut buffer, BODY_LINE, missing);
+    }
+
+    append_dot_terminator(&mut buffer);
+    buffer.into_boxed_slice()
+}
+
+fn build_selected_body_response(article_id: u64, target_bytes: usize) -> Box<[u8]> {
+    let mut buffer = Vec::with_capacity(target_bytes.max(BODY_RESPONSE_PREFIX.len()));
+    write!(
+        buffer,
+        "222 {article_id} <article.{article_id}@nntpbench.local> body follows\r\n"
+    )
+    .expect("write to Vec cannot fail");
+
+    if buffer.len() < target_bytes {
+        let missing = target_bytes - buffer.len();
+        append_repeated_payload_at_least(&mut buffer, BODY_LINE, missing);
+    }
+
+    append_dot_terminator(&mut buffer);
+    buffer.into_boxed_slice()
+}
+
+fn build_selected_head_response(article_id: u64) -> Box<[u8]> {
+    let mut buffer = Vec::new();
+    write!(
+        buffer,
+        "221 {article_id} <article.{article_id}@nntpbench.local> article retrieved\r\n"
+    )
+    .expect("write to Vec cannot fail");
+    append_synthetic_article_headers(&mut buffer, article_id);
+    append_dot_terminator(&mut buffer);
+    buffer.into_boxed_slice()
+}
+
+fn build_selected_stat_response(article_id: u64) -> Box<[u8]> {
+    format!("223 {article_id} <article.{article_id}@nntpbench.local> article retrieved\r\n")
+        .into_bytes()
+        .into_boxed_slice()
+}
+
 fn append_repeated_payload_at_least(buffer: &mut Vec<u8>, line: &[u8], min_bytes: usize) {
     if line.is_empty() {
         return;
@@ -2988,6 +3089,14 @@ where
                     .expect("response write failed");
                 return false;
             }
+            if let Some(article_id) = parse_article_id_arg(request.args()).filter(|id| *id != 1) {
+                let response = build_selected_article_response(article_id, config.article_bytes);
+                stats
+                    .bytes_sent
+                    .fetch_add(response.len() as u64, Ordering::Relaxed);
+                output.write_all(&response).expect("response write failed");
+                return false;
+            }
             stats
                 .bytes_sent
                 .fetch_add(config.article_response().len() as u64, Ordering::Relaxed);
@@ -2998,14 +3107,38 @@ where
         }
         RequestKind::Head => {
             stats.article_requests.fetch_add(1, Ordering::Relaxed);
+            if let Some(article_id) = parse_article_id_arg(request.args()).filter(|id| *id != 1) {
+                let response = build_selected_head_response(article_id);
+                stats
+                    .bytes_sent
+                    .fetch_add(response.len() as u64, Ordering::Relaxed);
+                output.write_all(&response).expect("response write failed");
+                return false;
+            }
             config.head_response()
         }
         RequestKind::Stat => {
             stats.article_requests.fetch_add(1, Ordering::Relaxed);
+            if let Some(article_id) = parse_article_id_arg(request.args()).filter(|id| *id != 1) {
+                let response = build_selected_stat_response(article_id);
+                stats
+                    .bytes_sent
+                    .fetch_add(response.len() as u64, Ordering::Relaxed);
+                output.write_all(&response).expect("response write failed");
+                return false;
+            }
             config.stat_response()
         }
         RequestKind::Body => {
             stats.body_requests.fetch_add(1, Ordering::Relaxed);
+            if let Some(article_id) = parse_article_id_arg(request.args()).filter(|id| *id != 1) {
+                let response = build_selected_body_response(article_id, config.body_bytes);
+                stats
+                    .bytes_sent
+                    .fetch_add(response.len() as u64, Ordering::Relaxed);
+                output.write_all(&response).expect("response write failed");
+                return false;
+            }
             stats
                 .bytes_sent
                 .fetch_add(config.body_response().len() as u64, Ordering::Relaxed);
@@ -4669,6 +4802,54 @@ mod tests {
                 b"430 no article with that number\r\n",
                 &output,
                 "RFC 3977",
+            );
+        }
+
+        #[tokio::test]
+        async fn rfc3977_red_article_family_numeric_selectors_echo_selected_article() {
+            // RFC 3977 sections 6.2.1 through 6.2.4 require successful
+            // ARTICLE/HEAD/BODY/STAT responses to include the selected article
+            // number and message-id, not a fixed fixture identity:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-6.2
+            for (name, input, expected_prefix) in [
+                (
+                    "ARTICLE numeric selector",
+                    b"ARTICLE 2\r\n".as_slice(),
+                    b"220 2 <article.2@nntpbench.local> article follows\r\n".as_slice(),
+                ),
+                (
+                    "HEAD numeric selector",
+                    b"HEAD 2\r\n".as_slice(),
+                    b"221 2 <article.2@nntpbench.local> article retrieved\r\n".as_slice(),
+                ),
+                (
+                    "BODY numeric selector",
+                    b"BODY 2\r\n".as_slice(),
+                    b"222 2 <article.2@nntpbench.local> body follows\r\n".as_slice(),
+                ),
+                (
+                    "STAT numeric selector",
+                    b"STAT 2\r\n".as_slice(),
+                    b"223 2 <article.2@nntpbench.local> article retrieved\r\n".as_slice(),
+                ),
+            ] {
+                let (output, _) = run_session_with_input(test_config(), input).await;
+                let actual = without_greeting(&output);
+                assert!(
+                    actual.starts_with(expected_prefix),
+                    "{name}: expected RFC 3977 response prefix {:?}, got {:?}",
+                    String::from_utf8_lossy(expected_prefix),
+                    String::from_utf8_lossy(actual)
+                );
+            }
+
+            let input = b"GROUP alt.test\r\nARTICLE 2\r\nSTAT\r\n";
+            let (output, _) = run_session_with_input(test_config(), input).await;
+            assert!(
+                without_greeting(&output)
+                    .ends_with(b"223 2 <article.2@nntpbench.local> article retrieved\r\n"),
+                "RFC 3977 current STAT should report current article 2, got {:?}",
+                String::from_utf8_lossy(without_greeting(&output))
             );
         }
 
@@ -9212,7 +9393,7 @@ mod tests {
         .await;
 
         let text = String::from_utf8_lossy(&output);
-        let body = text.find("222 1").unwrap();
+        let body = text.find("222 2").unwrap();
         let article = text.find("220 1").unwrap();
         let caps = text.find("101 Capability").unwrap();
         let date = text.find("111 ").unwrap();
@@ -9329,7 +9510,7 @@ mod tests {
     #[tokio::test]
     async fn serve_session_supports_group_navigation_commands() {
         let config = test_config();
-        let article_response = config.article_response.clone();
+        let article_response = build_selected_article_response(2, config.article_bytes);
         let (output, stats) = run_session_with_input(
             config,
             b"GROUP alt.test\r\nLISTGROUP\r\nLISTGROUP alt.test\r\nLISTGROUP 1-\r\nLISTGROUP 2-3\r\nLISTGROUP alt.test 1-10\r\nARTICLE 2\r\nLAST\r\nNEXT\r\n",
