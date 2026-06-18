@@ -2540,14 +2540,9 @@ fn validate_sasl_response_argument(value: &[u8], allow_zero_length: bool) -> boo
     let Some((tokens, trailing_text)) = split_required_response_tokens::<1>(value) else {
         return false;
     };
-    if !trailing_text.is_empty() {
-        return false;
-    }
 
-    if allow_zero_length && tokens[0] == b"=" {
-        return true;
-    }
-    validate_sasl_base64(tokens[0]).is_ok()
+    (allow_zero_length && tokens[0] == b"=" || validate_sasl_base64(tokens[0]).is_ok())
+        && validate_optional_trailing_comment(trailing_text)
 }
 
 fn validate_generic_response_arguments(value: &[u8]) -> bool {
@@ -5526,9 +5521,9 @@ mod tests {
 
         for wire in [
             b"283 =\r\n".as_slice(),
-            b"283 c2VydmVy final data\r\n".as_slice(),
+            b"283 bad*base64 final data\r\n".as_slice(),
             b"383 \r\n".as_slice(),
-            b"383 c2VydmVy final data\r\n".as_slice(),
+            b"383 bad*base64 challenge\r\n".as_slice(),
             b"383 A===\r\n".as_slice(),
         ] {
             assert!(

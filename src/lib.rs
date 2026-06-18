@@ -8906,6 +8906,18 @@ mod tests {
                         kind: RequestKind::Xhdr,
                         frame: b"221 headers follow\r\n<one@test> value\r\n.\r\n",
                     },
+                    ResponseFrameCase {
+                        name: "AUTHINFO SASL 283 accepts trailing comment after challenge",
+                        reference: "RFC 3977 section 9.4.1 and RFC 4643 section 3.3 https://www.rfc-editor.org/rfc/rfc3977#section-9.4.1",
+                        kind: RequestKind::AuthInfo,
+                        frame: b"283 c2VydmVyLWZpbmFsLWRhdGE= success data follows\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "AUTHINFO SASL 383 accepts trailing comment after zero-length challenge",
+                        reference: "RFC 3977 section 9.4.1 and RFC 4643 section 3.3 https://www.rfc-editor.org/rfc/rfc4643#section-3.3",
+                        kind: RequestKind::AuthInfo,
+                        frame: b"383 = continue exchange\r\n",
+                    },
                 ]);
             }
 
@@ -9574,10 +9586,10 @@ mod tests {
                         frame: b"383 \r\n",
                     },
                     ResponseFrameCase {
-                        name: "AUTHINFO SASL rejects whitespace inside challenge",
+                        name: "AUTHINFO SASL rejects malformed challenge before trailing comment",
                         reference: "RFC 4643 sections 3.3 and 3.5 https://www.rfc-editor.org/rfc/rfc4643#section-3.3",
                         kind: RequestKind::AuthInfo,
-                        frame: b"383 c2VydmVy challenge\r\n",
+                        frame: b"383 bad*base64 challenge\r\n",
                     },
                     ResponseFrameCase {
                         name: "XHDR rejects HDR response code",
