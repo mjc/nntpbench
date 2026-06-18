@@ -4626,15 +4626,6 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc3977_red_group_unknown_group_returns_411() {
-            // RFC 3977 section 6.1.1 defines 411 for a nonexistent newsgroup:
-            // https://www.rfc-editor.org/rfc/rfc3977#section-6.1.1
-            let input = b"GROUP no.such.group\r\n";
-            let (output, _) = run_session_with_input(test_config(), input).await;
-            assert_single_response(input, b"411 no such newsgroup\r\n", &output, "RFC 3977");
-        }
-
-        #[tokio::test]
         async fn rfc3977_red_group_and_listgroup_responses_match_selected_group() {
             // RFC 3977 sections 6.1.1 and 6.1.2 require GROUP and LISTGROUP
             // responses to describe the requested selected group, not a fixed
@@ -4826,16 +4817,6 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc3977_red_current_article_fetch_before_group_returns_412() {
-            // RFC 3977 section 6.2.1 requires current-article retrieval to fail
-            // when no group is selected:
-            // https://www.rfc-editor.org/rfc/rfc3977#section-6.2.1
-            let input = b"ARTICLE\r\n";
-            let (output, _) = run_session_with_input(test_config(), input).await;
-            assert_single_response(input, b"412 no newsgroup selected\r\n", &output, "RFC 3977");
-        }
-
-        #[tokio::test]
         async fn rfc3977_red_article_numeric_before_group_returns_412() {
             // RFC 3977 section 6.2 requires numeric article selectors to fail
             // with 412 when no group is selected:
@@ -4934,20 +4915,6 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc3977_red_missing_article_number_returns_423() {
-            // RFC 3977 section 6.2.1 defines 423 when an article number cannot
-            // be found in the selected group:
-            // https://www.rfc-editor.org/rfc/rfc3977#section-6.2.1
-            let input = b"GROUP alt.test\r\nARTICLE 999999\r\n";
-            let (output, _) = run_session_with_input(test_config(), input).await;
-            assert!(
-                without_greeting(&output).ends_with(b"423 no article with that number\r\n"),
-                "RFC 3977 missing numeric ARTICLE should end with 423, got {:?}",
-                String::from_utf8_lossy(without_greeting(&output))
-            );
-        }
-
-        #[tokio::test]
         async fn rfc3977_red_article_family_numeric_selectors_echo_selected_article() {
             // RFC 3977 sections 6.2.1 through 6.2.4 require successful
             // ARTICLE/HEAD/BODY/STAT responses to include the selected article
@@ -4973,6 +4940,11 @@ mod tests {
                     "STAT numeric selector",
                     b"GROUP alt.test\r\nSTAT 2\r\n".as_slice(),
                     b"223 2 <article.2@nntpbench.local> article retrieved\r\n".as_slice(),
+                ),
+                (
+                    "ARTICLE current selector after GROUP",
+                    b"GROUP alt.test\r\nARTICLE\r\n".as_slice(),
+                    b"220 1 <article.1@nntpbench.local> article follows\r\n".as_slice(),
                 ),
             ] {
                 let (output, _) = run_session_with_input(test_config(), input).await;
@@ -5427,80 +5399,6 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc3977_red_date_with_arguments_returns_501() {
-            // RFC 3977 sections 7.1 and 9.2 define DATE with no arguments:
-            // https://www.rfc-editor.org/rfc/rfc3977#section-7.1
-            let input = b"DATE now\r\n";
-            let (output, _) = run_session_with_input(test_config(), input).await;
-            assert_single_response(input, b"501 command syntax error\r\n", &output, "RFC 3977");
-        }
-
-        #[tokio::test]
-        async fn rfc3977_red_mode_transit_returns_501_not_unknown_command() {
-            // RFC 3977 section 5.3 defines only MODE READER. A recognized MODE
-            // command with an invalid argument is a 501 syntax error, not 500:
-            // https://www.rfc-editor.org/rfc/rfc3977#section-5.3
-            let input = b"MODE TRANSIT\r\n";
-            let (output, _) = run_session_with_input(test_config(), input).await;
-            assert_single_response(input, b"501 command syntax error\r\n", &output, "RFC 3977");
-        }
-
-        #[tokio::test]
-        async fn rfc3977_red_group_without_name_returns_501() {
-            // RFC 3977 section 6.1.1 requires GROUP to carry a newsgroup name:
-            // https://www.rfc-editor.org/rfc/rfc3977#section-6.1.1
-            let input = b"GROUP\r\n";
-            let (output, _) = run_session_with_input(test_config(), input).await;
-            assert_single_response(input, b"501 command syntax error\r\n", &output, "RFC 3977");
-        }
-
-        #[tokio::test]
-        async fn rfc3977_red_group_sets_current_article_to_first_article() {
-            // RFC 3977 section 6.1.1 requires GROUP to set the current article
-            // number to the first article in a non-empty group:
-            // https://www.rfc-editor.org/rfc/rfc3977#section-6.1.1
-            let input = b"GROUP alt.test\r\nARTICLE\r\n";
-            let (output, _) = run_session_with_input(test_config(), input).await;
-            let expected = b"220 1 <article.1@nntpbench.local> article follows\r\n";
-            assert!(
-                without_greeting(&output)
-                    .windows(expected.len())
-                    .any(|window| window == expected),
-                "RFC 3977 current ARTICLE after GROUP should return article 1, got {:?}",
-                String::from_utf8_lossy(without_greeting(&output))
-            );
-        }
-
-        #[tokio::test]
-        async fn rfc3977_red_missing_numeric_body_returns_423_not_body_payload() {
-            // RFC 3977 section 6.2.3 defines 423 for a nonexistent article
-            // number selector on BODY:
-            // https://www.rfc-editor.org/rfc/rfc3977#section-6.2.3
-            let input = b"GROUP alt.test\r\nBODY 999999\r\n";
-            let (output, _) = run_session_with_input(test_config(), input).await;
-            assert!(
-                without_greeting(&output).ends_with(b"423 no article with that number\r\n"),
-                "RFC 3977 missing numeric BODY should end with 423, got {:?}",
-                String::from_utf8_lossy(without_greeting(&output))
-            );
-        }
-
-        #[tokio::test]
-        async fn rfc3977_red_missing_message_id_head_returns_430_not_headers() {
-            // RFC 3977 section 6.2.2 defines 430 for a nonexistent message-id
-            // selector on HEAD:
-            // https://www.rfc-editor.org/rfc/rfc3977#section-6.2.2
-            let input = b"HEAD <missing@nntpbench.local>\r\n";
-            let (output, _) = run_session_with_input(test_config(), input).await;
-            assert_single_response(
-                input,
-                b"430 no article with that message-id\r\n",
-                &output,
-                "RFC 3977",
-            );
-        }
-
-        #[tokio::test]
         async fn rfc3977_red_posting_disabled_rejects_pipelined_body_before_next_command() {
             // RFC 3977 section 6.3.1 requires 440 when posting is prohibited.
             // The mock server may still discard an already-sent body to recover
@@ -5637,36 +5535,6 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc3977_red_listgroup_unknown_group_returns_411() {
-            // RFC 3977 section 6.1.2 defines 411 for LISTGROUP on an unknown
-            // group name:
-            // https://www.rfc-editor.org/rfc/rfc3977#section-6.1.2
-            let input = b"LISTGROUP no.such.group\r\n";
-            let (output, _) = run_session_with_input(test_config(), input).await;
-            assert_single_response(input, b"411 no such newsgroup\r\n", &output, "RFC 3977");
-        }
-
-        #[tokio::test]
-        async fn rfc3977_red_listgroup_current_before_group_returns_412() {
-            // RFC 3977 section 6.1.2 uses the current selected group when
-            // LISTGROUP omits an explicit group. Without one, response 412 applies:
-            // https://www.rfc-editor.org/rfc/rfc3977#section-6.1.2
-            let input = b"LISTGROUP\r\n";
-            let (output, _) = run_session_with_input(test_config(), input).await;
-            assert_single_response(input, b"412 no newsgroup selected\r\n", &output, "RFC 3977");
-        }
-
-        #[tokio::test]
-        async fn rfc3977_red_listgroup_current_range_before_group_returns_412() {
-            // RFC 3977 section 6.1.2 treats a bare range as applying to the current
-            // selected group, so it must also fail with 412 before GROUP:
-            // https://www.rfc-editor.org/rfc/rfc3977#section-6.1.2
-            let input = b"LISTGROUP 2-3\r\n";
-            let (output, _) = run_session_with_input(test_config(), input).await;
-            assert_single_response(input, b"412 no newsgroup selected\r\n", &output, "RFC 3977");
-        }
-
-        #[tokio::test]
         async fn rfc3977_red_listgroup_range_filters_article_numbers() {
             // RFC 3977 section 6.1.2 says LISTGROUP's optional range limits the
             // article numbers returned in the multi-line body. If the end is
@@ -5709,16 +5577,6 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc3977_red_listgroup_zero_range_returns_501() {
-            // RFC 3977 sections 6.1.2 and 9.8 require valid article-number or
-            // article-range syntax. Article number zero is invalid:
-            // https://www.rfc-editor.org/rfc/rfc3977#section-6.1.2
-            let input = b"LISTGROUP 0\r\n";
-            let (output, _) = run_session_with_input(test_config(), input).await;
-            assert_single_response(input, b"501 command syntax error\r\n", &output, "RFC 3977");
-        }
-
-        #[tokio::test]
         async fn rfc3977_red_list_active_unknown_wildmat_filters_results() {
             // RFC 3977 section 7.6.3 requires LIST ACTIVE to apply the optional
             // wildmat pattern to the returned newsgroups:
@@ -5730,149 +5588,6 @@ mod tests {
                 b"215 list of newsgroups follows\r\n.\r\n",
                 &output,
                 "RFC 3977",
-            );
-        }
-
-        #[tokio::test]
-        async fn rfc4643_red_authinfo_user_without_value_returns_501() {
-            // RFC 4643 section 2.1 requires AUTHINFO USER to include a username
-            // argument:
-            // https://www.rfc-editor.org/rfc/rfc4643#section-2.1
-            let input = b"AUTHINFO USER\r\n";
-            let (output, _) = run_session_with_input(test_config(), input).await;
-            assert_single_response(input, b"501 command syntax error\r\n", &output, "RFC 4643");
-        }
-
-        #[tokio::test]
-        async fn rfc4642_red_starttls_with_arguments_returns_501() {
-            // RFC 4642 section 2.2 defines STARTTLS without arguments:
-            // https://www.rfc-editor.org/rfc/rfc4642#section-2.2
-            let input = b"STARTTLS extra\r\n";
-            let (output, _) = run_session_with_input(test_config(), input).await;
-            assert_single_response(input, b"501 command syntax error\r\n", &output, "RFC 4642");
-        }
-
-        #[tokio::test]
-        async fn rfc4644_red_check_invalid_message_id_returns_501() {
-            // RFC 4644 section 2.3 requires CHECK to carry a valid message-id:
-            // https://www.rfc-editor.org/rfc/rfc4644#section-2.3
-            let input = b"CHECK not-a-message-id\r\n";
-            let (output, _) = run_session_with_input(test_config(), input).await;
-            assert_single_response(input, b"501 command syntax error\r\n", &output, "RFC 4644");
-        }
-
-        #[tokio::test]
-        async fn rfc3977_red_help_with_arguments_returns_501() {
-            // RFC 3977 sections 7.2 and 9.2 define HELP with no arguments:
-            // https://www.rfc-editor.org/rfc/rfc3977#section-7.2
-            let input = b"HELP verbose\r\n";
-            let (output, _) = run_session_with_input(test_config(), input).await;
-            assert_single_response(input, b"501 command syntax error\r\n", &output, "RFC 3977");
-        }
-
-        #[tokio::test]
-        async fn rfc3977_red_quit_with_arguments_returns_501() {
-            // RFC 3977 sections 5.4 and 9.2 define QUIT with no arguments:
-            // https://www.rfc-editor.org/rfc/rfc3977#section-5.4
-            let input = b"QUIT now\r\n";
-            let (output, _) = run_session_with_input(test_config(), input).await;
-            assert_single_response(input, b"501 command syntax error\r\n", &output, "RFC 3977");
-        }
-
-        #[tokio::test]
-        async fn rfc3977_red_mode_reader_with_extra_argument_returns_501() {
-            // RFC 3977 section 5.3 defines MODE READER exactly. Extra arguments
-            // after READER are a syntax error:
-            // https://www.rfc-editor.org/rfc/rfc3977#section-5.3
-            let input = b"MODE READER extra\r\n";
-            let (output, _) = run_session_with_input(test_config(), input).await;
-            assert_single_response(input, b"501 command syntax error\r\n", &output, "RFC 3977");
-        }
-
-        #[tokio::test]
-        async fn rfc3977_red_stat_current_before_group_returns_412() {
-            // RFC 3977 section 6.2.4 requires current STAT retrieval to fail
-            // when no group is selected:
-            // https://www.rfc-editor.org/rfc/rfc3977#section-6.2.4
-            let input = b"STAT\r\n";
-            let (output, _) = run_session_with_input(test_config(), input).await;
-            assert_single_response(input, b"412 no newsgroup selected\r\n", &output, "RFC 3977");
-        }
-
-        #[tokio::test]
-        async fn rfc3977_red_head_current_before_group_returns_412() {
-            // RFC 3977 section 6.2.2 requires current HEAD retrieval to fail
-            // when no group is selected:
-            // https://www.rfc-editor.org/rfc/rfc3977#section-6.2.2
-            let input = b"HEAD\r\n";
-            let (output, _) = run_session_with_input(test_config(), input).await;
-            assert_single_response(input, b"412 no newsgroup selected\r\n", &output, "RFC 3977");
-        }
-
-        #[tokio::test]
-        async fn rfc3977_red_body_current_before_group_returns_412() {
-            // RFC 3977 section 6.2.3 requires current BODY retrieval to fail
-            // when no group is selected:
-            // https://www.rfc-editor.org/rfc/rfc3977#section-6.2.3
-            let input = b"BODY\r\n";
-            let (output, _) = run_session_with_input(test_config(), input).await;
-            assert_single_response(input, b"412 no newsgroup selected\r\n", &output, "RFC 3977");
-        }
-
-        #[tokio::test]
-        async fn rfc3977_red_head_missing_numeric_article_returns_423() {
-            // RFC 3977 section 6.2.2 defines 423 when HEAD names an article
-            // number that does not exist in the selected group:
-            // https://www.rfc-editor.org/rfc/rfc3977#section-6.2.2
-            let input = b"GROUP alt.test\r\nHEAD 999999\r\n";
-            let (output, _) = run_session_with_input(test_config(), input).await;
-            assert!(
-                without_greeting(&output).ends_with(b"423 no article with that number\r\n"),
-                "RFC 3977 missing numeric HEAD should end with 423, got {:?}",
-                String::from_utf8_lossy(without_greeting(&output))
-            );
-        }
-
-        #[tokio::test]
-        async fn rfc3977_red_stat_missing_numeric_article_returns_423() {
-            // RFC 3977 section 6.2.4 defines 423 when STAT names an article
-            // number that does not exist in the selected group:
-            // https://www.rfc-editor.org/rfc/rfc3977#section-6.2.4
-            let input = b"GROUP alt.test\r\nSTAT 999999\r\n";
-            let (output, _) = run_session_with_input(test_config(), input).await;
-            assert!(
-                without_greeting(&output).ends_with(b"423 no article with that number\r\n"),
-                "RFC 3977 missing numeric STAT should end with 423, got {:?}",
-                String::from_utf8_lossy(without_greeting(&output))
-            );
-        }
-
-        #[tokio::test]
-        async fn rfc3977_red_over_missing_message_id_returns_430() {
-            // RFC 3977 section 8.3.2 defines 430 when an OVER message-id
-            // selector is unknown:
-            // https://www.rfc-editor.org/rfc/rfc3977#section-8.3.2
-            let input = b"OVER <missing@nntpbench.local>\r\n";
-            let (output, _) = run_session_with_input(test_config(), input).await;
-            assert_single_response(
-                input,
-                b"430 no article with that message-id\r\n",
-                &output,
-                "RFC 3977",
-            );
-        }
-
-        #[tokio::test]
-        async fn rfc3977_red_hdr_missing_numeric_article_returns_423() {
-            // RFC 3977 section 8.5.2 defines 423 for an HDR article-number
-            // selector that does not exist:
-            // https://www.rfc-editor.org/rfc/rfc3977#section-8.5.2
-            let input = b"GROUP alt.test\r\nHDR Subject 999999\r\n";
-            let (output, _) = run_session_with_input(test_config(), input).await;
-            assert!(
-                without_greeting(&output).ends_with(b"423 no article with that number\r\n"),
-                "RFC 3977 missing numeric HDR should end with 423, got {:?}",
-                String::from_utf8_lossy(without_greeting(&output))
             );
         }
 
@@ -6041,16 +5756,6 @@ mod tests {
             .await;
         }
 
-        #[tokio::test]
-        async fn rfc3977_red_newgroups_invalid_timezone_returns_501() {
-            // RFC 3977 section 7.3.1 permits an optional GMT token, not arbitrary
-            // timezone labels:
-            // https://www.rfc-editor.org/rfc/rfc3977#section-7.3.1
-            let input = b"NEWGROUPS 20260101 000000 LOCAL\r\n";
-            let (output, _) = run_session_with_input(test_config(), input).await;
-            assert_single_response(input, b"501 command syntax error\r\n", &output, "RFC 3977");
-        }
-
         #[test]
         fn rfc3977_red_short_date_century_mapping_matrix() {
             // RFC 3977 section 7.3.2 maps six-digit dates to the current
@@ -6061,86 +5766,6 @@ mod tests {
             assert_eq!(normalized_nntp_date_key(b"260101", 2026), Some(20260101));
             assert_eq!(normalized_nntp_date_key(b"270101", 2026), Some(19270101));
             assert_eq!(normalized_nntp_date_key(b"20260101", 2026), Some(20260101));
-        }
-
-        #[tokio::test]
-        async fn rfc3977_red_newnews_missing_time_returns_501() {
-            // RFC 3977 section 7.4.1 requires NEWNEWS to include wildmat, date,
-            // and time arguments:
-            // https://www.rfc-editor.org/rfc/rfc3977#section-7.4.1
-            let input = b"NEWNEWS comp.lang.* 20260101\r\n";
-            let (output, _) = run_session_with_input(test_config(), input).await;
-            assert_single_response(input, b"501 command syntax error\r\n", &output, "RFC 3977");
-        }
-
-        #[tokio::test]
-        async fn rfc2980_red_xover_zero_range_returns_501() {
-            // RFC 2980 section 2.8 uses an article range for XOVER. Article
-            // number zero is outside the RFC 3977 article-number grammar:
-            // https://www.rfc-editor.org/rfc/rfc2980#section-2.8
-            let input = b"XOVER 0\r\n";
-            let (output, _) = run_session_with_input(test_config(), input).await;
-            assert_single_response(input, b"501 command syntax error\r\n", &output, "RFC 2980");
-        }
-
-        #[tokio::test]
-        async fn rfc2980_red_xhdr_invalid_header_name_returns_501() {
-            // RFC 2980 section 2.6 requires XHDR to name a header field. A
-            // trailing colon is not part of the field-name token:
-            // https://www.rfc-editor.org/rfc/rfc2980#section-2.6
-            let input = b"XHDR Subject: 1\r\n";
-            let (output, _) = run_session_with_input(test_config(), input).await;
-            assert_single_response(input, b"501 command syntax error\r\n", &output, "RFC 2980");
-        }
-
-        #[tokio::test]
-        async fn rfc4643_red_authinfo_pass_without_value_returns_501() {
-            // RFC 4643 section 2.1 requires AUTHINFO PASS to include a password
-            // argument:
-            // https://www.rfc-editor.org/rfc/rfc4643#section-2.1
-            let input = b"AUTHINFO PASS\r\n";
-            let (output, _) = run_session_with_input(test_config(), input).await;
-            assert_single_response(input, b"501 command syntax error\r\n", &output, "RFC 4643");
-        }
-
-        #[tokio::test]
-        async fn rfc4643_red_authinfo_sasl_without_mechanism_returns_501() {
-            // RFC 4643 section 2.2 requires AUTHINFO SASL to include a SASL
-            // mechanism name:
-            // https://www.rfc-editor.org/rfc/rfc4643#section-2.2
-            let input = b"AUTHINFO SASL\r\n";
-            let (output, _) = run_session_with_input(test_config(), input).await;
-            assert_single_response(input, b"501 command syntax error\r\n", &output, "RFC 4643");
-        }
-
-        #[tokio::test]
-        async fn rfc4644_red_takethis_invalid_message_id_returns_501() {
-            // RFC 4644 section 2.4 requires TAKETHIS to carry a valid message-id
-            // before the streamed article data:
-            // https://www.rfc-editor.org/rfc/rfc4644#section-2.4
-            let input = b"TAKETHIS not-a-message-id\r\nHeader: value\r\n\r\nbody\r\n.\r\n";
-            let (output, _) = run_session_with_input(test_config(), input).await;
-            assert_single_response(input, b"501 command syntax error\r\n", &output, "RFC 4644");
-        }
-
-        #[tokio::test]
-        async fn rfc3977_red_over_current_before_group_returns_412() {
-            // RFC 3977 section 8.3.2 defines 412 when OVER without an argument is
-            // used before selecting a newsgroup:
-            // https://www.rfc-editor.org/rfc/rfc3977#section-8.3.2
-            let input = b"OVER\r\n";
-            let (output, _) = run_session_with_input(test_config(), input).await;
-            assert_single_response(input, b"412 no newsgroup selected\r\n", &output, "RFC 3977");
-        }
-
-        #[tokio::test]
-        async fn rfc3977_red_hdr_current_before_group_returns_412() {
-            // RFC 3977 section 8.5.2 defines 412 when HDR uses the current
-            // article but no newsgroup has been selected:
-            // https://www.rfc-editor.org/rfc/rfc3977#section-8.5.2
-            let input = b"HDR Subject\r\n";
-            let (output, _) = run_session_with_input(test_config(), input).await;
-            assert_single_response(input, b"412 no newsgroup selected\r\n", &output, "RFC 3977");
         }
 
         #[tokio::test]
@@ -6916,10 +6541,76 @@ mod tests {
         async fn rfc3977_red_server_selector_and_state_response_matrix() {
             assert_red_server_response_cases(&[
                 ServerResponseCase {
+                    name: "GROUP unknown group",
+                    reference: "RFC 3977 section 6.1.1 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.1",
+                    input: b"GROUP no.such.group\r\n",
+                    expected: b"411 no such newsgroup\r\n",
+                },
+                ServerResponseCase {
                     name: "BODY opaque missing message-id",
                     reference: "RFC 3977 sections 6.2.3 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-6.2.3",
                     input: b"BODY <missing-at-sign>\r\n",
                     expected: b"430 no article with that message-id\r\n",
+                },
+                ServerResponseCase {
+                    name: "HEAD missing message-id",
+                    reference: "RFC 3977 section 6.2.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.2.2",
+                    input: b"HEAD <missing@nntpbench.local>\r\n",
+                    expected: b"430 no article with that message-id\r\n",
+                },
+                ServerResponseCase {
+                    name: "OVER missing message-id",
+                    reference: "RFC 3977 section 8.3.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.3.2",
+                    input: b"OVER <missing@nntpbench.local>\r\n",
+                    expected: b"430 no article with that message-id\r\n",
+                },
+                ServerResponseCase {
+                    name: "ARTICLE current before GROUP",
+                    reference: "RFC 3977 section 6.2.1 https://www.rfc-editor.org/rfc/rfc3977#section-6.2.1",
+                    input: b"ARTICLE\r\n",
+                    expected: b"412 no newsgroup selected\r\n",
+                },
+                ServerResponseCase {
+                    name: "HEAD current before GROUP",
+                    reference: "RFC 3977 section 6.2.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.2.2",
+                    input: b"HEAD\r\n",
+                    expected: b"412 no newsgroup selected\r\n",
+                },
+                ServerResponseCase {
+                    name: "BODY current before GROUP",
+                    reference: "RFC 3977 section 6.2.3 https://www.rfc-editor.org/rfc/rfc3977#section-6.2.3",
+                    input: b"BODY\r\n",
+                    expected: b"412 no newsgroup selected\r\n",
+                },
+                ServerResponseCase {
+                    name: "STAT current before GROUP",
+                    reference: "RFC 3977 section 6.2.4 https://www.rfc-editor.org/rfc/rfc3977#section-6.2.4",
+                    input: b"STAT\r\n",
+                    expected: b"412 no newsgroup selected\r\n",
+                },
+                ServerResponseCase {
+                    name: "LISTGROUP current before GROUP",
+                    reference: "RFC 3977 section 6.1.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.2",
+                    input: b"LISTGROUP\r\n",
+                    expected: b"412 no newsgroup selected\r\n",
+                },
+                ServerResponseCase {
+                    name: "LISTGROUP current range before GROUP",
+                    reference: "RFC 3977 section 6.1.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.2",
+                    input: b"LISTGROUP 2-3\r\n",
+                    expected: b"412 no newsgroup selected\r\n",
+                },
+                ServerResponseCase {
+                    name: "OVER current before GROUP",
+                    reference: "RFC 3977 section 8.3.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.3.2",
+                    input: b"OVER\r\n",
+                    expected: b"412 no newsgroup selected\r\n",
+                },
+                ServerResponseCase {
+                    name: "HDR current before GROUP",
+                    reference: "RFC 3977 section 8.5.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.2",
+                    input: b"HDR Subject\r\n",
+                    expected: b"412 no newsgroup selected\r\n",
                 },
                 ServerResponseCase {
                     name: "HEAD zero selector",
@@ -6979,6 +6670,36 @@ mod tests {
             .await;
 
             assert_red_server_response_tail_cases(&[
+                ServerResponseCase {
+                    name: "ARTICLE missing numeric selector after GROUP",
+                    reference: "RFC 3977 section 6.2.1 https://www.rfc-editor.org/rfc/rfc3977#section-6.2.1",
+                    input: b"GROUP alt.test\r\nARTICLE 999999\r\n",
+                    expected: b"423 no article with that number\r\n",
+                },
+                ServerResponseCase {
+                    name: "HEAD missing numeric selector after GROUP",
+                    reference: "RFC 3977 section 6.2.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.2.2",
+                    input: b"GROUP alt.test\r\nHEAD 999999\r\n",
+                    expected: b"423 no article with that number\r\n",
+                },
+                ServerResponseCase {
+                    name: "BODY missing numeric selector after GROUP",
+                    reference: "RFC 3977 section 6.2.3 https://www.rfc-editor.org/rfc/rfc3977#section-6.2.3",
+                    input: b"GROUP alt.test\r\nBODY 999999\r\n",
+                    expected: b"423 no article with that number\r\n",
+                },
+                ServerResponseCase {
+                    name: "STAT missing numeric selector after GROUP",
+                    reference: "RFC 3977 section 6.2.4 https://www.rfc-editor.org/rfc/rfc3977#section-6.2.4",
+                    input: b"GROUP alt.test\r\nSTAT 999999\r\n",
+                    expected: b"423 no article with that number\r\n",
+                },
+                ServerResponseCase {
+                    name: "HDR missing numeric selector after GROUP",
+                    reference: "RFC 3977 section 8.5.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.2",
+                    input: b"GROUP alt.test\r\nHDR Subject 999999\r\n",
+                    expected: b"423 no article with that number\r\n",
+                },
                 ServerResponseCase {
                     name: "OVER after GROUP uses first article",
                     reference: "RFC 3977 section 8.3.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.3.2",
@@ -7041,6 +6762,42 @@ mod tests {
         async fn rfc3977_red_server_list_and_discovery_syntax_matrix() {
             assert_red_server_response_cases(&[
                 ServerResponseCase {
+                    name: "DATE with argument",
+                    reference: "RFC 3977 sections 7.1 and 9.2 https://www.rfc-editor.org/rfc/rfc3977#section-7.1",
+                    input: b"DATE now\r\n",
+                    expected: b"501 command syntax error\r\n",
+                },
+                ServerResponseCase {
+                    name: "MODE TRANSIT is invalid MODE syntax",
+                    reference: "RFC 3977 section 5.3 https://www.rfc-editor.org/rfc/rfc3977#section-5.3",
+                    input: b"MODE TRANSIT\r\n",
+                    expected: b"501 command syntax error\r\n",
+                },
+                ServerResponseCase {
+                    name: "MODE READER extra argument",
+                    reference: "RFC 3977 section 5.3 https://www.rfc-editor.org/rfc/rfc3977#section-5.3",
+                    input: b"MODE READER extra\r\n",
+                    expected: b"501 command syntax error\r\n",
+                },
+                ServerResponseCase {
+                    name: "GROUP without name",
+                    reference: "RFC 3977 section 6.1.1 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.1",
+                    input: b"GROUP\r\n",
+                    expected: b"501 command syntax error\r\n",
+                },
+                ServerResponseCase {
+                    name: "HELP with argument",
+                    reference: "RFC 3977 sections 7.2 and 9.2 https://www.rfc-editor.org/rfc/rfc3977#section-7.2",
+                    input: b"HELP verbose\r\n",
+                    expected: b"501 command syntax error\r\n",
+                },
+                ServerResponseCase {
+                    name: "QUIT with argument",
+                    reference: "RFC 3977 sections 5.4 and 9.2 https://www.rfc-editor.org/rfc/rfc3977#section-5.4",
+                    input: b"QUIT now\r\n",
+                    expected: b"501 command syntax error\r\n",
+                },
+                ServerResponseCase {
                     name: "LIST unknown keyword",
                     reference: "RFC 3977 section 7.6 https://www.rfc-editor.org/rfc/rfc3977#section-7.6",
                     input: b"LIST FROBNICATE\r\n",
@@ -7101,6 +6858,12 @@ mod tests {
                     expected: b"501 command syntax error\r\n",
                 },
                 ServerResponseCase {
+                    name: "NEWGROUPS invalid timezone",
+                    reference: "RFC 3977 section 7.3.1 https://www.rfc-editor.org/rfc/rfc3977#section-7.3.1",
+                    input: b"NEWGROUPS 20260101 000000 LOCAL\r\n",
+                    expected: b"501 command syntax error\r\n",
+                },
+                ServerResponseCase {
                     name: "NEWGROUPS accepts leap second",
                     reference: "RFC 3977 section 7.3.2 https://www.rfc-editor.org/rfc/rfc3977#section-7.3.2",
                     input: b"NEWGROUPS 20260101 235960 GMT\r\n",
@@ -7131,6 +6894,12 @@ mod tests {
                     expected: b"501 command syntax error\r\n",
                 },
                 ServerResponseCase {
+                    name: "NEWNEWS missing time",
+                    reference: "RFC 3977 section 7.4.1 https://www.rfc-editor.org/rfc/rfc3977#section-7.4.1",
+                    input: b"NEWNEWS comp.lang.* 20260101\r\n",
+                    expected: b"501 command syntax error\r\n",
+                },
+                ServerResponseCase {
                     name: "LAST with argument",
                     reference: "RFC 3977 section 6.1.3 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.3",
                     input: b"LAST 1\r\n",
@@ -7152,6 +6921,24 @@ mod tests {
                     name: "LISTGROUP invalid name",
                     reference: "RFC 3977 section 6.1.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.2",
                     input: b"LISTGROUP alt.*\r\n",
+                    expected: b"501 command syntax error\r\n",
+                },
+                ServerResponseCase {
+                    name: "LISTGROUP zero range",
+                    reference: "RFC 3977 sections 6.1.2 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.2",
+                    input: b"LISTGROUP 0\r\n",
+                    expected: b"501 command syntax error\r\n",
+                },
+                ServerResponseCase {
+                    name: "XOVER zero range",
+                    reference: "RFC 2980 section 2.8 https://www.rfc-editor.org/rfc/rfc2980#section-2.8",
+                    input: b"XOVER 0\r\n",
+                    expected: b"501 command syntax error\r\n",
+                },
+                ServerResponseCase {
+                    name: "XHDR invalid header name",
+                    reference: "RFC 2980 section 2.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.6",
+                    input: b"XHDR Subject: 1\r\n",
                     expected: b"501 command syntax error\r\n",
                 },
             ])
@@ -7186,15 +6973,51 @@ mod tests {
                     expected: b"501 command syntax error\r\n",
                 },
                 ServerResponseCase {
+                    name: "CHECK invalid message-id",
+                    reference: "RFC 4644 section 2.3 https://www.rfc-editor.org/rfc/rfc4644#section-2.3",
+                    input: b"CHECK not-a-message-id\r\n",
+                    expected: b"501 command syntax error\r\n",
+                },
+                ServerResponseCase {
                     name: "TAKETHIS without message-id",
                     reference: "RFC 4644 section 2.4 https://www.rfc-editor.org/rfc/rfc4644#section-2.4",
                     input: b"TAKETHIS\r\n.\r\n",
                     expected: b"501 command syntax error\r\n",
                 },
                 ServerResponseCase {
+                    name: "TAKETHIS invalid message-id",
+                    reference: "RFC 4644 section 2.4 https://www.rfc-editor.org/rfc/rfc4644#section-2.4",
+                    input: b"TAKETHIS not-a-message-id\r\nHeader: value\r\n\r\nbody\r\n.\r\n",
+                    expected: b"501 command syntax error\r\n",
+                },
+                ServerResponseCase {
                     name: "AUTHINFO unknown subcommand",
                     reference: "RFC 4643 sections 2.1 and 2.2 https://www.rfc-editor.org/rfc/rfc4643#section-2",
                     input: b"AUTHINFO FROBNICATE bench\r\n",
+                    expected: b"501 command syntax error\r\n",
+                },
+                ServerResponseCase {
+                    name: "AUTHINFO USER without value",
+                    reference: "RFC 4643 section 2.1 https://www.rfc-editor.org/rfc/rfc4643#section-2.1",
+                    input: b"AUTHINFO USER\r\n",
+                    expected: b"501 command syntax error\r\n",
+                },
+                ServerResponseCase {
+                    name: "AUTHINFO PASS without value",
+                    reference: "RFC 4643 section 2.1 https://www.rfc-editor.org/rfc/rfc4643#section-2.1",
+                    input: b"AUTHINFO PASS\r\n",
+                    expected: b"501 command syntax error\r\n",
+                },
+                ServerResponseCase {
+                    name: "AUTHINFO SASL without mechanism",
+                    reference: "RFC 4643 section 2.2 https://www.rfc-editor.org/rfc/rfc4643#section-2.2",
+                    input: b"AUTHINFO SASL\r\n",
+                    expected: b"501 command syntax error\r\n",
+                },
+                ServerResponseCase {
+                    name: "STARTTLS with argument",
+                    reference: "RFC 4642 section 2.2 https://www.rfc-editor.org/rfc/rfc4642#section-2.2",
+                    input: b"STARTTLS extra\r\n",
                     expected: b"501 command syntax error\r\n",
                 },
             ])
