@@ -8310,6 +8310,42 @@ mod tests {
                         frame: b"211 3  1 3 alt.test\r\n1\r\n2\r\n.\r\n",
                     },
                     ResponseFrameCase {
+                        name: "LISTGROUP rejects non-numeric article line",
+                        reference: "RFC 3977 section 6.1.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.2",
+                        kind: RequestKind::ListGroup,
+                        frame: b"211 3 1 3 alt.test\r\none\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "NEWNEWS rejects non-message-id article line",
+                        reference: "RFC 3977 sections 7.4 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-7.4",
+                        kind: RequestKind::NewNews,
+                        frame: b"230 list of new articles follows\r\none@alt.test\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "OVER rejects body row without tab-separated overview fields",
+                        reference: "RFC 3977 section 8.3.1 https://www.rfc-editor.org/rfc/rfc3977#section-8.3.1",
+                        kind: RequestKind::Over,
+                        frame: b"224 overview follows\r\n1 Subject without tabs\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "XOVER rejects body row without numeric article number",
+                        reference: "RFC 2980 section 2.1.7 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.7",
+                        kind: RequestKind::Xover,
+                        frame: b"224 overview follows\r\none\tSubject\tfrom@test\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "HDR rejects tab separator before header value",
+                        reference: "RFC 3977 section 8.5.1 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.1",
+                        kind: RequestKind::Hdr,
+                        frame: b"225 headers follow\r\n1\tvalue\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "XHDR rejects body row without numeric article number",
+                        reference: "RFC 2980 section 2.1.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.6",
+                        kind: RequestKind::Xhdr,
+                        frame: b"221 headers follow\r\none value\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "POST rejects IHAVE continuation",
                         reference: "RFC 3977 sections 6.3.1 and 6.3.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.3",
                         kind: RequestKind::Post,

@@ -10,7 +10,8 @@ use std::sync::Arc;
 use crate::terminator::append_crlf;
 use crate::terminator::{
     BoundedResponseLineStatus, DOT_TERMINATOR, crlf_normalized_payload_lines,
-    detect_bounded_response_line_end, find_dot_terminated_block, strip_complete_crlf_line,
+    detect_bounded_response_line_end, find_dot_terminated_block, strict_crlf_line_content_end_from,
+    strip_complete_crlf_line,
 };
 
 pub mod article;
@@ -124,6 +125,9 @@ impl<'a> ResponseFrame<'a> {
             let Some(block) = find_dot_terminated_block(buffer, status_line_end) else {
                 return ResponseFrameParse::NeedMore;
             };
+            if !validate_multiline_response_content(kind, status, block.content()) {
+                return ResponseFrameParse::Invalid;
+            }
             (block.block_end(), block.content(), block.terminator())
         } else {
             if find_dot_terminated_block(buffer, status_line_end).is_some() {
@@ -2434,6 +2438,56 @@ fn validate_article_status_response_arguments(value: &[u8]) -> bool {
         && std::str::from_utf8(tokens[1])
             .ok()
             .is_some_and(|message_id| MessageId::from_borrowed(message_id).is_ok())
+}
+
+fn validate_multiline_response_content(
+    kind: RequestKind,
+    _status: StatusCode,
+    content: &[u8],
+) -> bool {
+    match kind {
+        RequestKind::ListGroup => validate_crlf_lines(content, is_response_decimal_token),
+        RequestKind::NewNews => validate_crlf_lines(content, |line| {
+            std::str::from_utf8(line)
+                .ok()
+                .is_some_and(|message_id| MessageId::from_borrowed(message_id).is_ok())
+        }),
+        RequestKind::Over | RequestKind::Xover => {
+            validate_crlf_lines(content, validate_overview_response_line)
+        }
+        RequestKind::Hdr | RequestKind::Xhdr => {
+            validate_crlf_lines(content, validate_header_response_line)
+        }
+        _ => true,
+    }
+}
+
+fn validate_crlf_lines(content: &[u8], mut validate: impl FnMut(&[u8]) -> bool) -> bool {
+    let mut offset = 0;
+    while offset < content.len() {
+        let Some(line_end) = strict_crlf_line_content_end_from(content, offset) else {
+            return false;
+        };
+        if !validate(&content[offset..line_end]) {
+            return false;
+        }
+        offset = line_end + crate::CRLF.len();
+    }
+    true
+}
+
+fn validate_overview_response_line(line: &[u8]) -> bool {
+    let Some(tab) = memchr::memchr(b'\t', line) else {
+        return false;
+    };
+    is_response_decimal_token(&line[..tab])
+}
+
+fn validate_header_response_line(line: &[u8]) -> bool {
+    let Some(space) = memchr::memchr(b' ', line) else {
+        return false;
+    };
+    is_response_decimal_token(&line[..space])
 }
 
 /// Client client request for the current client NNTP surface.
@@ -4975,6 +5029,86 @@ mod tests {
                 matches!(
                     ResponseInitial::parse(kind, input),
                     ResponseInitialParse::Invalid
+                ),
+                "{kind:?} {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn multiline_response_frame_validates_rfc_body_line_formats() {
+        // RFC 3977 sections 6.1.2, 7.4, 8.3.1, and 8.5.1 define typed
+        // per-line bodies for LISTGROUP, NEWNEWS, OVER, and HDR. RFC 2980
+        // sections 2.1.6 and 2.1.7 define the matching XHDR/XOVER extension
+        // body shapes.
+        for (kind, input) in [
+            (
+                RequestKind::ListGroup,
+                b"211 2 1 2 alt.test\r\n1\r\n2\r\n.\r\n".as_slice(),
+            ),
+            (
+                RequestKind::NewNews,
+                b"230 articles follow\r\n<one@test>\r\n<two@test>\r\n.\r\n".as_slice(),
+            ),
+            (
+                RequestKind::Over,
+                b"224 overview follows\r\n1\tSubject\tfrom@test\tdate\t<one@test>\t\t1\t1\r\n.\r\n"
+                    .as_slice(),
+            ),
+            (
+                RequestKind::Xover,
+                b"224 overview follows\r\n1\tSubject\tfrom@test\tdate\t<one@test>\t\t1\t1\r\n.\r\n"
+                    .as_slice(),
+            ),
+            (
+                RequestKind::Hdr,
+                b"225 headers follow\r\n1 value\r\n0 \r\n.\r\n".as_slice(),
+            ),
+            (
+                RequestKind::Xhdr,
+                b"221 headers follow\r\n1 value\r\n0 \r\n.\r\n".as_slice(),
+            ),
+        ] {
+            assert!(
+                matches!(
+                    ResponseFrame::parse(kind, input),
+                    ResponseFrameParse::Complete(response)
+                        if response.descriptor().framing() == ResponseFraming::Multiline
+                ),
+                "{kind:?} {input:?}"
+            );
+        }
+
+        for (kind, input) in [
+            (
+                RequestKind::ListGroup,
+                b"211 2 1 2 alt.test\r\none\r\n.\r\n".as_slice(),
+            ),
+            (
+                RequestKind::NewNews,
+                b"230 articles follow\r\none@test\r\n.\r\n".as_slice(),
+            ),
+            (
+                RequestKind::Over,
+                b"224 overview follows\r\n1 Subject without tab\r\n.\r\n".as_slice(),
+            ),
+            (
+                RequestKind::Xover,
+                b"224 overview follows\r\none\tSubject\tfrom@test\r\n.\r\n".as_slice(),
+            ),
+            (
+                RequestKind::Hdr,
+                b"225 headers follow\r\n1\tvalue\r\n.\r\n".as_slice(),
+            ),
+            (
+                RequestKind::Xhdr,
+                b"221 headers follow\r\none value\r\n.\r\n".as_slice(),
+            ),
+        ] {
+            assert!(
+                matches!(
+                    ResponseFrame::parse(kind, input),
+                    ResponseFrameParse::Invalid
                 ),
                 "{kind:?} {input:?}"
             );
