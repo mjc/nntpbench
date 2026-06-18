@@ -5637,7 +5637,7 @@ mod tests {
             // RFC 4643 section 2.2 requires AUTHINFO SASL to name an advertised
             // SASL mechanism; arbitrary SASL values must not be accepted:
             // https://www.rfc-editor.org/rfc/rfc4643#section-2.2
-            let input = b"AUTHINFO SASL made-up-mechanism\r\n";
+            let input = b"AUTHINFO SASL MADE-UP-MECHANISM\r\n";
             let (output, _) = run_session_with_input(test_config(), input).await;
             assert_single_response(
                 input,
@@ -5657,13 +5657,13 @@ mod tests {
                 ServerResponseCase {
                     name: "SASL zero-length initial response marker",
                     reference: "RFC 4643 section 2.4.1 https://www.rfc-editor.org/rfc/rfc4643#section-2.4.1",
-                    input: b"AUTHINFO SASL made-up-mechanism =\r\n",
+                    input: b"AUTHINFO SASL MADE-UP-MECHANISM =\r\n",
                     expected: b"503 unsupported authentication mechanism\r\n",
                 },
                 ServerResponseCase {
                     name: "SASL padded base64 initial response",
                     reference: "RFC 4643 section 2.4.1 https://www.rfc-editor.org/rfc/rfc4643#section-2.4.1",
-                    input: b"AUTHINFO SASL made-up-mechanism YQ==\r\n",
+                    input: b"AUTHINFO SASL MADE-UP-MECHANISM YQ==\r\n",
                     expected: b"503 unsupported authentication mechanism\r\n",
                 },
             ])
@@ -5679,19 +5679,55 @@ mod tests {
                 ServerResponseCase {
                     name: "SASL padding in middle",
                     reference: "RFC 4643 section 2.4.2 https://www.rfc-editor.org/rfc/rfc4643#section-2.4.2",
-                    input: b"AUTHINFO SASL made-up-mechanism AAA=BBB\r\n",
+                    input: b"AUTHINFO SASL MADE-UP-MECHANISM AAA=BBB\r\n",
                     expected: b"501 command syntax error\r\n",
                 },
                 ServerResponseCase {
                     name: "SASL excessive padding",
                     reference: "RFC 4643 section 2.4.2 https://www.rfc-editor.org/rfc/rfc4643#section-2.4.2",
-                    input: b"AUTHINFO SASL made-up-mechanism Y===\r\n",
+                    input: b"AUTHINFO SASL MADE-UP-MECHANISM Y===\r\n",
                     expected: b"501 command syntax error\r\n",
                 },
                 ServerResponseCase {
                     name: "SASL non-quad base64 length",
                     reference: "RFC 4643 section 2.4.2 https://www.rfc-editor.org/rfc/rfc4643#section-2.4.2",
-                    input: b"AUTHINFO SASL made-up-mechanism Y\r\n",
+                    input: b"AUTHINFO SASL MADE-UP-MECHANISM Y\r\n",
+                    expected: b"501 command syntax error\r\n",
+                },
+            ])
+            .await;
+        }
+
+        #[tokio::test]
+        async fn rfc4643_red_authinfo_sasl_rejects_malformed_mechanism_names() {
+            // RFC 4643 section 2.2 uses SASL mechanism names. RFC 4422 section
+            // 3.1 defines those names as 1 to 20 ASCII uppercase letters,
+            // digits, hyphens, and underscores:
+            // https://www.rfc-editor.org/rfc/rfc4643#section-2.2
+            // https://www.rfc-editor.org/rfc/rfc4422#section-3.1
+            assert_red_server_response_cases(&[
+                ServerResponseCase {
+                    name: "SASL mechanism rejects lowercase",
+                    reference: "RFC 4422 section 3.1 https://www.rfc-editor.org/rfc/rfc4422#section-3.1",
+                    input: b"AUTHINFO SASL plain\r\n",
+                    expected: b"501 command syntax error\r\n",
+                },
+                ServerResponseCase {
+                    name: "SASL mechanism rejects dot",
+                    reference: "RFC 4422 section 3.1 https://www.rfc-editor.org/rfc/rfc4422#section-3.1",
+                    input: b"AUTHINFO SASL PLAIN.TEST\r\n",
+                    expected: b"501 command syntax error\r\n",
+                },
+                ServerResponseCase {
+                    name: "SASL mechanism rejects over 20 characters",
+                    reference: "RFC 4422 section 3.1 https://www.rfc-editor.org/rfc/rfc4422#section-3.1",
+                    input: b"AUTHINFO SASL ABCDEFGHIJKLMNOPQRSTU\r\n",
+                    expected: b"501 command syntax error\r\n",
+                },
+                ServerResponseCase {
+                    name: "SASL mechanism rejects lowercase with initial response",
+                    reference: "RFC 4422 section 3.1 https://www.rfc-editor.org/rfc/rfc4422#section-3.1",
+                    input: b"AUTHINFO SASL plain YQ==\r\n",
                     expected: b"501 command syntax error\r\n",
                 },
             ])
@@ -11166,7 +11202,7 @@ mod tests {
             &mut output,
         ));
         assert!(!process_request_to_buffer(
-            RequestLine::parse(b"AUTHINFO SASL bench\r\n"),
+            RequestLine::parse(b"AUTHINFO SASL BENCH\r\n"),
             &config,
             &stats,
             &mut output,

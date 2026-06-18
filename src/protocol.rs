@@ -3731,19 +3731,32 @@ fn classify_authinfo_command(args: &[u8]) -> RequestKind {
         }
         (Some(subcommand), Some(value), None, None)
             if eq_ignore_ascii_case_const(subcommand, b"SASL")
-                && validate_utf8_arg(value, AuthInfoValue::from_borrowed).is_ok() =>
+                && validate_sasl_mechanism(value).is_ok() =>
         {
             RequestKind::AuthInfo
         }
         (Some(subcommand), Some(mechanism), Some(initial_response), None)
             if eq_ignore_ascii_case_const(subcommand, b"SASL")
-                && validate_utf8_arg(mechanism, AuthInfoValue::from_borrowed).is_ok()
+                && validate_sasl_mechanism(mechanism).is_ok()
                 && validate_sasl_initial_response(initial_response).is_ok() =>
         {
             RequestKind::AuthInfo
         }
         _ => RequestKind::Unknown,
     }
+}
+
+fn validate_sasl_mechanism(value: &[u8]) -> Result<(), ()> {
+    if value.is_empty() || value.len() > 20 {
+        return Err(());
+    }
+    for byte in value {
+        match *byte {
+            b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' => {}
+            _ => return Err(()),
+        }
+    }
+    Ok(())
 }
 
 fn validate_sasl_initial_response(value: &[u8]) -> Result<(), ()> {
@@ -4377,8 +4390,8 @@ mod tests {
             (b"TAKETHIS <a@b>".as_slice(), RequestKind::TakeThis),
             (b"AUTHINFO USER test".as_slice(), RequestKind::AuthInfoUser),
             (b"AUTHINFO PASS test".as_slice(), RequestKind::AuthInfoPass),
-            (b"AUTHINFO SASL test".as_slice(), RequestKind::AuthInfo),
-            (b"AUTHINFO SASL test =".as_slice(), RequestKind::AuthInfo),
+            (b"AUTHINFO SASL TEST".as_slice(), RequestKind::AuthInfo),
+            (b"AUTHINFO SASL TEST =".as_slice(), RequestKind::AuthInfo),
             (b"STARTTLS".as_slice(), RequestKind::StartTls),
             (b"article <a@b>".as_slice(), RequestKind::Article),
             (b"authinfo user test".as_slice(), RequestKind::AuthInfoUser),
