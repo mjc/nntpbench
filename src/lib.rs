@@ -4154,6 +4154,11 @@ fn overview_selector_error(
     session_state: &SessionState,
 ) -> Option<&'static [u8]> {
     let args = command_args(command, command_lines).unwrap_or_default();
+    if matches!(command.kind, RequestKind::Hdr | RequestKind::Xhdr)
+        && header_query_name_from_args(args).is_some_and(|header| !hdr_field_is_supported(header))
+    {
+        return Some(b"503 HDR field unavailable\r\n");
+    }
     let current_selector = match command.kind {
         RequestKind::Over | RequestKind::Xover => args.is_empty(),
         RequestKind::Hdr | RequestKind::Xhdr => args.split(|byte| *byte == b' ').count() == 1,
@@ -4343,6 +4348,20 @@ fn header_query_name_from_args(args: &[u8]) -> Option<&[u8]> {
     args.split(|byte| *byte == b' ')
         .next()
         .filter(|header| !header.is_empty())
+}
+
+fn hdr_field_is_supported(field: &[u8]) -> bool {
+    [
+        b":bytes".as_slice(),
+        b":lines".as_slice(),
+        b"Subject".as_slice(),
+        b"From".as_slice(),
+        b"Date".as_slice(),
+        b"Message-ID".as_slice(),
+        b"References".as_slice(),
+    ]
+    .iter()
+    .any(|supported| field.eq_ignore_ascii_case(supported))
 }
 
 fn hdr_response_for_args(args: &[u8]) -> &'static [u8] {
@@ -6490,6 +6509,41 @@ mod tests {
                 text.ends_with("\r\n225 headers follow\r\n1 <one@example.com>\r\n.\r\n"),
                 "RFC 3977 HDR Message-ID should return valid selected message-id values, got {text:?}"
             );
+        }
+
+        #[tokio::test]
+        async fn rfc3977_red_hdr_unsupported_fields_return_503() {
+            // RFC 3977 section 8.5.2 permits a server to restrict HDR to a
+            // limited field set. When it does, unsupported valid fields must
+            // return 503 instead of successful empty or fabricated results:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-8.5.2
+            assert_red_server_response_tail_cases(&[
+                ServerResponseCase {
+                    name: "HDR unsupported header field",
+                    reference: "RFC 3977 section 8.5.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.2",
+                    input: b"GROUP alt.test\r\nHDR Content-Type 1\r\n",
+                    expected: b"503 HDR field unavailable\r\n",
+                },
+                ServerResponseCase {
+                    name: "HDR unsupported metadata field",
+                    reference: "RFC 3977 section 8.5.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.2",
+                    input: b"GROUP alt.test\r\nHDR :unknown 1\r\n",
+                    expected: b"503 HDR field unavailable\r\n",
+                },
+                ServerResponseCase {
+                    name: "XHDR unsupported header field",
+                    reference: "RFC 2980 section 2.1.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.6",
+                    input: b"GROUP alt.test\r\nXHDR Content-Type 1\r\n",
+                    expected: b"503 HDR field unavailable\r\n",
+                },
+                ServerResponseCase {
+                    name: "XHDR unsupported metadata field",
+                    reference: "RFC 2980 section 2.1.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.6",
+                    input: b"GROUP alt.test\r\nXHDR :unknown 1\r\n",
+                    expected: b"503 HDR field unavailable\r\n",
+                },
+            ])
+            .await;
         }
 
         #[tokio::test]
