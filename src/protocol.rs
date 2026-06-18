@@ -2434,8 +2434,9 @@ fn validate_response_initial_line(kind: RequestKind, status: StatusCode, line: &
         (RequestKind::Article, 220)
         | (RequestKind::Head, 221)
         | (RequestKind::Body, 222)
-        | (RequestKind::Stat | RequestKind::Last | RequestKind::Next, 223) => {
-            validate_article_status_response_arguments(arguments)
+        | (RequestKind::Stat, 223) => validate_article_status_response_arguments(arguments, true),
+        (RequestKind::Last | RequestKind::Next, 223) => {
+            validate_article_status_response_arguments(arguments, false)
         }
         (RequestKind::Check, 238 | 431 | 438) | (RequestKind::TakeThis, 239 | 439) => {
             validate_message_id_response_argument(arguments)
@@ -2558,16 +2559,20 @@ fn validate_group_watermarks(count: u64, low: u64, high: u64) -> bool {
             .is_some_and(|maximum_count| count <= maximum_count)
 }
 
-fn validate_article_status_response_arguments(value: &[u8]) -> bool {
+fn validate_article_status_response_arguments(value: &[u8], allow_zero_number: bool) -> bool {
     let Some((tokens, trailing_text)) = split_required_response_tokens::<2>(value) else {
         return false;
     };
 
-    validate_response_article_number(tokens[0])
+    validate_response_article_number_with_zero_policy(tokens[0], allow_zero_number)
         && std::str::from_utf8(tokens[1])
             .ok()
             .is_some_and(|message_id| MessageId::from_borrowed(message_id).is_ok())
         && validate_optional_trailing_comment(trailing_text)
+}
+
+fn validate_response_article_number_with_zero_policy(value: &[u8], allow_zero: bool) -> bool {
+    parse_response_article_number(value).is_some_and(|number| allow_zero || number != 0)
 }
 
 fn validate_message_id_response_argument(value: &[u8]) -> bool {
@@ -6073,6 +6078,14 @@ mod tests {
             (
                 RequestKind::Last,
                 b"223 1 stat@test article exists\r\n".as_slice(),
+            ),
+            (
+                RequestKind::Last,
+                b"223 0 <last@test> article exists\r\n".as_slice(),
+            ),
+            (
+                RequestKind::Next,
+                b"223 0 <next@test> article exists\r\n".as_slice(),
             ),
             (
                 RequestKind::Next,

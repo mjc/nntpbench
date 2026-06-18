@@ -8124,6 +8124,18 @@ mod tests {
                         frame: b"222 1 <body@test> body follows\r\nbad\0body\r\n.\r\n",
                     },
                     ResponseFrameCase {
+                        name: "LAST rejects zero article number",
+                        reference: "RFC 3977 sections 6.1.3 and 6.2.1 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.3",
+                        kind: RequestKind::Last,
+                        frame: b"223 0 <last@test> article retrieved\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "NEXT rejects zero article number",
+                        reference: "RFC 3977 sections 6.1.4 and 6.2.1 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.4",
+                        kind: RequestKind::Next,
+                        frame: b"223 0 <next@test> article retrieved\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "HELP rejects LIST success code",
                         reference: "RFC 3977 sections 7.2 and 7.6 https://www.rfc-editor.org/rfc/rfc3977#section-7.2",
                         kind: RequestKind::Help,
