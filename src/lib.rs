@@ -8066,6 +8066,12 @@ mod tests {
                         frame: b"221 headers follow\r\n<one@test> value\r\n.\r\n",
                     },
                     ResponseFrameCase {
+                        name: "XHDR accepts legacy no matching headers marker",
+                        reference: "RFC 2980 section 2.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.6",
+                        kind: RequestKind::Xhdr,
+                        frame: b"221 headers follow\r\n(none)\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "OVER accepts omitted trailing overview fields",
                         reference: "RFC 3977 sections 8.3.2 and 9.4.3 https://www.rfc-editor.org/rfc/rfc3977#section-8.3.2",
                         kind: RequestKind::Over,
