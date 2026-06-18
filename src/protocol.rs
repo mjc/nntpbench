@@ -141,9 +141,6 @@ impl<'a> ResponseFrame<'a> {
             }
             (block.block_end(), block.content(), block.terminator())
         } else {
-            if find_dot_terminated_block(buffer, status_line_end).is_some() {
-                return ResponseFrameParse::Invalid;
-            }
             (
                 status_line_end,
                 &buffer[status_line_end..status_line_end],

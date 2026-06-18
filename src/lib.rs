@@ -5485,6 +5485,15 @@ mod tests {
             frame: &'static [u8],
         }
 
+        struct ResponseFrameConsumedCase {
+            name: &'static str,
+            reference: &'static str,
+            kind: RequestKind,
+            frame: &'static [u8],
+            expected_consumed: usize,
+            expected_status: u16,
+        }
+
         fn assert_red_response_frame_invalid_cases(cases: &[ResponseFrameCase]) {
             let failures = cases
                 .iter()
@@ -5517,6 +5526,36 @@ mod tests {
             assert!(
                 failures.is_empty(),
                 "expected response frames to be valid; rejected unexpectedly:\n{}",
+                failures.join("\n")
+            );
+        }
+
+        fn assert_red_response_frame_consumed_cases(cases: &[ResponseFrameConsumedCase]) {
+            let failures = cases
+                .iter()
+                .filter_map(
+                    |case| match protocol::ResponseFrame::parse(case.kind, case.frame) {
+                        protocol::ResponseFrameParse::Complete(response)
+                            if response.status().as_u16() == case.expected_status
+                                && response.consumed() == case.expected_consumed =>
+                        {
+                            None
+                        }
+                        other => Some(format!(
+                            "{}: expected status {} consumed {}, got {:?} ({})",
+                            case.name,
+                            case.expected_status,
+                            case.expected_consumed,
+                            other,
+                            case.reference
+                        )),
+                    },
+                )
+                .collect::<Vec<_>>();
+
+            assert!(
+                failures.is_empty(),
+                "response frame consumed-byte RFC audit failed:\n{}",
                 failures.join("\n")
             );
         }
@@ -9202,6 +9241,48 @@ mod tests {
             }
 
             #[test]
+            fn rfc3977_red_single_line_response_consumes_only_initial_line() {
+                // RFC 3977 sections 3.1 and 9.4 define single-line responses
+                // as complete at the response initial-line CRLF. Extra bytes
+                // may be the next pipelined response and must remain unconsumed:
+                // https://www.rfc-editor.org/rfc/rfc3977#section-3.1
+                assert_red_response_frame_consumed_cases(&[
+                    ResponseFrameConsumedCase {
+                        name: "STAT single-line response before stray dot line",
+                        reference: "RFC 3977 sections 3.1 and 6.2.4 https://www.rfc-editor.org/rfc/rfc3977#section-3.1",
+                        kind: RequestKind::Stat,
+                        frame: b"223 1 <stat@test> article exists\r\n.\r\n",
+                        expected_consumed: b"223 1 <stat@test> article exists\r\n".len(),
+                        expected_status: 223,
+                    },
+                    ResponseFrameConsumedCase {
+                        name: "DATE single-line response before pipelined ARTICLE",
+                        reference: "RFC 3977 sections 3.1 and 7.1 https://www.rfc-editor.org/rfc/rfc3977#section-3.1",
+                        kind: RequestKind::Date,
+                        frame: b"111 20260602120000\r\n220 1 <a@test> article follows\r\nSubject: one\r\n\r\nbody\r\n.\r\n",
+                        expected_consumed: b"111 20260602120000\r\n".len(),
+                        expected_status: 111,
+                    },
+                    ResponseFrameConsumedCase {
+                        name: "AUTHINFO USER continuation before pipelined CAPABILITIES",
+                        reference: "RFC 3977 section 3.1 and RFC 4643 section 2.3 https://www.rfc-editor.org/rfc/rfc3977#section-3.1",
+                        kind: RequestKind::AuthInfoUser,
+                        frame: b"381 more authentication information required\r\n101 capability list follows\r\nVERSION 2\r\n.\r\n",
+                        expected_consumed: b"381 more authentication information required\r\n".len(),
+                        expected_status: 381,
+                    },
+                    ResponseFrameConsumedCase {
+                        name: "GROUP single-line response before non-response trailer",
+                        reference: "RFC 3977 sections 3.1 and 6.1.1 https://www.rfc-editor.org/rfc/rfc3977#section-3.1",
+                        kind: RequestKind::Group,
+                        frame: b"211 3 1 3 alt.test\r\n1\r\n2\r\n.\r\n",
+                        expected_consumed: b"211 3 1 3 alt.test\r\n".len(),
+                        expected_status: 211,
+                    },
+                ]);
+            }
+
+            #[test]
             fn rfc3977_red_response_frame_validation_matrix() {
                 assert_red_response_frame_invalid_cases(&[
                     ResponseFrameCase {
@@ -9216,12 +9297,6 @@ mod tests {
                         kind: RequestKind::Stat,
                         frame:
                             b"220 1 <a@test> article follows\r\nSubject: one\r\n\r\nbody\r\n.\r\n",
-                    },
-                    ResponseFrameCase {
-                        name: "STAT rejects dot block",
-                        reference: "RFC 3977 section 6.2.4 https://www.rfc-editor.org/rfc/rfc3977#section-6.2.4",
-                        kind: RequestKind::Stat,
-                        frame: b"223 1 <stat@test> article exists\r\n.\r\n",
                     },
                     ResponseFrameCase {
                         name: "STAT rejects missing article number",
@@ -9332,12 +9407,6 @@ mod tests {
                         frame: b"101 Capability list:\r\nVERSION 2\r\n.\r\n",
                     },
                     ResponseFrameCase {
-                        name: "DATE rejects multiline payload",
-                        reference: "RFC 3977 section 7.1 https://www.rfc-editor.org/rfc/rfc3977#section-7.1",
-                        kind: RequestKind::Date,
-                        frame: b"111 20260602120000\r\nextra\r\n.\r\n",
-                    },
-                    ResponseFrameCase {
                         name: "DATE rejects malformed timestamp",
                         reference: "RFC 3977 sections 7.1 and 7.5 https://www.rfc-editor.org/rfc/rfc3977#section-7.1",
                         kind: RequestKind::Date,
@@ -9426,12 +9495,6 @@ mod tests {
                         reference: "RFC 3977 sections 3.2.1 and 9.4.2 https://www.rfc-editor.org/rfc/rfc3977#section-9.4.2",
                         kind: RequestKind::Capabilities,
                         frame: b"401 READER_required\r\n",
-                    },
-                    ResponseFrameCase {
-                        name: "GROUP rejects multiline payload",
-                        reference: "RFC 3977 section 6.1.1 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.1",
-                        kind: RequestKind::Group,
-                        frame: b"211 3 1 3 alt.test\r\n1\r\n2\r\n.\r\n",
                     },
                     ResponseFrameCase {
                         name: "GROUP rejects missing count/low/high/group arguments",
