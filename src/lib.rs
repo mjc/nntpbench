@@ -5359,9 +5359,31 @@ mod tests {
             // RFC 3977 section 3.1.1 requires clients to remove one leading dot
             // from dot-stuffed data lines in multi-line data blocks:
             // https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1
-            let article =
-                Article::parse(b"222 1 <dot@test>\r\n..starts-with-dot\r\n.\r\n").unwrap();
-            assert_eq!(article.body, Some(b".starts-with-dot\r\n".as_slice()));
+            for (name, input, expected) in [
+                (
+                    "BODY first line",
+                    b"222 1 <dot@test>\r\n..starts-with-dot\r\n.\r\n".as_slice(),
+                    b".starts-with-dot\r\n".as_slice(),
+                ),
+                (
+                    "BODY later line",
+                    b"222 1 <dot@test>\r\nplain\r\n..middle-dot\r\n.more\r\n.\r\n".as_slice(),
+                    b"plain\r\n.middle-dot\r\nmore\r\n".as_slice(),
+                ),
+                (
+                    "ARTICLE body lines",
+                    b"220 1 <dot@test>\r\nSubject: dots\r\n\r\n..article-dot\r\nplain\r\n.more\r\n.\r\n"
+                        .as_slice(),
+                    b".article-dot\r\nplain\r\nmore\r\n".as_slice(),
+                ),
+            ] {
+                let article = Article::parse(input).unwrap();
+                assert_eq!(
+                    article.body.as_deref(),
+                    Some(expected),
+                    "{name}: RFC 3977 body lines should be dot-unstuffed"
+                );
+            }
         }
 
         #[tokio::test]
@@ -9958,7 +9980,7 @@ mod tests {
         assert_eq!(response.kind(), RequestKind::Body);
         assert_eq!(response.status().as_u16(), 222);
         assert_eq!(article.message_id.as_str(), "<client-fetch@test>");
-        assert_eq!(article.body, Some(&b"body payload\r\n"[..]));
+        assert_eq!(article.body.as_deref(), Some(&b"body payload\r\n"[..]));
 
         server.await.unwrap();
     }

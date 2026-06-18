@@ -4198,7 +4198,7 @@ mod tests {
             article.headers.unwrap().get("Subject"),
             Some(&b"Client"[..])
         );
-        assert_eq!(article.body, Some(&b"payload\r\n"[..]));
+        assert_eq!(article.body.as_deref(), Some(&b"payload\r\n"[..]));
 
         server.await.unwrap();
     }
@@ -4876,7 +4876,7 @@ mod tests {
             parsed.headers.unwrap().get("Subject"),
             Some(&b"Surface"[..])
         );
-        assert_eq!(parsed.body, Some(&b"payload\r\n"[..]));
+        assert_eq!(parsed.body.as_deref(), Some(&b"payload\r\n"[..]));
 
         server.await.unwrap();
     }
@@ -5403,7 +5403,7 @@ mod tests {
         assert_eq!(exchange.request(), &request);
         assert_eq!(exchange.article().status().as_u16(), 222);
         assert_eq!(
-            exchange.article().article().unwrap().body,
+            exchange.article().article().unwrap().body.as_deref(),
             Some(&b"direct body\r\n"[..])
         );
 

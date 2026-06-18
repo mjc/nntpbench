@@ -1,6 +1,6 @@
 //! Zero-copy NNTP article parsing borrowed and adapted from `nntp-proxy`.
 
-use std::fmt;
+use std::{borrow::Cow, fmt};
 
 use super::{InvalidMessageId, MessageId, StatusCode};
 use crate::terminator::{
@@ -202,7 +202,7 @@ mod proptests {
             let article = Article::parse(article_frame.as_bytes()).unwrap();
             prop_assert_eq!(article.message_id.as_str(), message_id.as_str());
             prop_assert_eq!(article.article_number, Some(ArticleNumber::from(article_number as u64)));
-            prop_assert_eq!(article.body, Some(body.as_bytes()));
+            prop_assert_eq!(article.body.as_deref(), Some(body.as_bytes()));
             let parsed_headers = article.headers.unwrap();
             for (name, _) in &headers {
                 let expected = headers
@@ -243,7 +243,7 @@ mod proptests {
                 Some(ArticleNumber::from(article_number as u64))
             );
             prop_assert!(parsed_body.headers.is_none());
-            prop_assert_eq!(parsed_body.body, Some(body.as_bytes()));
+            prop_assert_eq!(parsed_body.body.as_deref(), Some(body.as_bytes()));
 
             let stat_frame = format!("223 {article_number} {message_id}\r\n");
             let stat = Article::parse(stat_frame.as_bytes()).unwrap();
@@ -315,7 +315,7 @@ mod proptests {
             prop_assert_eq!(article.message_id.as_str(), message_id.as_str());
             prop_assert_eq!(article.article_number, expected_number);
             prop_assert_eq!(article.headers.unwrap().iter().count(), 0);
-            prop_assert_eq!(article.body, Some(&b""[..]));
+            prop_assert_eq!(article.body.as_deref(), Some(&b""[..]));
 
             let head_frame = format!("221 {first_line}\r\n.\r\n");
             let head = Article::parse(head_frame.as_bytes()).unwrap();
@@ -329,7 +329,7 @@ mod proptests {
             prop_assert_eq!(parsed_body.message_id.as_str(), message_id.as_str());
             prop_assert_eq!(parsed_body.article_number, expected_number);
             prop_assert!(parsed_body.headers.is_none());
-            prop_assert_eq!(parsed_body.body, Some(&b""[..]));
+            prop_assert_eq!(parsed_body.body.as_deref(), Some(&b""[..]));
         }
 
         #[test]
@@ -793,9 +793,10 @@ mod proptests {
             let parsed = Article::parse(&frame).unwrap();
             let mut expected_body = body;
             expected_body.extend_from_slice(crate::CRLF);
+            let expected_body = unstuff_dot_lines(&expected_body);
             prop_assert_eq!(parsed.message_id.as_str(), message_id.as_str());
             prop_assert_eq!(parsed.article_number, Some(ArticleNumber::from(article_number as u64)));
-            prop_assert_eq!(parsed.body, Some(expected_body.as_slice()));
+            prop_assert_eq!(parsed.body.as_deref(), Some(expected_body.as_ref()));
         }
 
         #[test]
@@ -1112,7 +1113,7 @@ pub struct Article<'a> {
     pub message_id: MessageId<'a>,
     pub article_number: Option<ArticleNumber>,
     pub headers: Option<Headers<'a>>,
-    pub body: Option<&'a [u8]>,
+    pub body: Option<Cow<'a, [u8]>>,
 }
 
 impl<'a> TryFrom<&'a [u8]> for Article<'a> {
@@ -1175,13 +1176,12 @@ impl<'a> Article<'a> {
         let body_start = separator_pos + 4;
         let body_end = find_article_content_end(buf, body_start)
             .ok_or(ArticleParseError::MissingTerminator)?;
-        let body_start = unstuff_leading_dot(buf, body_start, body_end);
 
         Ok(Self {
             message_id,
             article_number,
             headers,
-            body: Some(&buf[body_start..body_end]),
+            body: Some(unstuff_dot_lines(&buf[body_start..body_end])),
         })
     }
 
@@ -1211,13 +1211,12 @@ impl<'a> Article<'a> {
         let body_start = first_line_end + 2;
         let body_end = find_article_content_end(buf, body_start)
             .ok_or(ArticleParseError::MissingTerminator)?;
-        let body_start = unstuff_leading_dot(buf, body_start, body_end);
 
         Ok(Self {
             message_id,
             article_number,
             headers: None,
-            body: Some(&buf[body_start..body_end]),
+            body: Some(unstuff_dot_lines(&buf[body_start..body_end])),
         })
     }
 
@@ -1251,13 +1250,12 @@ impl<'a> Article<'a> {
         if body_start > content_end {
             return Err(ArticleParseError::BufferTooShort);
         }
-        let body_start = unstuff_leading_dot(buf, body_start, content_end);
 
         Ok(Self {
             message_id,
             article_number,
             headers,
-            body: Some(&buf[body_start..content_end]),
+            body: Some(unstuff_dot_lines(&buf[body_start..content_end])),
         })
     }
 
@@ -1287,13 +1285,12 @@ impl<'a> Article<'a> {
         content_end: usize,
     ) -> Result<Self, ArticleParseError> {
         let (message_id, article_number) = parse_first_line(&buf[..first_line_end])?;
-        let content_start = unstuff_leading_dot(buf, content_start, content_end);
 
         Ok(Self {
             message_id,
             article_number,
             headers: None,
-            body: Some(&buf[content_start..content_end]),
+            body: Some(unstuff_dot_lines(&buf[content_start..content_end])),
         })
     }
 
@@ -1326,12 +1323,29 @@ fn find_article_content_end(buf: &[u8], start: usize) -> Option<usize> {
     find_terminator_content_end(buf, start)
 }
 
-fn unstuff_leading_dot(buf: &[u8], start: usize, end: usize) -> usize {
-    if start < end && buf[start] == b'.' {
-        start + 1
-    } else {
-        start
+fn unstuff_dot_lines(buf: &[u8]) -> Cow<'_, [u8]> {
+    if !has_dot_stuffed_line(buf) {
+        return Cow::Borrowed(buf);
     }
+
+    let mut unstuffed = Vec::with_capacity(buf.len());
+    let mut line_start = true;
+    for &byte in buf {
+        if line_start && byte == b'.' {
+            line_start = false;
+            continue;
+        }
+        unstuffed.push(byte);
+        line_start = byte == b'\n';
+    }
+    Cow::Owned(unstuffed)
+}
+
+fn has_dot_stuffed_line(buf: &[u8]) -> bool {
+    buf.first() == Some(&b'.')
+        || buf
+            .windows(3)
+            .any(|window| window[0] == b'\r' && window[1] == b'\n' && window[2] == b'.')
 }
 
 fn parse_status_code(buf: &[u8]) -> Result<u16, ArticleParseError> {
@@ -1494,7 +1508,7 @@ Actual body content\r\n\
         assert_eq!(article.message_id.as_str(), "<test@example.com>");
         assert_eq!(article.article_number, Some(ArticleNumber(100)));
         assert_eq!(article.headers.unwrap().get("Subject"), Some(&b"Test"[..]));
-        assert_eq!(article.body, Some(&b"Body content\r\n"[..]));
+        assert_eq!(article.body.as_deref(), Some(&b"Body content\r\n"[..]));
     }
 
     #[test]
@@ -1516,7 +1530,7 @@ Actual body content\r\n\
 
         let article = Article::parse(buf).unwrap();
         assert_eq!(article.headers, None);
-        assert_eq!(article.body, Some(&b"Body content\r\n"[..]));
+        assert_eq!(article.body.as_deref(), Some(&b"Body content\r\n"[..]));
     }
 
     #[test]
@@ -1659,7 +1673,7 @@ Actual body content\r\n\
         let body_only = Article::parse(BODY_WITH_HEADERS).unwrap();
         assert!(body_only.headers.is_none());
         assert_eq!(
-            body_only.body,
+            body_only.body.as_deref(),
             Some(&b"Subject: Should be ignored\r\n\r\nActual body content\r\n"[..])
         );
     }
@@ -1725,14 +1739,14 @@ Actual body content\r\n\
     #[test]
     fn article_body_edge_cases_and_zero_copy_hold() {
         let empty_body = Article::parse(b"222 123 <test@example.com>\r\n.\r\n").unwrap();
-        assert_eq!(empty_body.body, Some(&b""[..]));
+        assert_eq!(empty_body.body.as_deref(), Some(&b""[..]));
 
         let mut binary_article = b"222 123 <test@example.com>\r\n".to_vec();
         binary_article.extend_from_slice(&[0xFF, 0xFE, 0xFD, 0xFC, 0xFB]);
         binary_article.extend_from_slice(b"\r\n.\r\n");
         let binary = Article::parse(&binary_article).unwrap();
         assert_eq!(
-            binary.body.unwrap(),
+            binary.body.as_deref().unwrap(),
             &[0xFF, 0xFE, 0xFD, 0xFC, 0xFB, b'\r', b'\n']
         );
 
