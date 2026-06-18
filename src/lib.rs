@@ -8835,6 +8835,12 @@ mod tests {
                         frame: b"221 headers follow\r\n1\r\n.\r\n",
                     },
                     ResponseFrameCase {
+                        name: "XHDR rejects HDR-specific 423 error",
+                        reference: "RFC 2980 section 2.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.6",
+                        kind: RequestKind::Xhdr,
+                        frame: b"423 no article with that number\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "CHECK rejects success response without message-id",
                         reference: "RFC 4644 section 2.4.1 https://www.rfc-editor.org/rfc/rfc4644#section-2.4.1",
                         kind: RequestKind::Check,
