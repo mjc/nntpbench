@@ -8418,6 +8418,12 @@ mod tests {
                         frame: b"215 headers supported\r\nSubject:\r\n.\r\n",
                     },
                     ResponseFrameCase {
+                        name: "LIST HEADERS rejects all-headers marker mixed with header names",
+                        reference: "RFC 3977 sections 8.6.2 and 9.6 https://www.rfc-editor.org/rfc/rfc3977#section-9.6",
+                        kind: RequestKind::ListHeaders,
+                        frame: b"215 headers supported\r\n:\r\nSubject\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "LIST DISTRIB.PATS rejects non-numeric priority",
                         reference: "RFC 3977 sections 7.6.5 and 9.6 https://www.rfc-editor.org/rfc/rfc3977#section-9.6",
                         kind: RequestKind::ListDistribPats,

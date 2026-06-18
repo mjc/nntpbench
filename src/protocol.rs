@@ -2496,9 +2496,7 @@ fn validate_multiline_response_content(kind: RequestKind, content: &[u8]) -> boo
             validate_crlf_lines(content, validate_newsgroups_response_line)
         }
         RequestKind::ListOverviewFmt => validate_overview_fmt_response_content(content),
-        RequestKind::ListHeaders => {
-            validate_crlf_lines(content, validate_header_list_response_line)
-        }
+        RequestKind::ListHeaders => validate_header_list_response_content(content),
         RequestKind::ListDistribPats => {
             validate_crlf_lines(content, validate_distrib_pats_response_line)
         }
@@ -2654,14 +2652,27 @@ fn validate_header_name_abnf_bytes(value: &[u8]) -> bool {
             .all(|byte| matches!(byte, 0x21..=0x39 | 0x3b..=0x7e))
 }
 
-fn validate_header_list_response_line(line: &[u8]) -> bool {
-    validate_header_name_bytes(line)
-}
+fn validate_header_list_response_content(content: &[u8]) -> bool {
+    let mut offset = 0;
+    let mut has_all_headers_marker = false;
+    let mut has_header_name = false;
 
-fn validate_header_name_bytes(value: &[u8]) -> bool {
-    std::str::from_utf8(value)
-        .ok()
-        .is_some_and(|header| HeaderName::from_borrowed(header).is_ok())
+    while offset < content.len() {
+        let Some(line) = next_strict_crlf_line(content, &mut offset) else {
+            return false;
+        };
+        if line == b":" {
+            has_all_headers_marker = true;
+        } else if validate_metadata_name_abnf_bytes(line) {
+            continue;
+        } else if validate_header_name_abnf_bytes(line) {
+            has_header_name = true;
+        } else {
+            return false;
+        }
+    }
+
+    !(has_all_headers_marker && has_header_name)
 }
 
 fn validate_distrib_pats_response_line(line: &[u8]) -> bool {
@@ -5460,6 +5471,10 @@ mod tests {
                 b"215 headers follow\r\nSubject\r\n:lines\r\n.\r\n".as_slice(),
             ),
             (
+                RequestKind::ListHeaders,
+                b"215 headers follow\r\n:\r\n:bytes\r\n:lines\r\n.\r\n".as_slice(),
+            ),
+            (
                 RequestKind::ListDistribPats,
                 b"215 distrib pats follow\r\n1:*:world\r\n.\r\n".as_slice(),
             ),
@@ -5548,6 +5563,10 @@ mod tests {
             (
                 RequestKind::ListHeaders,
                 b"215 headers follow\r\nSubject:\r\n.\r\n".as_slice(),
+            ),
+            (
+                RequestKind::ListHeaders,
+                b"215 headers follow\r\n:\r\nSubject\r\n.\r\n".as_slice(),
             ),
             (
                 RequestKind::ListDistribPats,
