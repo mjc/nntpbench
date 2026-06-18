@@ -7909,6 +7909,12 @@ mod tests {
                         frame: b"430\r\n",
                     },
                     ResponseFrameCase {
+                        name: "XOVER accepts legacy no-current-group error",
+                        reference: "RFC 2980 section 2.8.1 https://www.rfc-editor.org/rfc/rfc2980#section-2.8.1",
+                        kind: RequestKind::Xover,
+                        frame: b"412 no newsgroup selected\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "POST unavailable error accepts bare generic status line",
                         reference: "RFC 3977 sections 3.2.1, 6.3.1, and 9.4.1 https://www.rfc-editor.org/rfc/rfc3977#section-9.4.1",
                         kind: RequestKind::Post,

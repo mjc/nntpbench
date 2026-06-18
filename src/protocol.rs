@@ -2295,7 +2295,7 @@ fn is_specific_error_status_for_request(kind: RequestKind, code: u16) -> bool {
         RequestKind::Last => matches!(code, 412 | 420 | 422),
         RequestKind::Next => matches!(code, 412 | 420 | 421),
         RequestKind::Over => matches!(code, 412 | 420 | 423 | 430),
-        RequestKind::Xover => code == 420,
+        RequestKind::Xover => matches!(code, 412 | 420),
         RequestKind::Hdr | RequestKind::Xhdr => matches!(code, 412 | 420 | 423 | 430),
         RequestKind::Post => matches!(code, 440 | 441),
         RequestKind::Ihave => matches!(code, 435..=437),
