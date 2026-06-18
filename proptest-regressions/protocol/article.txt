@@ -9,3 +9,4 @@ cc 13be12cb9c025d5c7ec13904a57585854bbc7568bc5dff821e60eb7ddfe36ec2 # shrinks to
 cc c0c2d16a5915b26648cd5425194f64b8d63781a8b372014d37bfb1ad04c515c8 # shrinks to pairs = [("-", ""), ("-", "a")]
 cc a2003480f8e1c8f2a956233f0df25f0cd9d1b790bb2ce18bf9b5f9ee6bc26872 # shrinks to message_id = "<0@A.test>", article_number = 0, headers = [("A", ""), ("a", "a")], body_lines = ["A"]
 cc 793e1b46d01f493cf5e4c01dcdcc5726c70887b2db7be89748fd809c75b650fc # shrinks to status = "221", message_id = "<A@a.test>", article_number = 0, before = [13, 10], after = [], bad_separator = [10]
+cc 43762f9f9487568a935de271212814a0f30baa406b614552eae4e710bdc094a3 # shrinks to pairs = [("m", ""), ("M", "A")]

@@ -8377,12 +8377,32 @@ mod tests {
 
             #[test]
             fn rfc3977_red_response_frame_valid_shape_matrix() {
-                assert_red_response_frame_valid_cases(&[ResponseFrameCase {
-                    name: "HDR accepts omitted space for empty field content",
-                    reference: "RFC 3977 section 8.5.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.2",
-                    kind: RequestKind::Hdr,
-                    frame: b"225 headers follow\r\n1\r\n2 value\r\n.\r\n",
-                }]);
+                assert_red_response_frame_valid_cases(&[
+                    ResponseFrameCase {
+                        name: "QUIT accepts bare generic status line",
+                        reference: "RFC 3977 section 9.4.1 https://www.rfc-editor.org/rfc/rfc3977#section-9.4.1",
+                        kind: RequestKind::Quit,
+                        frame: b"205\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "ARTICLE missing message-id error accepts bare generic status line",
+                        reference: "RFC 3977 sections 3.2.1 and 9.4.1 https://www.rfc-editor.org/rfc/rfc3977#section-9.4.1",
+                        kind: RequestKind::Article,
+                        frame: b"430\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "POST unavailable error accepts bare generic status line",
+                        reference: "RFC 3977 sections 3.2.1, 6.3.1, and 9.4.1 https://www.rfc-editor.org/rfc/rfc3977#section-9.4.1",
+                        kind: RequestKind::Post,
+                        frame: b"440\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "HDR accepts omitted space for empty field content",
+                        reference: "RFC 3977 section 8.5.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.2",
+                        kind: RequestKind::Hdr,
+                        frame: b"225 headers follow\r\n1\r\n2 value\r\n.\r\n",
+                    },
+                ]);
             }
 
             #[test]

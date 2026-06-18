@@ -132,7 +132,7 @@ mod proptests {
             for (name, _) in &pairs {
                 let trimmed_value = pairs
                     .iter()
-                    .find(|(expected_name, _)| expected_name == name)
+                    .find(|(expected_name, _)| expected_name.eq_ignore_ascii_case(name))
                     .map(|(_, expected_value)| expected_value.trim_start_matches([' ', '\t']))
                     .unwrap();
                 prop_assert_eq!(headers.get(name), Some(trimmed_value.as_bytes()));

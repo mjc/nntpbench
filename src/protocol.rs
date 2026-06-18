@@ -110,7 +110,7 @@ impl<'a> ResponseFrame<'a> {
         let Some(status) = StatusCode::parse(buffer) else {
             return ResponseFrameParse::Invalid;
         };
-        if status_line_end < 5 || buffer.get(3) != Some(&b' ') {
+        if status_line_end < 5 {
             return ResponseFrameParse::Invalid;
         }
         let descriptor = ResponseDescriptor::for_request_status(kind, status);
@@ -2361,31 +2361,34 @@ fn responses_for_request(kind: RequestKind) -> impl Iterator<Item = ResponseDesc
 }
 
 fn validate_response_initial_line(kind: RequestKind, status: StatusCode, line: &[u8]) -> bool {
-    if line.len() < 5 || line.get(3) != Some(&b' ') || !line.ends_with(b"\r\n") {
+    if line.len() < 5 || !line.ends_with(b"\r\n") {
         return false;
     }
 
+    let content = &line[..line.len() - crate::CRLF.len()];
+    let arguments = match content.get(3..) {
+        Some([]) => b"".as_slice(),
+        Some([b' ', arguments @ ..]) => arguments,
+        _ => return false,
+    };
+
     match (kind, status.as_u16()) {
-        (RequestKind::Date, 111) => validate_date_response_argument(&line[4..line.len() - 2]),
-        (_, 401) => validate_capability_label_response_argument(&line[4..line.len() - 2]),
+        (RequestKind::Date, 111) => validate_date_response_argument(arguments),
+        (_, 401) => validate_capability_label_response_argument(arguments),
         (RequestKind::Group | RequestKind::ListGroup, 211) => {
-            validate_group_response_arguments(&line[4..line.len() - 2])
+            validate_group_response_arguments(arguments)
         }
         (RequestKind::Article, 220)
         | (RequestKind::Head, 221)
         | (RequestKind::Body, 222)
         | (RequestKind::Stat | RequestKind::Last | RequestKind::Next, 223) => {
-            validate_article_status_response_arguments(&line[4..line.len() - 2])
+            validate_article_status_response_arguments(arguments)
         }
         (RequestKind::Check, 238 | 431 | 438) | (RequestKind::TakeThis, 239 | 439) => {
-            validate_message_id_response_argument(&line[4..line.len() - 2])
+            validate_message_id_response_argument(arguments)
         }
-        (RequestKind::AuthInfo, 283) => {
-            validate_sasl_response_argument(&line[4..line.len() - 2], false)
-        }
-        (RequestKind::AuthInfo, 383) => {
-            validate_sasl_response_argument(&line[4..line.len() - 2], true)
-        }
+        (RequestKind::AuthInfo, 283) => validate_sasl_response_argument(arguments, false),
+        (RequestKind::AuthInfo, 383) => validate_sasl_response_argument(arguments, true),
         _ => true,
     }
 }
@@ -5302,6 +5305,32 @@ mod tests {
             response.consumed(),
             b"430 no article with that message-id\r\n".len()
         );
+    }
+
+    #[test]
+    fn response_frame_parse_accepts_bare_generic_status_line() {
+        // RFC 3977 section 9.4.1 permits an initial response line with only
+        // the three-digit response content and CRLF when no code-specific
+        // argument is required.
+        for (kind, wire, status) in [
+            (RequestKind::Quit, b"205\r\n".as_slice(), StatusCode(205)),
+            (RequestKind::Article, b"430\r\n".as_slice(), StatusCode(430)),
+            (RequestKind::Post, b"440\r\n".as_slice(), StatusCode(440)),
+        ] {
+            let ResponseFrameParse::Complete(response) = ResponseFrame::parse(kind, wire) else {
+                panic!("bare generic status line did not parse: {wire:?}");
+            };
+            assert_eq!(response.status(), status);
+            assert_eq!(response.status_line(), wire);
+            assert_eq!(response.bytes(), wire);
+            assert!(response.content().is_empty());
+
+            let ResponseInitialParse::Complete(initial) = ResponseInitial::parse(kind, wire) else {
+                panic!("bare generic response initial did not parse: {wire:?}");
+            };
+            assert_eq!(initial.status(), status);
+            assert_eq!(initial.descriptor().framing(), ResponseFraming::SingleLine);
+        }
     }
 
     #[test]
