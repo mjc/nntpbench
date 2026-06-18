@@ -154,8 +154,8 @@ pub const NEWNEWS_RESPONSE: &[u8] =
 const NEWNEWS_EMPTY_RESPONSE: &[u8] = b"230 list of new articles follows\r\n.\r\n";
 pub const POST_RESPONSE: &[u8] = b"340 send article to be posted\r\n";
 pub const IHAVE_RESPONSE: &[u8] = b"335 send article to be transferred\r\n";
-pub const CHECK_RESPONSE: &[u8] = b"238 send article to be transferred\r\n";
-pub const TAKETHIS_RESPONSE: &[u8] = b"239 article transferred ok\r\n";
+pub const CHECK_RESPONSE: &[u8] = b"238 <check@test> send article to be transferred\r\n";
+pub const TAKETHIS_RESPONSE: &[u8] = b"239 <take@test> article transferred ok\r\n";
 pub const AUTHINFO_USER_RESPONSE: &[u8] = b"381 more authentication information required\r\n";
 pub const AUTHINFO_RESPONSE: &[u8] = b"281 authentication accepted\r\n";
 pub const STARTTLS_RESPONSE: &[u8] = b"382 continue with TLS negotiation\r\n";
@@ -8398,6 +8398,18 @@ mod tests {
                         reference: "RFC 2980 section 2.1.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.6",
                         kind: RequestKind::Xhdr,
                         frame: b"221 headers follow\r\none value\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "CHECK rejects success response without message-id",
+                        reference: "RFC 4644 section 2.4.1 https://www.rfc-editor.org/rfc/rfc4644#section-2.4.1",
+                        kind: RequestKind::Check,
+                        frame: b"238 send article to be transferred\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "TAKETHIS rejects malformed success response message-id",
+                        reference: "RFC 4644 section 2.5.1 https://www.rfc-editor.org/rfc/rfc4644#section-2.5.1",
+                        kind: RequestKind::TakeThis,
+                        frame: b"239 take@test article transferred ok\r\n",
                     },
                     ResponseFrameCase {
                         name: "POST rejects IHAVE continuation",

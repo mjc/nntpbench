@@ -2367,6 +2367,9 @@ fn validate_response_initial_line(kind: RequestKind, status: StatusCode, line: &
         (RequestKind::Stat | RequestKind::Last | RequestKind::Next, 223) => {
             validate_article_status_response_arguments(&line[4..line.len() - 2])
         }
+        (RequestKind::Check, 238) | (RequestKind::TakeThis, 239) => {
+            validate_message_id_response_argument(&line[4..line.len() - 2])
+        }
         _ => true,
     }
 }
@@ -2438,6 +2441,16 @@ fn validate_article_status_response_arguments(value: &[u8]) -> bool {
         && std::str::from_utf8(tokens[1])
             .ok()
             .is_some_and(|message_id| MessageId::from_borrowed(message_id).is_ok())
+}
+
+fn validate_message_id_response_argument(value: &[u8]) -> bool {
+    let Some((tokens, _trailing_text)) = split_required_response_tokens::<1>(value) else {
+        return false;
+    };
+
+    std::str::from_utf8(tokens[0])
+        .ok()
+        .is_some_and(|message_id| MessageId::from_borrowed(message_id).is_ok())
 }
 
 fn validate_multiline_response_content(kind: RequestKind, content: &[u8]) -> bool {
@@ -5286,6 +5299,74 @@ mod tests {
                 matches!(
                     ResponseFrame::parse(kind, input),
                     ResponseFrameParse::Invalid
+                ),
+                "{kind:?} {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn streaming_response_frame_validates_rfc4644_message_id_arguments() {
+        // RFC 4644 sections 2.4.1 and 2.5.1 define the successful CHECK and
+        // TAKETHIS response lines with a message-id parameter:
+        // https://www.rfc-editor.org/rfc/rfc4644#section-2.4.1
+        for (kind, input) in [
+            (
+                RequestKind::Check,
+                b"238 <check@test> send article to be transferred\r\n".as_slice(),
+            ),
+            (
+                RequestKind::TakeThis,
+                b"239 <take@test> article transferred ok\r\n".as_slice(),
+            ),
+        ] {
+            assert!(
+                matches!(
+                    ResponseFrame::parse(kind, input),
+                    ResponseFrameParse::Complete(response)
+                        if response.descriptor().framing() == ResponseFraming::SingleLine
+                ),
+                "{kind:?} {input:?}"
+            );
+            assert!(
+                matches!(
+                    ResponseInitial::parse(kind, input),
+                    ResponseInitialParse::Complete(initial)
+                        if initial.descriptor().framing() == ResponseFraming::SingleLine
+                ),
+                "{kind:?} {input:?}"
+            );
+        }
+
+        for (kind, input) in [
+            (
+                RequestKind::Check,
+                b"238 send article to be transferred\r\n".as_slice(),
+            ),
+            (
+                RequestKind::Check,
+                b"238 check@test send article to be transferred\r\n".as_slice(),
+            ),
+            (
+                RequestKind::TakeThis,
+                b"239 article transferred ok\r\n".as_slice(),
+            ),
+            (
+                RequestKind::TakeThis,
+                b"239 <take test> article transferred ok\r\n".as_slice(),
+            ),
+        ] {
+            assert!(
+                matches!(
+                    ResponseFrame::parse(kind, input),
+                    ResponseFrameParse::Invalid
+                ),
+                "{kind:?} {input:?}"
+            );
+            assert!(
+                matches!(
+                    ResponseInitial::parse(kind, input),
+                    ResponseInitialParse::Invalid
                 ),
                 "{kind:?} {input:?}"
             );
