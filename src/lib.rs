@@ -4385,6 +4385,9 @@ fn overview_selector_error(
         overview_selector_is_range(selector)
             && !overview_selector_range_selects_articles(selector, session_state.article_count())
     }) {
+        if matches!(command.kind, RequestKind::Xover) {
+            return Some(b"420 no article(s) selected\r\n");
+        }
         return Some(b"423 no articles in that range\r\n");
     }
     if selector.is_some_and(|selector| {
@@ -4397,6 +4400,9 @@ fn overview_selector_error(
         .article_id
         .is_some_and(|article_id| article_id > session_state.article_count())
     {
+        if matches!(command.kind, RequestKind::Xover) {
+            return Some(b"420 no article(s) selected\r\n");
+        }
         return Some(b"423 no article with that number\r\n");
     }
     if (command.message_id.is_some() || selector.is_some_and(|value| value.starts_with(b"<")))
@@ -7260,9 +7266,9 @@ mod tests {
 
         #[tokio::test]
         async fn rfc2980_red_xover_zero_range_returns_501() {
-            // RFC 2980 section 2.1.7 uses an article range for XOVER. Article
+            // RFC 2980 section 2.8 uses an article range for XOVER. Article
             // number zero is outside the RFC 3977 article-number grammar:
-            // https://www.rfc-editor.org/rfc/rfc2980#section-2.1.7
+            // https://www.rfc-editor.org/rfc/rfc2980#section-2.8
             let input = b"XOVER 0\r\n";
             let (output, _) = run_session_with_input(test_config(), input).await;
             assert_single_response(input, b"501 command syntax error\r\n", &output, "RFC 2980");
@@ -7348,7 +7354,7 @@ mod tests {
                 },
                 ServerResponseCase {
                     name: "XOVER range selector before GROUP",
-                    reference: "RFC 2980 section 2.1.7 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.7",
+                    reference: "RFC 2980 section 2.8 https://www.rfc-editor.org/rfc/rfc2980#section-2.8",
                     input: b"XOVER 1-3\r\n",
                     expected: b"412 no newsgroup selected\r\n",
                 },
@@ -7500,7 +7506,7 @@ mod tests {
                 },
                 ServerResponseCase {
                     name: "XOVER numeric selector 2",
-                    reference: "RFC 2980 section 2.1.7 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.7",
+                    reference: "RFC 2980 section 2.8 https://www.rfc-editor.org/rfc/rfc2980#section-2.8",
                     input: b"GROUP alt.test\r\nXOVER 2\r\n",
                     expected: OVER_2_RESPONSE,
                 },
@@ -7596,7 +7602,7 @@ mod tests {
                 },
                 ServerResponseCase {
                     name: "XOVER range selector 1-2 returns both article rows",
-                    reference: "RFC 2980 section 2.1.7 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.7",
+                    reference: "RFC 2980 section 2.8 https://www.rfc-editor.org/rfc/rfc2980#section-2.8",
                     input: b"GROUP alt.test\r\nXOVER 1-2\r\n",
                     expected: OVER_RANGE_RESPONSE,
                 },
@@ -7608,7 +7614,7 @@ mod tests {
                 },
                 ServerResponseCase {
                     name: "XOVER range selector 2-",
-                    reference: "RFC 2980 section 2.1.7 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.7",
+                    reference: "RFC 2980 section 2.8 https://www.rfc-editor.org/rfc/rfc2980#section-2.8",
                     input: b"GROUP alt.test\r\nXOVER 2-\r\n",
                     expected: OVER_2_RESPONSE,
                 },
@@ -7649,16 +7655,16 @@ mod tests {
                     expected: b"423 no articles in that range\r\n",
                 },
                 ServerResponseCase {
-                    name: "XOVER empty range returns 423",
-                    reference: "RFC 2980 section 2.1.7 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.7",
+                    name: "XOVER empty range returns 420",
+                    reference: "RFC 2980 section 2.8 https://www.rfc-editor.org/rfc/rfc2980#section-2.8",
                     input: b"GROUP alt.test\r\nXOVER 4-\r\n",
-                    expected: b"423 no articles in that range\r\n",
+                    expected: b"420 no article(s) selected\r\n",
                 },
                 ServerResponseCase {
-                    name: "XOVER reversed range returns 423",
-                    reference: "RFC 3977 section 6.1.2 and RFC 2980 section 2.1.7 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.2",
+                    name: "XOVER reversed range returns 420",
+                    reference: "RFC 2980 section 2.8 https://www.rfc-editor.org/rfc/rfc2980#section-2.8",
                     input: b"GROUP alt.test\r\nXOVER 3-1\r\n",
-                    expected: b"423 no articles in that range\r\n",
+                    expected: b"420 no article(s) selected\r\n",
                 },
                 ServerResponseCase {
                     name: "HDR Subject empty range returns 423",
@@ -7712,12 +7718,6 @@ mod tests {
                     name: "OVER message-id selector uses article number 0",
                     reference: "RFC 3977 section 8.3.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.3.2",
                     input: b"OVER <one@example.com>\r\n",
-                    expected: OVER_MESSAGE_ID_RESPONSE,
-                },
-                ServerResponseCase {
-                    name: "XOVER message-id selector uses article number 0",
-                    reference: "RFC 2980 section 2.1.7 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.7",
-                    input: b"XOVER <one@example.com>\r\n",
                     expected: OVER_MESSAGE_ID_RESPONSE,
                 },
                 ServerResponseCase {
@@ -8126,7 +8126,7 @@ mod tests {
                 },
                 ServerResponseCase {
                     name: "XOVER current before GROUP",
-                    reference: "RFC 2980 section 2.1.7 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.7",
+                    reference: "RFC 2980 section 2.8 https://www.rfc-editor.org/rfc/rfc2980#section-2.8",
                     input: b"XOVER\r\n",
                     expected: b"412 no newsgroup selected\r\n",
                 },
@@ -8190,7 +8190,7 @@ mod tests {
                 },
                 ServerResponseCase {
                     name: "XOVER current article follows ARTICLE 2",
-                    reference: "RFC 2980 section 2.1.7 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.7",
+                    reference: "RFC 2980 section 2.8 https://www.rfc-editor.org/rfc/rfc2980#section-2.8",
                     input: b"GROUP alt.test\r\nARTICLE 2\r\nXOVER\r\n",
                     expected: OVER_2_RESPONSE,
                 },
@@ -9024,8 +9024,14 @@ mod tests {
                     },
                     ServerResponseCase {
                         name: "XOVER extra argument",
-                        reference: "RFC 2980 section 2.1.7 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.7",
+                        reference: "RFC 2980 section 2.8 https://www.rfc-editor.org/rfc/rfc2980#section-2.8",
                         input: b"XOVER 1-2 extra\r\n",
+                        expected: b"501 command syntax error\r\n",
+                    },
+                    ServerResponseCase {
+                        name: "XOVER message-id selector",
+                        reference: "RFC 2980 section 2.8 https://www.rfc-editor.org/rfc/rfc2980#section-2.8",
+                        input: b"XOVER <one@example.com>\r\n",
                         expected: b"501 command syntax error\r\n",
                     },
                     ServerResponseCase {
@@ -9222,7 +9228,7 @@ mod tests {
                     },
                     ResponseFrameCase {
                         name: "XOVER accepts omitted trailing overview fields",
-                        reference: "RFC 2980 section 2.1.7 and RFC 3977 section 8.3.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.3.2",
+                        reference: "RFC 2980 section 2.8 and RFC 3977 section 8.3.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.3.2",
                         kind: RequestKind::Xover,
                         frame: b"224 overview follows\r\n1\tSubject only\r\n.\r\n",
                     },
@@ -9234,7 +9240,7 @@ mod tests {
                     },
                     ResponseFrameCase {
                         name: "XOVER accepts empty bytes metadata with numeric lines",
-                        reference: "RFC 2980 section 2.1.7 and RFC 3977 section 8.3.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.3.2",
+                        reference: "RFC 2980 section 2.8 and RFC 3977 section 8.3.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.3.2",
                         kind: RequestKind::Xover,
                         frame: b"224 overview follows\r\n1\tSubject\tfrom@test\tdate\t<one@test>\t\t\t1\r\n.\r\n",
                     },
@@ -9889,13 +9895,13 @@ mod tests {
                     },
                     ResponseFrameCase {
                         name: "XOVER rejects body row without numeric article number",
-                        reference: "RFC 2980 section 2.1.7 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.7",
+                        reference: "RFC 2980 section 2.8 https://www.rfc-editor.org/rfc/rfc2980#section-2.8",
                         kind: RequestKind::Xover,
                         frame: b"224 overview follows\r\none\tSubject\tfrom@test\r\n.\r\n",
                     },
                     ResponseFrameCase {
                         name: "XOVER rejects labeled lines metadata field",
-                        reference: "RFC 2980 section 2.1.7 and RFC 3977 sections 8.1.2 and 8.3.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.3.2",
+                        reference: "RFC 2980 section 2.8 and RFC 3977 sections 8.1.2 and 8.3.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.3.2",
                         kind: RequestKind::Xover,
                         frame: b"224 overview follows\r\n1\tSubject\tfrom@test\tdate\t<one@test>\t\t1\tlines 1\r\n.\r\n",
                     },
@@ -12351,12 +12357,6 @@ mod tests {
             let read = third.read(&mut request).await.unwrap();
             assert_eq!(&request[..read], b"XOVER 1-10\r\n");
             third.write_all(XOVER_RESPONSE).await.unwrap();
-
-            let (mut fourth, _) = listener.accept().await.unwrap();
-            fourth.write_all(b"201 fetch ready\r\n").await.unwrap();
-            let read = fourth.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"XOVER <overview@test>\r\n");
-            fourth.write_all(XOVER_RESPONSE).await.unwrap();
         });
 
         let mut over_range_args = test_fetch_args();
@@ -12385,15 +12385,6 @@ mod tests {
         let xover_range = fetch_response(&xover_range_args).await.unwrap();
         assert_eq!(xover_range.kind(), RequestKind::Xover);
         assert_eq!(xover_range.status().as_u16(), 224);
-
-        let mut xover_message_id_args = test_fetch_args();
-        xover_message_id_args.connect = addr;
-        xover_message_id_args.request = FetchRequestKind::Xover;
-        xover_message_id_args.message_id = None;
-        xover_message_id_args.selector = Some("<overview@test>".to_string());
-        let xover_message_id = fetch_response(&xover_message_id_args).await.unwrap();
-        assert_eq!(xover_message_id.kind(), RequestKind::Xover);
-        assert_eq!(xover_message_id.status().as_u16(), 224);
 
         server.await.unwrap();
     }
@@ -13277,7 +13268,7 @@ mod tests {
                 OVER_RANGE_RESPONSE,
                 OVER_MESSAGE_ID_RESPONSE,
                 XOVER_RESPONSE,
-                OVER_MESSAGE_ID_RESPONSE
+                b"501 command syntax error\r\n",
             ]
             .concat()
         );
@@ -13845,12 +13836,6 @@ mod tests {
             &mut output,
         ));
         assert!(!process_request_to_buffer(
-            RequestLine::parse(b"XOVER <overview@test>\r\n"),
-            &config,
-            &stats,
-            &mut output,
-        ));
-        assert!(!process_request_to_buffer(
             RequestLine::parse(b"HDR Subject 1\r\n"),
             &config,
             &stats,
@@ -13881,7 +13866,6 @@ mod tests {
                 OVER_RANGE_RESPONSE,
                 OVER_MESSAGE_ID_RESPONSE,
                 XOVER_RESPONSE,
-                OVER_MESSAGE_ID_RESPONSE,
                 HDR_SUBJECT_1_RESPONSE,
                 HDR_MESSAGE_ID_1_RESPONSE,
                 XHDR_SUBJECT_1_RESPONSE,
@@ -13889,7 +13873,7 @@ mod tests {
             ]
             .concat()
         );
-        assert_eq!(stats.snapshot().commands, 8);
+        assert_eq!(stats.snapshot().commands, 7);
     }
 
     #[test]

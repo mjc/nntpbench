@@ -1371,7 +1371,7 @@ impl ClientConnection {
     /// Send an XOVER request and return the owned response frame.
     pub async fn xover(
         &self,
-        selector: ArticleSelector<'static>,
+        selector: ListGroupRange<'static>,
     ) -> Result<OwnedResponse, ClientError> {
         self.execute(Request::Xover { selector }).await
     }
@@ -1379,7 +1379,7 @@ impl ClientConnection {
     /// Send an XOVER request and return the completed request/response pair.
     pub async fn xover_exchange(
         &self,
-        selector: ArticleSelector<'static>,
+        selector: ListGroupRange<'static>,
     ) -> Result<OwnedExchange, ClientError> {
         self.execute_exchange(Request::Xover { selector }).await
     }
@@ -4809,8 +4809,6 @@ mod tests {
             stream.write_all(crate::OVER_RESPONSE).await.unwrap();
             assert_read_request(&mut stream, b"XOVER 1-10\r\n").await;
             stream.write_all(crate::XOVER_RESPONSE).await.unwrap();
-            assert_read_request(&mut stream, b"XOVER <overview@test>\r\n").await;
-            stream.write_all(crate::XOVER_RESPONSE).await.unwrap();
         });
 
         let connection = ClientConnection::connect(addr).await.unwrap();
@@ -4823,11 +4821,7 @@ mod tests {
             .await
             .unwrap();
         let xover_range = connection
-            .xover(ArticleSelector::from_owned("1-10").unwrap())
-            .await
-            .unwrap();
-        let xover_message_id = connection
-            .xover(ArticleSelector::from_owned("<overview@test>").unwrap())
+            .xover(ListGroupRange::from_owned("1-10").unwrap())
             .await
             .unwrap();
 
@@ -4840,9 +4834,6 @@ mod tests {
         assert_eq!(xover_range.kind(), RequestKind::Xover);
         assert_eq!(xover_range.status().as_u16(), 224);
         assert_eq!(xover_range.as_bytes(), crate::XOVER_RESPONSE);
-        assert_eq!(xover_message_id.kind(), RequestKind::Xover);
-        assert_eq!(xover_message_id.status().as_u16(), 224);
-        assert_eq!(xover_message_id.as_bytes(), crate::XOVER_RESPONSE);
 
         server.await.unwrap();
     }
@@ -5307,15 +5298,13 @@ mod tests {
             stream.write_all(crate::OVER_RESPONSE).await.unwrap();
             assert_read_request(&mut stream, b"XOVER 1-10\r\n").await;
             stream.write_all(crate::XOVER_RESPONSE).await.unwrap();
-            assert_read_request(&mut stream, b"XOVER <overview@test>\r\n").await;
-            stream.write_all(crate::XOVER_RESPONSE).await.unwrap();
         });
 
         let client = Client::connect(addr).await.unwrap();
         let over_range = client.over("1-10").await.unwrap();
         let over_message_id = client.over("<overview@test>").await.unwrap();
         let xover_range = client.xover("1-10").await.unwrap();
-        let xover_message_id = client.xover_exchange("<overview@test>").await.unwrap();
+        let xover_message_id = client.xover_exchange("<overview@test>").await;
 
         assert_eq!(over_range.kind(), RequestKind::Over);
         assert_eq!(over_range.status().as_u16(), 224);
@@ -5323,15 +5312,10 @@ mod tests {
         assert_eq!(over_message_id.status().as_u16(), 224);
         assert_eq!(xover_range.kind(), RequestKind::Xover);
         assert_eq!(xover_range.status().as_u16(), 224);
-        assert_eq!(
-            xover_message_id
-                .request()
-                .overview_selector()
-                .map(ArticleSelector::as_str),
-            Some("<overview@test>")
-        );
-        assert_eq!(xover_message_id.response().kind(), RequestKind::Xover);
-        assert_eq!(xover_message_id.response().status().as_u16(), 224);
+        assert!(matches!(
+            xover_message_id,
+            Err(ClientError::InvalidArticleSelector)
+        ));
 
         server.await.unwrap();
     }

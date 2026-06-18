@@ -1180,16 +1180,17 @@ mod proptests {
         #[test]
         fn overview_and_header_requests_preserve_rfc_wire_forms(
             selector in article_selector_strategy(),
+            range in listgroup_range_strategy(),
             header in header_name_strategy(),
         ) {
             let over = Request::over(&selector).unwrap();
-            let xover = Request::xover(&selector).unwrap();
+            let xover = Request::xover(&range).unwrap();
             let hdr = Request::hdr(&header, &selector).unwrap();
             let xhdr = Request::xhdr(&header, &selector).unwrap();
 
             for (request, expected_kind, expected_args) in [
                 (over, RequestKind::Over, selector.clone()),
-                (xover, RequestKind::Xover, selector.clone()),
+                (xover, RequestKind::Xover, range.clone()),
                 (hdr, RequestKind::Hdr, format!("{header} {selector}")),
                 (xhdr, RequestKind::Xhdr, format!("{header} {selector}")),
             ] {
@@ -1456,15 +1457,12 @@ mod proptests {
             );
 
             let over = Request::over(&selector).unwrap();
-            let xover = Request::xover(&selector).unwrap();
+            let xover = Request::xover(&range).unwrap();
             prop_assert_eq!(
                 over.overview_selector().map(ArticleSelector::as_str),
                 Some(selector.as_str())
             );
-            prop_assert_eq!(
-                xover.overview_selector().map(ArticleSelector::as_str),
-                Some(selector.as_str())
-            );
+            prop_assert!(xover.overview_selector().is_none());
 
             let hdr = Request::hdr(&header, &selector).unwrap();
             let xhdr = Request::xhdr(&header, &selector).unwrap();
@@ -2296,7 +2294,8 @@ fn is_specific_error_status_for_request(kind: RequestKind, code: u16) -> bool {
         RequestKind::ListGroup => matches!(code, 411 | 412),
         RequestKind::Last => matches!(code, 412 | 420 | 422),
         RequestKind::Next => matches!(code, 412 | 420 | 421),
-        RequestKind::Over | RequestKind::Xover => matches!(code, 412 | 420 | 423 | 430),
+        RequestKind::Over => matches!(code, 412 | 420 | 423 | 430),
+        RequestKind::Xover => code == 420,
         RequestKind::Hdr | RequestKind::Xhdr => matches!(code, 412 | 420 | 423 | 430),
         RequestKind::Post => matches!(code, 440 | 441),
         RequestKind::Ihave => matches!(code, 435..=437),
@@ -3243,7 +3242,7 @@ pub enum Request<'a> {
         selector: ArticleSelector<'a>,
     },
     Xover {
-        selector: ArticleSelector<'a>,
+        selector: ListGroupRange<'a>,
     },
     Hdr {
         header: HeaderName<'a>,
@@ -3518,7 +3517,7 @@ impl<'a> Request<'a> {
     #[must_use]
     pub const fn overview_selector(&self) -> Option<&ArticleSelector<'a>> {
         match self {
-            Self::Over { selector } | Self::Xover { selector } => Some(selector),
+            Self::Over { selector } => Some(selector),
             Self::Article { .. }
             | Self::Body { .. }
             | Self::Head { .. }
@@ -3528,6 +3527,7 @@ impl<'a> Request<'a> {
             | Self::ListGroup { .. }
             | Self::Last
             | Self::Next
+            | Self::Xover { .. }
             | Self::Hdr { .. }
             | Self::Xhdr { .. }
             | Self::NewGroups { .. }
@@ -3980,7 +3980,7 @@ impl Request<'static> {
     /// Build an XOVER request.
     pub fn xover(selector: impl AsRef<str>) -> Result<Self, InvalidArticleSelector> {
         Ok(Self::Xover {
-            selector: ArticleSelector::from_owned(selector)?,
+            selector: ListGroupRange::from_owned(selector).map_err(|_| InvalidArticleSelector)?,
         })
     }
 
@@ -4531,8 +4531,15 @@ fn classify_direct_command(kind: RequestKind, args: &[u8]) -> RequestKind {
                 _ => RequestKind::Unknown,
             }
         }
-        RequestKind::Over | RequestKind::Xover => {
+        RequestKind::Over => {
             if args.is_empty() || validate_utf8_arg(args, ArticleSelector::from_borrowed).is_ok() {
+                kind
+            } else {
+                RequestKind::Unknown
+            }
+        }
+        RequestKind::Xover => {
+            if args.is_empty() || validate_utf8_arg(args, ListGroupRange::from_borrowed).is_ok() {
                 kind
             } else {
                 RequestKind::Unknown
@@ -6534,7 +6541,7 @@ mod tests {
             selector: ArticleSelector::from_borrowed("1-10").unwrap(),
         };
         let xover = Request::Xover {
-            selector: ArticleSelector::from_borrowed("<o@v>").unwrap(),
+            selector: ListGroupRange::from_borrowed("1-10").unwrap(),
         };
         let hdr = Request::Hdr {
             header: HeaderName::from_borrowed("Subject").unwrap(),
@@ -6671,7 +6678,7 @@ mod tests {
         wire.clear();
         xover.write_wire_to(&mut wire);
         assert_eq!(xover.kind(), RequestKind::Xover);
-        assert_eq!(wire, b"XOVER <o@v>\r\n");
+        assert_eq!(wire, b"XOVER 1-10\r\n");
 
         wire.clear();
         hdr.write_wire_to(&mut wire);
@@ -6814,7 +6821,7 @@ mod tests {
         let last = Request::last();
         let next = Request::next();
         let over = Request::over("1-10").unwrap();
-        let xover = Request::xover("<g@h>").unwrap();
+        let xover = Request::xover("1-10").unwrap();
         let hdr = Request::hdr("Subject", "1-10").unwrap();
         let xhdr = Request::xhdr("Message-ID", "<g@h>").unwrap();
         let newgroups = Request::newgroups("20260101", "000000", true).unwrap();
@@ -6893,10 +6900,7 @@ mod tests {
             Some("1-10")
         );
         assert_eq!(xover.kind(), RequestKind::Xover);
-        assert_eq!(
-            xover.overview_selector().map(ArticleSelector::as_str),
-            Some("<g@h>")
-        );
+        assert!(xover.overview_selector().is_none());
         assert_eq!(hdr.kind(), RequestKind::Hdr);
         assert_eq!(
             hdr.header_query()
@@ -7101,7 +7105,7 @@ mod tests {
             Request::last(),
             Request::next(),
             Request::over("1-10").unwrap(),
-            Request::xover("<i@j>").unwrap(),
+            Request::xover("1-10").unwrap(),
             Request::hdr("Subject", "1-10").unwrap(),
             Request::xhdr("Message-ID", "<i@j>").unwrap(),
             Request::newgroups("20260101", "000000", true).unwrap(),
