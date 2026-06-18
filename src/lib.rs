@@ -205,7 +205,7 @@ pub const STAT_RESPONSE: &[u8] = b"223 1 <article.1@nntpbench.local> article ret
 pub const HELP_RESPONSE: &[u8] =
     b"100 help text follows\r\nARTICLE\r\nAUTHINFO\r\nBODY\r\nCAPABILITIES\r\nCHECK\r\nDATE\r\nGROUP\r\nHDR\r\nHEAD\r\nHELP\r\nIHAVE\r\nLAST\r\nLIST\r\nLISTGROUP\r\nMODE READER\r\nNEWGROUPS\r\nNEWNEWS\r\nNEXT\r\nOVER\r\nPOST\r\nQUIT\r\nSTARTTLS\r\nSTAT\r\nTAKETHIS\r\nXHDR\r\nXOVER\r\n.\r\n";
 pub const CAPABILITIES_RESPONSE: &[u8] =
-    b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nMODE-READER\r\nLIST ACTIVE ACTIVE.TIMES DISTRIB.PATS NEWSGROUPS OVERVIEW.FMT HEADERS\r\nOVER MSGID\r\nHDR\r\nNEWNEWS\r\nAUTHINFO\r\n.\r\n";
+    b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nLIST ACTIVE ACTIVE.TIMES DISTRIB.PATS NEWSGROUPS OVERVIEW.FMT HEADERS\r\nOVER MSGID\r\nHDR\r\nNEWNEWS\r\nAUTHINFO\r\n.\r\n";
 pub const QUIT_RESPONSE: &[u8] = b"205 closing connection\r\n";
 pub const ARTICLE_NOT_FOUND_RESPONSE: &[u8] = b"430 no article with that number\r\n";
 const BODY_RESPONSE_PREFIX: &[u8] = b"222 1 <article.1@nntpbench.local> body follows\r\n";
@@ -6031,14 +6031,15 @@ mod tests {
         async fn rfc3977_red_capabilities_do_not_advertise_unavailable_extensions() {
             // RFC 3977 section 3.3 requires CAPABILITIES to describe available
             // protocol extensions. RFC 4642 STARTTLS, RFC 4643 SASL, and RFC 4644
-            // STREAMING must not be advertised when their commands are unavailable:
+            // STREAMING must not be advertised when their commands are unavailable.
+            // Section 3.4.2 also reserves MODE-READER for mode-switching transit
+            // mode; this server offers reader commands immediately:
             // https://www.rfc-editor.org/rfc/rfc3977#section-3.3
+            // https://www.rfc-editor.org/rfc/rfc3977#section-3.4.2
             let (output, _) = run_session_with_input(test_config(), b"CAPABILITIES\r\n").await;
             let text = String::from_utf8_lossy(without_greeting(&output));
             assert!(
-                text.contains("VERSION 2")
-                    && text.contains("READER\r\n")
-                    && text.contains("MODE-READER\r\n"),
+                text.contains("VERSION 2") && text.contains("READER\r\n"),
                 "missing required RFC 3977 base/reader capabilities, got {text:?}"
             );
             assert!(
@@ -6049,8 +6050,25 @@ mod tests {
                 !text.contains("AUTHINFO USER")
                     && !text.contains("STARTTLS")
                     && !text.contains("SASL")
-                    && !text.contains("STREAMING"),
+                    && !text.contains("STREAMING")
+                    && !text.contains("MODE-READER"),
                 "advertised unavailable extension capability, got {text:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn rfc3977_red_capabilities_after_mode_reader_still_omit_mode_reader() {
+            // RFC 3977 section 3.4.2 requires reading mode to advertise READER and
+            // not advertise MODE-READER after a successful MODE READER command:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-3.4.2
+            let input = b"MODE READER\r\nCAPABILITIES\r\n";
+            let (output, _) = run_session_with_input(test_config(), input).await;
+            let text = String::from_utf8_lossy(without_greeting(&output));
+            assert!(
+                (text.starts_with("200 ") || text.starts_with("201 "))
+                    && text.contains("\r\nREADER\r\n")
+                    && !text.contains("MODE-READER"),
+                "RFC 3977 reading-mode capabilities should omit MODE-READER, got {text:?}"
             );
         }
 
