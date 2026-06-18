@@ -5648,6 +5648,32 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn rfc4643_red_authinfo_sasl_initial_response_is_valid_syntax() {
+            // RFC 4643 section 2.4.1 allows AUTHINFO SASL to include an
+            // optional base64 initial response. Unsupported mechanisms still
+            // fail as 503, not as command syntax errors:
+            // https://www.rfc-editor.org/rfc/rfc4643#section-2.4.1
+            let input = b"AUTHINFO SASL made-up-mechanism =\r\n";
+            let (output, _) = run_session_with_input(test_config(), input).await;
+            assert_single_response(
+                input,
+                b"503 unsupported authentication mechanism\r\n",
+                &output,
+                "RFC 4643",
+            );
+        }
+
+        #[tokio::test]
+        async fn rfc4643_red_authinfo_sasl_rejects_malformed_initial_response() {
+            // RFC 4643 section 2.4.2 requires SASL initial responses to use
+            // valid base64 syntax; padding cannot appear in the middle:
+            // https://www.rfc-editor.org/rfc/rfc4643#section-2.4.2
+            let input = b"AUTHINFO SASL made-up-mechanism AAA=BBB\r\n";
+            let (output, _) = run_session_with_input(test_config(), input).await;
+            assert_single_response(input, b"501 command syntax error\r\n", &output, "RFC 4643");
+        }
+
+        #[tokio::test]
         async fn rfc4644_red_check_not_advertised_as_streaming_returns_502() {
             // RFC 4644 section 2 makes CHECK part of the streaming extension. A
             // server that does not advertise STREAMING should reject CHECK:

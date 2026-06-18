@@ -3716,28 +3716,53 @@ fn validate_newnews_args(args: &[u8]) -> Result<(), ()> {
 
 fn classify_authinfo_command(args: &[u8]) -> RequestKind {
     let mut parts = args.split(|byte| *byte == b' ');
-    match (parts.next(), parts.next(), parts.next()) {
-        (Some(subcommand), Some(value), None)
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(subcommand), Some(value), None, None)
             if eq_ignore_ascii_case_const(subcommand, b"USER")
                 && validate_utf8_arg(value, AuthInfoValue::from_borrowed).is_ok() =>
         {
             RequestKind::AuthInfoUser
         }
-        (Some(subcommand), Some(value), None)
+        (Some(subcommand), Some(value), None, None)
             if eq_ignore_ascii_case_const(subcommand, b"PASS")
                 && validate_utf8_arg(value, AuthInfoValue::from_borrowed).is_ok() =>
         {
             RequestKind::AuthInfoPass
         }
-        (Some(subcommand), Some(value), None)
+        (Some(subcommand), Some(value), None, None)
             if eq_ignore_ascii_case_const(subcommand, b"SASL")
                 && validate_utf8_arg(value, AuthInfoValue::from_borrowed).is_ok() =>
         {
             RequestKind::AuthInfo
         }
-        (None, None, None) => RequestKind::AuthInfo,
+        (Some(subcommand), Some(mechanism), Some(initial_response), None)
+            if eq_ignore_ascii_case_const(subcommand, b"SASL")
+                && validate_utf8_arg(mechanism, AuthInfoValue::from_borrowed).is_ok()
+                && validate_sasl_initial_response(initial_response).is_ok() =>
+        {
+            RequestKind::AuthInfo
+        }
         _ => RequestKind::Unknown,
     }
+}
+
+fn validate_sasl_initial_response(value: &[u8]) -> Result<(), ()> {
+    if value == b"=" {
+        return Ok(());
+    }
+    if value.is_empty() {
+        return Err(());
+    }
+
+    let mut seen_padding = false;
+    for byte in value {
+        match *byte {
+            b'=' => seen_padding = true,
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/' if !seen_padding => {}
+            _ => return Err(()),
+        }
+    }
+    Ok(())
 }
 
 fn classify_subcommand(
@@ -4349,6 +4374,7 @@ mod tests {
             (b"AUTHINFO USER test".as_slice(), RequestKind::AuthInfoUser),
             (b"AUTHINFO PASS test".as_slice(), RequestKind::AuthInfoPass),
             (b"AUTHINFO SASL test".as_slice(), RequestKind::AuthInfo),
+            (b"AUTHINFO SASL test =".as_slice(), RequestKind::AuthInfo),
             (b"STARTTLS".as_slice(), RequestKind::StartTls),
             (b"article <a@b>".as_slice(), RequestKind::Article),
             (b"authinfo user test".as_slice(), RequestKind::AuthInfoUser),
