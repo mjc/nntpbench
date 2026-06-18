@@ -2351,6 +2351,12 @@ where
     match command.kind {
         RequestKind::Article => {
             session_stats.article_requests += 1;
+            if let Some(response) =
+                article_selector_error(command, command_lines, session_state, true)
+            {
+                write_response(writer, pending_write, response, session_stats).await?;
+                return Ok(false);
+            }
             if config.article_dir.is_some() {
                 let message_id = command_lines.and_then(|lines| command_message_id(command, lines));
                 if write_stored_article_response(
@@ -2369,16 +2375,10 @@ where
                 write_response(
                     writer,
                     pending_write,
-                    ARTICLE_NOT_FOUND_RESPONSE,
+                    article_not_found_response(command.article_id, message_id.as_ref()),
                     session_stats,
                 )
                 .await?;
-                return Ok(false);
-            }
-            if let Some(response) =
-                article_selector_error(command, command_lines, session_state, true)
-            {
-                write_response(writer, pending_write, response, session_stats).await?;
                 return Ok(false);
             }
             if let Some(message_id) =
@@ -3117,11 +3117,19 @@ where
                 {
                     return false;
                 }
-                stats
-                    .bytes_sent
-                    .fetch_add(ARTICLE_NOT_FOUND_RESPONSE.len() as u64, Ordering::Relaxed);
+                stats.bytes_sent.fetch_add(
+                    article_not_found_response(
+                        parse_article_id_arg(request.args()),
+                        request.message_id().as_ref(),
+                    )
+                    .len() as u64,
+                    Ordering::Relaxed,
+                );
                 output
-                    .write_all(ARTICLE_NOT_FOUND_RESPONSE)
+                    .write_all(article_not_found_response(
+                        parse_article_id_arg(request.args()),
+                        request.message_id().as_ref(),
+                    ))
                     .expect("response write failed");
                 return false;
             }
@@ -3333,6 +3341,19 @@ fn open_stored_article_response(
         );
     }
     Ok(None)
+}
+
+fn article_not_found_response(
+    article_id: Option<u64>,
+    message_id: Option<&MessageId<'_>>,
+) -> &'static [u8] {
+    if message_id.is_some() {
+        b"430 no article with that message-id\r\n"
+    } else if article_id.is_some() {
+        b"423 no article with that number\r\n"
+    } else {
+        b"420 no current article selected\r\n"
+    }
 }
 
 async fn write_stored_article_response<W>(
@@ -4701,9 +4722,16 @@ mod tests {
         }
 
         async fn assert_red_server_response_cases(cases: &[ServerResponseCase]) {
+            assert_red_server_response_cases_with_config(test_config(), cases).await;
+        }
+
+        async fn assert_red_server_response_cases_with_config(
+            config: Arc<ServerConfig>,
+            cases: &[ServerResponseCase],
+        ) {
             let mut failures = Vec::new();
             for case in cases {
-                let (output, _) = run_session_with_input(test_config(), case.input).await;
+                let (output, _) = run_session_with_input(config.clone(), case.input).await;
                 let actual = without_greeting(&output);
                 if actual != case.expected {
                     failures.push(format!(
@@ -4897,6 +4925,58 @@ mod tests {
                 },
             ])
             .await;
+        }
+
+        #[tokio::test]
+        async fn rfc3977_red_article_file_backend_preserves_selector_state_and_errors() {
+            // RFC 3977 section 6.2.1 keeps numeric ARTICLE selectors scoped to
+            // the selected group even when articles are served from a local store:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-6.2.1
+            let article_dir = unique_temp_dir("rfc-article-dir");
+            let response =
+                b"220 2 <article.2@test> article follows\r\nSubject: stored\r\n\r\nbody\r\n.\r\n";
+            let path = article_id_tree_path(&article_dir, 2);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, response).unwrap();
+
+            let message_response =
+                b"220 1 <stored@ngPost> article follows\r\nSubject: message\r\n\r\nbody\r\n.\r\n";
+            let message_id = MessageId::from_borrowed("<stored@ngPost>").unwrap();
+            let message_path = message_id_tree_path(&article_dir, &message_id);
+            fs::create_dir_all(message_path.parent().unwrap()).unwrap();
+            fs::write(&message_path, message_response).unwrap();
+
+            let mut args = test_args();
+            args.article_dir = Some(article_dir.clone());
+            let config = Arc::new(ServerConfig::from_args(args));
+            assert_red_server_response_cases_with_config(
+                config.clone(),
+                &[
+                    ServerResponseCase {
+                        name: "stored numeric ARTICLE before GROUP",
+                        reference: "RFC 3977 section 6.2.1 https://www.rfc-editor.org/rfc/rfc3977#section-6.2.1",
+                        input: b"ARTICLE 2\r\n",
+                        expected: b"412 no newsgroup selected\r\n",
+                    },
+                    ServerResponseCase {
+                        name: "stored missing message-id ARTICLE",
+                        reference: "RFC 3977 section 6.2.1 https://www.rfc-editor.org/rfc/rfc3977#section-6.2.1",
+                        input: b"ARTICLE <missing@ngPost>\r\n",
+                        expected: b"430 no article with that message-id\r\n",
+                    },
+                ],
+            )
+            .await;
+
+            let (output, _) =
+                run_session_with_input(config, b"GROUP alt.test\r\nARTICLE 3\r\n").await;
+            assert!(
+                without_greeting(&output).ends_with(b"423 no article with that number\r\n"),
+                "RFC 3977 missing stored numeric ARTICLE should end with 423, got {:?}",
+                String::from_utf8_lossy(without_greeting(&output))
+            );
+
+            fs::remove_dir_all(article_dir).unwrap();
         }
 
         #[tokio::test]
@@ -9641,8 +9721,8 @@ mod tests {
     async fn serve_session_reads_article_responses_from_article_dir() {
         let article_dir = unique_temp_dir("server-articles");
         let response =
-            b"220 42 <article.42@test> article follows\r\nSubject: stored\r\n\r\nbody\r\n.\r\n";
-        let path = article_id_tree_path(&article_dir, 42);
+            b"220 2 <article.2@test> article follows\r\nSubject: stored\r\n\r\nbody\r\n.\r\n";
+        let path = article_id_tree_path(&article_dir, 2);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, response).unwrap();
         let message_response =
@@ -9656,7 +9736,7 @@ mod tests {
         args.article_dir = Some(article_dir.clone());
         let (output, stats) = run_session_with_input(
             Arc::new(ServerConfig::from_args(args)),
-            b"ARTICLE 42\r\nARTICLE <stored@ngPost>\r\nARTICLE 43\r\nQUIT\r\n",
+            b"GROUP alt.test\r\nARTICLE 2\r\nARTICLE <stored@ngPost>\r\nARTICLE 3\r\nQUIT\r\n",
         )
         .await;
 
@@ -9664,15 +9744,16 @@ mod tests {
             output,
             [
                 GREETING,
+                GROUP_RESPONSE,
                 response,
                 message_response,
-                ARTICLE_NOT_FOUND_RESPONSE,
+                b"423 no article with that number\r\n".as_slice(),
                 QUIT_RESPONSE
             ]
             .concat()
         );
         let snapshot = stats.snapshot();
-        assert_eq!(snapshot.commands, 4);
+        assert_eq!(snapshot.commands, 5);
         assert_eq!(snapshot.article_requests, 3);
         assert_eq!(snapshot.bytes_sent, output.len() as u64);
 
