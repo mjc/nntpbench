@@ -2647,8 +2647,10 @@ fn validate_u_text(value: &[u8]) -> bool {
 }
 
 fn validate_u_chars(value: &[u8]) -> bool {
-    std::str::from_utf8(value)
-        .is_ok_and(|text| text.chars().all(|ch| !matches!(ch, '\0' | '\r' | '\n')))
+    std::str::from_utf8(value).is_ok_and(|text| {
+        text.chars()
+            .all(|ch| !matches!(ch, '\0' | '\r' | '\n' | '\u{feff}'))
+    })
 }
 
 fn is_p_char(ch: char) -> bool {

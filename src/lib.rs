@@ -8951,10 +8951,22 @@ mod tests {
                         frame: b"111 20260602120000 invalid caf\xe9\r\n",
                     },
                     ResponseFrameCase {
+                        name: "DATE rejects UTF-8 BOM in trailing comment",
+                        reference: "RFC 3977 section 3.1 https://www.rfc-editor.org/rfc/rfc3977#section-3.1",
+                        kind: RequestKind::Date,
+                        frame: b"111 20260602120000 clock \xef\xbb\xbfmark\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "QUIT rejects NUL in trailing comment",
                         reference: "RFC 3977 sections 9.4.1 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.4.1",
                         kind: RequestKind::Quit,
                         frame: b"205 closing\0now\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "QUIT rejects UTF-8 BOM in trailing comment",
+                        reference: "RFC 3977 sections 3.1 and 9.4.1 https://www.rfc-editor.org/rfc/rfc3977#section-3.1",
+                        kind: RequestKind::Quit,
+                        frame: b"205 closing \xef\xbb\xbfnow\r\n",
                     },
                     ResponseFrameCase {
                         name: "generic error rejects non-UTF-8 trailing comment",
