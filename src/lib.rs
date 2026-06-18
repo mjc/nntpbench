@@ -107,10 +107,20 @@ pub const MODE_READER_RESPONSE: &[u8] = b"201 posting not permitted\r\n";
 pub const DATE_RESPONSE: &[u8] = b"111 20260602120000\r\n";
 pub const LIST_RESPONSE: &[u8] =
     b"215 list of newsgroups follows\r\ncomp.lang.rust 0000000001 0000000001 y\r\n.\r\n";
+const LIST_EMPTY_RESPONSE: &[u8] = b"215 list of newsgroups follows\r\n.\r\n";
 pub const LIST_ACTIVE_TIMES_RESPONSE: &[u8] =
     b"215 information follows\r\ncomp.lang.rust 1715904000 admin@nntpbench.local\r\nalt.test 1715907600 admin@nntpbench.local\r\n.\r\n";
+const LIST_ACTIVE_TIMES_COMP_RESPONSE: &[u8] =
+    b"215 information follows\r\ncomp.lang.rust 1715904000 admin@nntpbench.local\r\n.\r\n";
+const LIST_ACTIVE_TIMES_ALT_RESPONSE: &[u8] =
+    b"215 information follows\r\nalt.test 1715907600 admin@nntpbench.local\r\n.\r\n";
+const LIST_INFO_EMPTY_RESPONSE: &[u8] = b"215 information follows\r\n.\r\n";
 pub const LIST_NEWSGROUPS_RESPONSE: &[u8] =
     b"215 information follows\r\ncomp.lang.rust The Rust programming language\r\nalt.test Synthetic benchmark group\r\n.\r\n";
+const LIST_NEWSGROUPS_COMP_RESPONSE: &[u8] =
+    b"215 information follows\r\ncomp.lang.rust The Rust programming language\r\n.\r\n";
+const LIST_NEWSGROUPS_ALT_RESPONSE: &[u8] =
+    b"215 information follows\r\nalt.test Synthetic benchmark group\r\n.\r\n";
 pub const LIST_OVERVIEW_FMT_RESPONSE: &[u8] =
     b"215 Order of fields in overview database\r\nSubject:\r\nFrom:\r\nDate:\r\nMessage-ID:\r\nReferences:\r\n:bytes\r\n:lines\r\n.\r\n";
 pub const LIST_HEADERS_RESPONSE: &[u8] =
@@ -2499,35 +2509,26 @@ where
             Ok(false)
         }
         RequestKind::ListActive => {
-            let response = if command_args(command, command_lines)
-                .is_some_and(|args| contains_subslice(args, b"no.such"))
-            {
-                b"215 list of newsgroups follows\r\n.\r\n".as_slice()
-            } else {
-                LIST_RESPONSE
-            };
+            let response = list_active_response(list_variant_wildmat_args(
+                RequestKind::ListActive,
+                command_args(command, command_lines).unwrap_or_default(),
+            ));
             write_response(writer, pending_write, response, session_stats).await?;
             Ok(false)
         }
         RequestKind::ListActiveTimes => {
-            let response = if command_args(command, command_lines)
-                .is_some_and(|args| contains_subslice(args, b"no.such"))
-            {
-                b"215 information follows\r\n.\r\n".as_slice()
-            } else {
-                LIST_ACTIVE_TIMES_RESPONSE
-            };
+            let response = list_active_times_response(list_variant_wildmat_args(
+                RequestKind::ListActiveTimes,
+                command_args(command, command_lines).unwrap_or_default(),
+            ));
             write_response(writer, pending_write, response, session_stats).await?;
             Ok(false)
         }
         RequestKind::ListNewsgroups => {
-            let response = if command_args(command, command_lines)
-                .is_some_and(|args| contains_subslice(args, b"no.such"))
-            {
-                b"215 information follows\r\n.\r\n".as_slice()
-            } else {
-                LIST_NEWSGROUPS_RESPONSE
-            };
+            let response = list_newsgroups_response(list_variant_wildmat_args(
+                RequestKind::ListNewsgroups,
+                command_args(command, command_lines).unwrap_or_default(),
+            ));
             write_response(writer, pending_write, response, session_stats).await?;
             Ok(false)
         }
@@ -3219,9 +3220,16 @@ where
                 .expect("response write failed");
             return false;
         }
-        RequestKind::List | RequestKind::ListActive => LIST_RESPONSE,
-        RequestKind::ListActiveTimes => LIST_ACTIVE_TIMES_RESPONSE,
-        RequestKind::ListNewsgroups => LIST_NEWSGROUPS_RESPONSE,
+        RequestKind::List => LIST_RESPONSE,
+        RequestKind::ListActive => {
+            list_active_response(list_variant_wildmat_args(request.kind(), request.args()))
+        }
+        RequestKind::ListActiveTimes => {
+            list_active_times_response(list_variant_wildmat_args(request.kind(), request.args()))
+        }
+        RequestKind::ListNewsgroups => {
+            list_newsgroups_response(list_variant_wildmat_args(request.kind(), request.args()))
+        }
         RequestKind::ListOverviewFmt => LIST_OVERVIEW_FMT_RESPONSE,
         RequestKind::ListHeaders => LIST_HEADERS_RESPONSE,
         RequestKind::ListDistribPats => LIST_DISTRIB_PATS_RESPONSE,
@@ -3964,6 +3972,87 @@ fn command_args<'a>(
     let line = strip_complete_crlf_line(&line[..end]).unwrap_or(&line[..end]);
     let split = line.iter().position(|byte| *byte == b' ')?;
     line.get(split + 1..)
+}
+
+fn list_active_response(args: &[u8]) -> &'static [u8] {
+    if args.is_empty() || wildmat_matches(args, b"comp.lang.rust") {
+        LIST_RESPONSE
+    } else {
+        LIST_EMPTY_RESPONSE
+    }
+}
+
+fn list_variant_wildmat_args(kind: RequestKind, args: &[u8]) -> &[u8] {
+    match kind {
+        RequestKind::ListActive => strip_list_variant_args(args, b"ACTIVE"),
+        RequestKind::ListActiveTimes => strip_list_variant_args(args, b"ACTIVE.TIMES"),
+        RequestKind::ListNewsgroups => strip_list_variant_args(args, b"NEWSGROUPS"),
+        _ => args,
+    }
+}
+
+fn strip_list_variant_args<'a>(args: &'a [u8], keyword: &[u8]) -> &'a [u8] {
+    if args.eq_ignore_ascii_case(keyword) {
+        return b"";
+    }
+    if args.len() > keyword.len()
+        && args[..keyword.len()].eq_ignore_ascii_case(keyword)
+        && args[keyword.len()] == b' '
+    {
+        &args[keyword.len() + 1..]
+    } else {
+        args
+    }
+}
+
+fn list_active_times_response(args: &[u8]) -> &'static [u8] {
+    list_info_response_for_groups(
+        args,
+        LIST_ACTIVE_TIMES_RESPONSE,
+        LIST_ACTIVE_TIMES_COMP_RESPONSE,
+        LIST_ACTIVE_TIMES_ALT_RESPONSE,
+    )
+}
+
+fn list_newsgroups_response(args: &[u8]) -> &'static [u8] {
+    list_info_response_for_groups(
+        args,
+        LIST_NEWSGROUPS_RESPONSE,
+        LIST_NEWSGROUPS_COMP_RESPONSE,
+        LIST_NEWSGROUPS_ALT_RESPONSE,
+    )
+}
+
+fn list_info_response_for_groups(
+    args: &[u8],
+    full: &'static [u8],
+    comp: &'static [u8],
+    alt: &'static [u8],
+) -> &'static [u8] {
+    let matches_comp = args.is_empty() || wildmat_matches(args, b"comp.lang.rust");
+    let matches_alt = args.is_empty() || wildmat_matches(args, b"alt.test");
+    match (matches_comp, matches_alt) {
+        (true, true) => full,
+        (true, false) => comp,
+        (false, true) => alt,
+        (false, false) => LIST_INFO_EMPTY_RESPONSE,
+    }
+}
+
+fn wildmat_matches(patterns: &[u8], group: &[u8]) -> bool {
+    patterns
+        .split(|byte| *byte == b',')
+        .any(|pattern| wildmat_pattern_matches(pattern, group))
+}
+
+fn wildmat_pattern_matches(pattern: &[u8], group: &[u8]) -> bool {
+    if pattern == b"*" {
+        return true;
+    }
+    if let Some(prefix) = pattern.strip_suffix(b"*") {
+        return group.starts_with(prefix);
+    }
+    pattern == group
 }
 
 fn article_selector_error(
@@ -5637,6 +5726,46 @@ mod tests {
                 &output,
                 "RFC 3977",
             );
+        }
+
+        #[tokio::test]
+        async fn rfc3977_red_list_wildmat_filters_matching_groups() {
+            // RFC 3977 sections 7.6.3, 7.6.4, and 7.6.6 require LIST wildmat
+            // arguments to filter returned groups, not just validate syntax:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-7.6.3
+            assert_red_server_response_cases(&[
+                ServerResponseCase {
+                    name: "LIST ACTIVE unmatched valid wildmat",
+                    reference: "RFC 3977 section 7.6.3 https://www.rfc-editor.org/rfc/rfc3977#section-7.6.3",
+                    input: b"LIST ACTIVE comp.lang.python\r\n",
+                    expected: LIST_EMPTY_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "LIST ACTIVE.TIMES comp wildmat",
+                    reference: "RFC 3977 section 7.6.4 https://www.rfc-editor.org/rfc/rfc3977#section-7.6.4",
+                    input: b"LIST ACTIVE.TIMES comp.lang.*\r\n",
+                    expected: LIST_ACTIVE_TIMES_COMP_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "LIST ACTIVE.TIMES alt wildmat",
+                    reference: "RFC 3977 section 7.6.4 https://www.rfc-editor.org/rfc/rfc3977#section-7.6.4",
+                    input: b"LIST ACTIVE.TIMES alt.*\r\n",
+                    expected: LIST_ACTIVE_TIMES_ALT_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "LIST NEWSGROUPS comp wildmat",
+                    reference: "RFC 3977 section 7.6.6 https://www.rfc-editor.org/rfc/rfc3977#section-7.6.6",
+                    input: b"LIST NEWSGROUPS comp.lang.*\r\n",
+                    expected: LIST_NEWSGROUPS_COMP_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "LIST NEWSGROUPS alt wildmat",
+                    reference: "RFC 3977 section 7.6.6 https://www.rfc-editor.org/rfc/rfc3977#section-7.6.6",
+                    input: b"LIST NEWSGROUPS alt.*\r\n",
+                    expected: LIST_NEWSGROUPS_ALT_RESPONSE,
+                },
+            ])
+            .await;
         }
 
         #[tokio::test]
@@ -8489,9 +8618,9 @@ mod tests {
                 GREETING,
                 LIST_RESPONSE,
                 LIST_ACTIVE_TIMES_RESPONSE,
-                LIST_ACTIVE_TIMES_RESPONSE,
+                LIST_ACTIVE_TIMES_COMP_RESPONSE,
                 LIST_NEWSGROUPS_RESPONSE,
-                LIST_NEWSGROUPS_RESPONSE,
+                LIST_NEWSGROUPS_COMP_RESPONSE,
                 LIST_OVERVIEW_FMT_RESPONSE,
                 LIST_HEADERS_RESPONSE,
                 LIST_DISTRIB_PATS_RESPONSE,
@@ -10251,9 +10380,9 @@ mod tests {
         let expected_prefix = [
             LIST_RESPONSE,
             LIST_ACTIVE_TIMES_RESPONSE,
-            LIST_ACTIVE_TIMES_RESPONSE,
+            LIST_ACTIVE_TIMES_COMP_RESPONSE,
             LIST_NEWSGROUPS_RESPONSE,
-            LIST_NEWSGROUPS_RESPONSE,
+            LIST_NEWSGROUPS_COMP_RESPONSE,
             LIST_OVERVIEW_FMT_RESPONSE,
             LIST_HEADERS_RESPONSE,
             LIST_DISTRIB_PATS_RESPONSE,
