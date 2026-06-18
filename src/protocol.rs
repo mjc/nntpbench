@@ -2643,7 +2643,12 @@ fn split_spa_field(value: &[u8]) -> Option<(&[u8], &[u8])> {
 }
 
 fn validate_active_status_token(token: &[u8]) -> bool {
-    matches!(token, b"y" | b"m" | b"n") || validate_p_char_token(token)
+    matches!(token, b"y" | b"m" | b"n" | b"x" | b"j")
+        || token.strip_prefix(b"=").is_some_and(|group| {
+            std::str::from_utf8(group)
+                .ok()
+                .is_some_and(|group| GroupName::from_borrowed(group).is_ok())
+        })
 }
 
 fn validate_active_times_response_line(line: &[u8]) -> bool {

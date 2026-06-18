@@ -8804,10 +8804,10 @@ mod tests {
                         frame: b"111 20260602120000 clock caf\xc3\xa9\r\n",
                     },
                     ResponseFrameCase {
-                        name: "LIST ACTIVE accepts private status token",
-                        reference: "RFC 3977 sections 7.6.3 and 9.4.3 https://www.rfc-editor.org/rfc/rfc3977#section-9.4.3",
+                        name: "LIST ACTIVE accepts defined status tokens",
+                        reference: "RFC 3977 section 7.6.3 and RFC 6048 section 3.1 https://www.rfc-editor.org/rfc/rfc6048#section-3.1",
                         kind: RequestKind::ListActive,
-                        frame: b"215 list of newsgroups follows\r\nalt.test 3 1 archived\r\n.\r\n",
+                        frame: b"215 list of newsgroups follows\r\nalt.y 3 1 y\r\nalt.n 3 1 n\r\nalt.m 3 1 m\r\nalt.x 3 1 x\r\nalt.j 3 1 j\r\nalt.redirect 3 1 =alt.target\r\n.\r\n",
                     },
                     ResponseFrameCase {
                         name: "GROUP accepts wildmat-exact punctuation in group name",
@@ -8823,11 +8823,10 @@ mod tests {
                             b"215 list of newsgroups follows\r\nalt:test/with@punct 3 1 y\r\n.\r\n",
                     },
                     ResponseFrameCase {
-                        name: "NEWGROUPS accepts private status token",
-                        reference: "RFC 3977 sections 7.3 and 9.4.3 https://www.rfc-editor.org/rfc/rfc3977#section-9.4.3",
+                        name: "NEWGROUPS accepts defined status tokens",
+                        reference: "RFC 3977 sections 7.3 and 7.6.3 and RFC 6048 section 3.1 https://www.rfc-editor.org/rfc/rfc6048#section-3.1",
                         kind: RequestKind::NewGroups,
-                        frame:
-                            b"231 list of new newsgroups follows\r\nalt.test 3 1 archived\r\n.\r\n",
+                        frame: b"231 list of new newsgroups follows\r\nalt.y 3 1 y\r\nalt.x 3 1 x\r\nalt.redirect 3 1 =alt.target\r\n.\r\n",
                     },
                     ResponseFrameCase {
                         name: "LIST NEWSGROUPS accepts byte-oriented S-TEXT description",
@@ -9155,6 +9154,24 @@ mod tests {
                         frame: b"215 list of newsgroups follows\r\nalt.test 3 1 bad\tstatus\r\n.\r\n",
                     },
                     ResponseFrameCase {
+                        name: "LIST ACTIVE rejects undefined posting status token",
+                        reference: "RFC 3977 section 7.6.3 and RFC 6048 section 3.1 https://www.rfc-editor.org/rfc/rfc6048#section-3.1",
+                        kind: RequestKind::ListActive,
+                        frame: b"215 list of newsgroups follows\r\nalt.test 3 1 archived\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "LIST ACTIVE rejects case-variant posting status token",
+                        reference: "RFC 6048 section 3.1 https://www.rfc-editor.org/rfc/rfc6048#section-3.1",
+                        kind: RequestKind::ListActive,
+                        frame: b"215 list of newsgroups follows\r\nalt.test 3 1 X\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "LIST ACTIVE rejects redirect status with invalid group name",
+                        reference: "RFC 6048 section 3.1 https://www.rfc-editor.org/rfc/rfc6048#section-3.1",
+                        kind: RequestKind::ListActive,
+                        frame: b"215 list of newsgroups follows\r\nalt.test 3 1 =alt!target\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "LIST ACTIVE rejects overlong high-water article number",
                         reference: "RFC 3977 sections 7.6.3 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
                         kind: RequestKind::ListActive,
@@ -9213,6 +9230,12 @@ mod tests {
                         reference: "RFC 3977 sections 7.3 and 7.6.3 https://www.rfc-editor.org/rfc/rfc3977#section-7.3",
                         kind: RequestKind::NewGroups,
                         frame: b"231 list of new newsgroups follows\r\nalt.test 3 1 bad\tstatus\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "NEWGROUPS rejects undefined posting status token",
+                        reference: "RFC 3977 sections 7.3 and 7.6.3 and RFC 6048 section 3.1 https://www.rfc-editor.org/rfc/rfc6048#section-3.1",
+                        kind: RequestKind::NewGroups,
+                        frame: b"231 list of new newsgroups follows\r\nalt.test 3 1 archived\r\n.\r\n",
                     },
                     ResponseFrameCase {
                         name: "NEWGROUPS rejects extra active row field",
