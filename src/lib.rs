@@ -7116,15 +7116,33 @@ mod tests {
                     expected: b"423 no articles in that range\r\n",
                 },
                 ServerResponseCase {
+                    name: "OVER reversed range returns 423",
+                    reference: "RFC 3977 sections 6.1.2 and 8.3.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.2",
+                    input: b"GROUP alt.test\r\nOVER 3-1\r\n",
+                    expected: b"423 no articles in that range\r\n",
+                },
+                ServerResponseCase {
                     name: "XOVER empty range returns 423",
                     reference: "RFC 2980 section 2.1.7 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.7",
                     input: b"GROUP alt.test\r\nXOVER 4-\r\n",
                     expected: b"423 no articles in that range\r\n",
                 },
                 ServerResponseCase {
+                    name: "XOVER reversed range returns 423",
+                    reference: "RFC 3977 section 6.1.2 and RFC 2980 section 2.1.7 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.2",
+                    input: b"GROUP alt.test\r\nXOVER 3-1\r\n",
+                    expected: b"423 no articles in that range\r\n",
+                },
+                ServerResponseCase {
                     name: "HDR Subject empty range returns 423",
                     reference: "RFC 3977 section 8.5.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.2",
                     input: b"GROUP alt.test\r\nHDR Subject 4-5\r\n",
+                    expected: b"423 no articles in that range\r\n",
+                },
+                ServerResponseCase {
+                    name: "HDR Subject reversed range returns 423",
+                    reference: "RFC 3977 sections 6.1.2 and 8.5.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.2",
+                    input: b"GROUP alt.test\r\nHDR Subject 3-1\r\n",
                     expected: b"423 no articles in that range\r\n",
                 },
                 ServerResponseCase {
@@ -7137,6 +7155,12 @@ mod tests {
                     name: "XHDR Subject empty range returns 423",
                     reference: "RFC 2980 section 2.1.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.6",
                     input: b"GROUP alt.test\r\nXHDR Subject 4-5\r\n",
+                    expected: b"423 no articles in that range\r\n",
+                },
+                ServerResponseCase {
+                    name: "XHDR Subject reversed range returns 423",
+                    reference: "RFC 3977 section 6.1.2 and RFC 2980 section 2.1.6 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.2",
+                    input: b"GROUP alt.test\r\nXHDR Subject 3-1\r\n",
                     expected: b"423 no articles in that range\r\n",
                 },
                 ServerResponseCase {
@@ -7817,9 +7841,9 @@ mod tests {
                         ArticleSelector::from_borrowed("not-a-selector").is_err(),
                     ),
                     (
-                        "article selector rejects reversed range",
-                        "RFC 3977 section 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
-                        ArticleSelector::from_borrowed("10-1").is_err(),
+                        "article selector accepts reversed range as empty",
+                        "RFC 3977 sections 6.1.2, 8.3.2, and 8.5.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.2",
+                        ArticleSelector::from_borrowed("10-1").is_ok(),
                     ),
                     (
                         "article selector rejects double hyphen range",

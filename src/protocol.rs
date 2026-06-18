@@ -359,16 +359,7 @@ mod proptests {
                 article_number_token_strategy(),
                 article_number_token_strategy()
             )
-                .prop_map(|(left, right)| {
-                    let left = left.parse::<u64>().unwrap();
-                    let right = right.parse::<u64>().unwrap();
-                    let (start, end) = if left <= right {
-                        (left, right)
-                    } else {
-                        (right, left)
-                    };
-                    format!("{start}-{end}")
-                }),
+                .prop_map(|(start, end)| format!("{start}-{end}")),
             article_number_token_strategy().prop_map(|start| format!("{start}-")),
         ]
         .boxed()
@@ -1700,12 +1691,12 @@ fn validate_article_selector(value: &str) -> Result<(), InvalidArticleSelector> 
     }
 
     if let Some((start, end)) = value.split_once('-') {
-        let start = article_number_token_value(start).map_err(|_| InvalidArticleSelector)?;
+        article_number_token_value(start).map_err(|_| InvalidArticleSelector)?;
         if end.is_empty() {
             return Ok(());
         }
-        let end = article_number_token_value(end).map_err(|_| InvalidArticleSelector)?;
-        return (start <= end).then_some(()).ok_or(InvalidArticleSelector);
+        article_number_token_value(end).map_err(|_| InvalidArticleSelector)?;
+        return Ok(());
     }
 
     article_number_token_value(value)
@@ -4221,6 +4212,10 @@ mod tests {
         assert_eq!(
             ArticleSelector::from_borrowed("1-10").unwrap().as_str(),
             "1-10"
+        );
+        assert_eq!(
+            ArticleSelector::from_borrowed("10-1").unwrap().as_str(),
+            "10-1"
         );
         assert_eq!(
             ArticleSelector::from_borrowed("<a@b>").unwrap().as_str(),
