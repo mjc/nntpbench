@@ -142,7 +142,8 @@ pub const LAST_RESPONSE: &[u8] =
 pub const NEXT_RESPONSE: &[u8] =
     b"223 2 <next@alt.test> article retrieved - request text separately\r\n";
 pub const NEWGROUPS_RESPONSE: &[u8] =
-    b"231 list of new newsgroups follows\r\ncomp.lang.rust 0000000003 0000000001 y\r\nalt.test 0000000003 0000000001 y\r\n.\r\n";
+    b"231 list of new newsgroups follows\r\ncomp.lang.rust 0000000001 0000000001 y\r\nalt.test 0000000003 0000000001 y\r\n.\r\n";
+const NEWGROUPS_EMPTY_RESPONSE: &[u8] = b"231 list of new newsgroups follows\r\n.\r\n";
 pub const NEWNEWS_RESPONSE: &[u8] =
     b"230 list of new articles follows\r\n<one@alt.test>\r\n<two@alt.test>\r\n.\r\n";
 const NEWNEWS_EMPTY_RESPONSE: &[u8] = b"230 list of new articles follows\r\n.\r\n";
@@ -2690,7 +2691,7 @@ where
             let response = if command_args(command, command_lines)
                 .is_some_and(|args| args.starts_with(b"991231"))
             {
-                b"231 list of new newsgroups follows\r\n.\r\n".as_slice()
+                NEWGROUPS_EMPTY_RESPONSE
             } else {
                 NEWGROUPS_RESPONSE
             };
@@ -6467,6 +6468,30 @@ mod tests {
                 without_greeting(&future_output),
                 "RFC 3977 NEWGROUPS should depend on requested date/time, not return a fixture"
             );
+        }
+
+        #[tokio::test]
+        async fn rfc3977_red_newgroups_uses_active_group_line_format() {
+            // RFC 3977 section 7.3 says NEWGROUPS results use the same line
+            // format as LIST ACTIVE. Section 7.6.3 defines those lines as
+            // newsgroup high-water low-water status:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-7.3
+            // https://www.rfc-editor.org/rfc/rfc3977#section-7.6.3
+            assert_red_server_response_cases(&[
+                ServerResponseCase {
+                    name: "NEWGROUPS active-format group state",
+                    reference: "RFC 3977 sections 7.3 and 7.6.3 https://www.rfc-editor.org/rfc/rfc3977#section-7.3",
+                    input: b"NEWGROUPS 700101 000000 GMT\r\n",
+                    expected: NEWGROUPS_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "NEWGROUPS empty list after future timestamp",
+                    reference: "RFC 3977 section 7.3.2 https://www.rfc-editor.org/rfc/rfc3977#section-7.3.2",
+                    input: b"NEWGROUPS 991231 235959 GMT\r\n",
+                    expected: NEWGROUPS_EMPTY_RESPONSE,
+                },
+            ])
+            .await;
         }
 
         #[tokio::test]
