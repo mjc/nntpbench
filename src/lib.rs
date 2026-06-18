@@ -8322,6 +8322,36 @@ mod tests {
                         frame: b"230 list of new articles follows\r\none@alt.test\r\n.\r\n",
                     },
                     ResponseFrameCase {
+                        name: "LIST ACTIVE rejects invalid group name line",
+                        reference: "RFC 3977 section 7.6.3 https://www.rfc-editor.org/rfc/rfc3977#section-7.6.3",
+                        kind: RequestKind::ListActive,
+                        frame: b"215 list of newsgroups follows\r\nalt.* 3 1 y\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "LIST ACTIVE rejects invalid posting status token",
+                        reference: "RFC 3977 sections 7.6.3 and 9.7 https://www.rfc-editor.org/rfc/rfc3977#section-7.6.3",
+                        kind: RequestKind::ListActive,
+                        frame: b"215 list of newsgroups follows\r\nalt.test 3 1 open\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "LIST ACTIVE.TIMES rejects non-numeric timestamp",
+                        reference: "RFC 3977 section 7.6.4 https://www.rfc-editor.org/rfc/rfc3977#section-7.6.4",
+                        kind: RequestKind::ListActiveTimes,
+                        frame: b"215 information follows\r\nalt.test yesterday admin@test\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "LIST NEWSGROUPS rejects invalid group name line",
+                        reference: "RFC 3977 section 7.6.6 https://www.rfc-editor.org/rfc/rfc3977#section-7.6.6",
+                        kind: RequestKind::ListNewsgroups,
+                        frame: b"215 information follows\r\nalt.* Synthetic group\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "NEWGROUPS rejects malformed active row",
+                        reference: "RFC 3977 sections 7.3 and 7.6.3 https://www.rfc-editor.org/rfc/rfc3977#section-7.3",
+                        kind: RequestKind::NewGroups,
+                        frame: b"231 list of new newsgroups follows\r\nalt.test 3 1 open\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "OVER rejects body row without tab-separated overview fields",
                         reference: "RFC 3977 section 8.3.1 https://www.rfc-editor.org/rfc/rfc3977#section-8.3.1",
                         kind: RequestKind::Over,

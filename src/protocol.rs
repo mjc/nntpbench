@@ -125,7 +125,7 @@ impl<'a> ResponseFrame<'a> {
             let Some(block) = find_dot_terminated_block(buffer, status_line_end) else {
                 return ResponseFrameParse::NeedMore;
             };
-            if !validate_multiline_response_content(kind, status, block.content()) {
+            if !validate_multiline_response_content(kind, block.content()) {
                 return ResponseFrameParse::Invalid;
             }
             (block.block_end(), block.content(), block.terminator())
@@ -2440,12 +2440,17 @@ fn validate_article_status_response_arguments(value: &[u8]) -> bool {
             .is_some_and(|message_id| MessageId::from_borrowed(message_id).is_ok())
 }
 
-fn validate_multiline_response_content(
-    kind: RequestKind,
-    _status: StatusCode,
-    content: &[u8],
-) -> bool {
+fn validate_multiline_response_content(kind: RequestKind, content: &[u8]) -> bool {
     match kind {
+        RequestKind::List | RequestKind::ListActive | RequestKind::NewGroups => {
+            validate_crlf_lines(content, validate_active_response_line)
+        }
+        RequestKind::ListActiveTimes => {
+            validate_crlf_lines(content, validate_active_times_response_line)
+        }
+        RequestKind::ListNewsgroups => {
+            validate_crlf_lines(content, validate_newsgroups_response_line)
+        }
         RequestKind::ListGroup => validate_crlf_lines(content, is_response_decimal_token),
         RequestKind::NewNews => validate_crlf_lines(content, |line| {
             std::str::from_utf8(line)
@@ -2474,6 +2479,52 @@ fn validate_crlf_lines(content: &[u8], mut validate: impl FnMut(&[u8]) -> bool) 
         offset = line_end + crate::CRLF.len();
     }
     true
+}
+
+fn validate_active_response_line(line: &[u8]) -> bool {
+    let Some((tokens, trailing_text)) = split_required_response_tokens::<4>(line) else {
+        return false;
+    };
+
+    trailing_text.is_empty()
+        && std::str::from_utf8(tokens[0])
+            .ok()
+            .is_some_and(|group| GroupName::from_borrowed(group).is_ok())
+        && is_response_decimal_token(tokens[1])
+        && is_response_decimal_token(tokens[2])
+        && validate_active_status_token(tokens[3])
+}
+
+fn validate_active_status_token(token: &[u8]) -> bool {
+    matches!(token, b"y" | b"m" | b"n" | b"j" | b"x")
+        || token.strip_prefix(b"=").is_some_and(|group| {
+            std::str::from_utf8(group)
+                .ok()
+                .is_some_and(|group| GroupName::from_borrowed(group).is_ok())
+        })
+}
+
+fn validate_active_times_response_line(line: &[u8]) -> bool {
+    let Some((tokens, trailing_text)) = split_required_response_tokens::<3>(line) else {
+        return false;
+    };
+
+    trailing_text.is_empty()
+        && std::str::from_utf8(tokens[0])
+            .ok()
+            .is_some_and(|group| GroupName::from_borrowed(group).is_ok())
+        && is_response_decimal_token(tokens[1])
+        && !tokens[2].is_empty()
+}
+
+fn validate_newsgroups_response_line(line: &[u8]) -> bool {
+    let Some(space) = memchr::memchr(b' ', line) else {
+        return false;
+    };
+
+    std::str::from_utf8(&line[..space])
+        .ok()
+        .is_some_and(|group| GroupName::from_borrowed(group).is_ok())
 }
 
 fn validate_overview_response_line(line: &[u8]) -> bool {
@@ -5047,6 +5098,23 @@ mod tests {
                 b"211 2 1 2 alt.test\r\n1\r\n2\r\n.\r\n".as_slice(),
             ),
             (
+                RequestKind::List,
+                b"215 list follows\r\nalt.test 3 1 y\r\nredirect.test 0 0 =alt.test\r\n.\r\n"
+                    .as_slice(),
+            ),
+            (
+                RequestKind::ListActiveTimes,
+                b"215 information follows\r\nalt.test 1715907600 admin@test\r\n.\r\n".as_slice(),
+            ),
+            (
+                RequestKind::ListNewsgroups,
+                b"215 information follows\r\nalt.test Synthetic group\r\n.\r\n".as_slice(),
+            ),
+            (
+                RequestKind::NewGroups,
+                b"231 new groups follow\r\nalt.test 3 1 y\r\n.\r\n".as_slice(),
+            ),
+            (
                 RequestKind::NewNews,
                 b"230 articles follow\r\n<one@test>\r\n<two@test>\r\n.\r\n".as_slice(),
             ),
@@ -5083,6 +5151,22 @@ mod tests {
             (
                 RequestKind::ListGroup,
                 b"211 2 1 2 alt.test\r\none\r\n.\r\n".as_slice(),
+            ),
+            (
+                RequestKind::ListActive,
+                b"215 list follows\r\nalt.* 3 1 y\r\n.\r\n".as_slice(),
+            ),
+            (
+                RequestKind::ListActiveTimes,
+                b"215 information follows\r\nalt.test yesterday admin@test\r\n.\r\n".as_slice(),
+            ),
+            (
+                RequestKind::ListNewsgroups,
+                b"215 information follows\r\nalt.* Synthetic group\r\n.\r\n".as_slice(),
+            ),
+            (
+                RequestKind::NewGroups,
+                b"231 new groups follow\r\nalt.test 3 1 open\r\n.\r\n".as_slice(),
             ),
             (
                 RequestKind::NewNews,
