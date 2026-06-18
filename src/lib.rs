@@ -154,20 +154,27 @@ pub const AUTHINFO_USER_RESPONSE: &[u8] = b"381 more authentication information 
 pub const AUTHINFO_RESPONSE: &[u8] = b"281 authentication accepted\r\n";
 pub const STARTTLS_RESPONSE: &[u8] = b"382 continue with TLS negotiation\r\n";
 pub const OVER_RESPONSE: &[u8] = b"224 Overview information follows\r\n1\tSubject one\tone@example.com\tFri, 16 May 2026 12:00:00 +0000\t<one@example.com>\t\t123\t4\r\n.\r\n";
+const OVER_MESSAGE_ID_RESPONSE: &[u8] = b"224 Overview information follows\r\n0\tSubject one\tone@example.com\tFri, 16 May 2026 12:00:00 +0000\t<one@example.com>\t\t123\t4\r\n.\r\n";
 const OVER_2_RESPONSE: &[u8] = b"224 Overview information follows\r\n2\tSubject two\ttwo@example.com\tFri, 16 May 2026 12:00:01 +0000\t<two@example.com>\t<ref@example.com>\t456\t8\r\n.\r\n";
 pub const XOVER_RESPONSE: &[u8] = b"224 Overview information follows\r\n2\tSubject two\ttwo@example.com\tFri, 16 May 2026 12:00:01 +0000\t<two@example.com>\t<ref@example.com>\t456\t8\r\n.\r\n";
 pub const HDR_RESPONSE: &[u8] = b"225 headers follow\r\n1 example one\r\n2 example two\r\n.\r\n";
+const HDR_SUBJECT_MESSAGE_ID_RESPONSE: &[u8] = b"225 headers follow\r\n0 example one\r\n.\r\n";
 const HDR_SUBJECT_1_RESPONSE: &[u8] = b"225 headers follow\r\n1 example one\r\n.\r\n";
 const HDR_SUBJECT_2_RESPONSE: &[u8] = b"225 headers follow\r\n2 example two\r\n.\r\n";
 pub const XHDR_RESPONSE: &[u8] = b"221 headers follow\r\n1 example one\r\n2 example two\r\n.\r\n";
+const XHDR_SUBJECT_MESSAGE_ID_RESPONSE: &[u8] = b"221 headers follow\r\n0 example one\r\n.\r\n";
 const XHDR_SUBJECT_1_RESPONSE: &[u8] = b"221 headers follow\r\n1 example one\r\n.\r\n";
 const XHDR_SUBJECT_2_RESPONSE: &[u8] = b"221 headers follow\r\n2 example two\r\n.\r\n";
 const HDR_MESSAGE_ID_RESPONSE: &[u8] =
     b"225 headers follow\r\n1 <one@example.com>\r\n2 <two@example.com>\r\n.\r\n";
+const HDR_MESSAGE_ID_MESSAGE_ID_RESPONSE: &[u8] =
+    b"225 headers follow\r\n0 <one@example.com>\r\n.\r\n";
 const HDR_MESSAGE_ID_1_RESPONSE: &[u8] = b"225 headers follow\r\n1 <one@example.com>\r\n.\r\n";
 const HDR_MESSAGE_ID_2_RESPONSE: &[u8] = b"225 headers follow\r\n2 <two@example.com>\r\n.\r\n";
 const XHDR_MESSAGE_ID_RESPONSE: &[u8] =
     b"221 headers follow\r\n1 <one@example.com>\r\n2 <two@example.com>\r\n.\r\n";
+const XHDR_MESSAGE_ID_MESSAGE_ID_RESPONSE: &[u8] =
+    b"221 headers follow\r\n0 <one@example.com>\r\n.\r\n";
 const XHDR_MESSAGE_ID_1_RESPONSE: &[u8] = b"221 headers follow\r\n1 <one@example.com>\r\n.\r\n";
 const XHDR_MESSAGE_ID_2_RESPONSE: &[u8] = b"221 headers follow\r\n2 <two@example.com>\r\n.\r\n";
 pub const HEAD_RESPONSE: &[u8] = b"221 1 <article.1@nntpbench.local> article retrieved\r\nPath: nntpbench.local!mock\r\nFrom: Bench User <bench@nntpbench.local>\r\nNewsgroups: alt.binaries.bench\r\nSubject: nntpbench synthetic article\r\nMessage-ID: <article.1@nntpbench.local>\r\nDate: Fri, 15 May 2026 00:00:00 +0000\r\n.\r\n";
@@ -4201,7 +4208,9 @@ fn overview_selector_arg(kind: RequestKind, args: &[u8]) -> Option<&[u8]> {
 }
 
 fn over_response_for_args(args: &[u8]) -> &'static [u8] {
-    if overview_selector_starts_at_second(args) {
+    if overview_selector_is_message_id(args) {
+        OVER_MESSAGE_ID_RESPONSE
+    } else if overview_selector_starts_at_second(args) {
         OVER_2_RESPONSE
     } else {
         OVER_RESPONSE
@@ -4209,7 +4218,9 @@ fn over_response_for_args(args: &[u8]) -> &'static [u8] {
 }
 
 fn xover_response_for_args(args: &[u8]) -> &'static [u8] {
-    if overview_selector_starts_at_second(args) {
+    if overview_selector_is_message_id(args) {
+        OVER_MESSAGE_ID_RESPONSE
+    } else if overview_selector_starts_at_second(args) {
         OVER_2_RESPONSE
     } else {
         XOVER_RESPONSE
@@ -4222,6 +4233,10 @@ fn overview_selector_starts_at_second(selector: &[u8]) -> bool {
 
 fn overview_selector_selects_first_only(selector: &[u8]) -> bool {
     selector == b"1"
+}
+
+fn overview_selector_is_message_id(selector: &[u8]) -> bool {
+    selector.starts_with(b"<")
 }
 
 fn listgroup_state_error(args: &[u8], session_state: &SessionState) -> Option<&'static [u8]> {
@@ -4335,6 +4350,9 @@ fn hdr_response_for_args(args: &[u8]) -> &'static [u8] {
     if header_query_name_from_args(args)
         .is_some_and(|header| header.eq_ignore_ascii_case(b"Message-ID"))
     {
+        if selector.is_some_and(overview_selector_is_message_id) {
+            return HDR_MESSAGE_ID_MESSAGE_ID_RESPONSE;
+        }
         if selector.is_some_and(overview_selector_selects_first_only) {
             return HDR_MESSAGE_ID_1_RESPONSE;
         }
@@ -4342,6 +4360,9 @@ fn hdr_response_for_args(args: &[u8]) -> &'static [u8] {
             return HDR_MESSAGE_ID_2_RESPONSE;
         }
         return HDR_MESSAGE_ID_RESPONSE;
+    }
+    if selector.is_some_and(overview_selector_is_message_id) {
+        return HDR_SUBJECT_MESSAGE_ID_RESPONSE;
     }
     if selector.is_some_and(overview_selector_selects_first_only) {
         return HDR_SUBJECT_1_RESPONSE;
@@ -4357,6 +4378,9 @@ fn xhdr_response_for_args(args: &[u8]) -> &'static [u8] {
     if header_query_name_from_args(args)
         .is_some_and(|header| header.eq_ignore_ascii_case(b"Message-ID"))
     {
+        if selector.is_some_and(overview_selector_is_message_id) {
+            return XHDR_MESSAGE_ID_MESSAGE_ID_RESPONSE;
+        }
         if selector.is_some_and(overview_selector_selects_first_only) {
             return XHDR_MESSAGE_ID_1_RESPONSE;
         }
@@ -4364,6 +4388,9 @@ fn xhdr_response_for_args(args: &[u8]) -> &'static [u8] {
             return XHDR_MESSAGE_ID_2_RESPONSE;
         }
         return XHDR_MESSAGE_ID_RESPONSE;
+    }
+    if selector.is_some_and(overview_selector_is_message_id) {
+        return XHDR_SUBJECT_MESSAGE_ID_RESPONSE;
     }
     if selector.is_some_and(overview_selector_selects_first_only) {
         return XHDR_SUBJECT_1_RESPONSE;
@@ -6553,6 +6580,54 @@ mod tests {
                     reference: "RFC 2980 section 2.1.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.6",
                     input: b"GROUP alt.test\r\nXHDR Message-ID 2-\r\n",
                     expected: XHDR_MESSAGE_ID_2_RESPONSE,
+                },
+            ])
+            .await;
+        }
+
+        #[tokio::test]
+        async fn rfc3977_red_overview_and_header_message_id_selectors_use_zero_article_number() {
+            // RFC 3977 sections 8.3.2 and 8.5.2 require message-id selectors
+            // to return the selected article. When group membership is not
+            // asserted, the article number is replaced with 0:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-8.3.2
+            // https://www.rfc-editor.org/rfc/rfc3977#section-8.5.2
+            assert_red_server_response_tail_cases(&[
+                ServerResponseCase {
+                    name: "OVER message-id selector uses article number 0",
+                    reference: "RFC 3977 section 8.3.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.3.2",
+                    input: b"OVER <one@example.com>\r\n",
+                    expected: OVER_MESSAGE_ID_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "XOVER message-id selector uses article number 0",
+                    reference: "RFC 2980 section 2.1.7 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.7",
+                    input: b"XOVER <one@example.com>\r\n",
+                    expected: OVER_MESSAGE_ID_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "HDR Subject message-id selector uses article number 0",
+                    reference: "RFC 3977 section 8.5.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.2",
+                    input: b"HDR Subject <one@example.com>\r\n",
+                    expected: HDR_SUBJECT_MESSAGE_ID_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "HDR Message-ID message-id selector uses article number 0",
+                    reference: "RFC 3977 section 8.5.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.2",
+                    input: b"HDR Message-ID <one@example.com>\r\n",
+                    expected: HDR_MESSAGE_ID_MESSAGE_ID_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "XHDR Subject message-id selector uses article number 0",
+                    reference: "RFC 2980 section 2.1.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.6",
+                    input: b"XHDR Subject <one@example.com>\r\n",
+                    expected: XHDR_SUBJECT_MESSAGE_ID_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "XHDR Message-ID message-id selector uses article number 0",
+                    reference: "RFC 2980 section 2.1.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.6",
+                    input: b"XHDR Message-ID <one@example.com>\r\n",
+                    expected: XHDR_MESSAGE_ID_MESSAGE_ID_RESPONSE,
                 },
             ])
             .await;
@@ -10716,9 +10791,9 @@ mod tests {
                 GREETING,
                 GROUP_RESPONSE,
                 OVER_RESPONSE,
-                OVER_RESPONSE,
+                OVER_MESSAGE_ID_RESPONSE,
                 XOVER_RESPONSE,
-                XOVER_RESPONSE
+                OVER_MESSAGE_ID_RESPONSE
             ]
             .concat()
         );
@@ -11320,9 +11395,9 @@ mod tests {
             output,
             [
                 OVER_RESPONSE,
-                OVER_RESPONSE,
+                OVER_MESSAGE_ID_RESPONSE,
                 XOVER_RESPONSE,
-                XOVER_RESPONSE,
+                OVER_MESSAGE_ID_RESPONSE,
                 HDR_SUBJECT_1_RESPONSE,
                 HDR_MESSAGE_ID_1_RESPONSE,
                 XHDR_SUBJECT_1_RESPONSE,
