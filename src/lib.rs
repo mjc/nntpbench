@@ -160,6 +160,8 @@ pub const HELP_RESPONSE: &[u8] =
     b"100 help text follows\r\nARTICLE\r\nHEAD\r\nBODY\r\nSTAT\r\nLIST\r\nCAPABILITIES\r\nDATE\r\nMODE READER\r\nQUIT\r\n.\r\n";
 pub const CAPABILITIES_RESPONSE: &[u8] =
     b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nAUTHINFO USER\r\n.\r\n";
+const AUTHENTICATED_CAPABILITIES_RESPONSE: &[u8] =
+    b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n";
 pub const QUIT_RESPONSE: &[u8] = b"205 closing connection\r\n";
 pub const ARTICLE_NOT_FOUND_RESPONSE: &[u8] = b"430 no article with that number\r\n";
 const BODY_RESPONSE_PREFIX: &[u8] = b"222 1 <article.1@nntpbench.local> body follows\r\n";
@@ -2281,6 +2283,7 @@ struct SessionState {
     group_selected: bool,
     current_article: Option<u64>,
     authinfo_user_pending: bool,
+    authenticated: bool,
 }
 
 impl BatchOutcome {
@@ -2720,13 +2723,34 @@ where
             Ok(false)
         }
         RequestKind::AuthInfoUser => {
+            if session_state.authenticated {
+                write_response(
+                    writer,
+                    pending_write,
+                    b"502 command unavailable\r\n",
+                    session_stats,
+                )
+                .await?;
+                return Ok(false);
+            }
             session_state.authinfo_user_pending = true;
             write_response(writer, pending_write, AUTHINFO_USER_RESPONSE, session_stats).await?;
             Ok(false)
         }
         RequestKind::AuthInfoPass => {
+            if session_state.authenticated {
+                write_response(
+                    writer,
+                    pending_write,
+                    b"502 command unavailable\r\n",
+                    session_stats,
+                )
+                .await?;
+                return Ok(false);
+            }
             if session_state.authinfo_user_pending {
                 session_state.authinfo_user_pending = false;
+                session_state.authenticated = true;
                 write_response(writer, pending_write, AUTHINFO_RESPONSE, session_stats).await?;
                 return Ok(false);
             }
@@ -2740,6 +2764,16 @@ where
             Ok(false)
         }
         RequestKind::AuthInfo => {
+            if session_state.authenticated {
+                write_response(
+                    writer,
+                    pending_write,
+                    b"502 command unavailable\r\n",
+                    session_stats,
+                )
+                .await?;
+                return Ok(false);
+            }
             write_response(
                 writer,
                 pending_write,
@@ -2804,7 +2838,12 @@ where
             Ok(false)
         }
         RequestKind::Capabilities => {
-            write_response(writer, pending_write, CAPABILITIES_RESPONSE, session_stats).await?;
+            let response = if session_state.authenticated {
+                AUTHENTICATED_CAPABILITIES_RESPONSE
+            } else {
+                CAPABILITIES_RESPONSE
+            };
+            write_response(writer, pending_write, response, session_stats).await?;
             Ok(false)
         }
         RequestKind::Help => {
@@ -5273,6 +5312,41 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn rfc4643_red_authenticated_sessions_reject_authinfo_and_hide_capability() {
+            // RFC 4643 section 2 requires a server, after successful
+            // authentication, to stop advertising AUTHINFO and reject subsequent
+            // AUTHINFO commands with 502:
+            // https://www.rfc-editor.org/rfc/rfc4643#section-2
+            assert_red_server_response_cases(&[
+                ServerResponseCase {
+                    name: "CAPABILITIES after AUTHINFO PASS omits AUTHINFO",
+                    reference: "RFC 4643 section 2 https://www.rfc-editor.org/rfc/rfc4643#section-2",
+                    input: b"AUTHINFO USER bench\r\nAUTHINFO PASS pass\r\nCAPABILITIES\r\n",
+                    expected: b"381 more authentication information required\r\n281 authentication accepted\r\n101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n",
+                },
+                ServerResponseCase {
+                    name: "AUTHINFO USER after authentication returns 502",
+                    reference: "RFC 4643 section 2 https://www.rfc-editor.org/rfc/rfc4643#section-2",
+                    input: b"AUTHINFO USER bench\r\nAUTHINFO PASS pass\r\nAUTHINFO USER again\r\n",
+                    expected: b"381 more authentication information required\r\n281 authentication accepted\r\n502 command unavailable\r\n",
+                },
+                ServerResponseCase {
+                    name: "AUTHINFO PASS after authentication returns 502",
+                    reference: "RFC 4643 section 2 https://www.rfc-editor.org/rfc/rfc4643#section-2",
+                    input: b"AUTHINFO USER bench\r\nAUTHINFO PASS pass\r\nAUTHINFO PASS again\r\n",
+                    expected: b"381 more authentication information required\r\n281 authentication accepted\r\n502 command unavailable\r\n",
+                },
+                ServerResponseCase {
+                    name: "AUTHINFO SASL after authentication returns 502",
+                    reference: "RFC 4643 section 2 https://www.rfc-editor.org/rfc/rfc4643#section-2",
+                    input: b"AUTHINFO USER bench\r\nAUTHINFO PASS pass\r\nAUTHINFO SASL PLAIN\r\n",
+                    expected: b"381 more authentication information required\r\n281 authentication accepted\r\n502 command unavailable\r\n",
+                },
+            ])
+            .await;
+        }
+
+        #[tokio::test]
         async fn rfc4642_red_starttls_without_tls_support_returns_502() {
             // RFC 4642 section 2.2 requires STARTTLS to begin TLS negotiation after
             // a 382 response. A server that cannot negotiate TLS must reject it:
@@ -6855,6 +6929,7 @@ mod tests {
             group_selected: true,
             current_article: Some(1),
             authinfo_user_pending: false,
+            authenticated: false,
         };
         let mut writer = FailingWriter;
         let command = ParsedCommand {
