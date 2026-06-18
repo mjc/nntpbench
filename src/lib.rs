@@ -4049,10 +4049,16 @@ fn list_info_response_for_groups(
 }
 
 fn wildmat_matches(patterns: &[u8], group: &[u8]) -> bool {
+    let Ok(patterns) = std::str::from_utf8(patterns) else {
+        return false;
+    };
+    let Ok(group) = std::str::from_utf8(group) else {
+        return false;
+    };
     let mut matched = None;
-    for pattern in patterns.split(|byte| *byte == b',') {
+    for pattern in patterns.split(',') {
         let (negated, pattern) = pattern
-            .strip_prefix(b"!")
+            .strip_prefix('!')
             .map_or((false, pattern), |pattern| (true, pattern));
         if wildmat_pattern_matches(pattern, group) {
             matched = Some(!negated);
@@ -4061,19 +4067,24 @@ fn wildmat_matches(patterns: &[u8], group: &[u8]) -> bool {
     matched.unwrap_or(false)
 }
 
-fn wildmat_pattern_matches(pattern: &[u8], group: &[u8]) -> bool {
-    fn matches_from(pattern: &[u8], group: &[u8]) -> bool {
-        match (pattern.split_first(), group.split_first()) {
+fn wildmat_pattern_matches(pattern: &str, group: &str) -> bool {
+    fn split_first_char(value: &str) -> Option<(char, &str)> {
+        let mut chars = value.chars();
+        let ch = chars.next()?;
+        Some((ch, chars.as_str()))
+    }
+
+    fn matches_from(pattern: &str, group: &str) -> bool {
+        match (split_first_char(pattern), split_first_char(group)) {
             (None, None) => true,
             (None, Some(_)) => false,
-            (Some((&b'*', rest)), _) => {
+            (Some(('*', rest)), _) => {
                 matches_from(rest, group)
-                    || group
-                        .split_first()
+                    || split_first_char(group)
                         .is_some_and(|(_, group_rest)| matches_from(pattern, group_rest))
             }
-            (Some((&b'?', rest)), Some((_, group_rest))) => matches_from(rest, group_rest),
-            (Some((&expected, rest)), Some((&actual, group_rest))) if expected == actual => {
+            (Some(('?', rest)), Some((_, group_rest))) => matches_from(rest, group_rest),
+            (Some((expected, rest)), Some((actual, group_rest))) if expected == actual => {
                 matches_from(rest, group_rest)
             }
             _ => false,
@@ -6138,6 +6149,19 @@ mod tests {
                 },
             ])
             .await;
+
+            assert!(
+                wildmat_matches("caf?".as_bytes(), "café".as_bytes()),
+                "RFC 3977 section 4.2 requires ? to match one UTF-8 character"
+            );
+            assert!(
+                wildmat_matches("ca*é".as_bytes(), "café".as_bytes()),
+                "RFC 3977 section 4.2 requires * to match UTF-8 character-aligned text"
+            );
+            assert!(
+                !wildmat_matches("*,!café".as_bytes(), "café".as_bytes()),
+                "RFC 3977 section 4.2 applies rightmost matching pattern semantics to UTF-8"
+            );
         }
 
         #[tokio::test]
@@ -7003,6 +7027,11 @@ mod tests {
                         "wildmat accepts ! as comma pattern negation marker",
                         "RFC 3977 sections 4.1 and 4.2 https://www.rfc-editor.org/rfc/rfc3977#section-4.1",
                         Wildmat::from_borrowed("alt.*,!alt.test").is_ok(),
+                    ),
+                    (
+                        "wildmat accepts UTF-8 non-ASCII exact text",
+                        "RFC 3977 sections 4.1 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-4.1",
+                        Wildmat::from_borrowed("comp.lang.rust.é").is_ok(),
                     ),
                 ]);
             }

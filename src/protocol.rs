@@ -2088,7 +2088,11 @@ impl<'a> Wildmat<'a> {
 pub struct InvalidWildmat;
 
 fn validate_wildmat(value: &str) -> Result<(), InvalidWildmat> {
-    if value.is_empty() || value.bytes().any(|byte| !(0x21..=0x7e).contains(&byte)) {
+    if value.is_empty()
+        || value
+            .chars()
+            .any(|ch| ch.is_ascii() && !(('\x21'..='\x7e').contains(&ch)))
+    {
         return Err(InvalidWildmat);
     }
 
