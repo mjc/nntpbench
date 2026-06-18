@@ -171,12 +171,28 @@ const HDR_MESSAGE_ID_MESSAGE_ID_RESPONSE: &[u8] =
     b"225 headers follow\r\n0 <one@example.com>\r\n.\r\n";
 const HDR_MESSAGE_ID_1_RESPONSE: &[u8] = b"225 headers follow\r\n1 <one@example.com>\r\n.\r\n";
 const HDR_MESSAGE_ID_2_RESPONSE: &[u8] = b"225 headers follow\r\n2 <two@example.com>\r\n.\r\n";
+const HDR_BYTES_RESPONSE: &[u8] = b"225 headers follow\r\n1 123\r\n2 456\r\n.\r\n";
+const HDR_BYTES_MESSAGE_ID_RESPONSE: &[u8] = b"225 headers follow\r\n0 123\r\n.\r\n";
+const HDR_BYTES_1_RESPONSE: &[u8] = b"225 headers follow\r\n1 123\r\n.\r\n";
+const HDR_BYTES_2_RESPONSE: &[u8] = b"225 headers follow\r\n2 456\r\n.\r\n";
+const HDR_LINES_RESPONSE: &[u8] = b"225 headers follow\r\n1 4\r\n2 8\r\n.\r\n";
+const HDR_LINES_MESSAGE_ID_RESPONSE: &[u8] = b"225 headers follow\r\n0 4\r\n.\r\n";
+const HDR_LINES_1_RESPONSE: &[u8] = b"225 headers follow\r\n1 4\r\n.\r\n";
+const HDR_LINES_2_RESPONSE: &[u8] = b"225 headers follow\r\n2 8\r\n.\r\n";
 const XHDR_MESSAGE_ID_RESPONSE: &[u8] =
     b"221 headers follow\r\n1 <one@example.com>\r\n2 <two@example.com>\r\n.\r\n";
 const XHDR_MESSAGE_ID_MESSAGE_ID_RESPONSE: &[u8] =
     b"221 headers follow\r\n0 <one@example.com>\r\n.\r\n";
 const XHDR_MESSAGE_ID_1_RESPONSE: &[u8] = b"221 headers follow\r\n1 <one@example.com>\r\n.\r\n";
 const XHDR_MESSAGE_ID_2_RESPONSE: &[u8] = b"221 headers follow\r\n2 <two@example.com>\r\n.\r\n";
+const XHDR_BYTES_RESPONSE: &[u8] = b"221 headers follow\r\n1 123\r\n2 456\r\n.\r\n";
+const XHDR_BYTES_MESSAGE_ID_RESPONSE: &[u8] = b"221 headers follow\r\n0 123\r\n.\r\n";
+const XHDR_BYTES_1_RESPONSE: &[u8] = b"221 headers follow\r\n1 123\r\n.\r\n";
+const XHDR_BYTES_2_RESPONSE: &[u8] = b"221 headers follow\r\n2 456\r\n.\r\n";
+const XHDR_LINES_RESPONSE: &[u8] = b"221 headers follow\r\n1 4\r\n2 8\r\n.\r\n";
+const XHDR_LINES_MESSAGE_ID_RESPONSE: &[u8] = b"221 headers follow\r\n0 4\r\n.\r\n";
+const XHDR_LINES_1_RESPONSE: &[u8] = b"221 headers follow\r\n1 4\r\n.\r\n";
+const XHDR_LINES_2_RESPONSE: &[u8] = b"221 headers follow\r\n2 8\r\n.\r\n";
 pub const HEAD_RESPONSE: &[u8] = b"221 1 <article.1@nntpbench.local> article retrieved\r\nPath: nntpbench.local!mock\r\nFrom: Bench User <bench@nntpbench.local>\r\nNewsgroups: alt.binaries.bench\r\nSubject: nntpbench synthetic article\r\nMessage-ID: <article.1@nntpbench.local>\r\nDate: Fri, 15 May 2026 00:00:00 +0000\r\n.\r\n";
 pub const STAT_RESPONSE: &[u8] = b"223 1 <article.1@nntpbench.local> article retrieved\r\n";
 pub const HELP_RESPONSE: &[u8] =
@@ -4366,19 +4382,43 @@ fn hdr_field_is_supported(field: &[u8]) -> bool {
 
 fn hdr_response_for_args(args: &[u8]) -> &'static [u8] {
     let selector = overview_selector_arg(RequestKind::Hdr, args);
-    if header_query_name_from_args(args)
-        .is_some_and(|header| header.eq_ignore_ascii_case(b"Message-ID"))
-    {
-        if selector.is_some_and(overview_selector_is_message_id) {
-            return HDR_MESSAGE_ID_MESSAGE_ID_RESPONSE;
+    if let Some(header) = header_query_name_from_args(args) {
+        if header.eq_ignore_ascii_case(b"Message-ID") {
+            if selector.is_some_and(overview_selector_is_message_id) {
+                return HDR_MESSAGE_ID_MESSAGE_ID_RESPONSE;
+            }
+            if selector.is_some_and(overview_selector_selects_first_only) {
+                return HDR_MESSAGE_ID_1_RESPONSE;
+            }
+            if selector.is_some_and(overview_selector_starts_at_second) {
+                return HDR_MESSAGE_ID_2_RESPONSE;
+            }
+            return HDR_MESSAGE_ID_RESPONSE;
         }
-        if selector.is_some_and(overview_selector_selects_first_only) {
-            return HDR_MESSAGE_ID_1_RESPONSE;
+        if header.eq_ignore_ascii_case(b":bytes") {
+            if selector.is_some_and(overview_selector_is_message_id) {
+                return HDR_BYTES_MESSAGE_ID_RESPONSE;
+            }
+            if selector.is_some_and(overview_selector_selects_first_only) {
+                return HDR_BYTES_1_RESPONSE;
+            }
+            if selector.is_some_and(overview_selector_starts_at_second) {
+                return HDR_BYTES_2_RESPONSE;
+            }
+            return HDR_BYTES_RESPONSE;
         }
-        if selector.is_some_and(overview_selector_starts_at_second) {
-            return HDR_MESSAGE_ID_2_RESPONSE;
+        if header.eq_ignore_ascii_case(b":lines") {
+            if selector.is_some_and(overview_selector_is_message_id) {
+                return HDR_LINES_MESSAGE_ID_RESPONSE;
+            }
+            if selector.is_some_and(overview_selector_selects_first_only) {
+                return HDR_LINES_1_RESPONSE;
+            }
+            if selector.is_some_and(overview_selector_starts_at_second) {
+                return HDR_LINES_2_RESPONSE;
+            }
+            return HDR_LINES_RESPONSE;
         }
-        return HDR_MESSAGE_ID_RESPONSE;
     }
     if selector.is_some_and(overview_selector_is_message_id) {
         return HDR_SUBJECT_MESSAGE_ID_RESPONSE;
@@ -4394,19 +4434,43 @@ fn hdr_response_for_args(args: &[u8]) -> &'static [u8] {
 
 fn xhdr_response_for_args(args: &[u8]) -> &'static [u8] {
     let selector = overview_selector_arg(RequestKind::Xhdr, args);
-    if header_query_name_from_args(args)
-        .is_some_and(|header| header.eq_ignore_ascii_case(b"Message-ID"))
-    {
-        if selector.is_some_and(overview_selector_is_message_id) {
-            return XHDR_MESSAGE_ID_MESSAGE_ID_RESPONSE;
+    if let Some(header) = header_query_name_from_args(args) {
+        if header.eq_ignore_ascii_case(b"Message-ID") {
+            if selector.is_some_and(overview_selector_is_message_id) {
+                return XHDR_MESSAGE_ID_MESSAGE_ID_RESPONSE;
+            }
+            if selector.is_some_and(overview_selector_selects_first_only) {
+                return XHDR_MESSAGE_ID_1_RESPONSE;
+            }
+            if selector.is_some_and(overview_selector_starts_at_second) {
+                return XHDR_MESSAGE_ID_2_RESPONSE;
+            }
+            return XHDR_MESSAGE_ID_RESPONSE;
         }
-        if selector.is_some_and(overview_selector_selects_first_only) {
-            return XHDR_MESSAGE_ID_1_RESPONSE;
+        if header.eq_ignore_ascii_case(b":bytes") {
+            if selector.is_some_and(overview_selector_is_message_id) {
+                return XHDR_BYTES_MESSAGE_ID_RESPONSE;
+            }
+            if selector.is_some_and(overview_selector_selects_first_only) {
+                return XHDR_BYTES_1_RESPONSE;
+            }
+            if selector.is_some_and(overview_selector_starts_at_second) {
+                return XHDR_BYTES_2_RESPONSE;
+            }
+            return XHDR_BYTES_RESPONSE;
         }
-        if selector.is_some_and(overview_selector_starts_at_second) {
-            return XHDR_MESSAGE_ID_2_RESPONSE;
+        if header.eq_ignore_ascii_case(b":lines") {
+            if selector.is_some_and(overview_selector_is_message_id) {
+                return XHDR_LINES_MESSAGE_ID_RESPONSE;
+            }
+            if selector.is_some_and(overview_selector_selects_first_only) {
+                return XHDR_LINES_1_RESPONSE;
+            }
+            if selector.is_some_and(overview_selector_starts_at_second) {
+                return XHDR_LINES_2_RESPONSE;
+            }
+            return XHDR_LINES_RESPONSE;
         }
-        return XHDR_MESSAGE_ID_RESPONSE;
     }
     if selector.is_some_and(overview_selector_is_message_id) {
         return XHDR_SUBJECT_MESSAGE_ID_RESPONSE;
@@ -5592,7 +5656,7 @@ mod tests {
             let (output, _) = run_session_with_input(test_config(), input).await;
             let text = String::from_utf8_lossy(without_greeting(&output));
             assert!(
-                text.ends_with("\r\n225 headers follow\r\n1 example one\r\n.\r\n"),
+                text.ends_with("\r\n225 headers follow\r\n1 123\r\n.\r\n"),
                 "RFC 3977 HDR metadata names must be accepted, got {text:?}"
             );
         }
@@ -6541,6 +6605,55 @@ mod tests {
                     reference: "RFC 2980 section 2.1.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.6",
                     input: b"GROUP alt.test\r\nXHDR :unknown 1\r\n",
                     expected: b"503 HDR field unavailable\r\n",
+                },
+            ])
+            .await;
+        }
+
+        #[tokio::test]
+        async fn rfc3977_red_hdr_metadata_fields_return_metadata_values() {
+            // RFC 3977 sections 8.1, 8.4, and 8.5 distinguish calculated
+            // metadata items such as :bytes and :lines from header fields.
+            // HDR must return the calculated metadata value, not a Subject
+            // fixture or any header text:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-8.1
+            // https://www.rfc-editor.org/rfc/rfc3977#section-8.5.2
+            assert_red_server_response_tail_cases(&[
+                ServerResponseCase {
+                    name: "HDR :bytes numeric selector",
+                    reference: "RFC 3977 section 8.1.1 https://www.rfc-editor.org/rfc/rfc3977#section-8.1.1",
+                    input: b"GROUP alt.test\r\nHDR :bytes 1\r\n",
+                    expected: HDR_BYTES_1_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "HDR :lines numeric selector",
+                    reference: "RFC 3977 section 8.1.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.1.2",
+                    input: b"GROUP alt.test\r\nHDR :lines 2\r\n",
+                    expected: HDR_LINES_2_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "HDR :bytes message-id selector",
+                    reference: "RFC 3977 section 8.5.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.2",
+                    input: b"HDR :bytes <one@example.com>\r\n",
+                    expected: HDR_BYTES_MESSAGE_ID_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "HDR :lines range selector",
+                    reference: "RFC 3977 section 8.5.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.2",
+                    input: b"GROUP alt.test\r\nHDR :lines 2-\r\n",
+                    expected: HDR_LINES_2_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "XHDR :bytes numeric selector",
+                    reference: "RFC 2980 section 2.1.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.6",
+                    input: b"GROUP alt.test\r\nXHDR :bytes 1\r\n",
+                    expected: XHDR_BYTES_1_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "XHDR :lines message-id selector",
+                    reference: "RFC 2980 section 2.1.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.6",
+                    input: b"XHDR :lines <one@example.com>\r\n",
+                    expected: XHDR_LINES_MESSAGE_ID_RESPONSE,
                 },
             ])
             .await;
