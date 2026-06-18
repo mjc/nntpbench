@@ -1462,6 +1462,11 @@ fn validate_headers(data: &[u8]) -> Result<(), ArticleParseError> {
                     InvalidHeaderReason::EmptyFold,
                 ));
             }
+            if line.contains(&b'\0') {
+                return Err(ArticleParseError::InvalidHeader(
+                    InvalidHeaderReason::InvalidContent,
+                ));
+            }
             pos = line_end + 2;
             continue;
         }
@@ -1636,6 +1641,7 @@ Actual body content\r\n\
         let missing_space = b"Subject:Test\r\n";
         let invalid_name = b"Invalid Header: value\r\n";
         let invalid_content = b"Subject: bad\0value\r\n";
+        let invalid_folded_content = b"Subject: good\r\n bad\0value\r\n";
         let leading_fold = b" folded\r\nSubject: Test\r\n";
         let empty_fold = b"Subject: Test\r\n \t\r\n";
 
@@ -1664,6 +1670,10 @@ Actual body content\r\n\
         );
         assert_eq!(
             Headers::parse(invalid_content).unwrap_err(),
+            ArticleParseError::InvalidHeader(InvalidHeaderReason::InvalidContent)
+        );
+        assert_eq!(
+            Headers::parse(invalid_folded_content).unwrap_err(),
             ArticleParseError::InvalidHeader(InvalidHeaderReason::InvalidContent)
         );
         assert_eq!(

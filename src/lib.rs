@@ -5590,6 +5590,11 @@ mod tests {
                     b"220 1 <nul@test>\r\nSubject: bad\0value\r\n\r\nbody\r\n.\r\n".as_slice(),
                 ),
                 (
+                    "ARTICLE folded header content NUL",
+                    b"220 1 <nul@test>\r\nSubject: good\r\n bad\0value\r\n\r\nbody\r\n.\r\n"
+                        .as_slice(),
+                ),
+                (
                     "ARTICLE body NUL",
                     b"220 1 <nul@test>\r\nSubject: ok\r\n\r\nbad\0body\r\n.\r\n".as_slice(),
                 ),
