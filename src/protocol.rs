@@ -2647,8 +2647,22 @@ fn validate_multiline_response_content(
         RequestKind::Xhdr => validate_crlf_lines(content, validate_xhdr_response_line),
         RequestKind::Capabilities => validate_capabilities_response_content(content),
         RequestKind::Help => validate_crlf_lines(content, validate_help_text_line),
+        RequestKind::Unknown => validate_generic_multiline_response_content(content),
         _ => true,
     }
+}
+
+fn validate_generic_multiline_response_content(content: &[u8]) -> bool {
+    validate_crlf_lines(content, validate_generic_multiline_response_line)
+}
+
+fn validate_generic_multiline_response_line(line: &[u8]) -> bool {
+    if line.starts_with(b".") && !line.starts_with(b"..") {
+        return false;
+    }
+
+    line.iter()
+        .all(|byte| !matches!(*byte, b'\0' | b'\r' | b'\n'))
 }
 
 fn validate_listgroup_response_content(status_line: &[u8], content: &[u8]) -> bool {

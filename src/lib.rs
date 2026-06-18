@@ -7983,6 +7983,12 @@ mod tests {
                         kind: RequestKind::Body,
                         frame: b"222 1 <body@test> body follows\r\nbody\r\n.\r\n",
                     },
+                    ResponseFrameCase {
+                        name: "unknown multiline response accepts generic content lines",
+                        reference: "RFC 3977 sections 3.1.1 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
+                        kind: RequestKind::Unknown,
+                        frame: b"100 extension multiline follows\r\n\r\nplain\r\n..dot-stuffed\r\nbinary-\xff\r\n.\r\n",
+                    },
                 ]);
             }
 
@@ -8102,6 +8108,30 @@ mod tests {
                         reference: "RFC 3977 sections 3.1 and 9.4 https://www.rfc-editor.org/rfc/rfc3977#section-9.4",
                         kind: RequestKind::Body,
                         frame: b"222body follows\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "unknown multiline response rejects NUL content octet",
+                        reference: "RFC 3977 sections 3.1.1 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
+                        kind: RequestKind::Unknown,
+                        frame: b"100 extension multiline follows\r\nvalid\r\nbad\0content\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "unknown multiline response rejects bare LF content",
+                        reference: "RFC 3977 sections 3.1.1 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
+                        kind: RequestKind::Unknown,
+                        frame: b"100 extension multiline follows\r\nvalid\nbad\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "unknown multiline response rejects bare CR content",
+                        reference: "RFC 3977 sections 3.1.1 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
+                        kind: RequestKind::Unknown,
+                        frame: b"100 extension multiline follows\r\nvalid\rbad\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "unknown multiline response rejects unstuffed dot line",
+                        reference: "RFC 3977 sections 3.1.1 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
+                        kind: RequestKind::Unknown,
+                        frame: b"100 extension multiline follows\r\n.dot-prefixed\r\n.\r\n",
                     },
                     ResponseFrameCase {
                         name: "STARTTLS rejects authentication required 480",
