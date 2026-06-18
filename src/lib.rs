@@ -9202,6 +9202,12 @@ mod tests {
                         frame: b"211 3 1 3 alt.test\r\none\r\n.\r\n",
                     },
                     ResponseFrameCase {
+                        name: "LISTGROUP rejects zero article number line",
+                        reference: "RFC 3977 sections 3.6 and 6.1.2 https://www.rfc-editor.org/rfc/rfc3977#section-3.6",
+                        kind: RequestKind::ListGroup,
+                        frame: b"211 3 1 3 alt.test\r\n0\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "LISTGROUP rejects overlong article number line",
                         reference: "RFC 3977 sections 6.1.2 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
                         kind: RequestKind::ListGroup,

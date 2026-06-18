@@ -2505,6 +2505,10 @@ fn validate_response_article_number(value: &[u8]) -> bool {
         .is_some_and(|number| number <= MAX_ARTICLE_NUMBER)
 }
 
+fn validate_nonzero_response_article_number(value: &[u8]) -> bool {
+    validate_response_article_number(value) && value.iter().any(|byte| *byte != b'0')
+}
+
 fn validate_article_status_response_arguments(value: &[u8]) -> bool {
     let Some((tokens, trailing_text)) = split_required_response_tokens::<2>(value) else {
         return false;
@@ -2569,7 +2573,9 @@ fn validate_multiline_response_content(kind: RequestKind, content: &[u8]) -> boo
         RequestKind::ListDistribPats => {
             validate_crlf_lines(content, validate_distrib_pats_response_line)
         }
-        RequestKind::ListGroup => validate_crlf_lines(content, validate_response_article_number),
+        RequestKind::ListGroup => {
+            validate_crlf_lines(content, validate_nonzero_response_article_number)
+        }
         RequestKind::NewNews => validate_crlf_lines(content, |line| {
             std::str::from_utf8(line)
                 .ok()
@@ -5792,6 +5798,22 @@ mod tests {
                 "{kind:?} {input:?}"
             );
         }
+
+        let invalid_body_input = b"211 3 1 3 alt.test\r\n0\r\n.\r\n".as_slice();
+        assert!(
+            matches!(
+                ResponseFrame::parse(RequestKind::ListGroup, invalid_body_input),
+                ResponseFrameParse::Invalid
+            ),
+            "{invalid_body_input:?}"
+        );
+        assert!(
+            matches!(
+                ResponseInitial::parse(RequestKind::ListGroup, invalid_body_input),
+                ResponseInitialParse::Complete(initial) if initial.status() == StatusCode(211)
+            ),
+            "{invalid_body_input:?}"
+        );
     }
 
     #[test]
