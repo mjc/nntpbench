@@ -2381,6 +2381,13 @@ where
                 write_response(writer, pending_write, response, session_stats).await?;
                 return Ok(false);
             }
+            if let Some(message_id) =
+                command_lines.and_then(|lines| command_message_id(command, lines))
+            {
+                let response = build_message_id_article_response(&message_id, config.article_bytes);
+                write_response(writer, pending_write, &response, session_stats).await?;
+                return Ok(false);
+            }
             let article_id = command
                 .article_id
                 .or(session_state.current_article)
@@ -2408,6 +2415,13 @@ where
                 write_response(writer, pending_write, response, session_stats).await?;
                 return Ok(false);
             }
+            if let Some(message_id) =
+                command_lines.and_then(|lines| command_message_id(command, lines))
+            {
+                let response = build_message_id_head_response(&message_id);
+                write_response(writer, pending_write, &response, session_stats).await?;
+                return Ok(false);
+            }
             let article_id = command
                 .article_id
                 .or(session_state.current_article)
@@ -2430,6 +2444,13 @@ where
                 write_response(writer, pending_write, response, session_stats).await?;
                 return Ok(false);
             }
+            if let Some(message_id) =
+                command_lines.and_then(|lines| command_message_id(command, lines))
+            {
+                let response = build_message_id_stat_response(&message_id);
+                write_response(writer, pending_write, &response, session_stats).await?;
+                return Ok(false);
+            }
             let article_id = command
                 .article_id
                 .or(session_state.current_article)
@@ -2450,6 +2471,13 @@ where
                 article_selector_error(command, command_lines, session_state, true)
             {
                 write_response(writer, pending_write, response, session_stats).await?;
+                return Ok(false);
+            }
+            if let Some(message_id) =
+                command_lines.and_then(|lines| command_message_id(command, lines))
+            {
+                let response = build_message_id_body_response(&message_id, config.body_bytes);
+                write_response(writer, pending_write, &response, session_stats).await?;
                 return Ok(false);
             }
             let article_id = command
@@ -2883,22 +2911,28 @@ fn build_generated_response(prefix: &[u8], target_bytes: usize) -> Box<[u8]> {
     buffer.into_boxed_slice()
 }
 
-fn append_synthetic_article_headers(buffer: &mut Vec<u8>, article_id: u64) {
+fn append_synthetic_article_headers(buffer: &mut Vec<u8>, message_id: &str) {
     write!(
         buffer,
-        "Path: nntpbench.local!mock\r\nFrom: Bench User <bench@nntpbench.local>\r\nNewsgroups: alt.binaries.bench\r\nSubject: nntpbench synthetic article\r\nMessage-ID: <article.{article_id}@nntpbench.local>\r\nDate: Fri, 15 May 2026 00:00:00 +0000\r\n"
+        "Path: nntpbench.local!mock\r\nFrom: Bench User <bench@nntpbench.local>\r\nNewsgroups: alt.binaries.bench\r\nSubject: nntpbench synthetic article\r\nMessage-ID: {message_id}\r\nDate: Fri, 15 May 2026 00:00:00 +0000\r\n"
     )
     .expect("write to Vec cannot fail");
 }
 
 fn build_selected_article_response(article_id: u64, target_bytes: usize) -> Box<[u8]> {
+    let message_id = format!("<article.{article_id}@nntpbench.local>");
+    build_article_response(article_id, &message_id, target_bytes)
+}
+
+fn build_message_id_article_response(message_id: &MessageId<'_>, target_bytes: usize) -> Box<[u8]> {
+    build_article_response(0, message_id.as_str(), target_bytes)
+}
+
+fn build_article_response(article_id: u64, message_id: &str, target_bytes: usize) -> Box<[u8]> {
     let mut buffer = Vec::with_capacity(target_bytes.max(ARTICLE_RESPONSE_PREFIX.len()));
-    write!(
-        buffer,
-        "220 {article_id} <article.{article_id}@nntpbench.local> article follows\r\n"
-    )
-    .expect("write to Vec cannot fail");
-    append_synthetic_article_headers(&mut buffer, article_id);
+    write!(buffer, "220 {article_id} {message_id} article follows\r\n")
+        .expect("write to Vec cannot fail");
+    append_synthetic_article_headers(&mut buffer, message_id);
     buffer.extend_from_slice(CRLF);
 
     if buffer.len() < target_bytes {
@@ -2911,12 +2945,18 @@ fn build_selected_article_response(article_id: u64, target_bytes: usize) -> Box<
 }
 
 fn build_selected_body_response(article_id: u64, target_bytes: usize) -> Box<[u8]> {
+    let message_id = format!("<article.{article_id}@nntpbench.local>");
+    build_body_response(article_id, &message_id, target_bytes)
+}
+
+fn build_message_id_body_response(message_id: &MessageId<'_>, target_bytes: usize) -> Box<[u8]> {
+    build_body_response(0, message_id.as_str(), target_bytes)
+}
+
+fn build_body_response(article_id: u64, message_id: &str, target_bytes: usize) -> Box<[u8]> {
     let mut buffer = Vec::with_capacity(target_bytes.max(BODY_RESPONSE_PREFIX.len()));
-    write!(
-        buffer,
-        "222 {article_id} <article.{article_id}@nntpbench.local> body follows\r\n"
-    )
-    .expect("write to Vec cannot fail");
+    write!(buffer, "222 {article_id} {message_id} body follows\r\n")
+        .expect("write to Vec cannot fail");
 
     if buffer.len() < target_bytes {
         let missing = target_bytes - buffer.len();
@@ -2928,19 +2968,37 @@ fn build_selected_body_response(article_id: u64, target_bytes: usize) -> Box<[u8
 }
 
 fn build_selected_head_response(article_id: u64) -> Box<[u8]> {
+    let message_id = format!("<article.{article_id}@nntpbench.local>");
+    build_head_response(article_id, &message_id)
+}
+
+fn build_message_id_head_response(message_id: &MessageId<'_>) -> Box<[u8]> {
+    build_head_response(0, message_id.as_str())
+}
+
+fn build_head_response(article_id: u64, message_id: &str) -> Box<[u8]> {
     let mut buffer = Vec::new();
     write!(
         buffer,
-        "221 {article_id} <article.{article_id}@nntpbench.local> article retrieved\r\n"
+        "221 {article_id} {message_id} article retrieved\r\n"
     )
     .expect("write to Vec cannot fail");
-    append_synthetic_article_headers(&mut buffer, article_id);
+    append_synthetic_article_headers(&mut buffer, message_id);
     append_dot_terminator(&mut buffer);
     buffer.into_boxed_slice()
 }
 
 fn build_selected_stat_response(article_id: u64) -> Box<[u8]> {
-    format!("223 {article_id} <article.{article_id}@nntpbench.local> article retrieved\r\n")
+    let message_id = format!("<article.{article_id}@nntpbench.local>");
+    build_stat_response(article_id, &message_id)
+}
+
+fn build_message_id_stat_response(message_id: &MessageId<'_>) -> Box<[u8]> {
+    build_stat_response(0, message_id.as_str())
+}
+
+fn build_stat_response(article_id: u64, message_id: &str) -> Box<[u8]> {
+    format!("223 {article_id} {message_id} article retrieved\r\n")
         .into_bytes()
         .into_boxed_slice()
 }
@@ -3089,6 +3147,14 @@ where
                     .expect("response write failed");
                 return false;
             }
+            if let Some(message_id) = request.message_id() {
+                let response = build_message_id_article_response(&message_id, config.article_bytes);
+                stats
+                    .bytes_sent
+                    .fetch_add(response.len() as u64, Ordering::Relaxed);
+                output.write_all(&response).expect("response write failed");
+                return false;
+            }
             if let Some(article_id) = parse_article_id_arg(request.args()).filter(|id| *id != 1) {
                 let response = build_selected_article_response(article_id, config.article_bytes);
                 stats
@@ -3107,6 +3173,14 @@ where
         }
         RequestKind::Head => {
             stats.article_requests.fetch_add(1, Ordering::Relaxed);
+            if let Some(message_id) = request.message_id() {
+                let response = build_message_id_head_response(&message_id);
+                stats
+                    .bytes_sent
+                    .fetch_add(response.len() as u64, Ordering::Relaxed);
+                output.write_all(&response).expect("response write failed");
+                return false;
+            }
             if let Some(article_id) = parse_article_id_arg(request.args()).filter(|id| *id != 1) {
                 let response = build_selected_head_response(article_id);
                 stats
@@ -3119,6 +3193,14 @@ where
         }
         RequestKind::Stat => {
             stats.article_requests.fetch_add(1, Ordering::Relaxed);
+            if let Some(message_id) = request.message_id() {
+                let response = build_message_id_stat_response(&message_id);
+                stats
+                    .bytes_sent
+                    .fetch_add(response.len() as u64, Ordering::Relaxed);
+                output.write_all(&response).expect("response write failed");
+                return false;
+            }
             if let Some(article_id) = parse_article_id_arg(request.args()).filter(|id| *id != 1) {
                 let response = build_selected_stat_response(article_id);
                 stats
@@ -3131,6 +3213,14 @@ where
         }
         RequestKind::Body => {
             stats.body_requests.fetch_add(1, Ordering::Relaxed);
+            if let Some(message_id) = request.message_id() {
+                let response = build_message_id_body_response(&message_id, config.body_bytes);
+                stats
+                    .bytes_sent
+                    .fetch_add(response.len() as u64, Ordering::Relaxed);
+                output.write_all(&response).expect("response write failed");
+                return false;
+            }
             if let Some(article_id) = parse_article_id_arg(request.args()).filter(|id| *id != 1) {
                 let response = build_selected_body_response(article_id, config.body_bytes);
                 stats
@@ -4849,6 +4939,55 @@ mod tests {
                 without_greeting(&output)
                     .ends_with(b"223 2 <article.2@nntpbench.local> article retrieved\r\n"),
                 "RFC 3977 current STAT should report current article 2, got {:?}",
+                String::from_utf8_lossy(without_greeting(&output))
+            );
+        }
+
+        #[tokio::test]
+        async fn rfc3977_red_article_family_message_id_selectors_do_not_change_current_article() {
+            // RFC 3977 section 6.2 requires message-id forms to return the
+            // requested message-id with article number 0 when group membership
+            // is not asserted, and to leave current group/article state alone:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-6.2
+            for (name, input, expected_prefix) in [
+                (
+                    "ARTICLE message-id selector",
+                    b"ARTICLE <by-id@nntpbench.local>\r\n".as_slice(),
+                    b"220 0 <by-id@nntpbench.local> article follows\r\n".as_slice(),
+                ),
+                (
+                    "HEAD message-id selector",
+                    b"HEAD <by-id@nntpbench.local>\r\n".as_slice(),
+                    b"221 0 <by-id@nntpbench.local> article retrieved\r\n".as_slice(),
+                ),
+                (
+                    "BODY message-id selector",
+                    b"BODY <by-id@nntpbench.local>\r\n".as_slice(),
+                    b"222 0 <by-id@nntpbench.local> body follows\r\n".as_slice(),
+                ),
+                (
+                    "STAT message-id selector",
+                    b"STAT <by-id@nntpbench.local>\r\n".as_slice(),
+                    b"223 0 <by-id@nntpbench.local> article retrieved\r\n".as_slice(),
+                ),
+            ] {
+                let (output, _) = run_session_with_input(test_config(), input).await;
+                let actual = without_greeting(&output);
+                assert!(
+                    actual.starts_with(expected_prefix),
+                    "{name}: expected RFC 3977 message-id response prefix {:?}, got {:?}",
+                    String::from_utf8_lossy(expected_prefix),
+                    String::from_utf8_lossy(actual)
+                );
+            }
+
+            let input =
+                b"GROUP alt.test\r\nARTICLE 2\r\nARTICLE <by-id@nntpbench.local>\r\nSTAT\r\n";
+            let (output, _) = run_session_with_input(test_config(), input).await;
+            assert!(
+                without_greeting(&output)
+                    .ends_with(b"223 2 <article.2@nntpbench.local> article retrieved\r\n"),
+                "RFC 3977 message-id ARTICLE must not change current article, got {:?}",
                 String::from_utf8_lossy(without_greeting(&output))
             );
         }
@@ -8175,7 +8314,17 @@ mod tests {
         )
         .await;
 
-        assert_eq!(output, [GREETING, HEAD_RESPONSE, STAT_RESPONSE].concat());
+        let head_id = MessageId::from_borrowed("<typed-head@test>").unwrap();
+        let stat_id = MessageId::from_borrowed("<typed-stat@test>").unwrap();
+        assert_eq!(
+            output,
+            [
+                GREETING,
+                &build_message_id_head_response(&head_id),
+                &build_message_id_stat_response(&stat_id),
+            ]
+            .concat()
+        );
 
         let snapshot = stats.snapshot();
         assert_eq!(snapshot.commands, 2);
