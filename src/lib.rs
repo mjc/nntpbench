@@ -6969,6 +6969,11 @@ mod tests {
                         ArticleSelector::from_borrowed("0").is_err(),
                     ),
                     (
+                        "article reference selector rejects leading-zero number",
+                        "RFC 3977 section 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
+                        ArticleRef::from_selector("0001").is_err(),
+                    ),
+                    (
                         "article selector rejects zero range start",
                         "RFC 3977 section 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
                         ArticleSelector::from_borrowed("0-10").is_err(),
@@ -9273,6 +9278,16 @@ mod tests {
 
         let err = fetch_response(&args).await.unwrap_err();
         assert!(matches!(err, ClientError::InvalidMessageId));
+    }
+
+    #[tokio::test]
+    async fn fetch_response_rejects_invalid_article_selector() {
+        let mut args = test_fetch_args();
+        args.message_id = None;
+        args.selector = Some("0001".to_string());
+
+        let err = fetch_response(&args).await.unwrap_err();
+        assert!(matches!(err, ClientError::InvalidArticleSelector));
     }
 
     #[tokio::test]

@@ -1587,7 +1587,7 @@ impl ArticleRef<'static> {
         }
 
         if value.bytes().all(|byte| byte.is_ascii_digit()) {
-            let number = value.parse::<u64>().map_err(|_| InvalidArticleRef)?;
+            let number = article_number_token_value(value).map_err(|_| InvalidArticleRef)?;
             return ArticleRef::from_number(number);
         }
 
