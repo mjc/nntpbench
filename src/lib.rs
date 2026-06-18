@@ -7772,6 +7772,29 @@ mod tests {
             ]);
         }
 
+        #[test]
+        fn rfc3977_red_request_line_length_limit_matrix() {
+            // RFC 3977 section 3.1 limits command lines to 512 octets,
+            // including the terminating CRLF:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-3.1
+            let mut exact = b"QUIT".to_vec();
+            exact.resize(MAX_COMMAND_LINE_BYTES - crate::CRLF.len(), b' ');
+            exact.extend_from_slice(crate::CRLF);
+            assert_eq!(
+                RequestLine::parse(&exact).kind(),
+                RequestKind::Quit,
+                "RFC 3977 permits command lines at the 512-octet boundary"
+            );
+
+            let mut overlong = exact;
+            overlong.insert(MAX_COMMAND_LINE_BYTES - crate::CRLF.len(), b' ');
+            assert_eq!(
+                RequestLine::parse(&overlong).kind(),
+                RequestKind::Unknown,
+                "RFC 3977 command lines over 512 octets must not parse as valid commands"
+            );
+        }
+
         #[tokio::test]
         async fn rfc3977_red_server_selector_and_state_response_matrix() {
             assert_red_server_response_cases(&[

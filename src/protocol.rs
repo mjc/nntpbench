@@ -4173,6 +4173,13 @@ impl<'a> RequestLine<'a> {
     /// Parse a raw command line into borrowed protocol pieces.
     #[must_use]
     pub fn parse(line: &'a [u8]) -> Self {
+        if line.len() > MAX_INITIAL_RESPONSE_LINE_BYTES {
+            return Self {
+                kind: RequestKind::Unknown,
+                verb: line,
+                args: &[],
+            };
+        }
         let Some(line) = strip_complete_crlf_line(line) else {
             return Self {
                 kind: RequestKind::Unknown,
