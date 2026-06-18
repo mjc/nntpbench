@@ -8660,6 +8660,12 @@ mod tests {
                         frame: b"224 overview follows\r\n12345678901234567\tSubject\tfrom@test\r\n.\r\n",
                     },
                     ResponseFrameCase {
+                        name: "OVER rejects labeled bytes metadata field",
+                        reference: "RFC 3977 sections 8.1.1 and 8.3.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.3.2",
+                        kind: RequestKind::Over,
+                        frame: b"224 overview follows\r\n1\tSubject\tfrom@test\tdate\t<one@test>\t\tbytes 1\t1\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "XOVER rejects missing required overview fields",
                         reference: "RFC 2980 section 2.1.7 and RFC 3977 section 9.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.7",
                         kind: RequestKind::Xover,
@@ -8670,6 +8676,12 @@ mod tests {
                         reference: "RFC 2980 section 2.1.7 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.7",
                         kind: RequestKind::Xover,
                         frame: b"224 overview follows\r\none\tSubject\tfrom@test\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "XOVER rejects labeled lines metadata field",
+                        reference: "RFC 2980 section 2.1.7 and RFC 3977 sections 8.1.2 and 8.3.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.3.2",
+                        kind: RequestKind::Xover,
+                        frame: b"224 overview follows\r\n1\tSubject\tfrom@test\tdate\t<one@test>\t\t1\tlines 1\r\n.\r\n",
                     },
                     ResponseFrameCase {
                         name: "XOVER rejects optional overview field without label separator",

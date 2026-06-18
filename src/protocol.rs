@@ -2804,6 +2804,9 @@ fn validate_overview_response_line(line: &[u8]) -> bool {
     let mut field_count = 0usize;
     for field in line[tab + 1..].split(|byte| *byte == b'\t') {
         field_count += 1;
+        if matches!(field_count, 6 | 7) && !is_response_decimal_token(field) {
+            return false;
+        }
         if field_count > 7 && !field.is_empty() && !validate_overview_optional_field(field) {
             return false;
         }
@@ -5807,6 +5810,11 @@ mod tests {
             ),
             (
                 RequestKind::Over,
+                b"224 overview follows\r\n1\tSubject\tfrom@test\tdate\t<one@test>\t\tbytes 1\t1\r\n.\r\n"
+                    .as_slice(),
+            ),
+            (
+                RequestKind::Over,
                 b"224 overview follows\r\n1\tSubject\tfrom@test\tdate\t<one@test>\t\t1\t1\toptional without label\r\n.\r\n"
                     .as_slice(),
             ),
@@ -5818,6 +5826,11 @@ mod tests {
             (
                 RequestKind::Xover,
                 b"224 overview follows\r\none\tSubject\tfrom@test\r\n.\r\n".as_slice(),
+            ),
+            (
+                RequestKind::Xover,
+                b"224 overview follows\r\n1\tSubject\tfrom@test\tdate\t<one@test>\t\t1\tlines 1\r\n.\r\n"
+                    .as_slice(),
             ),
             (
                 RequestKind::Xover,
