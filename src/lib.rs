@@ -3992,10 +3992,10 @@ fn article_selector_error(
         }
         return None;
     }
+    if command.article_id.is_some() && !session_state.group_selected {
+        return Some(b"412 no newsgroup selected\r\n");
+    }
     if command.article_id.is_some_and(|article_id| article_id > 3) {
-        if matches!(command.kind, RequestKind::Article) {
-            return Some(b"430 no article with that number\r\n");
-        }
         return Some(b"423 no article with that number\r\n");
     }
     if command.message_id.is_some() && contains_subslice(args, b"missing") {
@@ -4881,17 +4881,50 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc3977_red_missing_article_number_returns_430() {
-            // RFC 3977 section 6.2.1 defines 430 when an article number or
-            // message-id selector cannot be found:
+        async fn rfc3977_red_article_numeric_before_group_returns_412() {
+            // RFC 3977 section 6.2 requires numeric article selectors to fail
+            // with 412 when no group is selected:
             // https://www.rfc-editor.org/rfc/rfc3977#section-6.2.1
-            let input = b"ARTICLE 999999\r\n";
+            assert_red_server_response_cases(&[
+                ServerResponseCase {
+                    name: "ARTICLE numeric before GROUP",
+                    reference: "RFC 3977 section 6.2.1",
+                    input: b"ARTICLE 2\r\n",
+                    expected: b"412 no newsgroup selected\r\n",
+                },
+                ServerResponseCase {
+                    name: "HEAD numeric before GROUP",
+                    reference: "RFC 3977 section 6.2.2",
+                    input: b"HEAD 2\r\n",
+                    expected: b"412 no newsgroup selected\r\n",
+                },
+                ServerResponseCase {
+                    name: "BODY numeric before GROUP",
+                    reference: "RFC 3977 section 6.2.3",
+                    input: b"BODY 2\r\n",
+                    expected: b"412 no newsgroup selected\r\n",
+                },
+                ServerResponseCase {
+                    name: "STAT numeric before GROUP",
+                    reference: "RFC 3977 section 6.2.4",
+                    input: b"STAT 2\r\n",
+                    expected: b"412 no newsgroup selected\r\n",
+                },
+            ])
+            .await;
+        }
+
+        #[tokio::test]
+        async fn rfc3977_red_missing_article_number_returns_423() {
+            // RFC 3977 section 6.2.1 defines 423 when an article number cannot
+            // be found in the selected group:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-6.2.1
+            let input = b"GROUP alt.test\r\nARTICLE 999999\r\n";
             let (output, _) = run_session_with_input(test_config(), input).await;
-            assert_single_response(
-                input,
-                b"430 no article with that number\r\n",
-                &output,
-                "RFC 3977",
+            assert!(
+                without_greeting(&output).ends_with(b"423 no article with that number\r\n"),
+                "RFC 3977 missing numeric ARTICLE should end with 423, got {:?}",
+                String::from_utf8_lossy(without_greeting(&output))
             );
         }
 
@@ -4904,29 +4937,31 @@ mod tests {
             for (name, input, expected_prefix) in [
                 (
                     "ARTICLE numeric selector",
-                    b"ARTICLE 2\r\n".as_slice(),
+                    b"GROUP alt.test\r\nARTICLE 2\r\n".as_slice(),
                     b"220 2 <article.2@nntpbench.local> article follows\r\n".as_slice(),
                 ),
                 (
                     "HEAD numeric selector",
-                    b"HEAD 2\r\n".as_slice(),
+                    b"GROUP alt.test\r\nHEAD 2\r\n".as_slice(),
                     b"221 2 <article.2@nntpbench.local> article retrieved\r\n".as_slice(),
                 ),
                 (
                     "BODY numeric selector",
-                    b"BODY 2\r\n".as_slice(),
+                    b"GROUP alt.test\r\nBODY 2\r\n".as_slice(),
                     b"222 2 <article.2@nntpbench.local> body follows\r\n".as_slice(),
                 ),
                 (
                     "STAT numeric selector",
-                    b"STAT 2\r\n".as_slice(),
+                    b"GROUP alt.test\r\nSTAT 2\r\n".as_slice(),
                     b"223 2 <article.2@nntpbench.local> article retrieved\r\n".as_slice(),
                 ),
             ] {
                 let (output, _) = run_session_with_input(test_config(), input).await;
                 let actual = without_greeting(&output);
                 assert!(
-                    actual.starts_with(expected_prefix),
+                    actual
+                        .windows(expected_prefix.len())
+                        .any(|window| window == expected_prefix),
                     "{name}: expected RFC 3977 response prefix {:?}, got {:?}",
                     String::from_utf8_lossy(expected_prefix),
                     String::from_utf8_lossy(actual)
@@ -5217,13 +5252,12 @@ mod tests {
             // RFC 3977 section 6.2.3 defines 423 for a nonexistent article
             // number selector on BODY:
             // https://www.rfc-editor.org/rfc/rfc3977#section-6.2.3
-            let input = b"BODY 999999\r\n";
+            let input = b"GROUP alt.test\r\nBODY 999999\r\n";
             let (output, _) = run_session_with_input(test_config(), input).await;
-            assert_single_response(
-                input,
-                b"423 no article with that number\r\n",
-                &output,
-                "RFC 3977",
+            assert!(
+                without_greeting(&output).ends_with(b"423 no article with that number\r\n"),
+                "RFC 3977 missing numeric BODY should end with 423, got {:?}",
+                String::from_utf8_lossy(without_greeting(&output))
             );
         }
 
@@ -5461,13 +5495,12 @@ mod tests {
             // RFC 3977 section 6.2.2 defines 423 when HEAD names an article
             // number that does not exist in the selected group:
             // https://www.rfc-editor.org/rfc/rfc3977#section-6.2.2
-            let input = b"HEAD 999999\r\n";
+            let input = b"GROUP alt.test\r\nHEAD 999999\r\n";
             let (output, _) = run_session_with_input(test_config(), input).await;
-            assert_single_response(
-                input,
-                b"423 no article with that number\r\n",
-                &output,
-                "RFC 3977",
+            assert!(
+                without_greeting(&output).ends_with(b"423 no article with that number\r\n"),
+                "RFC 3977 missing numeric HEAD should end with 423, got {:?}",
+                String::from_utf8_lossy(without_greeting(&output))
             );
         }
 
@@ -5476,13 +5509,12 @@ mod tests {
             // RFC 3977 section 6.2.4 defines 423 when STAT names an article
             // number that does not exist in the selected group:
             // https://www.rfc-editor.org/rfc/rfc3977#section-6.2.4
-            let input = b"STAT 999999\r\n";
+            let input = b"GROUP alt.test\r\nSTAT 999999\r\n";
             let (output, _) = run_session_with_input(test_config(), input).await;
-            assert_single_response(
-                input,
-                b"423 no article with that number\r\n",
-                &output,
-                "RFC 3977",
+            assert!(
+                without_greeting(&output).ends_with(b"423 no article with that number\r\n"),
+                "RFC 3977 missing numeric STAT should end with 423, got {:?}",
+                String::from_utf8_lossy(without_greeting(&output))
             );
         }
 
@@ -9540,11 +9572,12 @@ mod tests {
     async fn serve_session_returns_pipelined_responses_in_order_and_counts_stats() {
         let (output, stats) = run_session_with_input(
             test_config(),
-            b"BODY 2\r\nARTICLE 1\r\nCAPABILITIES\r\nDATE\r\nMODE READER\r\nHEAD 1\r\nQUIT\r\n",
+            b"GROUP alt.test\r\nBODY 2\r\nARTICLE 1\r\nCAPABILITIES\r\nDATE\r\nMODE READER\r\nHEAD 1\r\nQUIT\r\n",
         )
         .await;
 
         let text = String::from_utf8_lossy(&output);
+        let group = text.find("211 3 1 3 alt.test").unwrap();
         let body = text.find("222 2").unwrap();
         let article = text.find("220 1").unwrap();
         let caps = text.find("101 Capability").unwrap();
@@ -9552,6 +9585,7 @@ mod tests {
         let mode = text.find("201 posting not permitted").unwrap();
         let head = text.find("221 1 <article.1@nntpbench.local>").unwrap();
         let quit = text.find("205 closing").unwrap();
+        assert!(group < body);
         assert!(body < article);
         assert!(article < caps);
         assert!(caps < date);
@@ -9560,7 +9594,7 @@ mod tests {
         assert!(head < quit);
 
         let snapshot = stats.snapshot();
-        assert_eq!(snapshot.commands, 7);
+        assert_eq!(snapshot.commands, 8);
         assert_eq!(snapshot.body_requests, 1);
         assert_eq!(snapshot.article_requests, 2);
         assert_eq!(snapshot.pipeline_batches, 1);
@@ -9732,12 +9766,12 @@ mod tests {
         args.flush = true;
         let (output, stats) = run_session_with_input(
             Arc::new(ServerConfig::from_args(args)),
-            b"CAPABILITIES\r\nBODY 1\r\n",
+            b"CAPABILITIES\r\nBODY <large-body@test>\r\n",
         )
         .await;
 
         let text = String::from_utf8_lossy(&output);
-        assert!(text.find("101 Capability").unwrap() < text.find("222 1").unwrap());
+        assert!(text.find("101 Capability").unwrap() < text.find("222 0").unwrap());
         assert!(output.ends_with(b"\r\n.\r\n"));
         let snapshot = stats.snapshot();
         assert_eq!(snapshot.commands, 2);
@@ -9769,10 +9803,13 @@ mod tests {
     async fn serve_session_writes_large_response_with_no_pending_prefix() {
         let mut args = test_args();
         args.body_bytes = 8192;
-        let (output, stats) =
-            run_session_with_input(Arc::new(ServerConfig::from_args(args)), b"BODY 1\r\n").await;
+        let (output, stats) = run_session_with_input(
+            Arc::new(ServerConfig::from_args(args)),
+            b"BODY <large-body@test>\r\n",
+        )
+        .await;
         assert!(output.starts_with(GREETING));
-        assert!(output[GREETING.len()..].starts_with(b"222 1"));
+        assert!(output[GREETING.len()..].starts_with(b"222 0 <large-body@test>"));
         assert!(output.ends_with(b"\r\n.\r\n"));
         assert_eq!(stats.snapshot().body_requests, 1);
     }
