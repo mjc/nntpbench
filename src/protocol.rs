@@ -2249,7 +2249,7 @@ impl ResponseDescriptor {
         if status.is_error() {
             let code = status.as_u16();
             let framing = if matches!(kind, RequestKind::Unknown)
-                || is_generic_error_status(code)
+                || is_generic_error_status_for_request(kind, code)
                 || is_specific_error_status_for_request(kind, code)
             {
                 ResponseFraming::SingleLine
@@ -2284,6 +2284,12 @@ fn is_generic_error_status(code: u16) -> bool {
         code,
         400 | 401 | 403 | 480 | 483 | 500 | 501 | 502 | 503 | 504
     )
+}
+
+fn is_generic_error_status_for_request(kind: RequestKind, code: u16) -> bool {
+    // RFC 4642 section 2.2 explicitly forbids STARTTLS from returning the
+    // generic 480 and 483 states because those codes are resolved by STARTTLS.
+    !matches!((kind, code), (RequestKind::StartTls, 480 | 483)) && is_generic_error_status(code)
 }
 
 fn is_specific_error_status_for_request(kind: RequestKind, code: u16) -> bool {

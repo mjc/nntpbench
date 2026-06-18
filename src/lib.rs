@@ -7744,6 +7744,12 @@ mod tests {
                         frame: b"440\r\n",
                     },
                     ResponseFrameCase {
+                        name: "STARTTLS accepts unable-to-initiate-TLS response",
+                        reference: "RFC 4642 section 2.2 https://www.rfc-editor.org/rfc/rfc4642#section-2.2",
+                        kind: RequestKind::StartTls,
+                        frame: b"580 can not initiate TLS negotiation\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "QUIT accepts UTF-8 trailing comment text",
                         reference: "RFC 3977 sections 9.4.1 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.4.1",
                         kind: RequestKind::Quit,
@@ -8025,6 +8031,18 @@ mod tests {
                         reference: "RFC 3977 sections 3.1 and 9.4 https://www.rfc-editor.org/rfc/rfc3977#section-9.4",
                         kind: RequestKind::Body,
                         frame: b"222body follows\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "STARTTLS rejects authentication required 480",
+                        reference: "RFC 4642 section 2.2 https://www.rfc-editor.org/rfc/rfc4642#section-2.2",
+                        kind: RequestKind::StartTls,
+                        frame: b"480 authentication required\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "STARTTLS rejects TLS-required 483",
+                        reference: "RFC 4642 section 2.2 https://www.rfc-editor.org/rfc/rfc4642#section-2.2",
+                        kind: RequestKind::StartTls,
+                        frame: b"483 command unavailable until TLS has been negotiated\r\n",
                     },
                     ResponseFrameCase {
                         name: "STAT rejects ARTICLE success code",
