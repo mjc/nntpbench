@@ -2367,7 +2367,7 @@ fn validate_response_initial_line(kind: RequestKind, status: StatusCode, line: &
         (RequestKind::Stat | RequestKind::Last | RequestKind::Next, 223) => {
             validate_article_status_response_arguments(&line[4..line.len() - 2])
         }
-        (RequestKind::Check, 238) | (RequestKind::TakeThis, 239) => {
+        (RequestKind::Check, 238 | 431 | 438) | (RequestKind::TakeThis, 239 | 439) => {
             validate_message_id_response_argument(&line[4..line.len() - 2])
         }
         _ => true,
@@ -5307,8 +5307,8 @@ mod tests {
 
     #[test]
     fn streaming_response_frame_validates_rfc4644_message_id_arguments() {
-        // RFC 4644 sections 2.4.1 and 2.5.1 define the successful CHECK and
-        // TAKETHIS response lines with a message-id parameter:
+        // RFC 4644 sections 2.4.1 and 2.5.1 define CHECK and TAKETHIS
+        // response lines with a message-id parameter:
         // https://www.rfc-editor.org/rfc/rfc4644#section-2.4.1
         for (kind, input) in [
             (
@@ -5316,8 +5316,20 @@ mod tests {
                 b"238 <check@test> send article to be transferred\r\n".as_slice(),
             ),
             (
+                RequestKind::Check,
+                b"431 <check@test> transfer not possible; try again later\r\n".as_slice(),
+            ),
+            (
+                RequestKind::Check,
+                b"438 <check@test> article not wanted\r\n".as_slice(),
+            ),
+            (
                 RequestKind::TakeThis,
                 b"239 <take@test> article transferred ok\r\n".as_slice(),
+            ),
+            (
+                RequestKind::TakeThis,
+                b"439 <take@test> transfer rejected; do not retry\r\n".as_slice(),
             ),
         ] {
             assert!(
@@ -5354,6 +5366,18 @@ mod tests {
             (
                 RequestKind::TakeThis,
                 b"239 <take test> article transferred ok\r\n".as_slice(),
+            ),
+            (
+                RequestKind::Check,
+                b"431 transfer not possible; try again later\r\n".as_slice(),
+            ),
+            (
+                RequestKind::Check,
+                b"438 check@test article not wanted\r\n".as_slice(),
+            ),
+            (
+                RequestKind::TakeThis,
+                b"439 transfer rejected; do not retry\r\n".as_slice(),
             ),
         ] {
             assert!(

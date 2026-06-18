@@ -8406,10 +8406,28 @@ mod tests {
                         frame: b"238 send article to be transferred\r\n",
                     },
                     ResponseFrameCase {
+                        name: "CHECK rejects retry error without message-id",
+                        reference: "RFC 4644 section 2.4.1 https://www.rfc-editor.org/rfc/rfc4644#section-2.4.1",
+                        kind: RequestKind::Check,
+                        frame: b"431 transfer not possible; try again later\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "CHECK rejects not-wanted error without valid message-id",
+                        reference: "RFC 4644 section 2.4.1 https://www.rfc-editor.org/rfc/rfc4644#section-2.4.1",
+                        kind: RequestKind::Check,
+                        frame: b"438 check@test article not wanted\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "TAKETHIS rejects malformed success response message-id",
                         reference: "RFC 4644 section 2.5.1 https://www.rfc-editor.org/rfc/rfc4644#section-2.5.1",
                         kind: RequestKind::TakeThis,
                         frame: b"239 take@test article transferred ok\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "TAKETHIS rejects error response without message-id",
+                        reference: "RFC 4644 section 2.5.1 https://www.rfc-editor.org/rfc/rfc4644#section-2.5.1",
+                        kind: RequestKind::TakeThis,
+                        frame: b"439 transfer rejected; do not retry\r\n",
                     },
                     ResponseFrameCase {
                         name: "POST rejects IHAVE continuation",
