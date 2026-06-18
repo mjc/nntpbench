@@ -2470,9 +2470,17 @@ fn validate_group_response_arguments(value: &[u8]) -> bool {
         return false;
     };
 
-    validate_response_article_number(tokens[0])
-        && validate_response_article_number(tokens[1])
-        && validate_response_article_number(tokens[2])
+    let Some(count) = parse_response_article_number(tokens[0]) else {
+        return false;
+    };
+    let Some(low) = parse_response_article_number(tokens[1]) else {
+        return false;
+    };
+    let Some(high) = parse_response_article_number(tokens[2]) else {
+        return false;
+    };
+
+    validate_group_watermarks(count, low, high)
         && std::str::from_utf8(tokens[3])
             .ok()
             .is_some_and(|group| GroupName::from_borrowed(group).is_ok())
@@ -2510,8 +2518,12 @@ fn is_response_decimal_token(value: &[u8]) -> bool {
 }
 
 fn validate_response_article_number(value: &[u8]) -> bool {
+    parse_response_article_number(value).is_some()
+}
+
+fn parse_response_article_number(value: &[u8]) -> Option<u64> {
     if value.is_empty() || value.len() > 16 || !value.iter().all(u8::is_ascii_digit) {
-        return false;
+        return None;
     }
     value
         .iter()
@@ -2519,7 +2531,20 @@ fn validate_response_article_number(value: &[u8]) -> bool {
             acc.checked_mul(10)?
                 .checked_add(u64::from(byte.checked_sub(b'0')?))
         })
-        .is_some_and(|number| number <= MAX_ARTICLE_NUMBER)
+        .filter(|number| *number <= MAX_ARTICLE_NUMBER)
+}
+
+fn validate_group_watermarks(count: u64, low: u64, high: u64) -> bool {
+    if count == 0 {
+        return high >= low || high.checked_add(1) == Some(low);
+    }
+
+    low != 0
+        && high >= low
+        && high
+            .checked_sub(low)
+            .and_then(|span| span.checked_add(1))
+            .is_some_and(|maximum_count| count <= maximum_count)
 }
 
 fn validate_nonzero_response_article_number(value: &[u8]) -> bool {
@@ -2640,11 +2665,17 @@ fn validate_active_response_line(line: &[u8]) -> bool {
         return false;
     };
 
+    let Some(high) = parse_response_article_number(high) else {
+        return false;
+    };
+    let Some(low) = parse_response_article_number(low) else {
+        return false;
+    };
+
     std::str::from_utf8(group)
         .ok()
         .is_some_and(|group| GroupName::from_borrowed(group).is_ok())
-        && validate_response_article_number(high)
-        && validate_response_article_number(low)
+        && (high >= low || high.checked_add(1) == Some(low))
         && validate_active_status_token(status)
 }
 

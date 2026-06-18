@@ -7952,6 +7952,24 @@ mod tests {
                         frame: b"215 list of newsgroups follows\r\nalt.test  3   1    y\r\n.\r\n",
                     },
                     ResponseFrameCase {
+                        name: "GROUP accepts RFC empty group water-mark encodings",
+                        reference: "RFC 3977 section 6.1.1.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.1.2",
+                        kind: RequestKind::Group,
+                        frame: b"211 0 4000 3999 alt.empty\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "LISTGROUP accepts RFC all-zero empty group summary",
+                        reference: "RFC 3977 sections 6.1.1.2 and 6.1.2.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.1.2",
+                        kind: RequestKind::ListGroup,
+                        frame: b"211 0 0 0 alt.empty\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "LIST ACTIVE accepts preferred empty group water marks",
+                        reference: "RFC 3977 sections 6.1.1.2 and 7.6.3 https://www.rfc-editor.org/rfc/rfc3977#section-7.6.3",
+                        kind: RequestKind::ListActive,
+                        frame: b"215 list of newsgroups follows\r\nalt.empty 3999 4000 y\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "NEWGROUPS accepts defined and private status tokens",
                         reference: "RFC 3977 sections 7.3, 7.6.3, and 9.4 plus RFC 6048 section 3.1 https://www.rfc-editor.org/rfc/rfc3977#section-9.4",
                         kind: RequestKind::NewGroups,
@@ -8403,6 +8421,24 @@ mod tests {
                         frame: b"211 2147483648 1 3 alt.test\r\n",
                     },
                     ResponseFrameCase {
+                        name: "GROUP rejects non-empty count larger than high-low window",
+                        reference: "RFC 3977 section 6.1.1.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.1.2",
+                        kind: RequestKind::Group,
+                        frame: b"211 4 1 3 alt.test\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "GROUP rejects high below low outside empty-group encoding",
+                        reference: "RFC 3977 section 6.1.1.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.1.2",
+                        kind: RequestKind::Group,
+                        frame: b"211 0 4000 3998 alt.empty\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "GROUP rejects non-empty summary with zero water marks",
+                        reference: "RFC 3977 sections 3.6 and 6.1.1.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.1.2",
+                        kind: RequestKind::Group,
+                        frame: b"211 1 0 0 alt.test\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "LISTGROUP rejects invalid article count argument",
                         reference: "RFC 3977 sections 6.1.2 and 9.4.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.2",
                         kind: RequestKind::ListGroup,
@@ -8413,6 +8449,12 @@ mod tests {
                         reference: "RFC 3977 sections 6.1.2 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
                         kind: RequestKind::ListGroup,
                         frame: b"211 12345678901234567 1 3 alt.test\r\n1\r\n2\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "LISTGROUP rejects count larger than high-low window",
+                        reference: "RFC 3977 sections 6.1.1.2 and 6.1.2.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.2.2",
+                        kind: RequestKind::ListGroup,
+                        frame: b"211 4 1 3 alt.test\r\n1\r\n2\r\n3\r\n.\r\n",
                     },
                     ResponseFrameCase {
                         name: "LISTGROUP rejects extra space between required arguments",
@@ -8467,6 +8509,12 @@ mod tests {
                         reference: "RFC 3977 sections 7.6.3 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
                         kind: RequestKind::ListActive,
                         frame: b"215 list of newsgroups follows\r\nalt.test 12345678901234567 1 y\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "LIST ACTIVE rejects high below low outside empty-group encoding",
+                        reference: "RFC 3977 sections 6.1.1.2 and 7.6.3 https://www.rfc-editor.org/rfc/rfc3977#section-7.6.3",
+                        kind: RequestKind::ListActive,
+                        frame: b"215 list of newsgroups follows\r\nalt.empty 3998 4000 y\r\n.\r\n",
                     },
                     ResponseFrameCase {
                         name: "LIST ACTIVE rejects tab field separator",
