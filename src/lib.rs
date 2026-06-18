@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arrayvec::ArrayVec;
 use clap::{ArgAction, Parser, ValueEnum};
@@ -164,6 +164,58 @@ const PROCESS_CLOCK_TICK: Duration = Duration::from_millis(10);
 const TCP_LINGER_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(target_os = "linux")]
 const TCP_USER_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn current_date_response() -> [u8; 20] {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_secs();
+    date_response_for_unix_seconds(now)
+}
+
+fn date_response_for_unix_seconds(seconds: u64) -> [u8; 20] {
+    let days = (seconds / 86_400) as i64;
+    let seconds_of_day = seconds % 86_400;
+    let (year, month, day) = civil_from_unix_days(days);
+    let hour = seconds_of_day / 3_600;
+    let minute = (seconds_of_day % 3_600) / 60;
+    let second = seconds_of_day % 60;
+
+    let mut response = *b"111 00000000000000\r\n";
+    write_four_digits(&mut response[4..8], year as u32);
+    write_two_digits(&mut response[8..10], month);
+    write_two_digits(&mut response[10..12], day);
+    write_two_digits(&mut response[12..14], hour as u32);
+    write_two_digits(&mut response[14..16], minute as u32);
+    write_two_digits(&mut response[16..18], second as u32);
+    response
+}
+
+fn civil_from_unix_days(days_since_epoch: i64) -> (i32, u32, u32) {
+    let z = days_since_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    let year = y + i64::from(month <= 2);
+    (year as i32, month as u32, day as u32)
+}
+
+fn write_four_digits(output: &mut [u8], value: u32) {
+    output[0] = b'0' + ((value / 1_000) % 10) as u8;
+    output[1] = b'0' + ((value / 100) % 10) as u8;
+    output[2] = b'0' + ((value / 10) % 10) as u8;
+    output[3] = b'0' + (value % 10) as u8;
+}
+
+fn write_two_digits(output: &mut [u8], value: u32) {
+    output[0] = b'0' + ((value / 10) % 10) as u8;
+    output[1] = b'0' + (value % 10) as u8;
+}
 #[cfg(target_os = "linux")]
 const TOS_THROUGHPUT: u32 = 0x08;
 
@@ -2665,7 +2717,8 @@ where
             Ok(false)
         }
         RequestKind::Date => {
-            write_response(writer, pending_write, DATE_RESPONSE, session_stats).await?;
+            let response = current_date_response();
+            write_response(writer, pending_write, &response, session_stats).await?;
             Ok(false)
         }
         RequestKind::ModeReader => {
@@ -2846,6 +2899,15 @@ where
 {
     stats.commands.fetch_add(1, Ordering::Relaxed);
 
+    if matches!(request.kind(), RequestKind::Date) {
+        let response = current_date_response();
+        stats
+            .bytes_sent
+            .fetch_add(response.len() as u64, Ordering::Relaxed);
+        output.write_all(&response).expect("response write failed");
+        return false;
+    }
+
     let response = match request.kind() {
         RequestKind::Article => {
             stats.article_requests.fetch_add(1, Ordering::Relaxed);
@@ -2921,7 +2983,6 @@ where
         RequestKind::Xhdr => XHDR_RESPONSE,
         RequestKind::Capabilities => CAPABILITIES_RESPONSE,
         RequestKind::Help => HELP_RESPONSE,
-        RequestKind::Date => DATE_RESPONSE,
         RequestKind::ModeReader => MODE_READER_RESPONSE,
         RequestKind::Quit => QUIT_RESPONSE,
         RequestKind::Unknown if is_known_request_syntax_error(request) => {
@@ -3918,6 +3979,24 @@ mod tests {
         Arc::new(ServerConfig::from_args(test_args()))
     }
 
+    fn assert_date_response(response: &[u8]) {
+        assert_eq!(response.len(), 20);
+        assert!(response.starts_with(b"111 "));
+        assert!(response.ends_with(b"\r\n"));
+        assert!(response[4..18].iter().all(u8::is_ascii_digit));
+    }
+
+    fn assert_current_date_response(response: &[u8], before: [u8; 20], after: [u8; 20]) {
+        assert_date_response(response);
+        assert!(
+            response[4..12] == before[4..12] || response[4..12] == after[4..12],
+            "DATE response should use current UTC day, got {:?}, before {:?}, after {:?}",
+            String::from_utf8_lossy(response),
+            String::from_utf8_lossy(&before),
+            String::from_utf8_lossy(&after)
+        );
+    }
+
     struct AllocationCountGuard;
 
     impl AllocationCountGuard {
@@ -4465,12 +4544,10 @@ mod tests {
             // and time in UTC, not a fixed fixture timestamp:
             // https://www.rfc-editor.org/rfc/rfc3977#section-7.1
             let input = b"DATE\r\n";
+            let before = current_date_response();
             let (output, _) = run_session_with_input(test_config(), input).await;
-            assert!(
-                without_greeting(&output).starts_with(b"111 20260602"),
-                "RFC 3977 DATE should reflect 2026-06-02 UTC during this test run, got {:?}",
-                String::from_utf8_lossy(without_greeting(&output))
-            );
+            let after = current_date_response();
+            assert_current_date_response(without_greeting(&output), before, after);
         }
 
         #[tokio::test]
@@ -9114,7 +9191,7 @@ mod tests {
         let body = text.find("222 1").unwrap();
         let article = text.find("220 1").unwrap();
         let caps = text.find("101 Capability").unwrap();
-        let date = text.find("111 20260602120000").unwrap();
+        let date = text.find("111 ").unwrap();
         let mode = text.find("201 posting not permitted").unwrap();
         let head = text.find("221 1 <article.1@nntpbench.local>").unwrap();
         let quit = text.find("205 closing").unwrap();
@@ -9180,15 +9257,13 @@ mod tests {
         let (output, stats) =
             run_session_with_input(test_config(), b"MODE READER\r\nDATE\r\nQUIT\r\n").await;
 
+        let prefix = [GREETING, MODE_READER_RESPONSE].concat();
+        assert!(output.starts_with(&prefix));
+        let date_start = prefix.len();
+        assert_date_response(&output[date_start..date_start + 20]);
         assert_eq!(
-            output,
-            [
-                GREETING,
-                MODE_READER_RESPONSE,
-                DATE_RESPONSE,
-                b"205 closing connection\r\n".as_slice()
-            ]
-            .concat()
+            &output[date_start + 20..],
+            b"205 closing connection\r\n".as_slice()
         );
         assert_eq!(stats.snapshot().commands, 3);
     }
@@ -9670,23 +9745,21 @@ mod tests {
             &mut output,
         ));
 
-        assert_eq!(
-            output,
-            [
-                LIST_RESPONSE,
-                LIST_ACTIVE_TIMES_RESPONSE,
-                LIST_ACTIVE_TIMES_RESPONSE,
-                LIST_NEWSGROUPS_RESPONSE,
-                LIST_NEWSGROUPS_RESPONSE,
-                LIST_OVERVIEW_FMT_RESPONSE,
-                LIST_HEADERS_RESPONSE,
-                LIST_DISTRIB_PATS_RESPONSE,
-                HELP_RESPONSE,
-                MODE_READER_RESPONSE,
-                DATE_RESPONSE
-            ]
-            .concat()
-        );
+        let expected_prefix = [
+            LIST_RESPONSE,
+            LIST_ACTIVE_TIMES_RESPONSE,
+            LIST_ACTIVE_TIMES_RESPONSE,
+            LIST_NEWSGROUPS_RESPONSE,
+            LIST_NEWSGROUPS_RESPONSE,
+            LIST_OVERVIEW_FMT_RESPONSE,
+            LIST_HEADERS_RESPONSE,
+            LIST_DISTRIB_PATS_RESPONSE,
+            HELP_RESPONSE,
+            MODE_READER_RESPONSE,
+        ]
+        .concat();
+        assert!(output.starts_with(&expected_prefix));
+        assert_date_response(&output[expected_prefix.len()..]);
         assert_eq!(stats.snapshot().commands, 11);
     }
 
