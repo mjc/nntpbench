@@ -151,9 +151,12 @@ pub const AUTHINFO_USER_RESPONSE: &[u8] = b"381 more authentication information 
 pub const AUTHINFO_RESPONSE: &[u8] = b"281 authentication accepted\r\n";
 pub const STARTTLS_RESPONSE: &[u8] = b"382 continue with TLS negotiation\r\n";
 pub const OVER_RESPONSE: &[u8] = b"224 Overview information follows\r\n1\tSubject one\tone@example.com\tFri, 16 May 2026 12:00:00 +0000\t<one@example.com>\t\t123\t4\r\n.\r\n";
+const OVER_2_RESPONSE: &[u8] = b"224 Overview information follows\r\n2\tSubject two\ttwo@example.com\tFri, 16 May 2026 12:00:01 +0000\t<two@example.com>\t<ref@example.com>\t456\t8\r\n.\r\n";
 pub const XOVER_RESPONSE: &[u8] = b"224 Overview information follows\r\n2\tSubject two\ttwo@example.com\tFri, 16 May 2026 12:00:01 +0000\t<two@example.com>\t<ref@example.com>\t456\t8\r\n.\r\n";
 pub const HDR_RESPONSE: &[u8] = b"225 headers follow\r\n1 example one\r\n2 example two\r\n.\r\n";
+const HDR_SUBJECT_2_RESPONSE: &[u8] = b"225 headers follow\r\n2 example two\r\n.\r\n";
 pub const XHDR_RESPONSE: &[u8] = b"221 headers follow\r\n1 example one\r\n2 example two\r\n.\r\n";
+const XHDR_SUBJECT_2_RESPONSE: &[u8] = b"221 headers follow\r\n2 example two\r\n.\r\n";
 const HDR_MESSAGE_ID_RESPONSE: &[u8] =
     b"225 headers follow\r\n1 <one@example.com>\r\n2 <two@example.com>\r\n.\r\n";
 const XHDR_MESSAGE_ID_RESPONSE: &[u8] =
@@ -2767,7 +2770,13 @@ where
                 write_response(writer, pending_write, response, session_stats).await?;
                 return Ok(false);
             }
-            write_response(writer, pending_write, OVER_RESPONSE, session_stats).await?;
+            write_response(
+                writer,
+                pending_write,
+                over_response(command, command_lines),
+                session_stats,
+            )
+            .await?;
             Ok(false)
         }
         RequestKind::Xover => {
@@ -2775,7 +2784,13 @@ where
                 write_response(writer, pending_write, response, session_stats).await?;
                 return Ok(false);
             }
-            write_response(writer, pending_write, XOVER_RESPONSE, session_stats).await?;
+            write_response(
+                writer,
+                pending_write,
+                xover_response(command, command_lines),
+                session_stats,
+            )
+            .await?;
             Ok(false)
         }
         RequestKind::Hdr => {
@@ -3247,8 +3262,8 @@ where
             b"483 command unavailable until TLS has been negotiated\r\n"
         }
         RequestKind::AuthInfo => b"503 unsupported authentication mechanism\r\n",
-        RequestKind::Over => OVER_RESPONSE,
-        RequestKind::Xover => XOVER_RESPONSE,
+        RequestKind::Over => over_response_for_args(request.args()),
+        RequestKind::Xover => xover_response_for_args(request.args()),
         RequestKind::Hdr => hdr_response_for_args(request.args()),
         RequestKind::Xhdr => xhdr_response_for_args(request.args()),
         RequestKind::Capabilities => CAPABILITIES_RESPONSE,
@@ -4155,6 +4170,22 @@ fn overview_selector_arg(kind: RequestKind, args: &[u8]) -> Option<&[u8]> {
     }
 }
 
+fn over_response_for_args(args: &[u8]) -> &'static [u8] {
+    if args == b"2" {
+        OVER_2_RESPONSE
+    } else {
+        OVER_RESPONSE
+    }
+}
+
+fn xover_response_for_args(args: &[u8]) -> &'static [u8] {
+    if args == b"2" {
+        OVER_2_RESPONSE
+    } else {
+        XOVER_RESPONSE
+    }
+}
+
 fn listgroup_state_error(args: &[u8], session_state: &SessionState) -> Option<&'static [u8]> {
     if contains_subslice(args, b"no.such") {
         return Some(b"411 no such newsgroup\r\n");
@@ -4192,21 +4223,45 @@ fn header_query_name_from_args(args: &[u8]) -> Option<&[u8]> {
 }
 
 fn hdr_response_for_args(args: &[u8]) -> &'static [u8] {
+    let selector = overview_selector_arg(RequestKind::Hdr, args);
     if header_query_name_from_args(args)
         .is_some_and(|header| header.eq_ignore_ascii_case(b"Message-ID"))
     {
         return HDR_MESSAGE_ID_RESPONSE;
     }
+    if selector == Some(b"2".as_slice()) {
+        return HDR_SUBJECT_2_RESPONSE;
+    }
     HDR_RESPONSE
 }
 
 fn xhdr_response_for_args(args: &[u8]) -> &'static [u8] {
+    let selector = overview_selector_arg(RequestKind::Xhdr, args);
     if header_query_name_from_args(args)
         .is_some_and(|header| header.eq_ignore_ascii_case(b"Message-ID"))
     {
         return XHDR_MESSAGE_ID_RESPONSE;
     }
+    if selector == Some(b"2".as_slice()) {
+        return XHDR_SUBJECT_2_RESPONSE;
+    }
     XHDR_RESPONSE
+}
+
+fn over_response(
+    command: &ParsedCommand,
+    command_lines: Option<&CommandLineBatch>,
+) -> &'static [u8] {
+    let args = command_args(command, command_lines).unwrap_or_default();
+    over_response_for_args(args)
+}
+
+fn xover_response(
+    command: &ParsedCommand,
+    command_lines: Option<&CommandLineBatch>,
+) -> &'static [u8] {
+    let args = command_args(command, command_lines).unwrap_or_default();
+    xover_response_for_args(args)
 }
 
 fn hdr_response(
@@ -6034,6 +6089,40 @@ mod tests {
                     && text.contains("2 <two@example.com>\r\n"),
                 "RFC 3977 HDR Message-ID should return valid message-id values, got {text:?}"
             );
+        }
+
+        #[tokio::test]
+        async fn rfc3977_red_overview_and_header_numeric_selectors_filter_results() {
+            // RFC 3977 sections 8.3.2 and 8.5.2 require overview and header
+            // metadata responses to match the supplied article-number selector:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-8.3.2
+            assert_red_server_response_tail_cases(&[
+                ServerResponseCase {
+                    name: "OVER numeric selector 2",
+                    reference: "RFC 3977 section 8.3.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.3.2",
+                    input: b"GROUP alt.test\r\nOVER 2\r\n",
+                    expected: OVER_2_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "XOVER numeric selector 2",
+                    reference: "RFC 2980 section 2.1.7 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.7",
+                    input: b"GROUP alt.test\r\nXOVER 2\r\n",
+                    expected: OVER_2_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "HDR numeric selector 2",
+                    reference: "RFC 3977 section 8.5.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.2",
+                    input: b"GROUP alt.test\r\nHDR Subject 2\r\n",
+                    expected: HDR_SUBJECT_2_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "XHDR numeric selector 2",
+                    reference: "RFC 2980 section 2.1.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.1.6",
+                    input: b"GROUP alt.test\r\nXHDR Subject 2\r\n",
+                    expected: XHDR_SUBJECT_2_RESPONSE,
+                },
+            ])
+            .await;
         }
 
         #[tokio::test]
