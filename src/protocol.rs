@@ -445,30 +445,12 @@ mod proptests {
 
     fn nntp_date_strategy() -> BoxedStrategy<String> {
         prop_oneof![
-            (0_u8..=99, 1_u8..=12)
-                .prop_flat_map(|(year, month)| {
-                    let max_day = valid_days_in_month(u16::from(year) + 2000, month);
-                    (Just(year), Just(month), 1_u8..=max_day)
-                })
+            (0_u8..=99, 1_u8..=12, 1_u8..=31)
                 .prop_map(|(year, month, day)| format!("{year:02}{month:02}{day:02}")),
-            (1900_u16..=9999, 1_u8..=12)
-                .prop_flat_map(|(year, month)| {
-                    let max_day = valid_days_in_month(year, month);
-                    (Just(year), Just(month), 1_u8..=max_day)
-                })
+            (1900_u16..=9999, 1_u8..=12, 1_u8..=31)
                 .prop_map(|(year, month, day)| format!("{year:04}{month:02}{day:02}")),
         ]
         .boxed()
-    }
-
-    fn valid_days_in_month(year: u16, month: u8) -> u8 {
-        match month {
-            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-            4 | 6 | 9 | 11 => 30,
-            2 if is_leap_year(year) => 29,
-            2 => 28,
-            _ => unreachable!("strategy only generates valid months"),
-        }
     }
 
     fn invalid_nntp_date_strategy() -> BoxedStrategy<String> {
@@ -2010,7 +1992,7 @@ fn validate_nntp_date(value: &str) -> Result<(), InvalidNntpDate> {
     if !(1..=12).contains(&month) || day == 0 {
         return Err(InvalidNntpDate);
     }
-    let year = if bytes.len() == 8 {
+    if bytes.len() == 8 {
         let year = std::str::from_utf8(&bytes[..4])
             .ok()
             .and_then(|value| value.parse::<u16>().ok())
@@ -2018,19 +2000,10 @@ fn validate_nntp_date(value: &str) -> Result<(), InvalidNntpDate> {
         if !(1900..=9999).contains(&year) {
             return Err(InvalidNntpDate);
         }
-        year
-    } else {
-        let short_year = parse_two_digits(&bytes[..2]).ok_or(InvalidNntpDate)?;
-        u16::from(short_year) + 2000
-    };
-    let max_day = match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 if is_leap_year(year) => 29,
-        2 => 28,
-        _ => return Err(InvalidNntpDate),
-    };
-    if day > max_day {
+    } else if parse_two_digits(&bytes[..2]).is_none() {
+        return Err(InvalidNntpDate);
+    }
+    if day > 31 {
         return Err(InvalidNntpDate);
     }
 
@@ -2079,10 +2052,6 @@ fn validate_nntp_time(value: &str) -> Result<(), InvalidNntpTime> {
     }
 
     Ok(())
-}
-
-const fn is_leap_year(year: u16) -> bool {
-    (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
 }
 
 /// Validated wildmat argument for NEWNEWS.
@@ -5306,6 +5275,7 @@ mod tests {
 
         assert!(NntpDate::from_borrowed("20261301").is_err());
         assert!(NntpDate::from_borrowed("20260100").is_err());
+        assert!(NntpDate::from_borrowed("20260132").is_err());
         assert!(NntpDate::from_borrowed("202601").is_err());
         assert!(NntpTime::from_borrowed("240000").is_err());
         assert!(NntpTime::from_borrowed("126061").is_err());
@@ -5862,7 +5832,7 @@ mod tests {
         }
 
         for input in [
-            b"111 20260230000000\r\n".as_slice(),
+            b"111 20260132000000\r\n".as_slice(),
             b"111 20260602240000\r\n".as_slice(),
             b"111 2026060212000\r\n".as_slice(),
             b"111 202606021200000\r\n".as_slice(),
