@@ -7035,6 +7035,21 @@ mod tests {
                         "RFC 4643 section 2 https://www.rfc-editor.org/rfc/rfc4643#section-2",
                     ),
                     (
+                        "GROUP non-UTF-8 argument",
+                        b"GROUP alt.\xff\r\n",
+                        "RFC 3977 section 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
+                    ),
+                    (
+                        "HDR non-UTF-8 header name",
+                        b"HDR Subj\xffct 1\r\n",
+                        "RFC 3977 sections 8.5.1 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.1",
+                    ),
+                    (
+                        "NEWNEWS non-UTF-8 wildmat",
+                        b"NEWNEWS alt.\xff 20260101 000000\r\n",
+                        "RFC 3977 sections 7.4.1 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-7.4.1",
+                    ),
+                    (
                         "NEWGROUPS extra argument",
                         b"NEWGROUPS 20260101 000000 GMT extra\r\n",
                         "RFC 3977 section 7.3.1 https://www.rfc-editor.org/rfc/rfc3977#section-7.3.1",
@@ -7058,6 +7073,24 @@ mod tests {
                         name: "LIST unknown keyword with trailing token",
                         reference: "RFC 3977 section 7.6 https://www.rfc-editor.org/rfc/rfc3977#section-7.6",
                         input: b"LIST FROBNICATE extra\r\n",
+                        expected: b"501 command syntax error\r\n",
+                    },
+                    ServerResponseCase {
+                        name: "GROUP non-UTF-8 argument",
+                        reference: "RFC 3977 section 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
+                        input: b"GROUP alt.\xff\r\n",
+                        expected: b"501 command syntax error\r\n",
+                    },
+                    ServerResponseCase {
+                        name: "HDR non-UTF-8 header name",
+                        reference: "RFC 3977 sections 8.5.1 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.1",
+                        input: b"HDR Subj\xffct 1\r\n",
+                        expected: b"501 command syntax error\r\n",
+                    },
+                    ServerResponseCase {
+                        name: "NEWNEWS non-UTF-8 wildmat",
+                        reference: "RFC 3977 sections 7.4.1 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-7.4.1",
+                        input: b"NEWNEWS alt.\xff 20260101 000000\r\n",
                         expected: b"501 command syntax error\r\n",
                     },
                     ServerResponseCase {

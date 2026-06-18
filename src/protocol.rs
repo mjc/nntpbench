@@ -3668,9 +3668,9 @@ fn validate_article_fetch_selector(args: &[u8]) -> Result<(), ()> {
 fn validate_utf8_arg<'a, T, E>(
     args: &'a [u8],
     validate: impl FnOnce(&'a str) -> Result<T, E>,
-) -> Result<T, E> {
-    let value = std::str::from_utf8(args).map_err(|_| panic!("non-utf8 NNTP argument"))?;
-    validate(value)
+) -> Result<T, ()> {
+    let value = std::str::from_utf8(args).map_err(|_| ())?;
+    validate(value).map_err(|_| ())
 }
 
 fn validate_discovery_datetime_args(args: &[u8], allow_wildmat: bool) -> Result<(), ()> {
