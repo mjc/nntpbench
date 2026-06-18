@@ -29,12 +29,12 @@ pub(crate) const MAX_COMMAND_ARGUMENT_BYTES: usize = 497;
 /// RFC 3977 base command-line limit when carrying an initial response.
 pub(crate) const MAX_AUTHINFO_SASL_COMMAND_LINE_BYTES: usize = 4096;
 
-/// Raw NNTP status code.
+/// NNTP response status code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StatusCode(u16);
 
 impl StatusCode {
-    /// Parse the leading 3-digit NNTP status code.
+    /// Parse the leading 3-digit NNTP response status code.
     #[must_use]
     pub fn parse(data: &[u8]) -> Option<Self> {
         if data.len() < 3 {
@@ -48,9 +48,12 @@ impl StatusCode {
             return None;
         }
 
-        Some(Self(
-            u16::from(d0) * 100 + u16::from(d1) * 10 + u16::from(d2),
-        ))
+        let code = u16::from(d0) * 100 + u16::from(d1) * 10 + u16::from(d2);
+        if !(100..600).contains(&code) {
+            return None;
+        }
+
+        Some(Self(code))
     }
 
     /// Return the raw numeric value.
@@ -958,16 +961,23 @@ mod proptests {
         #![proptest_config(ProptestConfig::with_cases(1024))]
 
         #[test]
-        fn status_code_parse_accepts_any_three_digit_prefix(
-            d0 in 0_u8..=9,
-            d1 in 0_u8..=9,
-            d2 in 0_u8..=9,
+        fn status_code_parse_accepts_rfc_response_code_prefix(
+            code in 100_u16..600,
             suffix in ascii_suffix_strategy(),
         ) {
-            let mut input = vec![b'0' + d0, b'0' + d1, b'0' + d2];
+            let mut input = format!("{code:03}").into_bytes();
             input.extend_from_slice(&suffix);
-            let expected = u16::from(d0) * 100 + u16::from(d1) * 10 + u16::from(d2);
-            prop_assert_eq!(StatusCode::parse(&input), Some(StatusCode(expected)));
+            prop_assert_eq!(StatusCode::parse(&input), Some(StatusCode(code)));
+        }
+
+        #[test]
+        fn status_code_parse_rejects_out_of_class_digit_prefix(
+            code in prop_oneof![0_u16..100, 600_u16..1000],
+            suffix in ascii_suffix_strategy(),
+        ) {
+            let mut input = format!("{code:03}").into_bytes();
+            input.extend_from_slice(&suffix);
+            prop_assert_eq!(StatusCode::parse(&input), None);
         }
 
         #[test]
@@ -5069,8 +5079,10 @@ mod tests {
                 b"200  multiple  spaces  \r\n".as_slice(),
                 Some(StatusCode(200)),
             ),
-            (b"000".as_slice(), Some(StatusCode(0))),
-            (b"999 message\r\n".as_slice(), Some(StatusCode(999))),
+            (b"000".as_slice(), None),
+            (b"099 message\r\n".as_slice(), None),
+            (b"600 message\r\n".as_slice(), None),
+            (b"999 message\r\n".as_slice(), None),
             (b"211 42 1 100 alt.test".as_slice(), Some(StatusCode(211))),
             ("200 Привет мир\r\n".as_bytes(), Some(StatusCode(200))),
             (b"".as_slice(), None),

@@ -9286,6 +9286,30 @@ mod tests {
             fn rfc3977_red_response_frame_validation_matrix() {
                 assert_red_response_frame_invalid_cases(&[
                     ResponseFrameCase {
+                        name: "response status rejects 000 class",
+                        reference: "RFC 3977 sections 3.2 and 9.4 https://www.rfc-editor.org/rfc/rfc3977#section-3.2",
+                        kind: RequestKind::Unknown,
+                        frame: b"000 invalid response class\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "response status rejects 099 class",
+                        reference: "RFC 3977 sections 3.2 and 9.4 https://www.rfc-editor.org/rfc/rfc3977#section-3.2",
+                        kind: RequestKind::Unknown,
+                        frame: b"099 invalid response class\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "response status rejects 600 class",
+                        reference: "RFC 3977 sections 3.2 and 9.4 https://www.rfc-editor.org/rfc/rfc3977#section-3.2",
+                        kind: RequestKind::Unknown,
+                        frame: b"600 invalid response class\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "response status rejects 999 class",
+                        reference: "RFC 3977 sections 3.2 and 9.4 https://www.rfc-editor.org/rfc/rfc3977#section-3.2",
+                        kind: RequestKind::Unknown,
+                        frame: b"999 invalid response class\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "response line requires separator after status",
                         reference: "RFC 3977 sections 3.1 and 9.4 https://www.rfc-editor.org/rfc/rfc3977#section-9.4",
                         kind: RequestKind::Body,
