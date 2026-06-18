@@ -5328,6 +5328,24 @@ mod tests {
             );
         }
 
+        fn assert_red_request_line_known_cases(cases: &[(&str, &'static [u8], RequestKind, &str)]) {
+            let failures = cases
+                .iter()
+                .filter_map(|(name, input, expected, reference)| {
+                    let actual = RequestLine::parse(input).kind();
+                    (actual != *expected).then(|| {
+                        format!("{name}: expected {expected:?}, got {actual:?} ({reference})")
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            assert!(
+                failures.is_empty(),
+                "expected request-line parser to accept RFC-valid cases:\n{}",
+                failures.join("\n")
+            );
+        }
+
         struct ServerResponseCase {
             name: &'static str,
             reference: &'static str,
@@ -7504,28 +7522,50 @@ mod tests {
         }
 
         #[test]
+        fn rfc3977_red_request_line_accepts_rfc_ws_and_eol_matrix() {
+            assert_red_request_line_known_cases(&[
+                (
+                    "GROUP accepts TAB as WS separator",
+                    b"GROUP\talt.test\r\n",
+                    RequestKind::Group,
+                    "RFC 3977 sections 9.2 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
+                ),
+                (
+                    "HEAD accepts repeated SP as WS separator",
+                    b"HEAD  1\r\n",
+                    RequestKind::Head,
+                    "RFC 3977 sections 9.2 and 6.2.2 https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
+                ),
+                (
+                    "DATE accepts EOL trailing whitespace",
+                    b"DATE \t\r\n",
+                    RequestKind::Date,
+                    "RFC 3977 sections 9.2 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
+                ),
+                (
+                    "LIST accepts TAB before subcommand",
+                    b"LIST\tACTIVE\r\n",
+                    RequestKind::ListActive,
+                    "RFC 3977 sections 7.6 and 9.2 https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
+                ),
+                (
+                    "NEWNEWS accepts mixed WS separators",
+                    b"NEWNEWS\talt.*  20260101\t000000 GMT\r\n",
+                    RequestKind::NewNews,
+                    "RFC 3977 sections 7.4.1 and 9.2 https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
+                ),
+                (
+                    "AUTHINFO accepts TAB between subcommand and value",
+                    b"AUTHINFO USER\tbench\r\n",
+                    RequestKind::AuthInfoUser,
+                    "RFC 4643 section 2 and RFC 3977 section 9.2 https://www.rfc-editor.org/rfc/rfc4643#section-2",
+                ),
+            ]);
+        }
+
+        #[test]
         fn rfc3977_red_request_line_rejects_invalid_command_shapes_matrix() {
             assert_red_request_line_unknown_cases(&[
-                (
-                    "CAPABILITIES trailing space",
-                    b"CAPABILITIES \r\n",
-                    "RFC 3977 sections 5.2 and 9.2 https://www.rfc-editor.org/rfc/rfc3977#section-5.2",
-                ),
-                (
-                    "HELP trailing tab",
-                    b"HELP\t\r\n",
-                    "RFC 3977 sections 7.2 and 9.2 https://www.rfc-editor.org/rfc/rfc3977#section-7.2",
-                ),
-                (
-                    "QUIT trailing space",
-                    b"QUIT \r\n",
-                    "RFC 3977 sections 5.4 and 9.2 https://www.rfc-editor.org/rfc/rfc3977#section-5.4",
-                ),
-                (
-                    "POST trailing space",
-                    b"POST \r\n",
-                    "RFC 3977 sections 6.3.1 and 9.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.3.1",
-                ),
                 (
                     "LAST argument",
                     b"LAST 1\r\n",
@@ -7580,11 +7620,6 @@ mod tests {
                     "AUTHINFO USER extra argument",
                     b"AUTHINFO USER bench extra\r\n",
                     "RFC 4643 section 2.1 https://www.rfc-editor.org/rfc/rfc4643#section-2.1",
-                ),
-                (
-                    "MODE READER double space",
-                    b"MODE  READER\r\n",
-                    "RFC 3977 section 5.3 https://www.rfc-editor.org/rfc/rfc3977#section-5.3",
                 ),
             ]);
         }
@@ -8114,6 +8149,60 @@ mod tests {
             use super::*;
 
             #[test]
+            fn rfc3977_red_request_line_valid_ws_matrix() {
+                assert_red_request_line_known_cases(&[
+                    (
+                        "GROUP tab separator",
+                        b"GROUP\talt.test\r\n",
+                        RequestKind::Group,
+                        "RFC 3977 section 9.2 https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
+                    ),
+                    (
+                        "DATE trailing EOL spaces",
+                        b"DATE  \r\n",
+                        RequestKind::Date,
+                        "RFC 3977 section 9.2 https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
+                    ),
+                    (
+                        "GROUP multiple token separators",
+                        b"GROUP  alt.test\r\n",
+                        RequestKind::Group,
+                        "RFC 3977 section 9.2 https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
+                    ),
+                    (
+                        "BODY tab separator",
+                        b"BODY\t1\r\n",
+                        RequestKind::Body,
+                        "RFC 3977 section 9.2 https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
+                    ),
+                    (
+                        "HEAD double space before selector",
+                        b"HEAD  1\r\n",
+                        RequestKind::Head,
+                        "RFC 3977 section 9.2 https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
+                    ),
+                    (
+                        "GROUP trailing EOL space after argument",
+                        b"GROUP alt.test \r\n",
+                        RequestKind::Group,
+                        "RFC 3977 section 9.2 https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
+                    ),
+                    (
+                        "LIST tab separator",
+                        b"LIST\tACTIVE\r\n",
+                        RequestKind::ListActive,
+                        "RFC 3977 sections 7.6 and 9.2 https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
+                    ),
+                    (
+                        "AUTHINFO tab separator",
+                        b"AUTHINFO\tUSER bench\r\n",
+                        RequestKind::AuthInfoUser,
+                        "RFC 4643 section 2 and RFC 3977 section 9.2 https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
+                    ),
+                ]);
+            }
+
+            #[test]
             fn rfc3977_red_request_line_grammar_matrix() {
                 assert_red_request_line_unknown_cases(&[
                     (
@@ -8122,49 +8211,9 @@ mod tests {
                         "RFC 3977 sections 6.2.1.1 and 9.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.2.1.1",
                     ),
                     (
-                        "GROUP tab separator",
-                        b"GROUP\talt.test\r\n",
-                        "RFC 3977 section 9.2 https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
-                    ),
-                    (
                         "ARTICLE zero selector",
                         b"ARTICLE 0\r\n",
                         "RFC 3977 section 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
-                    ),
-                    (
-                        "DATE trailing spaces",
-                        b"DATE  \r\n",
-                        "RFC 3977 section 9.2 https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
-                    ),
-                    (
-                        "GROUP multiple token separators",
-                        b"GROUP  alt.test\r\n",
-                        "RFC 3977 section 9.2 https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
-                    ),
-                    (
-                        "BODY tab separator",
-                        b"BODY\t1\r\n",
-                        "RFC 3977 section 9.2 https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
-                    ),
-                    (
-                        "HEAD double space before selector",
-                        b"HEAD  1\r\n",
-                        "RFC 3977 section 9.2 https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
-                    ),
-                    (
-                        "GROUP trailing space after argument",
-                        b"GROUP alt.test \r\n",
-                        "RFC 3977 section 9.2 https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
-                    ),
-                    (
-                        "LIST tab separator",
-                        b"LIST\tACTIVE\r\n",
-                        "RFC 3977 sections 7.6 and 9.2 https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
-                    ),
-                    (
-                        "AUTHINFO tab separator",
-                        b"AUTHINFO\tUSER bench\r\n",
-                        "RFC 4643 section 2 https://www.rfc-editor.org/rfc/rfc4643#section-2",
                     ),
                     (
                         "GROUP non-UTF-8 argument",

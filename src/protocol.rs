@@ -3915,6 +3915,7 @@ impl<'a> RequestLine<'a> {
                 args: &[],
             };
         };
+        let line = trim_command_eol_ws(line);
         if command_spacing_is_invalid(line) {
             return Self {
                 kind: RequestKind::Unknown,
@@ -3925,11 +3926,11 @@ impl<'a> RequestLine<'a> {
 
         let split = line
             .iter()
-            .position(|byte| *byte == b' ')
+            .position(|byte| is_command_ws(*byte))
             .unwrap_or(line.len());
         let verb = &line[..split];
         let args = if split < line.len() {
-            &line[split + 1..]
+            skip_command_ws(&line[split..])
         } else {
             &[]
         };
@@ -4122,12 +4123,35 @@ fn classify_request_kind(verb: &[u8], args: &[u8]) -> RequestKind {
 
 fn command_spacing_is_invalid(line: &[u8]) -> bool {
     line.is_empty()
-        || line.starts_with(b" ")
-        || line.ends_with(b" ")
-        || line.windows(2).any(|window| window == b"  ")
+        || line.first().is_some_and(|byte| is_command_ws(*byte))
         || line
             .iter()
-            .any(|byte| byte.is_ascii_whitespace() && *byte != b' ')
+            .any(|byte| byte.is_ascii_whitespace() && !is_command_ws(*byte))
+}
+
+fn is_command_ws(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t')
+}
+
+fn trim_command_eol_ws(line: &[u8]) -> &[u8] {
+    let end = line
+        .iter()
+        .rposition(|byte| !is_command_ws(*byte))
+        .map_or(0, |index| index + 1);
+    &line[..end]
+}
+
+fn skip_command_ws(line: &[u8]) -> &[u8] {
+    let start = line
+        .iter()
+        .position(|byte| !is_command_ws(*byte))
+        .unwrap_or(line.len());
+    &line[start..]
+}
+
+fn command_tokens(args: &[u8]) -> impl Iterator<Item = &[u8]> {
+    args.split(|byte| is_command_ws(*byte))
+        .filter(|token| !token.is_empty())
 }
 
 fn classify_direct_command(kind: RequestKind, args: &[u8]) -> RequestKind {
@@ -4146,7 +4170,7 @@ fn classify_direct_command(kind: RequestKind, args: &[u8]) -> RequestKind {
             if args.is_empty() {
                 return kind;
             }
-            let mut parts = args.split(|byte| *byte == b' ');
+            let mut parts = command_tokens(args);
             match (parts.next(), parts.next(), parts.next()) {
                 (Some(one), None, None) => {
                     let one = std::str::from_utf8(one).ok();
@@ -4186,7 +4210,7 @@ fn classify_direct_command(kind: RequestKind, args: &[u8]) -> RequestKind {
             }
         }
         RequestKind::Hdr | RequestKind::Xhdr => {
-            let mut parts = args.split(|byte| *byte == b' ');
+            let mut parts = command_tokens(args);
             match (parts.next(), parts.next(), parts.next()) {
                 (Some(header), None, None) => {
                     if validate_utf8_arg(header, HeaderName::from_borrowed).is_ok() {
@@ -4239,10 +4263,14 @@ fn classify_direct_command(kind: RequestKind, args: &[u8]) -> RequestKind {
 }
 
 fn validate_capabilities_args(args: &[u8]) -> Result<(), ()> {
-    if args.contains(&b' ') {
+    let mut parts = command_tokens(args);
+    let Some(keyword) = parts.next() else {
+        return Err(());
+    };
+    if parts.next().is_some() {
         return Err(());
     }
-    validate_utf8_arg(args, validate_keyword).map(|_| ())
+    validate_utf8_arg(keyword, validate_keyword).map(|_| ())
 }
 
 fn validate_keyword(value: &str) -> Result<(), ()> {
@@ -4284,7 +4312,7 @@ fn validate_utf8_arg<'a, T, E>(
 }
 
 fn validate_discovery_datetime_args(args: &[u8], allow_wildmat: bool) -> Result<(), ()> {
-    let mut parts = args.split(|byte| *byte == b' ');
+    let mut parts = command_tokens(args);
     if allow_wildmat {
         let wildmat = parts.next().ok_or(())?;
         validate_utf8_arg(wildmat, Wildmat::from_borrowed).map_err(|_| ())?;
@@ -4305,7 +4333,7 @@ fn validate_newnews_args(args: &[u8]) -> Result<(), ()> {
 }
 
 fn classify_authinfo_command(args: &[u8]) -> RequestKind {
-    let mut parts = args.split(|byte| *byte == b' ');
+    let mut parts = command_tokens(args);
     match (parts.next(), parts.next(), parts.next(), parts.next()) {
         (Some(subcommand), Some(value), None, None)
             if eq_ignore_ascii_case_const(subcommand, b"USER")
@@ -4381,7 +4409,7 @@ fn classify_subcommand(
     table: &[(&'static [u8], RequestKind)],
     default: RequestKind,
 ) -> RequestKind {
-    let mut parts = args.split(|byte| *byte == b' ');
+    let mut parts = command_tokens(args);
     let subcommand = parts.next();
 
     let Some(subcommand) = subcommand else {
@@ -4914,16 +4942,17 @@ mod tests {
         );
         assert_eq!(
             RequestLine::parse(b"GROUP\talt.test\r\n").kind(),
-            RequestKind::Unknown
+            RequestKind::Group
         );
         assert_eq!(
             RequestLine::parse(b"MODE\tREADER\r\n").kind(),
-            RequestKind::Unknown
+            RequestKind::ModeReader
         );
         assert_eq!(
             RequestLine::parse(b"MODE  READER\r\n").kind(),
-            RequestKind::Unknown
+            RequestKind::ModeReader
         );
+        assert_eq!(RequestLine::parse(b"DATE \t\r\n").kind(), RequestKind::Date);
         assert_eq!(RequestLine::parse(b"QUIT\r\n").kind(), RequestKind::Quit);
         assert_eq!(RequestLine::parse(b"HEAD 1\r\n").kind(), RequestKind::Head);
         assert_eq!(
@@ -4943,6 +4972,8 @@ mod tests {
             (b"STAT <a@b>".as_slice(), RequestKind::Stat),
             (b"ARTICLE 12345".as_slice(), RequestKind::Article),
             (b"GROUP alt.test".as_slice(), RequestKind::Group),
+            (b"GROUP\talt.test".as_slice(), RequestKind::Group),
+            (b"GROUP  alt.test".as_slice(), RequestKind::Group),
             (b"LISTGROUP".as_slice(), RequestKind::ListGroup),
             (b"LISTGROUP alt.test".as_slice(), RequestKind::ListGroup),
             (b"LISTGROUP 1-".as_slice(), RequestKind::ListGroup),
@@ -4974,9 +5005,12 @@ mod tests {
                 RequestKind::ListDistribPats,
             ),
             (b"DATE".as_slice(), RequestKind::Date),
+            (b"DATE \t".as_slice(), RequestKind::Date),
             (b"HELP".as_slice(), RequestKind::Help),
             (b"CAPABILITIES".as_slice(), RequestKind::Capabilities),
             (b"MODE READER".as_slice(), RequestKind::ModeReader),
+            (b"MODE\tREADER".as_slice(), RequestKind::ModeReader),
+            (b"MODE  READER".as_slice(), RequestKind::ModeReader),
             (b"QUIT".as_slice(), RequestKind::Quit),
             (b"OVER 1-10".as_slice(), RequestKind::Over),
             (b"XOVER 1-10".as_slice(), RequestKind::Xover),
@@ -4992,6 +5026,10 @@ mod tests {
             ),
             (
                 b"NEWNEWS * 20260101 000000 GMT".as_slice(),
+                RequestKind::NewNews,
+            ),
+            (
+                b"NEWNEWS\t*\t20260101  000000\tGMT".as_slice(),
                 RequestKind::NewNews,
             ),
             (
