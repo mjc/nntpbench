@@ -7641,10 +7641,10 @@ mod tests {
         async fn rfc3977_red_server_selector_and_state_response_matrix() {
             assert_red_server_response_cases(&[
                 ServerResponseCase {
-                    name: "BODY invalid message-id",
+                    name: "BODY opaque missing message-id",
                     reference: "RFC 3977 sections 6.2.3 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-6.2.3",
                     input: b"BODY <missing-at-sign>\r\n",
-                    expected: b"501 command syntax error\r\n",
+                    expected: b"430 no article with that message-id\r\n",
                 },
                 ServerResponseCase {
                     name: "HEAD zero selector",
@@ -7941,36 +7941,62 @@ mod tests {
 
             #[test]
             fn rfc3977_red_value_validation_matrix() {
+                assert!(
+                    [
+                        (
+                            "message-id accepts opaque local-only text",
+                            MessageId::from_borrowed("<local-only>").is_ok(),
+                        ),
+                        (
+                            "message-id accepts empty left side in opaque text",
+                            MessageId::from_borrowed("<@example.com>").is_ok(),
+                        ),
+                        (
+                            "message-id accepts empty right side in opaque text",
+                            MessageId::from_borrowed("<local@>").is_ok(),
+                        ),
+                        (
+                            "message-id accepts multiple @ signs as opaque text",
+                            MessageId::from_borrowed("<local@@example.com>").is_ok(),
+                        ),
+                        (
+                            "message-id accepts repeated dots as opaque text",
+                            MessageId::from_borrowed("<local@example..com>").is_ok(),
+                        ),
+                        (
+                            "wrapped message-id accepts opaque unbracketed value",
+                            MessageId::from_str_or_wrap("@example.com").is_ok(),
+                        ),
+                    ]
+                    .iter()
+                    .all(|(_, accepted)| *accepted),
+                    "RFC 3977 sections 3.6 and 9.8 define message-id as opaque printable US-ASCII in angle brackets"
+                );
                 assert_red_invalid_values(&[
                     (
-                        "message-id requires @",
+                        "message-id rejects empty body",
                         "RFC 3977 section 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
-                        MessageId::from_borrowed("<local-only>").is_err(),
+                        MessageId::from_borrowed("<>").is_err(),
                     ),
                     (
-                        "message-id rejects empty left side",
+                        "message-id rejects spaces",
                         "RFC 3977 section 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
-                        MessageId::from_borrowed("<@example.com>").is_err(),
+                        MessageId::from_borrowed("<local id>").is_err(),
                     ),
                     (
-                        "message-id rejects empty right side",
+                        "message-id rejects > inside body",
                         "RFC 3977 section 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
-                        MessageId::from_borrowed("<local@>").is_err(),
+                        MessageId::from_borrowed("<local>id>").is_err(),
                     ),
                     (
-                        "message-id rejects multiple @ signs",
+                        "message-id rejects non-ASCII",
                         "RFC 3977 section 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
-                        MessageId::from_borrowed("<local@@example.com>").is_err(),
+                        MessageId::from_borrowed("<caf\u{e9}>").is_err(),
                     ),
                     (
-                        "message-id rejects empty domain label",
+                        "wrapped message-id rejects empty unbracketed value",
                         "RFC 3977 section 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
-                        MessageId::from_borrowed("<local@example..com>").is_err(),
-                    ),
-                    (
-                        "wrapped message-id rejects invalid unbracketed value",
-                        "RFC 3977 section 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
-                        MessageId::from_str_or_wrap("@example.com").is_err(),
+                        MessageId::from_str_or_wrap("").is_err(),
                     ),
                     (
                         "HDR metadata name accepts leading colon",
@@ -8035,7 +8061,7 @@ mod tests {
                     (
                         "article selector rejects invalid message-id shape",
                         "RFC 3977 section 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
-                        ArticleSelector::from_borrowed("<missing-at-sign>").is_err(),
+                        ArticleSelector::from_borrowed("<bad id>").is_err(),
                     ),
                     (
                         "article selector rejects bare atom",
@@ -11873,10 +11899,9 @@ mod tests {
 
     #[tokio::test]
     async fn read_command_batch_preserves_full_length_message_id_without_allocating_per_command() {
-        // RFC 3977 section 3.1 caps command lines at 512 octets including CRLF.
-        // Keep message-id parsing tied to the full command line, not a smaller
-        // internal shortcut.
-        let long_message = format!("<{}@example.test>", "a".repeat(480));
+        // RFC 3977 sections 3.1 and 9.8 cap command lines at 512 octets
+        // including CRLF and message-ids at 250 octets.
+        let long_message = format!("<{}@example.test>", "a".repeat(235));
         let wire = format!("ARTICLE {long_message}\r\n");
         assert!(wire.len() <= MAX_COMMAND_LINE_BYTES);
 
@@ -13053,7 +13078,7 @@ mod tests {
             &article_target,
         )
         .unwrap();
-        let long_message = format!("<{}@example.test>", "a".repeat(480));
+        let long_message = format!("<{}@example.test>", "a".repeat(235));
         let long_command = format!("ARTICLE {long_message}\r\n");
         assert!(long_command.len() <= MAX_COMMAND_LINE_BYTES);
         let mut command_lines = CommandLineBatch::default();

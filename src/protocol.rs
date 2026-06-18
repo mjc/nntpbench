@@ -1544,23 +1544,13 @@ impl<'a> MessageId<'a> {
 pub struct InvalidMessageId;
 
 fn validate_message_id(value: &str) -> Result<(), InvalidMessageId> {
-    if value.len() < 3 || !value.starts_with('<') || !value.ends_with('>') {
+    if !(3..=250).contains(&value.len()) || !value.starts_with('<') || !value.ends_with('>') {
         return Err(InvalidMessageId);
     }
     let inner = &value[1..value.len() - 1];
-    if inner.bytes().any(|byte| {
-        byte.is_ascii_whitespace() || byte.is_ascii_control() || matches!(byte, b'<' | b'>')
-    }) {
-        return Err(InvalidMessageId);
-    }
-    let Some((left, right)) = inner.split_once('@') else {
-        return Err(InvalidMessageId);
-    };
-    if left.is_empty()
-        || right.is_empty()
-        || right.contains("..")
-        || inner.matches('@').count() != 1
-        || right.split('.').any(str::is_empty)
+    if inner
+        .bytes()
+        .any(|byte| !matches!(byte, 0x21..=0x3d | 0x3f..=0x7e))
     {
         return Err(InvalidMessageId);
     }
@@ -4890,12 +4880,23 @@ mod tests {
 
     #[test]
     fn message_id_validation_covers_rfc_edge_shapes() {
-        assert!(MessageId::from_borrowed("<a>").is_err());
+        assert!(MessageId::from_borrowed("<a>").is_ok());
         assert!(MessageId::from_borrowed("<a@b>").is_ok());
+        assert!(MessageId::from_borrowed("<local-only>").is_ok());
+        assert!(MessageId::from_borrowed("<@example.com>").is_ok());
+        assert!(MessageId::from_borrowed("<local@@example..com>").is_ok());
+        assert!(MessageId::from_borrowed("<<opaque>").is_ok());
         assert!(MessageId::from_borrowed("<>").is_err());
+        assert!(MessageId::from_borrowed("<a>b>").is_err());
+        assert!(MessageId::from_borrowed("<a b>").is_err());
+        assert!(MessageId::from_borrowed("<caf\u{e9}>").is_err());
         assert!(MessageId::from_borrowed("<no-end").is_err());
         assert!(MessageId::from_borrowed("no-start>").is_err());
         assert!(MessageId::from_str_or_wrap("").is_err());
+        assert_eq!(
+            MessageId::from_str_or_wrap("opaque").unwrap().as_str(),
+            "<opaque>"
+        );
     }
 
     #[test]
