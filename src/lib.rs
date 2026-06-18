@@ -8440,6 +8440,12 @@ mod tests {
                         frame: b"101 capability list follows\r\nVERSION 2\r\nIMPLEMENTATION caf\xc3\xa9 build!\r\n.\r\n",
                     },
                     ResponseFrameCase {
+                        name: "HELP accepts UTF-8 multiline text",
+                        reference: "RFC 3977 section 7.2 https://www.rfc-editor.org/rfc/rfc3977#section-7.2",
+                        kind: RequestKind::Help,
+                        frame: b"100 help follows\r\nCommands include CAPABILITIES\r\nUTF-8 caf\xc3\xa9\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "HDR accepts omitted space for empty field content",
                         reference: "RFC 3977 section 8.5.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.2",
                         kind: RequestKind::Hdr,
@@ -8529,6 +8535,12 @@ mod tests {
                         reference: "RFC 3977 sections 7.2 and 7.6 https://www.rfc-editor.org/rfc/rfc3977#section-7.2",
                         kind: RequestKind::Help,
                         frame: b"215 list follows\r\nalt.test 1 1 y\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "HELP rejects non-UTF-8 help text",
+                        reference: "RFC 3977 section 7.2 https://www.rfc-editor.org/rfc/rfc3977#section-7.2",
+                        kind: RequestKind::Help,
+                        frame: b"100 help follows\r\ninvalid caf\xe9\r\n.\r\n",
                     },
                     ResponseFrameCase {
                         name: "LIST rejects CAPABILITIES success code",

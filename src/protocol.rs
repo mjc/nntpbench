@@ -2530,6 +2530,7 @@ fn validate_multiline_response_content(kind: RequestKind, content: &[u8]) -> boo
             validate_crlf_lines(content, validate_header_response_line)
         }
         RequestKind::Capabilities => validate_capabilities_response_content(content),
+        RequestKind::Help => validate_crlf_lines(content, validate_help_text_line),
         _ => true,
     }
 }
@@ -2859,6 +2860,10 @@ fn validate_s_text(value: &[u8]) -> bool {
 
 fn is_s_text_initial_byte(byte: u8) -> bool {
     matches!(byte, 0x01..=0x08 | 0x0b..=0x0c | 0x0e..=0xff)
+}
+
+fn validate_help_text_line(line: &[u8]) -> bool {
+    !line.contains(&b'\0') && std::str::from_utf8(line).is_ok()
 }
 
 fn validate_capabilities_response_content(content: &[u8]) -> bool {
