@@ -2219,11 +2219,21 @@ impl ResponseDescriptor {
     /// Return the full protocol response descriptor for a request/status pair.
     #[must_use]
     pub fn for_request_status(kind: RequestKind, status: StatusCode) -> Self {
-        // RFC 3977 section 3.2.1 generic errors are single-line. Keep that
-        // hot path ahead of command metadata so clients do not wait for a
-        // dot terminator after 4xx/5xx failures.
+        // RFC 3977 section 3.2.1 generic errors are single-line, but
+        // command-specific error codes are only valid for commands that list
+        // them. Keep valid errors ahead of success metadata so clients do not
+        // wait for a dot terminator after failures.
         if status.is_error() {
-            return response_descriptor(kind, status.as_u16(), ResponseFraming::SingleLine);
+            let code = status.as_u16();
+            let framing = if matches!(kind, RequestKind::Unknown)
+                || is_generic_error_status(code)
+                || is_specific_error_status_for_request(kind, code)
+            {
+                ResponseFraming::SingleLine
+            } else {
+                ResponseFraming::Unexpected
+            };
+            return response_descriptor(kind, code, framing);
         }
 
         responses_for_request(kind)
@@ -2243,6 +2253,36 @@ impl ResponseDescriptor {
                 };
                 response_descriptor(kind, status.as_u16(), framing)
             })
+    }
+}
+
+fn is_generic_error_status(code: u16) -> bool {
+    matches!(
+        code,
+        400 | 401 | 403 | 480 | 483 | 500 | 501 | 502 | 503 | 504
+    )
+}
+
+fn is_specific_error_status_for_request(kind: RequestKind, code: u16) -> bool {
+    match kind {
+        RequestKind::Article | RequestKind::Body | RequestKind::Head | RequestKind::Stat => {
+            matches!(code, 412 | 420 | 423 | 430)
+        }
+        RequestKind::Group => matches!(code, 411 | 412),
+        RequestKind::ListGroup => matches!(code, 411 | 412),
+        RequestKind::Last => matches!(code, 412 | 420 | 422),
+        RequestKind::Next => matches!(code, 412 | 420 | 421),
+        RequestKind::Over | RequestKind::Xover => matches!(code, 412 | 420 | 423 | 430),
+        RequestKind::Hdr | RequestKind::Xhdr => matches!(code, 412 | 420 | 423 | 430),
+        RequestKind::Post => matches!(code, 440 | 441),
+        RequestKind::Ihave => matches!(code, 435..=437),
+        RequestKind::Check => matches!(code, 431 | 438),
+        RequestKind::TakeThis => code == 439,
+        RequestKind::AuthInfoUser | RequestKind::AuthInfoPass | RequestKind::AuthInfo => {
+            matches!(code, 481 | 482)
+        }
+        RequestKind::StartTls => code == 580,
+        _ => false,
     }
 }
 

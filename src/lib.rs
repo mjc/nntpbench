@@ -8975,6 +8975,36 @@ mod tests {
                         frame: b"430 missing caf\xe9\r\n",
                     },
                     ResponseFrameCase {
+                        name: "GROUP rejects article-specific 430 error",
+                        reference: "RFC 3977 sections 3.2 and 6.1.1 https://www.rfc-editor.org/rfc/rfc3977#section-3.2",
+                        kind: RequestKind::Group,
+                        frame: b"430 no article with that message-id\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "ARTICLE rejects posting-specific 440 error",
+                        reference: "RFC 3977 sections 3.2 and 6.3.1 https://www.rfc-editor.org/rfc/rfc3977#section-3.2",
+                        kind: RequestKind::Article,
+                        frame: b"440 posting not permitted\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "CAPABILITIES rejects group-specific 411 error",
+                        reference: "RFC 3977 sections 3.2, 5.2, and 6.1.1 https://www.rfc-editor.org/rfc/rfc3977#section-3.2",
+                        kind: RequestKind::Capabilities,
+                        frame: b"411 no such newsgroup\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "POST rejects transfer-specific 435 error",
+                        reference: "RFC 3977 sections 3.2 and 6.3.2 https://www.rfc-editor.org/rfc/rfc3977#section-3.2",
+                        kind: RequestKind::Post,
+                        frame: b"435 article not wanted\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "CHECK rejects TAKETHIS-specific 439 error",
+                        reference: "RFC 4644 sections 2.4 and 2.5 https://www.rfc-editor.org/rfc/rfc4644#section-2.4",
+                        kind: RequestKind::Check,
+                        frame: b"439 <take@test> transfer rejected\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "generic 401 rejects missing capability label",
                         reference: "RFC 3977 sections 3.2.1 and 9.4.2 https://www.rfc-editor.org/rfc/rfc3977#section-9.4.2",
                         kind: RequestKind::Article,
