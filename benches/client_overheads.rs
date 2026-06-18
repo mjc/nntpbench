@@ -1,14 +1,14 @@
-//! Focused benchmarks for typed-client per-request overheads.
+//! Focused benchmarks for client per-request overheads.
 //!
 //! These isolate costs that are hard to read from the end-to-end client profile:
 //! request construction, request wire serialization, streaming response decoding,
 //! and Tokio channel/future handoffs.
 
 use divan::{Bencher, black_box};
-use nntpbench::typed_client::{bench_streaming_decode_response, bench_write_request_wire_to_sink};
+use nntpbench::client::{bench_streaming_decode_response, bench_write_request_wire_to_sink};
 use nntpbench::{
-    ClientCommandMix, MessageId, Request, RequestKind, bench_typed_request_for_command,
-    bench_typed_segment_request_for_command,
+    ClientCommandMix, MessageId, Request, RequestKind, bench_client_request_for_command,
+    bench_client_segment_request_for_command,
 };
 use std::sync::Arc;
 use tokio::runtime::Builder;
@@ -30,14 +30,14 @@ fn runtime() -> tokio::runtime::Runtime {
 
 mod request_construction {
     use super::{
-        Arc, Bencher, ClientCommandMix, MessageId, bench_typed_request_for_command,
-        bench_typed_segment_request_for_command, black_box,
+        Arc, Bencher, ClientCommandMix, MessageId, bench_client_request_for_command,
+        bench_client_segment_request_for_command, black_box,
     };
 
     #[divan::bench(sample_count = 1000, sample_size = 100)]
     fn numeric_article(bencher: Bencher) {
         bencher.bench_local(|| {
-            black_box(bench_typed_request_for_command(
+            black_box(bench_client_request_for_command(
                 black_box(42),
                 black_box(42),
                 black_box(ClientCommandMix::Article),
@@ -48,7 +48,7 @@ mod request_construction {
     #[divan::bench(sample_count = 1000, sample_size = 100)]
     fn numeric_body(bencher: Bencher) {
         bencher.bench_local(|| {
-            black_box(bench_typed_request_for_command(
+            black_box(bench_client_request_for_command(
                 black_box(42),
                 black_box(42),
                 black_box(ClientCommandMix::Body),
@@ -59,7 +59,7 @@ mod request_construction {
     #[divan::bench(sample_count = 1000, sample_size = 100)]
     fn synthetic_message_id(bencher: Bencher) {
         bencher.bench_local(|| {
-            black_box(bench_typed_request_for_command(
+            black_box(bench_client_request_for_command(
                 black_box(0),
                 black_box(0),
                 black_box(ClientCommandMix::Article),
@@ -72,7 +72,7 @@ mod request_construction {
         let segment =
             MessageId::from_shared(Arc::<str>::from("<bench.42@nntpbench.local>")).unwrap();
         bencher.bench_local(|| {
-            black_box(bench_typed_segment_request_for_command(
+            black_box(bench_client_segment_request_for_command(
                 black_box(segment.clone()),
                 black_box(ClientCommandMix::Article),
             ))

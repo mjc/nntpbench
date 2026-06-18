@@ -1,16 +1,16 @@
-//! End-to-end typed client benchmarks.
+//! End-to-end client benchmarks.
 //!
 //! These benches drive the new request/future client surface against the real
 //! mock NNTP server over localhost TCP.
 //!
-//! Run with: `cargo bench --bench typed_client_roundtrip`
+//! Run with: `cargo bench --bench client_roundtrip`
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use divan::{Bencher, black_box};
 use nntpbench::{
-    Client, ServerArgs, ServerConfig, Stats, TypedClientOptions, bind_listener, serve_session,
+    Client, ClientOptions, ServerArgs, ServerConfig, Stats, bind_listener, serve_session,
 };
 use tokio::runtime::Builder;
 
@@ -65,21 +65,21 @@ async fn spawn_server(body_bytes: usize, article_bytes: usize) -> SocketAddr {
     addr
 }
 
-struct TypedHarness {
+struct ClientHarness {
     rt: tokio::runtime::Runtime,
     client: Client,
 }
 
-impl TypedHarness {
+impl ClientHarness {
     fn start(body_bytes: usize, article_bytes: usize, pipeline_depth: usize) -> Self {
         let rt = Builder::new_current_thread().enable_all().build().unwrap();
         let addr = rt.block_on(spawn_server(body_bytes, article_bytes));
         let client = rt
             .block_on(Client::connect_with_options(
                 addr,
-                TypedClientOptions {
+                ClientOptions {
                     pipeline_depth,
-                    ..TypedClientOptions::default()
+                    ..ClientOptions::default()
                 },
             ))
             .unwrap();
@@ -88,7 +88,7 @@ impl TypedHarness {
 }
 
 fn bench_public_article_roundtrip(bencher: Bencher) {
-    let harness = TypedHarness::start(BODY_64K, ARTICLE_64K, 1);
+    let harness = ClientHarness::start(BODY_64K, ARTICLE_64K, 1);
     bencher
         .counter(divan::counter::BytesCount::new(ARTICLE_64K))
         .bench_local(|| {
@@ -105,7 +105,7 @@ fn bench_public_article_roundtrip(bencher: Bencher) {
 }
 
 fn bench_raw_capabilities_roundtrip(bencher: Bencher) {
-    let harness = TypedHarness::start(BODY_64K, ARTICLE_64K, 1);
+    let harness = ClientHarness::start(BODY_64K, ARTICLE_64K, 1);
     bencher
         .counter(divan::counter::ItemsCount::new(1usize))
         .bench_local(|| {
@@ -122,7 +122,7 @@ fn bench_raw_capabilities_roundtrip(bencher: Bencher) {
 }
 
 fn bench_pipelined_body_burst(bencher: Bencher) {
-    let harness = TypedHarness::start(BODY_64K, ARTICLE_64K, 4);
+    let harness = ClientHarness::start(BODY_64K, ARTICLE_64K, 4);
     bencher
         .counter(divan::counter::ItemsCount::new(4usize))
         .bench_local(|| {
@@ -141,7 +141,7 @@ fn bench_pipelined_body_burst(bencher: Bencher) {
 }
 
 fn bench_pipelined_mixed_requests(bencher: Bencher) {
-    let harness = TypedHarness::start(BODY_64K, ARTICLE_64K, 4);
+    let harness = ClientHarness::start(BODY_64K, ARTICLE_64K, 4);
     bencher
         .counter(divan::counter::ItemsCount::new(4usize))
         .bench_local(|| {
@@ -163,7 +163,7 @@ fn bench_pipelined_mixed_requests(bencher: Bencher) {
 }
 
 fn bench_pipelined_rfc_grammar_requests(bencher: Bencher) {
-    let harness = TypedHarness::start(BODY_64K, ARTICLE_64K, 4);
+    let harness = ClientHarness::start(BODY_64K, ARTICLE_64K, 4);
     bencher
         .counter(divan::counter::ItemsCount::new(4usize))
         .bench_local(|| {

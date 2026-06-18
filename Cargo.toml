@@ -33,7 +33,7 @@ name = "server_callgrind"
 harness = false
 
 [[bench]]
-name = "typed_client_roundtrip"
+name = "client_roundtrip"
 harness = false
 
 [[bench]]
@@ -41,7 +41,7 @@ name = "response_parsing"
 harness = false
 
 [[bench]]
-name = "typed_client_overheads"
+name = "client_overheads"
 harness = false
 
 [profile.release]

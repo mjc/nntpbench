@@ -6,13 +6,13 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR"
 TARGET_DIR="${CARGO_TARGET_DIR:-$PROJECT_DIR/target}"
 
-BENCH_NAME="typed_client_roundtrip"
+BENCH_NAME="client_roundtrip"
 BENCH_ARGS=("$@")
 
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
     echo "Usage: $0 [DIVAN_ARGS...]"
     echo ""
-    echo "Build and profile the typed client benchmark target with perf."
+    echo "Build and profile the client benchmark target with perf."
     echo "Any extra arguments are passed directly to the divan bench binary."
     echo ""
     echo "Examples:"
@@ -30,7 +30,7 @@ fi
 echo 0 | sudo tee /proc/sys/kernel/kptr_restrict > /dev/null
 echo -1 | sudo tee /proc/sys/kernel/perf_event_paranoid > /dev/null
 
-printf '\033]0;perf: nntpbench typed bench\007'
+printf '\033]0;perf: nntpbench client bench\007'
 
 echo "Building $BENCH_NAME..."
 RUSTFLAGS="-C target-cpu=native -C force-frame-pointers=yes" \

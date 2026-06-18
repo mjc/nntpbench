@@ -75,9 +75,9 @@ unsafe impl GlobalAlloc for CountingAllocator {
 }
 
 mod article_store;
+pub mod client;
 pub mod protocol;
 pub mod terminator;
-pub mod typed_client;
 
 use article_store::{
     ArticleDownloadTarget, ArticleStoreKey, article_ref_for_download_target, download_target_label,
@@ -89,15 +89,15 @@ use article_store::{
     article_download_target_path_into, article_id_tree_path, message_id_tree_path,
 };
 
+pub use client::{
+    Client, ClientConnection, ClientError, ClientOptions, OwnedArticle, OwnedArticleExchange,
+    OwnedExchange, OwnedResponse,
+};
 pub use protocol::{
     Article, ArticleNumber, ArticleParseError, ArticleRef, ArticleSelector, ArticleTransfer,
     AuthInfoKind, AuthInfoValue, GroupName, HeaderIter, HeaderName, Headers, ListGroupRange,
     ListKind, MessageId, NntpDate, NntpTime, Request, RequestKind, RequestLine, StatusCode,
     Wildmat,
-};
-pub use typed_client::{
-    Client, OwnedArticle, OwnedArticleExchange, OwnedExchange, OwnedResponse,
-    TypedClientConnection, TypedClientError, TypedClientOptions,
 };
 
 pub const CRLF: &[u8] = b"\r\n";
@@ -341,7 +341,7 @@ mod proptests {
         #![proptest_config(ProptestConfig::with_cases(48))]
 
         #[test]
-        fn typed_request_for_command_uses_numeric_selectors_for_nonzero_synthetic_ids(
+        fn client_request_for_command_uses_numeric_selectors_for_nonzero_synthetic_ids(
             command_id in 1_u64..=10_000,
             mix in prop_oneof![
                 Just(ClientCommandMix::Article),
@@ -349,7 +349,7 @@ mod proptests {
                 Just(ClientCommandMix::Alternate),
             ],
         ) {
-            let request = typed_request_for_command(command_id, 0, mix, None, 0, 1).unwrap();
+            let request = client_request_for_command(command_id, 0, mix, None, 0, 1).unwrap();
             let expected_kind = client_command_kind(command_id, mix);
 
             match expected_kind {
@@ -369,7 +369,7 @@ mod proptests {
         }
 
         #[test]
-        fn typed_request_for_command_uses_message_ids_for_zero_and_segment_inputs(
+        fn client_request_for_command_uses_message_ids_for_zero_and_segment_inputs(
             mix in prop_oneof![
                 Just(ClientCommandMix::Article),
                 Just(ClientCommandMix::Body),
@@ -380,11 +380,11 @@ mod proptests {
             total_clients in 1_usize..4,
             segments in segment_set_strategy(),
         ) {
-            let zero_request = typed_request_for_command(0, request_index, mix, None, client_index, total_clients).unwrap();
+            let zero_request = client_request_for_command(0, request_index, mix, None, client_index, total_clients).unwrap();
             prop_assert!(zero_request.message_id().is_some());
             prop_assert_eq!(zero_request.message_id().unwrap().as_str(), "<bench.0@nntpbench.local>");
 
-            let segmented = typed_request_for_command(17, request_index, mix, Some(&segments), client_index, total_clients).unwrap();
+            let segmented = client_request_for_command(17, request_index, mix, Some(&segments), client_index, total_clients).unwrap();
             let expected = segment_for_request(&segments, client_index, total_clients, request_index);
             prop_assert_eq!(segmented.message_id().unwrap().as_str(), expected.as_str());
         }
@@ -451,7 +451,7 @@ pub enum ClientCommandMix {
 }
 
 #[derive(Debug, Parser, Clone)]
-pub struct TypedClientArgs {
+pub struct ClientArgs {
     /// Address to connect to.
     #[arg(long, default_value = "127.0.0.1:1199")]
     pub connect: SocketAddr,
@@ -550,14 +550,14 @@ pub struct TypedClientArgs {
 }
 
 #[derive(Debug, Parser, Clone)]
-pub struct TypedFetchArgs {
+pub struct FetchArgs {
     /// Address to connect to.
     #[arg(long, default_value = "127.0.0.1:1199")]
     pub connect: SocketAddr,
 
     /// Request kind to send.
     #[arg(long, value_enum)]
-    pub request: TypedRequestKind,
+    pub request: FetchRequestKind,
 
     /// Message-ID to request for ARTICLE/BODY/HEAD/STAT. Bare IDs are wrapped in angle brackets.
     #[arg(long)]
@@ -625,7 +625,7 @@ pub struct TypedFetchArgs {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum TypedRequestKind {
+pub enum FetchRequestKind {
     Article,
     Body,
     Head,
@@ -667,13 +667,13 @@ struct SegmentSet {
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
-pub async fn run_typed_client(args: TypedClientArgs) -> io::Result<()> {
-    let config = TypedClientConfig::from_args(args)?;
-    run_typed_workload(config).await
+pub async fn run_client(args: ClientArgs) -> io::Result<()> {
+    let config = ClientConfig::from_args(args)?;
+    run_client_workload(config).await
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
-async fn run_typed_workload(config: TypedClientConfig) -> io::Result<()> {
+async fn run_client_workload(config: ClientConfig) -> io::Result<()> {
     if config.article_targets.is_some() {
         return run_article_id_download_workload(config).await;
     }
@@ -725,7 +725,7 @@ async fn run_typed_workload(config: TypedClientConfig) -> io::Result<()> {
     for connection_index in 0..config.connections {
         let global_index = config.client_offset + connection_index;
         let requests = requests_for_connection(config.requests, config.total_clients, global_index);
-        let session = TypedClientSession::new(&config, global_index, next_start_id, requests);
+        let session = ClientSession::new(&config, global_index, next_start_id, requests);
         next_start_id = next_start_id.wrapping_add(requests);
         let stats = stats.clone();
         let stop = stop.clone();
@@ -767,7 +767,7 @@ async fn run_typed_workload(config: TypedClientConfig) -> io::Result<()> {
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
-async fn run_article_id_download_workload(config: TypedClientConfig) -> io::Result<()> {
+async fn run_article_id_download_workload(config: ClientConfig) -> io::Result<()> {
     let start_cpu_ticks = process_cpu_ticks();
     let started = Instant::now();
     let stats = Arc::new(Stats::new());
@@ -864,20 +864,16 @@ async fn run_article_id_download_workload(config: TypedClientConfig) -> io::Resu
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
-pub async fn run_typed_fetch(args: TypedFetchArgs) -> io::Result<()> {
-    let response = fetch_typed_response(&args)
-        .await
-        .map_err(map_typed_client_error)?;
+pub async fn run_fetch(args: FetchArgs) -> io::Result<()> {
+    let response = fetch_response(&args).await.map_err(map_client_error)?;
     io::stdout().write_all(response.as_bytes())
 }
 
-pub async fn fetch_typed_response(
-    args: &TypedFetchArgs,
-) -> Result<OwnedResponse, TypedClientError> {
-    let request = typed_fetch_request(args)?;
-    let connection = TypedClientConnection::connect_with_options(
+pub async fn fetch_response(args: &FetchArgs) -> Result<OwnedResponse, ClientError> {
+    let request = fetch_request(args)?;
+    let connection = ClientConnection::connect_with_options(
         args.connect,
-        TypedClientOptions {
+        ClientOptions {
             read_buffer_bytes: args.read_buffer_bytes.max(terminator::TERMINATOR_TAIL_SIZE),
             nodelay: args.nodelay,
             socket_recv_buffer: args.socket_recv_buffer,
@@ -890,249 +886,217 @@ pub async fn fetch_typed_response(
     connection.execute(request).await
 }
 
-fn typed_fetch_request(args: &TypedFetchArgs) -> Result<Request<'static>, TypedClientError> {
+fn fetch_request(args: &FetchArgs) -> Result<Request<'static>, ClientError> {
     match args.request {
-        TypedRequestKind::Article => typed_fetch_article_request(
+        FetchRequestKind::Article => fetch_article_request(
             args,
             |message_id| Request::article(message_id),
             |selector| Request::article_selector(selector),
             Request::article_current,
         ),
-        TypedRequestKind::Body => typed_fetch_article_request(
+        FetchRequestKind::Body => fetch_article_request(
             args,
             |message_id| Request::body(message_id),
             |selector| Request::body_selector(selector),
             Request::body_current,
         ),
-        TypedRequestKind::Head => typed_fetch_article_request(
+        FetchRequestKind::Head => fetch_article_request(
             args,
             |message_id| Request::head(message_id),
             |selector| Request::head_selector(selector),
             Request::head_current,
         ),
-        TypedRequestKind::Stat => typed_fetch_article_request(
+        FetchRequestKind::Stat => fetch_article_request(
             args,
             |message_id| Request::stat(message_id),
             |selector| Request::stat_selector(selector),
             Request::stat_current,
         ),
-        TypedRequestKind::ListActive => match args.wildmat.as_deref() {
+        FetchRequestKind::ListActive => match args.wildmat.as_deref() {
             Some(wildmat) => {
-                Request::list_active_wildmat(wildmat).map_err(|_| TypedClientError::InvalidWildmat)
+                Request::list_active_wildmat(wildmat).map_err(|_| ClientError::InvalidWildmat)
             }
             None => Ok(Request::list_active()),
         },
-        TypedRequestKind::ListActiveTimes => match args.wildmat.as_deref() {
-            Some(wildmat) => Request::list_active_times_wildmat(wildmat)
-                .map_err(|_| TypedClientError::InvalidWildmat),
+        FetchRequestKind::ListActiveTimes => match args.wildmat.as_deref() {
+            Some(wildmat) => {
+                Request::list_active_times_wildmat(wildmat).map_err(|_| ClientError::InvalidWildmat)
+            }
             None => Ok(Request::list_active_times()),
         },
-        TypedRequestKind::ListNewsgroups => match args.wildmat.as_deref() {
-            Some(wildmat) => Request::list_newsgroups_wildmat(wildmat)
-                .map_err(|_| TypedClientError::InvalidWildmat),
+        FetchRequestKind::ListNewsgroups => match args.wildmat.as_deref() {
+            Some(wildmat) => {
+                Request::list_newsgroups_wildmat(wildmat).map_err(|_| ClientError::InvalidWildmat)
+            }
             None => Ok(Request::list_newsgroups()),
         },
-        TypedRequestKind::ListOverviewFmt => Ok(Request::list_overview_fmt()),
-        TypedRequestKind::ListHeaders => Ok(Request::list_headers()),
-        TypedRequestKind::ListDistribPats => Ok(Request::list_distrib_pats()),
-        TypedRequestKind::Group => typed_fetch_group_request(args, |group| Request::group(group)),
-        TypedRequestKind::Listgroup => typed_fetch_listgroup_request(args),
-        TypedRequestKind::Last => Ok(Request::last()),
-        TypedRequestKind::Next => Ok(Request::next()),
-        TypedRequestKind::Newgroups => typed_fetch_newgroups_request(args),
-        TypedRequestKind::Newnews => typed_fetch_newnews_request(args),
-        TypedRequestKind::Post => Ok(Request::post()),
-        TypedRequestKind::Ihave => {
-            typed_fetch_message_id_request(args, |message_id| Request::ihave(message_id))
+        FetchRequestKind::ListOverviewFmt => Ok(Request::list_overview_fmt()),
+        FetchRequestKind::ListHeaders => Ok(Request::list_headers()),
+        FetchRequestKind::ListDistribPats => Ok(Request::list_distrib_pats()),
+        FetchRequestKind::Group => fetch_group_request(args, |group| Request::group(group)),
+        FetchRequestKind::Listgroup => fetch_listgroup_request(args),
+        FetchRequestKind::Last => Ok(Request::last()),
+        FetchRequestKind::Next => Ok(Request::next()),
+        FetchRequestKind::Newgroups => fetch_newgroups_request(args),
+        FetchRequestKind::Newnews => fetch_newnews_request(args),
+        FetchRequestKind::Post => Ok(Request::post()),
+        FetchRequestKind::Ihave => {
+            fetch_message_id_request(args, |message_id| Request::ihave(message_id))
         }
-        TypedRequestKind::Check => {
-            typed_fetch_message_id_request(args, |message_id| Request::check(message_id))
+        FetchRequestKind::Check => {
+            fetch_message_id_request(args, |message_id| Request::check(message_id))
         }
-        TypedRequestKind::Takethis => typed_fetch_takethis_request(args),
-        TypedRequestKind::AuthinfoUser => {
-            typed_fetch_authinfo_request(args, |value| Request::authinfo_user(value))
+        FetchRequestKind::Takethis => fetch_takethis_request(args),
+        FetchRequestKind::AuthinfoUser => {
+            fetch_authinfo_request(args, |value| Request::authinfo_user(value))
         }
-        TypedRequestKind::AuthinfoPass => {
-            typed_fetch_authinfo_request(args, |value| Request::authinfo_pass(value))
+        FetchRequestKind::AuthinfoPass => {
+            fetch_authinfo_request(args, |value| Request::authinfo_pass(value))
         }
-        TypedRequestKind::Starttls => Ok(Request::starttls()),
-        TypedRequestKind::Over => {
-            typed_fetch_selector_request(args, |selector| Request::over(selector))
+        FetchRequestKind::Starttls => Ok(Request::starttls()),
+        FetchRequestKind::Over => fetch_selector_request(args, |selector| Request::over(selector)),
+        FetchRequestKind::Xover => {
+            fetch_selector_request(args, |selector| Request::xover(selector))
         }
-        TypedRequestKind::Xover => {
-            typed_fetch_selector_request(args, |selector| Request::xover(selector))
+        FetchRequestKind::Hdr => {
+            fetch_header_request(args, |header, selector| Request::hdr(header, selector))
         }
-        TypedRequestKind::Hdr => {
-            typed_fetch_header_request(args, |header, selector| Request::hdr(header, selector))
+        FetchRequestKind::Xhdr => {
+            fetch_header_request(args, |header, selector| Request::xhdr(header, selector))
         }
-        TypedRequestKind::Xhdr => {
-            typed_fetch_header_request(args, |header, selector| Request::xhdr(header, selector))
-        }
-        TypedRequestKind::List => Ok(Request::list()),
-        TypedRequestKind::Help => Ok(Request::help()),
-        TypedRequestKind::Capabilities => Ok(Request::capabilities()),
-        TypedRequestKind::Date => Ok(Request::date()),
-        TypedRequestKind::ModeReader => Ok(Request::mode_reader()),
-        TypedRequestKind::Quit => Ok(Request::quit()),
+        FetchRequestKind::List => Ok(Request::list()),
+        FetchRequestKind::Help => Ok(Request::help()),
+        FetchRequestKind::Capabilities => Ok(Request::capabilities()),
+        FetchRequestKind::Date => Ok(Request::date()),
+        FetchRequestKind::ModeReader => Ok(Request::mode_reader()),
+        FetchRequestKind::Quit => Ok(Request::quit()),
     }
 }
 
-fn typed_fetch_message_id_request<F>(
-    args: &TypedFetchArgs,
-    build: F,
-) -> Result<Request<'static>, TypedClientError>
+fn fetch_message_id_request<F>(args: &FetchArgs, build: F) -> Result<Request<'static>, ClientError>
 where
     F: FnOnce(&str) -> Result<Request<'static>, protocol::InvalidMessageId>,
 {
     let message_id = args
         .message_id
         .as_deref()
-        .ok_or(TypedClientError::MissingMessageId)?;
-    build(message_id).map_err(|_| TypedClientError::InvalidMessageId)
+        .ok_or(ClientError::MissingMessageId)?;
+    build(message_id).map_err(|_| ClientError::InvalidMessageId)
 }
 
-fn typed_fetch_article_request<F, G, H>(
-    args: &TypedFetchArgs,
+fn fetch_article_request<F, G, H>(
+    args: &FetchArgs,
     build_message_id: F,
     build_selector: G,
     build_current: H,
-) -> Result<Request<'static>, TypedClientError>
+) -> Result<Request<'static>, ClientError>
 where
     F: FnOnce(&str) -> Result<Request<'static>, protocol::InvalidMessageId>,
     G: FnOnce(&str) -> Result<Request<'static>, protocol::InvalidArticleRef>,
     H: FnOnce() -> Request<'static>,
 {
     if let Some(message_id) = args.message_id.as_deref() {
-        return build_message_id(message_id).map_err(|_| TypedClientError::InvalidMessageId);
+        return build_message_id(message_id).map_err(|_| ClientError::InvalidMessageId);
     }
 
     if let Some(selector) = args.selector.as_deref() {
-        return build_selector(selector).map_err(|_| TypedClientError::InvalidArticleSelector);
+        return build_selector(selector).map_err(|_| ClientError::InvalidArticleSelector);
     }
 
     Ok(build_current())
 }
 
-fn typed_fetch_header_request<F>(
-    args: &TypedFetchArgs,
-    build: F,
-) -> Result<Request<'static>, TypedClientError>
+fn fetch_header_request<F>(args: &FetchArgs, build: F) -> Result<Request<'static>, ClientError>
 where
     F: FnOnce(&str, &str) -> Result<Request<'static>, crate::protocol::InvalidHeaderQuery>,
 {
     let header = args
         .header
         .as_deref()
-        .ok_or(TypedClientError::MissingHeaderName)?;
+        .ok_or(ClientError::MissingHeaderName)?;
     let selector = args
         .selector
         .as_deref()
-        .ok_or(TypedClientError::MissingArticleSelector)?;
-    build(header, selector).map_err(TypedClientError::from)
+        .ok_or(ClientError::MissingArticleSelector)?;
+    build(header, selector).map_err(ClientError::from)
 }
 
-fn typed_fetch_group_request<F>(
-    args: &TypedFetchArgs,
-    build: F,
-) -> Result<Request<'static>, TypedClientError>
+fn fetch_group_request<F>(args: &FetchArgs, build: F) -> Result<Request<'static>, ClientError>
 where
     F: FnOnce(&str) -> Result<Request<'static>, crate::protocol::InvalidGroupName>,
 {
-    let group = args
-        .group
-        .as_deref()
-        .ok_or(TypedClientError::MissingGroupName)?;
-    build(group).map_err(|_| TypedClientError::InvalidGroupName)
+    let group = args.group.as_deref().ok_or(ClientError::MissingGroupName)?;
+    build(group).map_err(|_| ClientError::InvalidGroupName)
 }
 
-fn typed_fetch_listgroup_request(
-    args: &TypedFetchArgs,
-) -> Result<Request<'static>, TypedClientError> {
+fn fetch_listgroup_request(args: &FetchArgs) -> Result<Request<'static>, ClientError> {
     match (args.group.as_deref(), args.selector.as_deref()) {
         (Some(group), Some(range)) => {
-            Request::listgroup_group_range(group, range).map_err(TypedClientError::from)
+            Request::listgroup_group_range(group, range).map_err(ClientError::from)
         }
-        (Some(group), None) => {
-            Request::listgroup(group).map_err(|_| TypedClientError::InvalidGroupName)
-        }
+        (Some(group), None) => Request::listgroup(group).map_err(|_| ClientError::InvalidGroupName),
         (None, Some(range)) => {
-            Request::listgroup_range(range).map_err(|_| TypedClientError::InvalidListGroupRange)
+            Request::listgroup_range(range).map_err(|_| ClientError::InvalidListGroupRange)
         }
         (None, None) => Ok(Request::listgroup_current()),
     }
 }
 
-fn typed_fetch_newgroups_request(
-    args: &TypedFetchArgs,
-) -> Result<Request<'static>, TypedClientError> {
-    let date = args.date.as_deref().ok_or(TypedClientError::MissingDate)?;
-    let time = args.time.as_deref().ok_or(TypedClientError::MissingTime)?;
-    Request::newgroups(date, time, args.gmt).map_err(TypedClientError::from)
+fn fetch_newgroups_request(args: &FetchArgs) -> Result<Request<'static>, ClientError> {
+    let date = args.date.as_deref().ok_or(ClientError::MissingDate)?;
+    let time = args.time.as_deref().ok_or(ClientError::MissingTime)?;
+    Request::newgroups(date, time, args.gmt).map_err(ClientError::from)
 }
 
-fn typed_fetch_newnews_request(
-    args: &TypedFetchArgs,
-) -> Result<Request<'static>, TypedClientError> {
-    let wildmat = args
-        .wildmat
-        .as_deref()
-        .ok_or(TypedClientError::MissingWildmat)?;
-    let date = args.date.as_deref().ok_or(TypedClientError::MissingDate)?;
-    let time = args.time.as_deref().ok_or(TypedClientError::MissingTime)?;
-    Request::newnews(wildmat, date, time, args.gmt).map_err(TypedClientError::from)
+fn fetch_newnews_request(args: &FetchArgs) -> Result<Request<'static>, ClientError> {
+    let wildmat = args.wildmat.as_deref().ok_or(ClientError::MissingWildmat)?;
+    let date = args.date.as_deref().ok_or(ClientError::MissingDate)?;
+    let time = args.time.as_deref().ok_or(ClientError::MissingTime)?;
+    Request::newnews(wildmat, date, time, args.gmt).map_err(ClientError::from)
 }
 
-fn typed_fetch_selector_request<F>(
-    args: &TypedFetchArgs,
-    build: F,
-) -> Result<Request<'static>, TypedClientError>
+fn fetch_selector_request<F>(args: &FetchArgs, build: F) -> Result<Request<'static>, ClientError>
 where
     F: FnOnce(&str) -> Result<Request<'static>, crate::protocol::InvalidArticleSelector>,
 {
     let selector = args
         .selector
         .as_deref()
-        .ok_or(TypedClientError::MissingArticleSelector)?;
-    build(selector).map_err(|_| TypedClientError::InvalidArticleSelector)
+        .ok_or(ClientError::MissingArticleSelector)?;
+    build(selector).map_err(|_| ClientError::InvalidArticleSelector)
 }
 
-fn typed_fetch_authinfo_request<F>(
-    args: &TypedFetchArgs,
-    build: F,
-) -> Result<Request<'static>, TypedClientError>
+fn fetch_authinfo_request<F>(args: &FetchArgs, build: F) -> Result<Request<'static>, ClientError>
 where
     F: FnOnce(&str) -> Result<Request<'static>, crate::protocol::InvalidAuthInfoValue>,
 {
     let value = args
         .auth_value
         .as_deref()
-        .ok_or(TypedClientError::MissingAuthInfoValue)?;
-    build(value).map_err(TypedClientError::from)
+        .ok_or(ClientError::MissingAuthInfoValue)?;
+    build(value).map_err(ClientError::from)
 }
 
-fn typed_fetch_takethis_request(
-    args: &TypedFetchArgs,
-) -> Result<Request<'static>, TypedClientError> {
+fn fetch_takethis_request(args: &FetchArgs) -> Result<Request<'static>, ClientError> {
     let message_id = args
         .message_id
         .as_deref()
-        .ok_or(TypedClientError::MissingMessageId)?;
+        .ok_or(ClientError::MissingMessageId)?;
     let article = args
         .article_body
         .as_deref()
-        .ok_or(TypedClientError::MissingArticleBody)?;
-    Request::takethis(message_id, article.as_bytes())
-        .map_err(|_| TypedClientError::InvalidMessageId)
+        .ok_or(ClientError::MissingArticleBody)?;
+    Request::takethis(message_id, article.as_bytes()).map_err(|_| ClientError::InvalidMessageId)
 }
 
-fn map_typed_client_error(err: TypedClientError) -> io::Error {
+fn map_client_error(err: ClientError) -> io::Error {
     match err {
-        TypedClientError::Io(err) => err,
-        TypedClientError::UnexpectedEof => io::Error::new(
+        ClientError::Io(err) => err,
+        ClientError::UnexpectedEof => io::Error::new(
             io::ErrorKind::UnexpectedEof,
             "server closed before completing response",
         ),
-        TypedClientError::ConnectionClosed => {
+        ClientError::ConnectionClosed => {
             io::Error::new(io::ErrorKind::BrokenPipe, "connection engine closed")
         }
         other => io::Error::new(io::ErrorKind::InvalidData, other),
@@ -1153,7 +1117,7 @@ fn validate_client_auth_value(
 }
 
 #[derive(Debug, Clone)]
-struct TypedClientConfig {
+struct ClientConfig {
     connect: SocketAddr,
     ports: Box<[u16]>,
     segments: Option<Arc<SegmentSet>>,
@@ -1179,8 +1143,8 @@ struct TypedClientConfig {
     stats_interval: Duration,
 }
 
-impl TypedClientConfig {
-    fn from_args(args: TypedClientArgs) -> io::Result<Self> {
+impl ClientConfig {
+    fn from_args(args: ClientArgs) -> io::Result<Self> {
         Self::build(
             args.connect,
             args.ports.into_boxed_slice(),
@@ -1329,7 +1293,7 @@ struct ArticleIdDownloadSession {
 
 impl ArticleIdDownloadSession {
     fn new(
-        config: &TypedClientConfig,
+        config: &ClientConfig,
         global_index: usize,
         article_targets: Arc<[ArticleDownloadTarget]>,
         output_dir: Arc<PathBuf>,
@@ -1369,8 +1333,7 @@ impl ArticleIdDownloadSession {
         )
         .await?;
         read_greeting(&mut stream).await?;
-        let mut response_reader =
-            crate::typed_client::DrainedResponseReader::new(self.read_buffer_bytes);
+        let mut response_reader = crate::client::DrainedResponseReader::new(self.read_buffer_bytes);
         authenticate_client_stream(
             &mut stream,
             &mut response_reader,
@@ -1392,7 +1355,7 @@ impl ArticleIdDownloadSession {
             {
                 let target = &self.article_targets[next_send_index];
                 let article_ref = article_ref_for_download_target(target)?;
-                crate::typed_client::write_article_request_wire(&mut stream, &article_ref).await?;
+                crate::client::write_article_request_wire(&mut stream, &article_ref).await?;
                 in_flight += 1;
                 next_send_index = next_send_index.saturating_add(self.total_clients);
             }
@@ -1408,7 +1371,7 @@ impl ArticleIdDownloadSession {
             let response = response_reader
                 .read_response_frame(&mut stream, RequestKind::Article)
                 .await
-                .map_err(map_typed_client_error)?;
+                .map_err(map_client_error)?;
 
             stats.commands.fetch_add(1, Ordering::Relaxed);
             stats.article_requests.fetch_add(1, Ordering::Relaxed);
@@ -1432,7 +1395,7 @@ impl ArticleIdDownloadSession {
 }
 
 #[derive(Debug)]
-struct TypedClientSession {
+struct ClientSession {
     connect: SocketAddr,
     segments: Option<Arc<SegmentSet>>,
     auth_user: Option<AuthInfoValue<'static>>,
@@ -1450,8 +1413,8 @@ struct TypedClientSession {
     socket_send_buffer: usize,
 }
 
-impl TypedClientSession {
-    fn new(config: &TypedClientConfig, global_index: usize, start_id: u64, requests: u64) -> Self {
+impl ClientSession {
+    fn new(config: &ClientConfig, global_index: usize, start_id: u64, requests: u64) -> Self {
         Self {
             connect: config.endpoint_for(global_index),
             segments: config.segments.clone(),
@@ -1489,8 +1452,7 @@ impl TypedClientSession {
         )
         .await?;
         read_greeting(&mut stream).await?;
-        let mut response_reader =
-            crate::typed_client::DrainedResponseReader::new(self.read_buffer_bytes);
+        let mut response_reader = crate::client::DrainedResponseReader::new(self.read_buffer_bytes);
         self.authenticate(&mut stream, &mut response_reader).await?;
 
         let mut in_flight = 0_usize;
@@ -1499,7 +1461,7 @@ impl TypedClientSession {
         let mut request_buffer = Vec::with_capacity(self.pipeline_depth.saturating_mul(32));
 
         let initial_fill = self
-            .fill_typed_pipeline(
+            .fill_pipeline(
                 &mut stream,
                 &mut request_buffer,
                 in_flight,
@@ -1520,7 +1482,7 @@ impl TypedClientSession {
             let response = response_reader
                 .read_response(&mut stream, kind)
                 .await
-                .map_err(map_typed_client_error)?;
+                .map_err(map_client_error)?;
             in_flight -= 1;
             received = received.wrapping_add(1);
 
@@ -1548,7 +1510,7 @@ impl TypedClientSession {
 
             if in_flight <= self.pipeline_refill_low_water() {
                 let filled = self
-                    .fill_typed_pipeline(
+                    .fill_pipeline(
                         &mut stream,
                         &mut request_buffer,
                         in_flight,
@@ -1571,7 +1533,7 @@ impl TypedClientSession {
     async fn authenticate(
         &self,
         stream: &mut TcpStream,
-        response_reader: &mut crate::typed_client::DrainedResponseReader,
+        response_reader: &mut crate::client::DrainedResponseReader,
     ) -> io::Result<()> {
         let mut user_status = None;
         if let Some(value) = self.auth_user.as_ref() {
@@ -1609,7 +1571,7 @@ impl TypedClientSession {
         Ok(())
     }
 
-    async fn fill_typed_pipeline(
+    async fn fill_pipeline(
         &self,
         stream: &mut TcpStream,
         request_buffer: &mut Vec<u8>,
@@ -1630,7 +1592,7 @@ impl TypedClientSession {
         {
             let request_index = issued.wrapping_add(filled as u64);
             let command_id = self.next_id.wrapping_add(request_index);
-            append_typed_workload_request(
+            append_client_workload_request(
                 request_buffer,
                 command_id,
                 request_index,
@@ -1656,24 +1618,24 @@ impl TypedClientSession {
 
 async fn send_authinfo(
     stream: &mut TcpStream,
-    response_reader: &mut crate::typed_client::DrainedResponseReader,
+    response_reader: &mut crate::client::DrainedResponseReader,
     kind: AuthInfoKind,
     value: &AuthInfoValue<'_>,
-) -> io::Result<crate::typed_client::DrainedResponse> {
+) -> io::Result<crate::client::DrainedResponse> {
     let request_kind = match kind {
         AuthInfoKind::User => RequestKind::AuthInfoUser,
         AuthInfoKind::Pass => RequestKind::AuthInfoPass,
     };
-    crate::typed_client::write_authinfo_wire(stream, kind, value).await?;
+    crate::client::write_authinfo_wire(stream, kind, value).await?;
     response_reader
         .read_response(stream, request_kind)
         .await
-        .map_err(map_typed_client_error)
+        .map_err(map_client_error)
 }
 
 async fn authenticate_client_stream(
     stream: &mut TcpStream,
-    response_reader: &mut crate::typed_client::DrainedResponseReader,
+    response_reader: &mut crate::client::DrainedResponseReader,
     auth_user: Option<AuthInfoValue<'static>>,
     auth_pass: Option<AuthInfoValue<'static>>,
 ) -> io::Result<()> {
@@ -1757,7 +1719,7 @@ fn transfer_limit_reached(stats: &Stats, transfer_bytes: u64) -> bool {
     transfer_bytes != 0 && stats.bytes_sent.load(Ordering::Relaxed) >= transfer_bytes
 }
 
-fn append_typed_workload_request(
+fn append_client_workload_request(
     buffer: &mut Vec<u8>,
     command_id: u64,
     request_index: u64,
@@ -1772,12 +1734,12 @@ fn append_typed_workload_request(
     if let Some(segments) = segments {
         let message_id =
             segment_ref_for_request(segments, client_index, total_clients, request_index);
-        append_typed_message_id_request(buffer, kind, message_id);
+        append_client_message_id_request(buffer, kind, message_id);
         return Ok(request_kind);
     }
 
     if (1..=crate::protocol::MAX_ARTICLE_NUMBER).contains(&command_id) {
-        append_typed_number_request(buffer, kind, command_id)?;
+        append_client_number_request(buffer, kind, command_id)?;
         return Ok(request_kind);
     }
 
@@ -1786,11 +1748,11 @@ fn append_typed_workload_request(
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid synthetic message-id"))?;
     let message_id = MessageId::from_borrowed(synthetic.as_str())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid synthetic message-id"))?;
-    append_typed_message_id_request(buffer, kind, &message_id);
+    append_client_message_id_request(buffer, kind, &message_id);
     Ok(request_kind)
 }
 
-fn append_typed_number_request(
+fn append_client_number_request(
     buffer: &mut Vec<u8>,
     kind: ClientCommandMix,
     number: u64,
@@ -1798,23 +1760,23 @@ fn append_typed_number_request(
     let mut number_buf = arrayvec::ArrayString::<20>::new();
     write!(&mut number_buf, "{number}")
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid article number"))?;
-    append_typed_request_prefix(buffer, kind);
+    append_client_request_prefix(buffer, kind);
     buffer.extend_from_slice(number_buf.as_bytes());
     buffer.extend_from_slice(crate::CRLF);
     Ok(())
 }
 
-fn append_typed_message_id_request(
+fn append_client_message_id_request(
     buffer: &mut Vec<u8>,
     kind: ClientCommandMix,
     message_id: &MessageId<'_>,
 ) {
-    append_typed_request_prefix(buffer, kind);
+    append_client_request_prefix(buffer, kind);
     buffer.extend_from_slice(message_id.as_str().as_bytes());
     buffer.extend_from_slice(crate::CRLF);
 }
 
-fn append_typed_request_prefix(buffer: &mut Vec<u8>, kind: ClientCommandMix) {
+fn append_client_request_prefix(buffer: &mut Vec<u8>, kind: ClientCommandMix) {
     match kind {
         ClientCommandMix::Article => buffer.extend_from_slice(b"ARTICLE "),
         ClientCommandMix::Body => buffer.extend_from_slice(b"BODY "),
@@ -1838,7 +1800,7 @@ fn request_kind_for_normalized_client_command(kind: ClientCommandMix) -> Request
     }
 }
 
-fn typed_request_for_command(
+fn client_request_for_command(
     command_id: u64,
     request_index: u64,
     mix: ClientCommandMix,
@@ -1881,16 +1843,16 @@ fn typed_request_for_command(
 }
 
 #[doc(hidden)]
-pub fn bench_typed_request_for_command(
+pub fn bench_client_request_for_command(
     command_id: u64,
     request_index: u64,
     mix: ClientCommandMix,
 ) -> io::Result<Request<'static>> {
-    typed_request_for_command(command_id, request_index, mix, None, 0, 1)
+    client_request_for_command(command_id, request_index, mix, None, 0, 1)
 }
 
 #[doc(hidden)]
-pub fn bench_typed_segment_request_for_command(
+pub fn bench_client_segment_request_for_command(
     segment_message_id: MessageId<'static>,
     mix: ClientCommandMix,
 ) -> io::Result<Request<'static>> {
@@ -4731,7 +4693,7 @@ mod tests {
             }
         });
 
-        let mut client_args = test_typed_client_args();
+        let mut client_args = test_client_args();
         client_args.connect = addr;
         client_args.requests = requests;
         client_args.transfer_bytes = transfer_bytes;
@@ -4741,8 +4703,8 @@ mod tests {
         client_args.read_buffer_bytes = read_buffer_bytes;
         client_args.socket_recv_buffer = 0;
         client_args.socket_send_buffer = 0;
-        let client_config = TypedClientConfig::from_args(client_args)?;
-        let client_session = TypedClientSession::new(&client_config, 0, start_id, requests);
+        let client_config = ClientConfig::from_args(client_args)?;
+        let client_session = ClientSession::new(&client_config, 0, start_id, requests);
         let client_stats = Arc::new(Stats::new());
         let stop = Arc::new(AtomicBool::new(false));
 
@@ -4793,10 +4755,10 @@ mod tests {
         }
     }
 
-    fn test_typed_fetch_args() -> TypedFetchArgs {
-        TypedFetchArgs {
+    fn test_fetch_args() -> FetchArgs {
+        FetchArgs {
             connect: "127.0.0.1:1199".parse().unwrap(),
-            request: TypedRequestKind::Article,
+            request: FetchRequestKind::Article,
             message_id: Some("bench@test".to_string()),
             article_body: None,
             auth_value: None,
@@ -4816,8 +4778,8 @@ mod tests {
         }
     }
 
-    fn test_typed_client_args() -> TypedClientArgs {
-        TypedClientArgs {
+    fn test_client_args() -> ClientArgs {
+        ClientArgs {
             connect: "127.0.0.1:1199".parse().unwrap(),
             ports: Vec::new(),
             segments: None,
@@ -6861,11 +6823,11 @@ mod tests {
             );
         }
 
-        mod typed_value_validation {
+        mod value_validation {
             use super::*;
 
             #[test]
-            fn rfc3977_red_typed_value_validation_matrix() {
+            fn rfc3977_red_value_validation_matrix() {
                 assert_red_invalid_values(&[
                     (
                         "message-id requires @",
@@ -7656,7 +7618,7 @@ mod tests {
     #[test]
     fn client_config_from_args_clamps_loads_segments_and_rotates_ports() {
         let path = write_temp_segments("config", "123\tbare@example.test\n456\t<wrapped@test>\n");
-        let mut args = test_typed_client_args();
+        let mut args = test_client_args();
         args.connect = "127.0.0.1:1199".parse().unwrap();
         args.ports = vec![1200, 1201];
         args.segments = Some(path.clone());
@@ -7678,7 +7640,7 @@ mod tests {
         args.csv = true;
         args.stats_interval_secs = 2;
 
-        let config = TypedClientConfig::from_args(args).unwrap();
+        let config = ClientConfig::from_args(args).unwrap();
         fs::remove_file(path).unwrap();
 
         assert_eq!(config.requests, 17);
@@ -7713,42 +7675,42 @@ mod tests {
     #[test]
     fn client_config_rejects_invalid_or_empty_segment_files() {
         let invalid = write_temp_segments("invalid", "missing-tab\n");
-        let mut args = test_typed_client_args();
+        let mut args = test_client_args();
         args.segments = Some(invalid.clone());
-        let err = TypedClientConfig::from_args(args).unwrap_err();
+        let err = ClientConfig::from_args(args).unwrap_err();
         fs::remove_file(invalid).unwrap();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
 
         let empty = write_temp_segments("empty", "\n\n");
-        let mut args = test_typed_client_args();
+        let mut args = test_client_args();
         args.segments = Some(empty.clone());
-        let err = TypedClientConfig::from_args(args).unwrap_err();
+        let err = ClientConfig::from_args(args).unwrap_err();
         fs::remove_file(empty).unwrap();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
 
-        let mut args = test_typed_client_args();
+        let mut args = test_client_args();
         args.segments = Some(std::env::temp_dir().join("nntpbench-missing-segments"));
-        let err = TypedClientConfig::from_args(args).unwrap_err();
+        let err = ClientConfig::from_args(args).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
     }
 
     #[test]
     fn client_config_rejects_invalid_authinfo_values() {
-        let mut args = test_typed_client_args();
+        let mut args = test_client_args();
         args.auth_user = Some("bad\ruser".to_string());
-        let err = TypedClientConfig::from_args(args).unwrap_err();
+        let err = ClientConfig::from_args(args).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
 
-        let mut args = test_typed_client_args();
+        let mut args = test_client_args();
         args.auth_pass = Some("bad\npass".to_string());
-        let err = TypedClientConfig::from_args(args).unwrap_err();
+        let err = ClientConfig::from_args(args).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]
     fn client_session_new_copies_connection_distribution() {
         let path = write_temp_segments("session", "1\tone@test\n22\t<two@test>\n");
-        let mut args = test_typed_client_args();
+        let mut args = test_client_args();
         args.connect = "127.0.0.1:1199".parse().unwrap();
         args.ports = vec![1300, 1301];
         args.segments = Some(path.clone());
@@ -7765,9 +7727,9 @@ mod tests {
         args.socket_recv_buffer = 1024;
         args.socket_send_buffer = 2048;
 
-        let config = TypedClientConfig::from_args(args).unwrap();
+        let config = ClientConfig::from_args(args).unwrap();
         fs::remove_file(path).unwrap();
-        let session = TypedClientSession::new(&config, 3, 55, 7);
+        let session = ClientSession::new(&config, 3, 55, 7);
 
         assert_eq!(session.connect.port(), 1301);
         assert_eq!(session.client_index, 3);
@@ -7793,8 +7755,8 @@ mod tests {
     }
 
     #[test]
-    fn typed_client_config_from_args_clamps_and_copies_fields() {
-        let mut args = test_typed_client_args();
+    fn client_config_from_args_clamps_and_copies_fields() {
+        let mut args = test_client_args();
         args.requests = 17;
         args.transfer_bytes = 8192;
         args.duration_secs = 3;
@@ -7811,7 +7773,7 @@ mod tests {
         args.csv = true;
         args.stats_interval_secs = 2;
 
-        let config = TypedClientConfig::from_args(args).unwrap();
+        let config = ClientConfig::from_args(args).unwrap();
 
         assert_eq!(config.requests, 17);
         assert_eq!(config.transfer_bytes, 8192);
@@ -7861,14 +7823,14 @@ mod tests {
     }
 
     #[test]
-    fn typed_request_for_command_prefers_numeric_refs_without_segments() {
+    fn client_request_for_command_prefers_numeric_refs_without_segments() {
         let article =
-            typed_request_for_command(42, 0, ClientCommandMix::Article, None, 0, 1).unwrap();
-        let body = typed_request_for_command(7, 0, ClientCommandMix::Body, None, 0, 1).unwrap();
+            client_request_for_command(42, 0, ClientCommandMix::Article, None, 0, 1).unwrap();
+        let body = client_request_for_command(7, 0, ClientCommandMix::Body, None, 0, 1).unwrap();
         let alternate_article =
-            typed_request_for_command(1, 0, ClientCommandMix::Alternate, None, 0, 1).unwrap();
+            client_request_for_command(1, 0, ClientCommandMix::Alternate, None, 0, 1).unwrap();
         let alternate_body =
-            typed_request_for_command(2, 0, ClientCommandMix::Alternate, None, 0, 1).unwrap();
+            client_request_for_command(2, 0, ClientCommandMix::Alternate, None, 0, 1).unwrap();
 
         assert_eq!(article.kind(), RequestKind::Article);
         assert_eq!(article.article_ref(), Some(&ArticleRef::Number(42)));
@@ -7888,23 +7850,23 @@ mod tests {
     }
 
     #[test]
-    fn typed_request_for_command_keeps_message_ids_for_segments_and_zero_id() {
-        let path = write_temp_segments("typed-request", "1\tsegment@test\n2\tbody@test\n");
+    fn client_request_for_command_keeps_message_ids_for_segments_and_zero_id() {
+        let path = write_temp_segments("client-request", "1\tsegment@test\n2\tbody@test\n");
         let segments = read_segments(&path).unwrap();
         fs::remove_file(path).unwrap();
 
         let segmented =
-            typed_request_for_command(11, 0, ClientCommandMix::Article, Some(&segments), 0, 1)
+            client_request_for_command(11, 0, ClientCommandMix::Article, Some(&segments), 0, 1)
                 .unwrap();
         let segmented_body =
-            typed_request_for_command(12, 1, ClientCommandMix::Body, Some(&segments), 0, 1)
+            client_request_for_command(12, 1, ClientCommandMix::Body, Some(&segments), 0, 1)
                 .unwrap();
         let zero_article =
-            typed_request_for_command(0, 0, ClientCommandMix::Article, None, 0, 1).unwrap();
+            client_request_for_command(0, 0, ClientCommandMix::Article, None, 0, 1).unwrap();
         let zero_body =
-            typed_request_for_command(0, 0, ClientCommandMix::Body, None, 0, 1).unwrap();
+            client_request_for_command(0, 0, ClientCommandMix::Body, None, 0, 1).unwrap();
         let zero_alternate =
-            typed_request_for_command(0, 0, ClientCommandMix::Alternate, None, 0, 1).unwrap();
+            client_request_for_command(0, 0, ClientCommandMix::Alternate, None, 0, 1).unwrap();
 
         assert_eq!(
             segmented.message_id().map(MessageId::as_str),
@@ -8061,7 +8023,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn client_session_runs_pipelined_requests_against_loopback_server() {
+    async fn client_session_writes_expected_pipeline_wire_to_loopback_server() {
         let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -8089,14 +8051,14 @@ mod tests {
             }
         });
 
-        let mut args = test_typed_client_args();
+        let mut args = test_client_args();
         args.connect = addr;
         args.requests = 2;
         args.pipeline_depth = 2;
         args.command_mix = ClientCommandMix::Alternate;
         args.read_buffer_bytes = 64;
-        let config = TypedClientConfig::from_args(args).unwrap();
-        let session = TypedClientSession::new(&config, 0, 1, 2);
+        let config = ClientConfig::from_args(args).unwrap();
+        let session = ClientSession::new(&config, 0, 1, 2);
         let stats = Arc::new(Stats::new());
         let stop = Arc::new(AtomicBool::new(false));
 
@@ -8242,7 +8204,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn typed_client_session_runs_pipelined_requests_against_loopback_server() {
+    async fn client_session_runs_pipelined_requests_against_loopback_server() {
         let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -8271,14 +8233,14 @@ mod tests {
                 .unwrap();
         });
 
-        let mut args = test_typed_client_args();
+        let mut args = test_client_args();
         args.connect = addr;
         args.requests = 2;
         args.pipeline_depth = 2;
         args.command_mix = ClientCommandMix::Alternate;
         args.read_buffer_bytes = 64;
-        let config = TypedClientConfig::from_args(args).unwrap();
-        let session = TypedClientSession::new(&config, 0, 1, 2);
+        let config = ClientConfig::from_args(args).unwrap();
+        let session = ClientSession::new(&config, 0, 1, 2);
         let stats = Arc::new(Stats::new());
         let stop = Arc::new(AtomicBool::new(false));
 
@@ -8297,7 +8259,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn typed_client_session_sends_authinfo_before_workload_requests() {
+    async fn client_session_sends_authinfo_before_workload_requests() {
         let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -8349,7 +8311,7 @@ mod tests {
                 .unwrap();
         });
 
-        let mut args = test_typed_client_args();
+        let mut args = test_client_args();
         args.connect = addr;
         args.auth_user = Some("bench-user".to_string());
         args.auth_pass = Some("bench-pass".to_string());
@@ -8357,8 +8319,8 @@ mod tests {
         args.pipeline_depth = 2;
         args.command_mix = ClientCommandMix::Alternate;
         args.read_buffer_bytes = 64;
-        let config = TypedClientConfig::from_args(args).unwrap();
-        let session = TypedClientSession::new(&config, 0, 1, 2);
+        let config = ClientConfig::from_args(args).unwrap();
+        let session = ClientSession::new(&config, 0, 1, 2);
         let stats = Arc::new(Stats::new());
         let stop = Arc::new(AtomicBool::new(false));
 
@@ -8373,7 +8335,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn typed_client_session_skips_authinfo_pass_after_user_success() {
+    async fn client_session_skips_authinfo_pass_after_user_success() {
         let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -8402,15 +8364,15 @@ mod tests {
                 .unwrap();
         });
 
-        let mut args = test_typed_client_args();
+        let mut args = test_client_args();
         args.connect = addr;
         args.auth_user = Some("bench-user".to_string());
         args.auth_pass = Some("bench-pass".to_string());
         args.requests = 1;
         args.pipeline_depth = 1;
         args.command_mix = ClientCommandMix::Article;
-        let config = TypedClientConfig::from_args(args).unwrap();
-        let session = TypedClientSession::new(&config, 0, 1, 1);
+        let config = ClientConfig::from_args(args).unwrap();
+        let session = ClientSession::new(&config, 0, 1, 1);
         let stats = Arc::new(Stats::new());
         let stop = Arc::new(AtomicBool::new(false));
 
@@ -8441,8 +8403,7 @@ mod tests {
         });
 
         let mut stream = TcpStream::connect(addr).await.unwrap();
-        let mut response_reader =
-            crate::typed_client::DrainedResponseReader::new(CLIENT_READER_CAPACITY);
+        let mut response_reader = crate::client::DrainedResponseReader::new(CLIENT_READER_CAPACITY);
         authenticate_client_stream(
             &mut stream,
             &mut response_reader,
@@ -8484,7 +8445,7 @@ mod tests {
         let verify_path = article_id_tree_path(&verify_dir, 1);
         fs::create_dir_all(verify_path.parent().unwrap()).unwrap();
         fs::write(&verify_path, response).unwrap();
-        let mut args = test_typed_client_args();
+        let mut args = test_client_args();
         args.connect = addr;
         args.article_ids = Some(id_file.clone());
         args.article_output_dir = Some(output_dir.clone());
@@ -8493,7 +8454,7 @@ mod tests {
         args.pipeline_depth = 2;
         args.stats_interval_secs = 0;
 
-        run_typed_client(args).await.unwrap();
+        run_client(args).await.unwrap();
         server.await.unwrap();
 
         let stored = fs::read(article_id_tree_path(&output_dir, 1)).unwrap();
@@ -8535,7 +8496,7 @@ mod tests {
         fs::create_dir_all(verify_path.parent().unwrap()).unwrap();
         fs::write(&verify_path, expected).unwrap();
 
-        let mut args = test_typed_client_args();
+        let mut args = test_client_args();
         args.connect = addr;
         args.article_ids = Some(id_file.clone());
         args.article_output_dir = Some(output_dir.clone());
@@ -8543,7 +8504,7 @@ mod tests {
         args.connections = 1;
         args.stats_interval_secs = 0;
 
-        let err = run_typed_client(args).await.unwrap_err();
+        let err = run_client(args).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("MD5 mismatch"));
         assert!(!article_id_tree_path(&output_dir, 1).exists());
@@ -8581,14 +8542,14 @@ mod tests {
 
         let ids = write_temp_segments("message-ids", "abc123@ngPost\n");
         let output_dir = unique_temp_dir("message-id-output");
-        let mut args = test_typed_client_args();
+        let mut args = test_client_args();
         args.connect = addr;
         args.article_ids = Some(ids.clone());
         args.article_output_dir = Some(output_dir.clone());
         args.connections = 1;
         args.stats_interval_secs = 0;
 
-        run_typed_client(args).await.unwrap();
+        run_client(args).await.unwrap();
         server.await.unwrap();
 
         let message_id = MessageId::from_borrowed("<abc123@ngPost>").unwrap();
@@ -8600,7 +8561,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn typed_client_session_uses_segment_message_ids_on_wire() {
+    async fn client_session_uses_segment_message_ids_on_wire() {
         let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -8633,19 +8594,19 @@ mod tests {
         });
 
         let path = write_temp_segments(
-            "typed-session-wire",
+            "client-session-wire",
             "1\tsegment-1@test\n2\tsegment-2@test\n",
         );
-        let mut args = test_typed_client_args();
+        let mut args = test_client_args();
         args.connect = addr;
         args.requests = 2;
         args.pipeline_depth = 2;
         args.command_mix = ClientCommandMix::Alternate;
         args.read_buffer_bytes = 64;
         args.segments = Some(path.clone());
-        let config = TypedClientConfig::from_args(args).unwrap();
+        let config = ClientConfig::from_args(args).unwrap();
         fs::remove_file(path).unwrap();
-        let session = TypedClientSession::new(&config, 0, 1, 2);
+        let session = ClientSession::new(&config, 0, 1, 2);
         let stats = Arc::new(Stats::new());
         let stop = Arc::new(AtomicBool::new(false));
 
@@ -8660,7 +8621,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn typed_client_session_zero_start_id_falls_back_per_request() {
+    async fn client_session_zero_start_id_falls_back_per_request() {
         let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -8692,15 +8653,15 @@ mod tests {
                 .unwrap();
         });
 
-        let mut args = test_typed_client_args();
+        let mut args = test_client_args();
         args.connect = addr;
         args.requests = 2;
         args.pipeline_depth = 2;
         args.command_mix = ClientCommandMix::Alternate;
         args.start_id = 0;
         args.read_buffer_bytes = 64;
-        let config = TypedClientConfig::from_args(args).unwrap();
-        let session = TypedClientSession::new(&config, 0, 0, 2);
+        let config = ClientConfig::from_args(args).unwrap();
+        let session = ClientSession::new(&config, 0, 0, 2);
         let stats = Arc::new(Stats::new());
         let stop = Arc::new(AtomicBool::new(false));
 
@@ -8715,8 +8676,8 @@ mod tests {
     }
 
     #[test]
-    fn typed_request_for_command_uses_message_id_after_numeric_article_range() {
-        let request = typed_request_for_command(
+    fn client_request_for_command_uses_message_id_after_numeric_article_range() {
+        let request = client_request_for_command(
             i32::MAX as u64 + 1,
             0,
             ClientCommandMix::Article,
@@ -8735,7 +8696,7 @@ mod tests {
         }
 
         let request =
-            typed_request_for_command(i32::MAX as u64 + 2, 0, ClientCommandMix::Body, None, 0, 1)
+            client_request_for_command(i32::MAX as u64 + 2, 0, ClientCommandMix::Body, None, 0, 1)
                 .unwrap();
 
         match request {
@@ -8788,14 +8749,14 @@ mod tests {
                 .unwrap();
         });
 
-        let mut args = test_typed_client_args();
+        let mut args = test_client_args();
         args.connect = addr;
         args.requests = 3;
         args.pipeline_depth = 2;
         args.command_mix = ClientCommandMix::Alternate;
         args.read_buffer_bytes = 64;
-        let config = TypedClientConfig::from_args(args).unwrap();
-        let session = TypedClientSession::new(&config, 0, 1, 3);
+        let config = ClientConfig::from_args(args).unwrap();
+        let session = ClientSession::new(&config, 0, 1, 3);
         let stats = Arc::new(Stats::new());
         let stop = Arc::new(AtomicBool::new(false));
 
@@ -8814,12 +8775,12 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         drop(listener);
 
-        let mut args = test_typed_client_args();
+        let mut args = test_client_args();
         args.connect = addr;
         args.requests = 1;
         args.pipeline_depth = 1;
-        let config = TypedClientConfig::from_args(args).unwrap();
-        let session = TypedClientSession::new(&config, 0, 1, 1);
+        let config = ClientConfig::from_args(args).unwrap();
+        let session = ClientSession::new(&config, 0, 1, 1);
         let stats = Arc::new(Stats::new());
         let stop = Arc::new(AtomicBool::new(false));
 
@@ -8846,15 +8807,15 @@ mod tests {
                 .unwrap();
         });
 
-        let mut args = test_typed_client_args();
+        let mut args = test_client_args();
         args.connect = addr;
         args.requests = 0;
         args.transfer_bytes = 1;
         args.pipeline_depth = 1;
         args.command_mix = ClientCommandMix::Body;
         args.read_buffer_bytes = 64;
-        let config = TypedClientConfig::from_args(args).unwrap();
-        let session = TypedClientSession::new(&config, 0, 1, 0);
+        let config = ClientConfig::from_args(args).unwrap();
+        let session = ClientSession::new(&config, 0, 1, 0);
         let stats = Arc::new(Stats::new());
         let stop = Arc::new(AtomicBool::new(false));
 
@@ -8877,13 +8838,13 @@ mod tests {
             assert_ne!(read, 0);
         });
 
-        let mut args = test_typed_client_args();
+        let mut args = test_client_args();
         args.connect = addr;
         args.requests = 1;
         args.pipeline_depth = 1;
         args.read_buffer_bytes = 64;
-        let config = TypedClientConfig::from_args(args).unwrap();
-        let session = TypedClientSession::new(&config, 0, 1, 1);
+        let config = ClientConfig::from_args(args).unwrap();
+        let session = ClientSession::new(&config, 0, 1, 1);
         let stats = Arc::new(Stats::new());
         let stop = Arc::new(AtomicBool::new(false));
 
@@ -8909,13 +8870,13 @@ mod tests {
                 .unwrap();
         });
 
-        let mut args = test_typed_client_args();
+        let mut args = test_client_args();
         args.connect = addr;
         args.requests = 1;
         args.pipeline_depth = 1;
         args.read_buffer_bytes = 64;
-        let config = TypedClientConfig::from_args(args).unwrap();
-        let session = TypedClientSession::new(&config, 0, 1, 1);
+        let config = ClientConfig::from_args(args).unwrap();
+        let session = ClientSession::new(&config, 0, 1, 1);
         let stats = Arc::new(Stats::new());
         let stop = Arc::new(AtomicBool::new(false));
 
@@ -8935,13 +8896,13 @@ mod tests {
             drop(stream);
         });
 
-        let mut args = test_typed_client_args();
+        let mut args = test_client_args();
         args.connect = addr;
         args.requests = 1;
         args.pipeline_depth = 1;
         args.read_buffer_bytes = 64;
-        let config = TypedClientConfig::from_args(args).unwrap();
-        let session = TypedClientSession::new(&config, 0, 1, 1);
+        let config = ClientConfig::from_args(args).unwrap();
+        let session = ClientSession::new(&config, 0, 1, 1);
         let stats = Arc::new(Stats::new());
         let stop = Arc::new(AtomicBool::new(false));
 
@@ -8964,13 +8925,13 @@ mod tests {
                 .unwrap();
         });
 
-        let mut args = test_typed_client_args();
+        let mut args = test_client_args();
         args.connect = addr;
         args.requests = 1;
         args.pipeline_depth = 1;
         args.read_buffer_bytes = 64;
-        let config = TypedClientConfig::from_args(args).unwrap();
-        let session = TypedClientSession::new(&config, 0, 1, 1);
+        let config = ClientConfig::from_args(args).unwrap();
+        let session = ClientSession::new(&config, 0, 1, 1);
         let stats = Arc::new(Stats::new());
         let stop = Arc::new(AtomicBool::new(false));
 
@@ -8982,7 +8943,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_typed_response_uses_typed_connection_path() {
+    async fn fetch_response_uses_client_connection_path() {
         let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -8991,33 +8952,33 @@ mod tests {
 
             let mut request = [0_u8; 128];
             let read = stream.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"BODY <typed-fetch@test>\r\n");
+            assert_eq!(&request[..read], b"BODY <client-fetch@test>\r\n");
 
             stream
-                .write_all(b"222 1 <typed-fetch@test> body follows\r\nbody payload\r\n.\r\n")
+                .write_all(b"222 1 <client-fetch@test> body follows\r\nbody payload\r\n.\r\n")
                 .await
                 .unwrap();
         });
 
-        let mut args = test_typed_fetch_args();
+        let mut args = test_fetch_args();
         args.connect = addr;
-        args.request = TypedRequestKind::Body;
-        args.message_id = Some("typed-fetch@test".to_string());
+        args.request = FetchRequestKind::Body;
+        args.message_id = Some("client-fetch@test".to_string());
         args.read_buffer_bytes = 64;
 
-        let response = fetch_typed_response(&args).await.unwrap();
+        let response = fetch_response(&args).await.unwrap();
         let article = response.parse_article().unwrap();
 
         assert_eq!(response.kind(), RequestKind::Body);
         assert_eq!(response.status().as_u16(), 222);
-        assert_eq!(article.message_id.as_str(), "<typed-fetch@test>");
+        assert_eq!(article.message_id.as_str(), "<client-fetch@test>");
         assert_eq!(article.body, Some(&b"body payload\r\n"[..]));
 
         server.await.unwrap();
     }
 
     #[tokio::test]
-    async fn fetch_typed_response_supports_head_and_stat_requests() {
+    async fn fetch_response_supports_head_and_stat_requests() {
         let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -9026,9 +8987,9 @@ mod tests {
 
             let mut first = [0_u8; 128];
             let read = head_stream.read(&mut first).await.unwrap();
-            assert_eq!(&first[..read], b"HEAD <typed-head@test>\r\n");
+            assert_eq!(&first[..read], b"HEAD <client-head@test>\r\n");
             head_stream
-                .write_all(b"221 1 <typed-head@test> article retrieved\r\nSubject: Head\r\n.\r\n")
+                .write_all(b"221 1 <client-head@test> article retrieved\r\nSubject: Head\r\n.\r\n")
                 .await
                 .unwrap();
 
@@ -9037,31 +8998,31 @@ mod tests {
 
             let mut second = [0_u8; 128];
             let read = stat_stream.read(&mut second).await.unwrap();
-            assert_eq!(&second[..read], b"STAT <typed-stat@test>\r\n");
+            assert_eq!(&second[..read], b"STAT <client-stat@test>\r\n");
             stat_stream
-                .write_all(b"223 1 <typed-stat@test> article retrieved\r\n")
+                .write_all(b"223 1 <client-stat@test> article retrieved\r\n")
                 .await
                 .unwrap();
         });
 
-        let mut head_args = test_typed_fetch_args();
+        let mut head_args = test_fetch_args();
         head_args.connect = addr;
-        head_args.request = TypedRequestKind::Head;
-        head_args.message_id = Some("typed-head@test".to_string());
-        let head = fetch_typed_response(&head_args).await.unwrap();
+        head_args.request = FetchRequestKind::Head;
+        head_args.message_id = Some("client-head@test".to_string());
+        let head = fetch_response(&head_args).await.unwrap();
         assert_eq!(head.kind(), RequestKind::Head);
         assert_eq!(head.status().as_u16(), 221);
 
-        let mut stat_args = test_typed_fetch_args();
+        let mut stat_args = test_fetch_args();
         stat_args.connect = addr;
-        stat_args.request = TypedRequestKind::Stat;
-        stat_args.message_id = Some("typed-stat@test".to_string());
-        let stat = fetch_typed_response(&stat_args).await.unwrap();
+        stat_args.request = FetchRequestKind::Stat;
+        stat_args.message_id = Some("client-stat@test".to_string());
+        let stat = fetch_response(&stat_args).await.unwrap();
         assert_eq!(stat.kind(), RequestKind::Stat);
         assert_eq!(stat.status().as_u16(), 223);
         assert_eq!(
             stat.parse_article().unwrap().message_id.as_str(),
-            "<typed-stat@test>"
+            "<client-stat@test>"
         );
 
         server.await.unwrap();
@@ -9072,12 +9033,12 @@ mod tests {
         let config = test_config();
         let (output, stats) = run_session_with_input(
             config,
-            b"HEAD <typed-head@test>\r\nSTAT <typed-stat@test>\r\n",
+            b"HEAD <client-head@test>\r\nSTAT <client-stat@test>\r\n",
         )
         .await;
 
-        let head_id = MessageId::from_borrowed("<typed-head@test>").unwrap();
-        let stat_id = MessageId::from_borrowed("<typed-stat@test>").unwrap();
+        let head_id = MessageId::from_borrowed("<client-head@test>").unwrap();
+        let stat_id = MessageId::from_borrowed("<client-stat@test>").unwrap();
         assert_eq!(
             output,
             [
@@ -9126,16 +9087,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_typed_response_rejects_invalid_message_id() {
-        let mut args = test_typed_fetch_args();
+    async fn fetch_response_rejects_invalid_message_id() {
+        let mut args = test_fetch_args();
         args.message_id = Some("<bad id>".to_string());
 
-        let err = fetch_typed_response(&args).await.unwrap_err();
-        assert!(matches!(err, TypedClientError::InvalidMessageId));
+        let err = fetch_response(&args).await.unwrap_err();
+        assert!(matches!(err, ClientError::InvalidMessageId));
     }
 
     #[tokio::test]
-    async fn fetch_typed_response_clamps_pipeline_depth_for_typed_engine() {
+    async fn fetch_response_clamps_pipeline_depth_for_client_engine() {
         let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -9154,19 +9115,19 @@ mod tests {
                 .unwrap();
         });
 
-        let mut args = test_typed_fetch_args();
+        let mut args = test_fetch_args();
         args.connect = addr;
         args.message_id = Some("clamp@test".to_string());
         args.pipeline_depth = 0;
 
-        let response = fetch_typed_response(&args).await.unwrap();
+        let response = fetch_response(&args).await.unwrap();
         assert_eq!(response.status().as_u16(), 220);
 
         server.await.unwrap();
     }
 
     #[tokio::test]
-    async fn fetch_typed_response_supports_general_request_kinds_without_message_id() {
+    async fn fetch_response_supports_general_request_kinds_without_message_id() {
         let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -9215,51 +9176,51 @@ mod tests {
             sixth.write_all(QUIT_RESPONSE).await.unwrap();
         });
 
-        let mut list_args = test_typed_fetch_args();
+        let mut list_args = test_fetch_args();
         list_args.connect = addr;
-        list_args.request = TypedRequestKind::List;
+        list_args.request = FetchRequestKind::List;
         list_args.message_id = None;
-        let list = fetch_typed_response(&list_args).await.unwrap();
+        let list = fetch_response(&list_args).await.unwrap();
         assert_eq!(list.kind(), RequestKind::List);
         assert_eq!(list.status().as_u16(), 215);
 
-        let mut help_args = test_typed_fetch_args();
+        let mut help_args = test_fetch_args();
         help_args.connect = addr;
-        help_args.request = TypedRequestKind::Help;
+        help_args.request = FetchRequestKind::Help;
         help_args.message_id = None;
-        let help = fetch_typed_response(&help_args).await.unwrap();
+        let help = fetch_response(&help_args).await.unwrap();
         assert_eq!(help.kind(), RequestKind::Help);
         assert_eq!(help.status().as_u16(), 100);
 
-        let mut capabilities_args = test_typed_fetch_args();
+        let mut capabilities_args = test_fetch_args();
         capabilities_args.connect = addr;
-        capabilities_args.request = TypedRequestKind::Capabilities;
+        capabilities_args.request = FetchRequestKind::Capabilities;
         capabilities_args.message_id = None;
-        let capabilities = fetch_typed_response(&capabilities_args).await.unwrap();
+        let capabilities = fetch_response(&capabilities_args).await.unwrap();
         assert_eq!(capabilities.kind(), RequestKind::Capabilities);
         assert_eq!(capabilities.status().as_u16(), 101);
 
-        let mut date_args = test_typed_fetch_args();
+        let mut date_args = test_fetch_args();
         date_args.connect = addr;
-        date_args.request = TypedRequestKind::Date;
+        date_args.request = FetchRequestKind::Date;
         date_args.message_id = None;
-        let date = fetch_typed_response(&date_args).await.unwrap();
+        let date = fetch_response(&date_args).await.unwrap();
         assert_eq!(date.kind(), RequestKind::Date);
         assert_eq!(date.status().as_u16(), 111);
 
-        let mut mode_reader_args = test_typed_fetch_args();
+        let mut mode_reader_args = test_fetch_args();
         mode_reader_args.connect = addr;
-        mode_reader_args.request = TypedRequestKind::ModeReader;
+        mode_reader_args.request = FetchRequestKind::ModeReader;
         mode_reader_args.message_id = None;
-        let mode_reader = fetch_typed_response(&mode_reader_args).await.unwrap();
+        let mode_reader = fetch_response(&mode_reader_args).await.unwrap();
         assert_eq!(mode_reader.kind(), RequestKind::ModeReader);
         assert_eq!(mode_reader.status().as_u16(), 201);
 
-        let mut quit_args = test_typed_fetch_args();
+        let mut quit_args = test_fetch_args();
         quit_args.connect = addr;
-        quit_args.request = TypedRequestKind::Quit;
+        quit_args.request = FetchRequestKind::Quit;
         quit_args.message_id = None;
-        let quit = fetch_typed_response(&quit_args).await.unwrap();
+        let quit = fetch_response(&quit_args).await.unwrap();
         assert_eq!(quit.kind(), RequestKind::Quit);
         assert_eq!(quit.status().as_u16(), 205);
 
@@ -9267,7 +9228,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_typed_response_supports_list_subcommand_request_kinds() {
+    async fn fetch_response_supports_list_subcommand_request_kinds() {
         let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -9322,28 +9283,28 @@ mod tests {
             eighth.write_all(LIST_DISTRIB_PATS_RESPONSE).await.unwrap();
         });
 
-        let mut list_active_args = test_typed_fetch_args();
+        let mut list_active_args = test_fetch_args();
         list_active_args.connect = addr;
-        list_active_args.request = TypedRequestKind::ListActive;
+        list_active_args.request = FetchRequestKind::ListActive;
         list_active_args.message_id = None;
-        let list_active = fetch_typed_response(&list_active_args).await.unwrap();
+        let list_active = fetch_response(&list_active_args).await.unwrap();
         assert_eq!(list_active.kind(), RequestKind::ListActive);
         assert_eq!(list_active.status().as_u16(), 215);
 
-        let mut list_active_times_args = test_typed_fetch_args();
+        let mut list_active_times_args = test_fetch_args();
         list_active_times_args.connect = addr;
-        list_active_times_args.request = TypedRequestKind::ListActiveTimes;
+        list_active_times_args.request = FetchRequestKind::ListActiveTimes;
         list_active_times_args.message_id = None;
-        let list_active_times = fetch_typed_response(&list_active_times_args).await.unwrap();
+        let list_active_times = fetch_response(&list_active_times_args).await.unwrap();
         assert_eq!(list_active_times.kind(), RequestKind::ListActiveTimes);
         assert_eq!(list_active_times.status().as_u16(), 215);
 
-        let mut list_active_times_wildmat_args = test_typed_fetch_args();
+        let mut list_active_times_wildmat_args = test_fetch_args();
         list_active_times_wildmat_args.connect = addr;
-        list_active_times_wildmat_args.request = TypedRequestKind::ListActiveTimes;
+        list_active_times_wildmat_args.request = FetchRequestKind::ListActiveTimes;
         list_active_times_wildmat_args.message_id = None;
         list_active_times_wildmat_args.wildmat = Some("comp.lang.*".to_string());
-        let list_active_times_wildmat = fetch_typed_response(&list_active_times_wildmat_args)
+        let list_active_times_wildmat = fetch_response(&list_active_times_wildmat_args)
             .await
             .unwrap();
         assert_eq!(
@@ -9352,46 +9313,44 @@ mod tests {
         );
         assert_eq!(list_active_times_wildmat.status().as_u16(), 215);
 
-        let mut list_newsgroups_args = test_typed_fetch_args();
+        let mut list_newsgroups_args = test_fetch_args();
         list_newsgroups_args.connect = addr;
-        list_newsgroups_args.request = TypedRequestKind::ListNewsgroups;
+        list_newsgroups_args.request = FetchRequestKind::ListNewsgroups;
         list_newsgroups_args.message_id = None;
-        let list_newsgroups = fetch_typed_response(&list_newsgroups_args).await.unwrap();
+        let list_newsgroups = fetch_response(&list_newsgroups_args).await.unwrap();
         assert_eq!(list_newsgroups.kind(), RequestKind::ListNewsgroups);
         assert_eq!(list_newsgroups.status().as_u16(), 215);
 
-        let mut list_newsgroups_wildmat_args = test_typed_fetch_args();
+        let mut list_newsgroups_wildmat_args = test_fetch_args();
         list_newsgroups_wildmat_args.connect = addr;
-        list_newsgroups_wildmat_args.request = TypedRequestKind::ListNewsgroups;
+        list_newsgroups_wildmat_args.request = FetchRequestKind::ListNewsgroups;
         list_newsgroups_wildmat_args.message_id = None;
         list_newsgroups_wildmat_args.wildmat = Some("comp.lang.*".to_string());
-        let list_newsgroups_wildmat = fetch_typed_response(&list_newsgroups_wildmat_args)
-            .await
-            .unwrap();
+        let list_newsgroups_wildmat = fetch_response(&list_newsgroups_wildmat_args).await.unwrap();
         assert_eq!(list_newsgroups_wildmat.kind(), RequestKind::ListNewsgroups);
         assert_eq!(list_newsgroups_wildmat.status().as_u16(), 215);
 
-        let mut list_overview_fmt_args = test_typed_fetch_args();
+        let mut list_overview_fmt_args = test_fetch_args();
         list_overview_fmt_args.connect = addr;
-        list_overview_fmt_args.request = TypedRequestKind::ListOverviewFmt;
+        list_overview_fmt_args.request = FetchRequestKind::ListOverviewFmt;
         list_overview_fmt_args.message_id = None;
-        let list_overview_fmt = fetch_typed_response(&list_overview_fmt_args).await.unwrap();
+        let list_overview_fmt = fetch_response(&list_overview_fmt_args).await.unwrap();
         assert_eq!(list_overview_fmt.kind(), RequestKind::ListOverviewFmt);
         assert_eq!(list_overview_fmt.status().as_u16(), 215);
 
-        let mut list_headers_args = test_typed_fetch_args();
+        let mut list_headers_args = test_fetch_args();
         list_headers_args.connect = addr;
-        list_headers_args.request = TypedRequestKind::ListHeaders;
+        list_headers_args.request = FetchRequestKind::ListHeaders;
         list_headers_args.message_id = None;
-        let list_headers = fetch_typed_response(&list_headers_args).await.unwrap();
+        let list_headers = fetch_response(&list_headers_args).await.unwrap();
         assert_eq!(list_headers.kind(), RequestKind::ListHeaders);
         assert_eq!(list_headers.status().as_u16(), 215);
 
-        let mut list_distrib_pats_args = test_typed_fetch_args();
+        let mut list_distrib_pats_args = test_fetch_args();
         list_distrib_pats_args.connect = addr;
-        list_distrib_pats_args.request = TypedRequestKind::ListDistribPats;
+        list_distrib_pats_args.request = FetchRequestKind::ListDistribPats;
         list_distrib_pats_args.message_id = None;
-        let list_distrib_pats = fetch_typed_response(&list_distrib_pats_args).await.unwrap();
+        let list_distrib_pats = fetch_response(&list_distrib_pats_args).await.unwrap();
         assert_eq!(list_distrib_pats.kind(), RequestKind::ListDistribPats);
         assert_eq!(list_distrib_pats.status().as_u16(), 215);
 
@@ -9399,7 +9358,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_typed_response_supports_header_query_request_kinds() {
+    async fn fetch_response_supports_header_query_request_kinds() {
         let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -9430,43 +9389,43 @@ mod tests {
             fourth.write_all(XHDR_RESPONSE).await.unwrap();
         });
 
-        let mut hdr_range_args = test_typed_fetch_args();
+        let mut hdr_range_args = test_fetch_args();
         hdr_range_args.connect = addr;
-        hdr_range_args.request = TypedRequestKind::Hdr;
+        hdr_range_args.request = FetchRequestKind::Hdr;
         hdr_range_args.message_id = None;
         hdr_range_args.header = Some("Subject".to_string());
         hdr_range_args.selector = Some("1-10".to_string());
-        let hdr_range = fetch_typed_response(&hdr_range_args).await.unwrap();
+        let hdr_range = fetch_response(&hdr_range_args).await.unwrap();
         assert_eq!(hdr_range.kind(), RequestKind::Hdr);
         assert_eq!(hdr_range.status().as_u16(), 225);
 
-        let mut hdr_message_id_args = test_typed_fetch_args();
+        let mut hdr_message_id_args = test_fetch_args();
         hdr_message_id_args.connect = addr;
-        hdr_message_id_args.request = TypedRequestKind::Hdr;
+        hdr_message_id_args.request = FetchRequestKind::Hdr;
         hdr_message_id_args.message_id = None;
         hdr_message_id_args.header = Some("Message-ID".to_string());
         hdr_message_id_args.selector = Some("<headers@test>".to_string());
-        let hdr_message_id = fetch_typed_response(&hdr_message_id_args).await.unwrap();
+        let hdr_message_id = fetch_response(&hdr_message_id_args).await.unwrap();
         assert_eq!(hdr_message_id.kind(), RequestKind::Hdr);
         assert_eq!(hdr_message_id.status().as_u16(), 225);
 
-        let mut xhdr_range_args = test_typed_fetch_args();
+        let mut xhdr_range_args = test_fetch_args();
         xhdr_range_args.connect = addr;
-        xhdr_range_args.request = TypedRequestKind::Xhdr;
+        xhdr_range_args.request = FetchRequestKind::Xhdr;
         xhdr_range_args.message_id = None;
         xhdr_range_args.header = Some("Subject".to_string());
         xhdr_range_args.selector = Some("1-10".to_string());
-        let xhdr_range = fetch_typed_response(&xhdr_range_args).await.unwrap();
+        let xhdr_range = fetch_response(&xhdr_range_args).await.unwrap();
         assert_eq!(xhdr_range.kind(), RequestKind::Xhdr);
         assert_eq!(xhdr_range.status().as_u16(), 221);
 
-        let mut xhdr_message_id_args = test_typed_fetch_args();
+        let mut xhdr_message_id_args = test_fetch_args();
         xhdr_message_id_args.connect = addr;
-        xhdr_message_id_args.request = TypedRequestKind::Xhdr;
+        xhdr_message_id_args.request = FetchRequestKind::Xhdr;
         xhdr_message_id_args.message_id = None;
         xhdr_message_id_args.header = Some("Message-ID".to_string());
         xhdr_message_id_args.selector = Some("<headers@test>".to_string());
-        let xhdr_message_id = fetch_typed_response(&xhdr_message_id_args).await.unwrap();
+        let xhdr_message_id = fetch_response(&xhdr_message_id_args).await.unwrap();
         assert_eq!(xhdr_message_id.kind(), RequestKind::Xhdr);
         assert_eq!(xhdr_message_id.status().as_u16(), 221);
 
@@ -9474,7 +9433,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_typed_response_supports_overview_request_kinds() {
+    async fn fetch_response_supports_overview_request_kinds() {
         let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -9505,39 +9464,39 @@ mod tests {
             fourth.write_all(XOVER_RESPONSE).await.unwrap();
         });
 
-        let mut over_range_args = test_typed_fetch_args();
+        let mut over_range_args = test_fetch_args();
         over_range_args.connect = addr;
-        over_range_args.request = TypedRequestKind::Over;
+        over_range_args.request = FetchRequestKind::Over;
         over_range_args.message_id = None;
         over_range_args.selector = Some("1-10".to_string());
-        let over_range = fetch_typed_response(&over_range_args).await.unwrap();
+        let over_range = fetch_response(&over_range_args).await.unwrap();
         assert_eq!(over_range.kind(), RequestKind::Over);
         assert_eq!(over_range.status().as_u16(), 224);
 
-        let mut over_message_id_args = test_typed_fetch_args();
+        let mut over_message_id_args = test_fetch_args();
         over_message_id_args.connect = addr;
-        over_message_id_args.request = TypedRequestKind::Over;
+        over_message_id_args.request = FetchRequestKind::Over;
         over_message_id_args.message_id = None;
         over_message_id_args.selector = Some("<overview@test>".to_string());
-        let over_message_id = fetch_typed_response(&over_message_id_args).await.unwrap();
+        let over_message_id = fetch_response(&over_message_id_args).await.unwrap();
         assert_eq!(over_message_id.kind(), RequestKind::Over);
         assert_eq!(over_message_id.status().as_u16(), 224);
 
-        let mut xover_range_args = test_typed_fetch_args();
+        let mut xover_range_args = test_fetch_args();
         xover_range_args.connect = addr;
-        xover_range_args.request = TypedRequestKind::Xover;
+        xover_range_args.request = FetchRequestKind::Xover;
         xover_range_args.message_id = None;
         xover_range_args.selector = Some("1-10".to_string());
-        let xover_range = fetch_typed_response(&xover_range_args).await.unwrap();
+        let xover_range = fetch_response(&xover_range_args).await.unwrap();
         assert_eq!(xover_range.kind(), RequestKind::Xover);
         assert_eq!(xover_range.status().as_u16(), 224);
 
-        let mut xover_message_id_args = test_typed_fetch_args();
+        let mut xover_message_id_args = test_fetch_args();
         xover_message_id_args.connect = addr;
-        xover_message_id_args.request = TypedRequestKind::Xover;
+        xover_message_id_args.request = FetchRequestKind::Xover;
         xover_message_id_args.message_id = None;
         xover_message_id_args.selector = Some("<overview@test>".to_string());
-        let xover_message_id = fetch_typed_response(&xover_message_id_args).await.unwrap();
+        let xover_message_id = fetch_response(&xover_message_id_args).await.unwrap();
         assert_eq!(xover_message_id.kind(), RequestKind::Xover);
         assert_eq!(xover_message_id.status().as_u16(), 224);
 
@@ -9545,7 +9504,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_typed_response_supports_group_navigation_and_discovery_request_kinds() {
+    async fn fetch_response_supports_group_navigation_and_discovery_request_kinds() {
         let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -9603,79 +9562,79 @@ mod tests {
             eighth.write_all(NEWNEWS_RESPONSE).await.unwrap();
         });
 
-        let mut group_args = test_typed_fetch_args();
+        let mut group_args = test_fetch_args();
         group_args.connect = addr;
-        group_args.request = TypedRequestKind::Group;
+        group_args.request = FetchRequestKind::Group;
         group_args.message_id = None;
         group_args.group = Some("alt.test".to_string());
-        let group = fetch_typed_response(&group_args).await.unwrap();
+        let group = fetch_response(&group_args).await.unwrap();
         assert_eq!(group.kind(), RequestKind::Group);
         assert_eq!(group.status().as_u16(), 211);
 
-        let mut listgroup_args = test_typed_fetch_args();
+        let mut listgroup_args = test_fetch_args();
         listgroup_args.connect = addr;
-        listgroup_args.request = TypedRequestKind::Listgroup;
+        listgroup_args.request = FetchRequestKind::Listgroup;
         listgroup_args.message_id = None;
         listgroup_args.group = None;
-        let listgroup = fetch_typed_response(&listgroup_args).await.unwrap();
+        let listgroup = fetch_response(&listgroup_args).await.unwrap();
         assert_eq!(listgroup.kind(), RequestKind::ListGroup);
         assert_eq!(listgroup.status().as_u16(), 211);
 
-        let mut listgroup_range_args = test_typed_fetch_args();
+        let mut listgroup_range_args = test_fetch_args();
         listgroup_range_args.connect = addr;
-        listgroup_range_args.request = TypedRequestKind::Listgroup;
+        listgroup_range_args.request = FetchRequestKind::Listgroup;
         listgroup_range_args.message_id = None;
         listgroup_range_args.group = None;
         listgroup_range_args.selector = Some("1-".to_string());
-        let listgroup_range = fetch_typed_response(&listgroup_range_args).await.unwrap();
+        let listgroup_range = fetch_response(&listgroup_range_args).await.unwrap();
         assert_eq!(listgroup_range.kind(), RequestKind::ListGroup);
         assert_eq!(listgroup_range.status().as_u16(), 211);
 
-        let mut listgroup_group_args = test_typed_fetch_args();
+        let mut listgroup_group_args = test_fetch_args();
         listgroup_group_args.connect = addr;
-        listgroup_group_args.request = TypedRequestKind::Listgroup;
+        listgroup_group_args.request = FetchRequestKind::Listgroup;
         listgroup_group_args.message_id = None;
         listgroup_group_args.group = Some("alt.test".to_string());
         listgroup_group_args.selector = Some("1-10".to_string());
-        let listgroup_group = fetch_typed_response(&listgroup_group_args).await.unwrap();
+        let listgroup_group = fetch_response(&listgroup_group_args).await.unwrap();
         assert_eq!(listgroup_group.kind(), RequestKind::ListGroup);
         assert_eq!(listgroup_group.status().as_u16(), 211);
 
-        let mut last_args = test_typed_fetch_args();
+        let mut last_args = test_fetch_args();
         last_args.connect = addr;
-        last_args.request = TypedRequestKind::Last;
+        last_args.request = FetchRequestKind::Last;
         last_args.message_id = None;
-        let last = fetch_typed_response(&last_args).await.unwrap();
+        let last = fetch_response(&last_args).await.unwrap();
         assert_eq!(last.kind(), RequestKind::Last);
         assert_eq!(last.status().as_u16(), 223);
 
-        let mut next_args = test_typed_fetch_args();
+        let mut next_args = test_fetch_args();
         next_args.connect = addr;
-        next_args.request = TypedRequestKind::Next;
+        next_args.request = FetchRequestKind::Next;
         next_args.message_id = None;
-        let next = fetch_typed_response(&next_args).await.unwrap();
+        let next = fetch_response(&next_args).await.unwrap();
         assert_eq!(next.kind(), RequestKind::Next);
         assert_eq!(next.status().as_u16(), 223);
 
-        let mut newgroups_args = test_typed_fetch_args();
+        let mut newgroups_args = test_fetch_args();
         newgroups_args.connect = addr;
-        newgroups_args.request = TypedRequestKind::Newgroups;
+        newgroups_args.request = FetchRequestKind::Newgroups;
         newgroups_args.message_id = None;
         newgroups_args.date = Some("20260101".to_string());
         newgroups_args.time = Some("000000".to_string());
-        let newgroups = fetch_typed_response(&newgroups_args).await.unwrap();
+        let newgroups = fetch_response(&newgroups_args).await.unwrap();
         assert_eq!(newgroups.kind(), RequestKind::NewGroups);
         assert_eq!(newgroups.status().as_u16(), 231);
 
-        let mut newnews_args = test_typed_fetch_args();
+        let mut newnews_args = test_fetch_args();
         newnews_args.connect = addr;
-        newnews_args.request = TypedRequestKind::Newnews;
+        newnews_args.request = FetchRequestKind::Newnews;
         newnews_args.message_id = None;
         newnews_args.wildmat = Some("comp.lang.*,alt.test".to_string());
         newnews_args.date = Some("20260101".to_string());
         newnews_args.time = Some("000000".to_string());
         newnews_args.gmt = false;
-        let newnews = fetch_typed_response(&newnews_args).await.unwrap();
+        let newnews = fetch_response(&newnews_args).await.unwrap();
         assert_eq!(newnews.kind(), RequestKind::NewNews);
         assert_eq!(newnews.status().as_u16(), 230);
 
@@ -9683,7 +9642,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_typed_response_supports_remaining_rfc_request_kinds() {
+    async fn fetch_response_supports_remaining_rfc_request_kinds() {
         let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -9734,62 +9693,62 @@ mod tests {
             seventh.write_all(STARTTLS_RESPONSE).await.unwrap();
         });
 
-        let mut post_args = test_typed_fetch_args();
+        let mut post_args = test_fetch_args();
         post_args.connect = addr;
-        post_args.request = TypedRequestKind::Post;
+        post_args.request = FetchRequestKind::Post;
         post_args.message_id = None;
-        let post = fetch_typed_response(&post_args).await.unwrap();
+        let post = fetch_response(&post_args).await.unwrap();
         assert_eq!(post.kind(), RequestKind::Post);
         assert_eq!(post.status().as_u16(), 340);
 
-        let mut ihave_args = test_typed_fetch_args();
+        let mut ihave_args = test_fetch_args();
         ihave_args.connect = addr;
-        ihave_args.request = TypedRequestKind::Ihave;
+        ihave_args.request = FetchRequestKind::Ihave;
         ihave_args.message_id = Some("ihave@test".to_string());
-        let ihave = fetch_typed_response(&ihave_args).await.unwrap();
+        let ihave = fetch_response(&ihave_args).await.unwrap();
         assert_eq!(ihave.kind(), RequestKind::Ihave);
         assert_eq!(ihave.status().as_u16(), 335);
 
-        let mut check_args = test_typed_fetch_args();
+        let mut check_args = test_fetch_args();
         check_args.connect = addr;
-        check_args.request = TypedRequestKind::Check;
+        check_args.request = FetchRequestKind::Check;
         check_args.message_id = Some("check@test".to_string());
-        let check = fetch_typed_response(&check_args).await.unwrap();
+        let check = fetch_response(&check_args).await.unwrap();
         assert_eq!(check.kind(), RequestKind::Check);
         assert_eq!(check.status().as_u16(), 238);
 
-        let mut takethis_args = test_typed_fetch_args();
+        let mut takethis_args = test_fetch_args();
         takethis_args.connect = addr;
-        takethis_args.request = TypedRequestKind::Takethis;
+        takethis_args.request = FetchRequestKind::Takethis;
         takethis_args.message_id = Some("take@test".to_string());
         takethis_args.article_body = Some("Subject: Taken\r\n\r\n.dot line\r\npayload".to_string());
-        let takethis = fetch_typed_response(&takethis_args).await.unwrap();
+        let takethis = fetch_response(&takethis_args).await.unwrap();
         assert_eq!(takethis.kind(), RequestKind::TakeThis);
         assert_eq!(takethis.status().as_u16(), 239);
 
-        let mut auth_user_args = test_typed_fetch_args();
+        let mut auth_user_args = test_fetch_args();
         auth_user_args.connect = addr;
-        auth_user_args.request = TypedRequestKind::AuthinfoUser;
+        auth_user_args.request = FetchRequestKind::AuthinfoUser;
         auth_user_args.message_id = None;
         auth_user_args.auth_value = Some("bench user".to_string());
-        let auth_user = fetch_typed_response(&auth_user_args).await.unwrap();
+        let auth_user = fetch_response(&auth_user_args).await.unwrap();
         assert_eq!(auth_user.kind(), RequestKind::AuthInfoUser);
         assert_eq!(auth_user.status().as_u16(), 281);
 
-        let mut auth_pass_args = test_typed_fetch_args();
+        let mut auth_pass_args = test_fetch_args();
         auth_pass_args.connect = addr;
-        auth_pass_args.request = TypedRequestKind::AuthinfoPass;
+        auth_pass_args.request = FetchRequestKind::AuthinfoPass;
         auth_pass_args.message_id = None;
         auth_pass_args.auth_value = Some("bench pass".to_string());
-        let auth_pass = fetch_typed_response(&auth_pass_args).await.unwrap();
+        let auth_pass = fetch_response(&auth_pass_args).await.unwrap();
         assert_eq!(auth_pass.kind(), RequestKind::AuthInfoPass);
         assert_eq!(auth_pass.status().as_u16(), 281);
 
-        let mut starttls_args = test_typed_fetch_args();
+        let mut starttls_args = test_fetch_args();
         starttls_args.connect = addr;
-        starttls_args.request = TypedRequestKind::Starttls;
+        starttls_args.request = FetchRequestKind::Starttls;
         starttls_args.message_id = None;
-        let starttls = fetch_typed_response(&starttls_args).await.unwrap();
+        let starttls = fetch_response(&starttls_args).await.unwrap();
         assert_eq!(starttls.kind(), RequestKind::StartTls);
         assert_eq!(starttls.status().as_u16(), 382);
 
@@ -9797,30 +9756,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_typed_response_rejects_missing_message_id_for_message_id_only_requests() {
-        let mut args = test_typed_fetch_args();
-        args.request = TypedRequestKind::Ihave;
+    async fn fetch_response_rejects_missing_message_id_for_message_id_only_requests() {
+        let mut args = test_fetch_args();
+        args.request = FetchRequestKind::Ihave;
         args.message_id = None;
         assert!(matches!(
-            fetch_typed_response(&args).await.unwrap_err(),
-            TypedClientError::MissingMessageId
+            fetch_response(&args).await.unwrap_err(),
+            ClientError::MissingMessageId
         ));
     }
 
     #[tokio::test]
-    async fn fetch_typed_response_rejects_range_selector_for_article_style_requests() {
-        let mut args = test_typed_fetch_args();
+    async fn fetch_response_rejects_range_selector_for_article_style_requests() {
+        let mut args = test_fetch_args();
         args.message_id = None;
         args.selector = Some("1-10".to_string());
 
         assert!(matches!(
-            fetch_typed_response(&args).await.unwrap_err(),
-            TypedClientError::InvalidArticleSelector
+            fetch_response(&args).await.unwrap_err(),
+            ClientError::InvalidArticleSelector
         ));
     }
 
     #[tokio::test]
-    async fn fetch_typed_response_supports_article_request_current_and_numeric_selector() {
+    async fn fetch_response_supports_article_request_current_and_numeric_selector() {
         let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -9847,20 +9806,20 @@ mod tests {
                 .unwrap();
         });
 
-        let mut current_args = test_typed_fetch_args();
+        let mut current_args = test_fetch_args();
         current_args.connect = addr;
         current_args.message_id = None;
         current_args.selector = None;
-        let current = fetch_typed_response(&current_args).await.unwrap();
+        let current = fetch_response(&current_args).await.unwrap();
         assert_eq!(current.kind(), RequestKind::Article);
         assert_eq!(current.status().as_u16(), 220);
 
-        let mut numeric_args = test_typed_fetch_args();
+        let mut numeric_args = test_fetch_args();
         numeric_args.connect = addr;
-        numeric_args.request = TypedRequestKind::Body;
+        numeric_args.request = FetchRequestKind::Body;
         numeric_args.message_id = None;
         numeric_args.selector = Some("42".to_string());
-        let numeric = fetch_typed_response(&numeric_args).await.unwrap();
+        let numeric = fetch_response(&numeric_args).await.unwrap();
         assert_eq!(numeric.kind(), RequestKind::Body);
         assert_eq!(numeric.status().as_u16(), 222);
 
@@ -9868,113 +9827,113 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_typed_response_rejects_missing_header_query_arguments() {
-        let mut args = test_typed_fetch_args();
-        args.request = TypedRequestKind::Hdr;
+    async fn fetch_response_rejects_missing_header_query_arguments() {
+        let mut args = test_fetch_args();
+        args.request = FetchRequestKind::Hdr;
         args.message_id = None;
         args.header = None;
         args.selector = Some("1-10".to_string());
         assert!(matches!(
-            fetch_typed_response(&args).await.unwrap_err(),
-            TypedClientError::MissingHeaderName
+            fetch_response(&args).await.unwrap_err(),
+            ClientError::MissingHeaderName
         ));
 
         args.header = Some("Subject".to_string());
         args.selector = None;
         assert!(matches!(
-            fetch_typed_response(&args).await.unwrap_err(),
-            TypedClientError::MissingArticleSelector
+            fetch_response(&args).await.unwrap_err(),
+            ClientError::MissingArticleSelector
         ));
     }
 
     #[tokio::test]
-    async fn fetch_typed_response_rejects_missing_overview_selector() {
-        let mut args = test_typed_fetch_args();
-        args.request = TypedRequestKind::Over;
+    async fn fetch_response_rejects_missing_overview_selector() {
+        let mut args = test_fetch_args();
+        args.request = FetchRequestKind::Over;
         args.message_id = None;
         args.selector = None;
 
         assert!(matches!(
-            fetch_typed_response(&args).await.unwrap_err(),
-            TypedClientError::MissingArticleSelector
+            fetch_response(&args).await.unwrap_err(),
+            ClientError::MissingArticleSelector
         ));
     }
 
     #[tokio::test]
-    async fn fetch_typed_response_rejects_missing_group_argument() {
-        let mut args = test_typed_fetch_args();
-        args.request = TypedRequestKind::Group;
+    async fn fetch_response_rejects_missing_group_argument() {
+        let mut args = test_fetch_args();
+        args.request = FetchRequestKind::Group;
         args.message_id = None;
         args.group = None;
 
         assert!(matches!(
-            fetch_typed_response(&args).await.unwrap_err(),
-            TypedClientError::MissingGroupName
+            fetch_response(&args).await.unwrap_err(),
+            ClientError::MissingGroupName
         ));
     }
 
     #[tokio::test]
-    async fn fetch_typed_response_rejects_invalid_listgroup_range() {
-        let mut args = test_typed_fetch_args();
-        args.request = TypedRequestKind::Listgroup;
+    async fn fetch_response_rejects_invalid_listgroup_range() {
+        let mut args = test_fetch_args();
+        args.request = FetchRequestKind::Listgroup;
         args.message_id = None;
         args.group = Some("alt.test".to_string());
         args.selector = Some("-10".to_string());
 
         assert!(matches!(
-            fetch_typed_response(&args).await.unwrap_err(),
-            TypedClientError::InvalidListGroupRange
+            fetch_response(&args).await.unwrap_err(),
+            ClientError::InvalidListGroupRange
         ));
     }
 
     #[tokio::test]
-    async fn fetch_typed_response_rejects_missing_discovery_arguments() {
-        let mut newgroups_args = test_typed_fetch_args();
-        newgroups_args.request = TypedRequestKind::Newgroups;
+    async fn fetch_response_rejects_missing_discovery_arguments() {
+        let mut newgroups_args = test_fetch_args();
+        newgroups_args.request = FetchRequestKind::Newgroups;
         newgroups_args.message_id = None;
         newgroups_args.date = None;
         newgroups_args.time = Some("000000".to_string());
         assert!(matches!(
-            fetch_typed_response(&newgroups_args).await.unwrap_err(),
-            TypedClientError::MissingDate
+            fetch_response(&newgroups_args).await.unwrap_err(),
+            ClientError::MissingDate
         ));
 
         newgroups_args.date = Some("20260101".to_string());
         newgroups_args.time = None;
         assert!(matches!(
-            fetch_typed_response(&newgroups_args).await.unwrap_err(),
-            TypedClientError::MissingTime
+            fetch_response(&newgroups_args).await.unwrap_err(),
+            ClientError::MissingTime
         ));
 
-        let mut newnews_args = test_typed_fetch_args();
-        newnews_args.request = TypedRequestKind::Newnews;
+        let mut newnews_args = test_fetch_args();
+        newnews_args.request = FetchRequestKind::Newnews;
         newnews_args.message_id = None;
         newnews_args.wildmat = None;
         newnews_args.date = Some("20260101".to_string());
         newnews_args.time = Some("000000".to_string());
         assert!(matches!(
-            fetch_typed_response(&newnews_args).await.unwrap_err(),
-            TypedClientError::MissingWildmat
+            fetch_response(&newnews_args).await.unwrap_err(),
+            ClientError::MissingWildmat
         ));
     }
 
     #[tokio::test]
-    async fn fetch_typed_response_rejects_missing_remaining_rfc_arguments() {
-        let mut takethis_args = test_typed_fetch_args();
-        takethis_args.request = TypedRequestKind::Takethis;
+    async fn fetch_response_rejects_missing_remaining_rfc_arguments() {
+        let mut takethis_args = test_fetch_args();
+        takethis_args.request = FetchRequestKind::Takethis;
         takethis_args.article_body = None;
         assert!(matches!(
-            fetch_typed_response(&takethis_args).await.unwrap_err(),
-            TypedClientError::MissingArticleBody
+            fetch_response(&takethis_args).await.unwrap_err(),
+            ClientError::MissingArticleBody
         ));
 
-        let mut auth_args = test_typed_fetch_args();
-        auth_args.request = TypedRequestKind::AuthinfoUser;
+        let mut auth_args = test_fetch_args();
+        auth_args.request = FetchRequestKind::AuthinfoUser;
         auth_args.message_id = None;
         auth_args.auth_value = None;
         assert!(matches!(
-            fetch_typed_response(&auth_args).await.unwrap_err(),
-            TypedClientError::MissingAuthInfoValue
+            fetch_response(&auth_args).await.unwrap_err(),
+            ClientError::MissingAuthInfoValue
         ));
     }
 
@@ -11222,7 +11181,7 @@ mod tests {
                 Request::body_number(42).unwrap().write_wire_to(&mut output);
                 assert_eq!(output.as_slice(), b"BODY 42\r\n");
 
-                let segment_request = typed_request_for_command(
+                let segment_request = client_request_for_command(
                     42,
                     0,
                     ClientCommandMix::Article,

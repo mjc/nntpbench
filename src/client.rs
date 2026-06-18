@@ -30,9 +30,9 @@ const DRAINED_PENDING_READ_BYTES: usize = 1024 * 1024;
 const OWNED_RESPONSE_PREALLOC_BYTES: usize = 8 * 1024 * 1024;
 const STREAMING_STATUS_LINE_BYTES: usize = crate::protocol::MAX_INITIAL_RESPONSE_LINE_BYTES;
 
-/// Options for the typed one-connection client prototype.
+/// Options for the client one-connection client prototype.
 #[derive(Debug, Clone, Copy)]
-pub struct TypedClientOptions {
+pub struct ClientOptions {
     pub read_buffer_bytes: usize,
     pub nodelay: bool,
     pub socket_recv_buffer: usize,
@@ -40,7 +40,7 @@ pub struct TypedClientOptions {
     pub pipeline_depth: usize,
 }
 
-impl Default for TypedClientOptions {
+impl Default for ClientOptions {
     fn default() -> Self {
         Self {
             read_buffer_bytes: crate::CLIENT_READER_CAPACITY,
@@ -52,84 +52,77 @@ impl Default for TypedClientOptions {
     }
 }
 
-/// Primary request-specific client surface for typed NNTP calls.
+/// Primary request-specific client surface for client NNTP calls.
 #[derive(Debug, Clone)]
 pub struct Client {
-    connection: TypedClientConnection,
+    connection: ClientConnection,
 }
 
 impl Client {
     /// Connect and consume the NNTP greeting.
-    pub async fn connect(addr: SocketAddr) -> Result<Self, TypedClientError> {
-        Self::connect_with_options(addr, TypedClientOptions::default()).await
+    pub async fn connect(addr: SocketAddr) -> Result<Self, ClientError> {
+        Self::connect_with_options(addr, ClientOptions::default()).await
     }
 
     /// Connect with explicit socket and buffer options.
     pub async fn connect_with_options(
         addr: SocketAddr,
-        options: TypedClientOptions,
-    ) -> Result<Self, TypedClientError> {
+        options: ClientOptions,
+    ) -> Result<Self, ClientError> {
         Ok(Self {
-            connection: TypedClientConnection::connect_with_options(addr, options).await?,
+            connection: ClientConnection::connect_with_options(addr, options).await?,
         })
     }
 
-    /// Execute a typed article-style request directly and return a typed owned article-style response.
-    pub async fn execute(
-        &self,
-        request: Request<'static>,
-    ) -> Result<OwnedArticle, TypedClientError> {
+    /// Execute a client article-style request directly and return a client owned article-style response.
+    pub async fn execute(&self, request: Request<'static>) -> Result<OwnedArticle, ClientError> {
         let response = self.connection.execute(request).await?;
         OwnedArticle::try_from(response)
     }
 
-    /// Execute a typed request directly and return the completed request/response pair.
+    /// Execute a client request directly and return the completed request/response pair.
     pub async fn execute_exchange(
         &self,
         request: Request<'static>,
-    ) -> Result<OwnedArticleExchange, TypedClientError> {
+    ) -> Result<OwnedArticleExchange, ClientError> {
         let exchange = self.connection.execute_exchange(request).await?;
         OwnedArticleExchange::try_from(exchange)
     }
 
-    /// Execute a typed request directly and return the owned raw response frame.
+    /// Execute a client request directly and return the owned raw response frame.
     pub async fn execute_raw(
         &self,
         request: Request<'static>,
-    ) -> Result<OwnedResponse, TypedClientError> {
+    ) -> Result<OwnedResponse, ClientError> {
         self.connection.execute(request).await
     }
 
-    /// Execute a typed request directly and return the completed raw request/response pair.
+    /// Execute a client request directly and return the completed raw request/response pair.
     pub async fn execute_raw_exchange(
         &self,
         request: Request<'static>,
-    ) -> Result<OwnedExchange, TypedClientError> {
+    ) -> Result<OwnedExchange, ClientError> {
         self.connection.execute_exchange(request).await
     }
 
-    /// Send an ARTICLE request and return a typed owned article response.
-    pub async fn article(
-        &self,
-        message_id: impl AsRef<str>,
-    ) -> Result<OwnedArticle, TypedClientError> {
-        let request =
-            Request::article(message_id).map_err(|_| TypedClientError::InvalidMessageId)?;
+    /// Send an ARTICLE request and return a client owned article response.
+    pub async fn article(&self, message_id: impl AsRef<str>) -> Result<OwnedArticle, ClientError> {
+        let request = Request::article(message_id).map_err(|_| ClientError::InvalidMessageId)?;
         self.execute(request).await
     }
 
-    /// Send an ARTICLE request for the current article and return a typed owned article response.
-    pub async fn article_current(&self) -> Result<OwnedArticle, TypedClientError> {
+    /// Send an ARTICLE request for the current article and return a client owned article response.
+    pub async fn article_current(&self) -> Result<OwnedArticle, ClientError> {
         self.execute(Request::article_current()).await
     }
 
-    /// Send an ARTICLE request using a numeric/message-id selector and return a typed owned article response.
+    /// Send an ARTICLE request using a numeric/message-id selector and return a client owned article response.
     pub async fn article_selector(
         &self,
         selector: impl AsRef<str>,
-    ) -> Result<OwnedArticle, TypedClientError> {
-        let request = Request::article_selector(selector)
-            .map_err(|_| TypedClientError::InvalidArticleSelector)?;
+    ) -> Result<OwnedArticle, ClientError> {
+        let request =
+            Request::article_selector(selector).map_err(|_| ClientError::InvalidArticleSelector)?;
         self.execute(request).await
     }
 
@@ -137,14 +130,13 @@ impl Client {
     pub async fn article_exchange(
         &self,
         message_id: impl AsRef<str>,
-    ) -> Result<OwnedArticleExchange, TypedClientError> {
-        let request =
-            Request::article(message_id).map_err(|_| TypedClientError::InvalidMessageId)?;
+    ) -> Result<OwnedArticleExchange, ClientError> {
+        let request = Request::article(message_id).map_err(|_| ClientError::InvalidMessageId)?;
         self.execute_exchange(request).await
     }
 
     /// Send an ARTICLE request for the current article and return the completed request/response pair.
-    pub async fn article_current_exchange(&self) -> Result<OwnedArticleExchange, TypedClientError> {
+    pub async fn article_current_exchange(&self) -> Result<OwnedArticleExchange, ClientError> {
         self.execute_exchange(Request::article_current()).await
     }
 
@@ -152,33 +144,30 @@ impl Client {
     pub async fn article_selector_exchange(
         &self,
         selector: impl AsRef<str>,
-    ) -> Result<OwnedArticleExchange, TypedClientError> {
-        let request = Request::article_selector(selector)
-            .map_err(|_| TypedClientError::InvalidArticleSelector)?;
+    ) -> Result<OwnedArticleExchange, ClientError> {
+        let request =
+            Request::article_selector(selector).map_err(|_| ClientError::InvalidArticleSelector)?;
         self.execute_exchange(request).await
     }
 
-    /// Send a BODY request and return a typed owned article-style response.
-    pub async fn body(
-        &self,
-        message_id: impl AsRef<str>,
-    ) -> Result<OwnedArticle, TypedClientError> {
-        let request = Request::body(message_id).map_err(|_| TypedClientError::InvalidMessageId)?;
+    /// Send a BODY request and return a client owned article-style response.
+    pub async fn body(&self, message_id: impl AsRef<str>) -> Result<OwnedArticle, ClientError> {
+        let request = Request::body(message_id).map_err(|_| ClientError::InvalidMessageId)?;
         self.execute(request).await
     }
 
-    /// Send a BODY request for the current article and return a typed owned article-style response.
-    pub async fn body_current(&self) -> Result<OwnedArticle, TypedClientError> {
+    /// Send a BODY request for the current article and return a client owned article-style response.
+    pub async fn body_current(&self) -> Result<OwnedArticle, ClientError> {
         self.execute(Request::body_current()).await
     }
 
-    /// Send a BODY request using a numeric/message-id selector and return a typed owned article-style response.
+    /// Send a BODY request using a numeric/message-id selector and return a client owned article-style response.
     pub async fn body_selector(
         &self,
         selector: impl AsRef<str>,
-    ) -> Result<OwnedArticle, TypedClientError> {
-        let request = Request::body_selector(selector)
-            .map_err(|_| TypedClientError::InvalidArticleSelector)?;
+    ) -> Result<OwnedArticle, ClientError> {
+        let request =
+            Request::body_selector(selector).map_err(|_| ClientError::InvalidArticleSelector)?;
         self.execute(request).await
     }
 
@@ -186,13 +175,13 @@ impl Client {
     pub async fn body_exchange(
         &self,
         message_id: impl AsRef<str>,
-    ) -> Result<OwnedArticleExchange, TypedClientError> {
-        let request = Request::body(message_id).map_err(|_| TypedClientError::InvalidMessageId)?;
+    ) -> Result<OwnedArticleExchange, ClientError> {
+        let request = Request::body(message_id).map_err(|_| ClientError::InvalidMessageId)?;
         self.execute_exchange(request).await
     }
 
     /// Send a BODY request for the current article and return the completed request/response pair.
-    pub async fn body_current_exchange(&self) -> Result<OwnedArticleExchange, TypedClientError> {
+    pub async fn body_current_exchange(&self) -> Result<OwnedArticleExchange, ClientError> {
         self.execute_exchange(Request::body_current()).await
     }
 
@@ -200,33 +189,30 @@ impl Client {
     pub async fn body_selector_exchange(
         &self,
         selector: impl AsRef<str>,
-    ) -> Result<OwnedArticleExchange, TypedClientError> {
-        let request = Request::body_selector(selector)
-            .map_err(|_| TypedClientError::InvalidArticleSelector)?;
+    ) -> Result<OwnedArticleExchange, ClientError> {
+        let request =
+            Request::body_selector(selector).map_err(|_| ClientError::InvalidArticleSelector)?;
         self.execute_exchange(request).await
     }
 
-    /// Send a HEAD request and return a typed owned article-style response.
-    pub async fn head(
-        &self,
-        message_id: impl AsRef<str>,
-    ) -> Result<OwnedArticle, TypedClientError> {
-        let request = Request::head(message_id).map_err(|_| TypedClientError::InvalidMessageId)?;
+    /// Send a HEAD request and return a client owned article-style response.
+    pub async fn head(&self, message_id: impl AsRef<str>) -> Result<OwnedArticle, ClientError> {
+        let request = Request::head(message_id).map_err(|_| ClientError::InvalidMessageId)?;
         self.execute(request).await
     }
 
-    /// Send a HEAD request for the current article and return a typed owned article-style response.
-    pub async fn head_current(&self) -> Result<OwnedArticle, TypedClientError> {
+    /// Send a HEAD request for the current article and return a client owned article-style response.
+    pub async fn head_current(&self) -> Result<OwnedArticle, ClientError> {
         self.execute(Request::head_current()).await
     }
 
-    /// Send a HEAD request using a numeric/message-id selector and return a typed owned article-style response.
+    /// Send a HEAD request using a numeric/message-id selector and return a client owned article-style response.
     pub async fn head_selector(
         &self,
         selector: impl AsRef<str>,
-    ) -> Result<OwnedArticle, TypedClientError> {
-        let request = Request::head_selector(selector)
-            .map_err(|_| TypedClientError::InvalidArticleSelector)?;
+    ) -> Result<OwnedArticle, ClientError> {
+        let request =
+            Request::head_selector(selector).map_err(|_| ClientError::InvalidArticleSelector)?;
         self.execute(request).await
     }
 
@@ -234,13 +220,13 @@ impl Client {
     pub async fn head_exchange(
         &self,
         message_id: impl AsRef<str>,
-    ) -> Result<OwnedArticleExchange, TypedClientError> {
-        let request = Request::head(message_id).map_err(|_| TypedClientError::InvalidMessageId)?;
+    ) -> Result<OwnedArticleExchange, ClientError> {
+        let request = Request::head(message_id).map_err(|_| ClientError::InvalidMessageId)?;
         self.execute_exchange(request).await
     }
 
     /// Send a HEAD request for the current article and return the completed request/response pair.
-    pub async fn head_current_exchange(&self) -> Result<OwnedArticleExchange, TypedClientError> {
+    pub async fn head_current_exchange(&self) -> Result<OwnedArticleExchange, ClientError> {
         self.execute_exchange(Request::head_current()).await
     }
 
@@ -248,33 +234,30 @@ impl Client {
     pub async fn head_selector_exchange(
         &self,
         selector: impl AsRef<str>,
-    ) -> Result<OwnedArticleExchange, TypedClientError> {
-        let request = Request::head_selector(selector)
-            .map_err(|_| TypedClientError::InvalidArticleSelector)?;
+    ) -> Result<OwnedArticleExchange, ClientError> {
+        let request =
+            Request::head_selector(selector).map_err(|_| ClientError::InvalidArticleSelector)?;
         self.execute_exchange(request).await
     }
 
-    /// Send a STAT request and return a typed owned article-style response.
-    pub async fn stat(
-        &self,
-        message_id: impl AsRef<str>,
-    ) -> Result<OwnedArticle, TypedClientError> {
-        let request = Request::stat(message_id).map_err(|_| TypedClientError::InvalidMessageId)?;
+    /// Send a STAT request and return a client owned article-style response.
+    pub async fn stat(&self, message_id: impl AsRef<str>) -> Result<OwnedArticle, ClientError> {
+        let request = Request::stat(message_id).map_err(|_| ClientError::InvalidMessageId)?;
         self.execute(request).await
     }
 
-    /// Send a STAT request for the current article and return a typed owned article-style response.
-    pub async fn stat_current(&self) -> Result<OwnedArticle, TypedClientError> {
+    /// Send a STAT request for the current article and return a client owned article-style response.
+    pub async fn stat_current(&self) -> Result<OwnedArticle, ClientError> {
         self.execute(Request::stat_current()).await
     }
 
-    /// Send a STAT request using a numeric/message-id selector and return a typed owned article-style response.
+    /// Send a STAT request using a numeric/message-id selector and return a client owned article-style response.
     pub async fn stat_selector(
         &self,
         selector: impl AsRef<str>,
-    ) -> Result<OwnedArticle, TypedClientError> {
-        let request = Request::stat_selector(selector)
-            .map_err(|_| TypedClientError::InvalidArticleSelector)?;
+    ) -> Result<OwnedArticle, ClientError> {
+        let request =
+            Request::stat_selector(selector).map_err(|_| ClientError::InvalidArticleSelector)?;
         self.execute(request).await
     }
 
@@ -282,13 +265,13 @@ impl Client {
     pub async fn stat_exchange(
         &self,
         message_id: impl AsRef<str>,
-    ) -> Result<OwnedArticleExchange, TypedClientError> {
-        let request = Request::stat(message_id).map_err(|_| TypedClientError::InvalidMessageId)?;
+    ) -> Result<OwnedArticleExchange, ClientError> {
+        let request = Request::stat(message_id).map_err(|_| ClientError::InvalidMessageId)?;
         self.execute_exchange(request).await
     }
 
     /// Send a STAT request for the current article and return the completed request/response pair.
-    pub async fn stat_current_exchange(&self) -> Result<OwnedArticleExchange, TypedClientError> {
+    pub async fn stat_current_exchange(&self) -> Result<OwnedArticleExchange, ClientError> {
         self.execute_exchange(Request::stat_current()).await
     }
 
@@ -296,15 +279,15 @@ impl Client {
     pub async fn stat_selector_exchange(
         &self,
         selector: impl AsRef<str>,
-    ) -> Result<OwnedArticleExchange, TypedClientError> {
-        let request = Request::stat_selector(selector)
-            .map_err(|_| TypedClientError::InvalidArticleSelector)?;
+    ) -> Result<OwnedArticleExchange, ClientError> {
+        let request =
+            Request::stat_selector(selector).map_err(|_| ClientError::InvalidArticleSelector)?;
         self.execute_exchange(request).await
     }
 
     /// Send a GROUP request and return the owned raw response frame.
-    pub async fn group(&self, group: impl AsRef<str>) -> Result<OwnedResponse, TypedClientError> {
-        let request = Request::group(group).map_err(|_| TypedClientError::InvalidGroupName)?;
+    pub async fn group(&self, group: impl AsRef<str>) -> Result<OwnedResponse, ClientError> {
+        let request = Request::group(group).map_err(|_| ClientError::InvalidGroupName)?;
         self.execute_raw(request).await
     }
 
@@ -312,22 +295,19 @@ impl Client {
     pub async fn group_exchange(
         &self,
         group: impl AsRef<str>,
-    ) -> Result<OwnedExchange, TypedClientError> {
-        let request = Request::group(group).map_err(|_| TypedClientError::InvalidGroupName)?;
+    ) -> Result<OwnedExchange, ClientError> {
+        let request = Request::group(group).map_err(|_| ClientError::InvalidGroupName)?;
         self.execute_raw_exchange(request).await
     }
 
     /// Send a LISTGROUP request and return the owned raw response frame.
-    pub async fn listgroup(
-        &self,
-        group: impl AsRef<str>,
-    ) -> Result<OwnedResponse, TypedClientError> {
-        let request = Request::listgroup(group).map_err(|_| TypedClientError::InvalidGroupName)?;
+    pub async fn listgroup(&self, group: impl AsRef<str>) -> Result<OwnedResponse, ClientError> {
+        let request = Request::listgroup(group).map_err(|_| ClientError::InvalidGroupName)?;
         self.execute_raw(request).await
     }
 
     /// Send a LISTGROUP request for the current selected group and return the owned raw response frame.
-    pub async fn listgroup_current(&self) -> Result<OwnedResponse, TypedClientError> {
+    pub async fn listgroup_current(&self) -> Result<OwnedResponse, ClientError> {
         self.execute_raw(Request::listgroup_current()).await
     }
 
@@ -335,9 +315,9 @@ impl Client {
     pub async fn listgroup_range(
         &self,
         range: impl AsRef<str>,
-    ) -> Result<OwnedResponse, TypedClientError> {
+    ) -> Result<OwnedResponse, ClientError> {
         let request =
-            Request::listgroup_range(range).map_err(|_| TypedClientError::InvalidListGroupRange)?;
+            Request::listgroup_range(range).map_err(|_| ClientError::InvalidListGroupRange)?;
         self.execute_raw(request).await
     }
 
@@ -346,9 +326,8 @@ impl Client {
         &self,
         group: impl AsRef<str>,
         range: impl AsRef<str>,
-    ) -> Result<OwnedResponse, TypedClientError> {
-        let request =
-            Request::listgroup_group_range(group, range).map_err(TypedClientError::from)?;
+    ) -> Result<OwnedResponse, ClientError> {
+        let request = Request::listgroup_group_range(group, range).map_err(ClientError::from)?;
         self.execute_raw(request).await
     }
 
@@ -356,13 +335,13 @@ impl Client {
     pub async fn listgroup_exchange(
         &self,
         group: impl AsRef<str>,
-    ) -> Result<OwnedExchange, TypedClientError> {
-        let request = Request::listgroup(group).map_err(|_| TypedClientError::InvalidGroupName)?;
+    ) -> Result<OwnedExchange, ClientError> {
+        let request = Request::listgroup(group).map_err(|_| ClientError::InvalidGroupName)?;
         self.execute_raw_exchange(request).await
     }
 
     /// Send a LISTGROUP request for the current selected group and return the completed raw request/response pair.
-    pub async fn listgroup_current_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+    pub async fn listgroup_current_exchange(&self) -> Result<OwnedExchange, ClientError> {
         self.execute_raw_exchange(Request::listgroup_current())
             .await
     }
@@ -371,9 +350,9 @@ impl Client {
     pub async fn listgroup_range_exchange(
         &self,
         range: impl AsRef<str>,
-    ) -> Result<OwnedExchange, TypedClientError> {
+    ) -> Result<OwnedExchange, ClientError> {
         let request =
-            Request::listgroup_range(range).map_err(|_| TypedClientError::InvalidListGroupRange)?;
+            Request::listgroup_range(range).map_err(|_| ClientError::InvalidListGroupRange)?;
         self.execute_raw_exchange(request).await
     }
 
@@ -382,29 +361,28 @@ impl Client {
         &self,
         group: impl AsRef<str>,
         range: impl AsRef<str>,
-    ) -> Result<OwnedExchange, TypedClientError> {
-        let request =
-            Request::listgroup_group_range(group, range).map_err(TypedClientError::from)?;
+    ) -> Result<OwnedExchange, ClientError> {
+        let request = Request::listgroup_group_range(group, range).map_err(ClientError::from)?;
         self.execute_raw_exchange(request).await
     }
 
     /// Send a LAST request and return the owned raw response frame.
-    pub async fn last(&self) -> Result<OwnedResponse, TypedClientError> {
+    pub async fn last(&self) -> Result<OwnedResponse, ClientError> {
         self.execute_raw(Request::last()).await
     }
 
     /// Send a LAST request and return the completed raw request/response pair.
-    pub async fn last_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+    pub async fn last_exchange(&self) -> Result<OwnedExchange, ClientError> {
         self.execute_raw_exchange(Request::last()).await
     }
 
     /// Send a NEXT request and return the owned raw response frame.
-    pub async fn next(&self) -> Result<OwnedResponse, TypedClientError> {
+    pub async fn next(&self) -> Result<OwnedResponse, ClientError> {
         self.execute_raw(Request::next()).await
     }
 
     /// Send a NEXT request and return the completed raw request/response pair.
-    pub async fn next_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+    pub async fn next_exchange(&self) -> Result<OwnedExchange, ClientError> {
         self.execute_raw_exchange(Request::next()).await
     }
 
@@ -414,8 +392,8 @@ impl Client {
         date: impl AsRef<str>,
         time: impl AsRef<str>,
         gmt: bool,
-    ) -> Result<OwnedResponse, TypedClientError> {
-        let request = Request::newgroups(date, time, gmt).map_err(TypedClientError::from)?;
+    ) -> Result<OwnedResponse, ClientError> {
+        let request = Request::newgroups(date, time, gmt).map_err(ClientError::from)?;
         self.execute_raw(request).await
     }
 
@@ -425,8 +403,8 @@ impl Client {
         date: impl AsRef<str>,
         time: impl AsRef<str>,
         gmt: bool,
-    ) -> Result<OwnedExchange, TypedClientError> {
-        let request = Request::newgroups(date, time, gmt).map_err(TypedClientError::from)?;
+    ) -> Result<OwnedExchange, ClientError> {
+        let request = Request::newgroups(date, time, gmt).map_err(ClientError::from)?;
         self.execute_raw_exchange(request).await
     }
 
@@ -437,8 +415,8 @@ impl Client {
         date: impl AsRef<str>,
         time: impl AsRef<str>,
         gmt: bool,
-    ) -> Result<OwnedResponse, TypedClientError> {
-        let request = Request::newnews(wildmat, date, time, gmt).map_err(TypedClientError::from)?;
+    ) -> Result<OwnedResponse, ClientError> {
+        let request = Request::newnews(wildmat, date, time, gmt).map_err(ClientError::from)?;
         self.execute_raw(request).await
     }
 
@@ -449,27 +427,24 @@ impl Client {
         date: impl AsRef<str>,
         time: impl AsRef<str>,
         gmt: bool,
-    ) -> Result<OwnedExchange, TypedClientError> {
-        let request = Request::newnews(wildmat, date, time, gmt).map_err(TypedClientError::from)?;
+    ) -> Result<OwnedExchange, ClientError> {
+        let request = Request::newnews(wildmat, date, time, gmt).map_err(ClientError::from)?;
         self.execute_raw_exchange(request).await
     }
 
     /// Send a POST request and return the owned raw response frame.
-    pub async fn post(&self) -> Result<OwnedResponse, TypedClientError> {
+    pub async fn post(&self) -> Result<OwnedResponse, ClientError> {
         self.execute_raw(Request::post()).await
     }
 
     /// Send a POST request and return the completed raw request/response pair.
-    pub async fn post_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+    pub async fn post_exchange(&self) -> Result<OwnedExchange, ClientError> {
         self.execute_raw_exchange(Request::post()).await
     }
 
     /// Send an IHAVE request and return the owned raw response frame.
-    pub async fn ihave(
-        &self,
-        message_id: impl AsRef<str>,
-    ) -> Result<OwnedResponse, TypedClientError> {
-        let request = Request::ihave(message_id).map_err(|_| TypedClientError::InvalidMessageId)?;
+    pub async fn ihave(&self, message_id: impl AsRef<str>) -> Result<OwnedResponse, ClientError> {
+        let request = Request::ihave(message_id).map_err(|_| ClientError::InvalidMessageId)?;
         self.execute_raw(request).await
     }
 
@@ -477,17 +452,14 @@ impl Client {
     pub async fn ihave_exchange(
         &self,
         message_id: impl AsRef<str>,
-    ) -> Result<OwnedExchange, TypedClientError> {
-        let request = Request::ihave(message_id).map_err(|_| TypedClientError::InvalidMessageId)?;
+    ) -> Result<OwnedExchange, ClientError> {
+        let request = Request::ihave(message_id).map_err(|_| ClientError::InvalidMessageId)?;
         self.execute_raw_exchange(request).await
     }
 
     /// Send a CHECK request and return the owned raw response frame.
-    pub async fn check(
-        &self,
-        message_id: impl AsRef<str>,
-    ) -> Result<OwnedResponse, TypedClientError> {
-        let request = Request::check(message_id).map_err(|_| TypedClientError::InvalidMessageId)?;
+    pub async fn check(&self, message_id: impl AsRef<str>) -> Result<OwnedResponse, ClientError> {
+        let request = Request::check(message_id).map_err(|_| ClientError::InvalidMessageId)?;
         self.execute_raw(request).await
     }
 
@@ -495,8 +467,8 @@ impl Client {
     pub async fn check_exchange(
         &self,
         message_id: impl AsRef<str>,
-    ) -> Result<OwnedExchange, TypedClientError> {
-        let request = Request::check(message_id).map_err(|_| TypedClientError::InvalidMessageId)?;
+    ) -> Result<OwnedExchange, ClientError> {
+        let request = Request::check(message_id).map_err(|_| ClientError::InvalidMessageId)?;
         self.execute_raw_exchange(request).await
     }
 
@@ -505,9 +477,9 @@ impl Client {
         &self,
         message_id: impl AsRef<str>,
         article: impl AsRef<[u8]>,
-    ) -> Result<OwnedResponse, TypedClientError> {
-        let request = Request::takethis(message_id, article)
-            .map_err(|_| TypedClientError::InvalidMessageId)?;
+    ) -> Result<OwnedResponse, ClientError> {
+        let request =
+            Request::takethis(message_id, article).map_err(|_| ClientError::InvalidMessageId)?;
         self.execute_raw(request).await
     }
 
@@ -516,9 +488,9 @@ impl Client {
         &self,
         message_id: impl AsRef<str>,
         article: impl AsRef<[u8]>,
-    ) -> Result<OwnedExchange, TypedClientError> {
-        let request = Request::takethis(message_id, article)
-            .map_err(|_| TypedClientError::InvalidMessageId)?;
+    ) -> Result<OwnedExchange, ClientError> {
+        let request =
+            Request::takethis(message_id, article).map_err(|_| ClientError::InvalidMessageId)?;
         self.execute_raw_exchange(request).await
     }
 
@@ -526,9 +498,9 @@ impl Client {
     pub async fn authinfo_user(
         &self,
         value: impl AsRef<str>,
-    ) -> Result<OwnedResponse, TypedClientError> {
+    ) -> Result<OwnedResponse, ClientError> {
         let request =
-            Request::authinfo_user(value).map_err(|_| TypedClientError::InvalidAuthInfoValue)?;
+            Request::authinfo_user(value).map_err(|_| ClientError::InvalidAuthInfoValue)?;
         self.execute_raw(request).await
     }
 
@@ -536,9 +508,9 @@ impl Client {
     pub async fn authinfo_user_exchange(
         &self,
         value: impl AsRef<str>,
-    ) -> Result<OwnedExchange, TypedClientError> {
+    ) -> Result<OwnedExchange, ClientError> {
         let request =
-            Request::authinfo_user(value).map_err(|_| TypedClientError::InvalidAuthInfoValue)?;
+            Request::authinfo_user(value).map_err(|_| ClientError::InvalidAuthInfoValue)?;
         self.execute_raw_exchange(request).await
     }
 
@@ -546,9 +518,9 @@ impl Client {
     pub async fn authinfo_pass(
         &self,
         value: impl AsRef<str>,
-    ) -> Result<OwnedResponse, TypedClientError> {
+    ) -> Result<OwnedResponse, ClientError> {
         let request =
-            Request::authinfo_pass(value).map_err(|_| TypedClientError::InvalidAuthInfoValue)?;
+            Request::authinfo_pass(value).map_err(|_| ClientError::InvalidAuthInfoValue)?;
         self.execute_raw(request).await
     }
 
@@ -556,26 +528,25 @@ impl Client {
     pub async fn authinfo_pass_exchange(
         &self,
         value: impl AsRef<str>,
-    ) -> Result<OwnedExchange, TypedClientError> {
+    ) -> Result<OwnedExchange, ClientError> {
         let request =
-            Request::authinfo_pass(value).map_err(|_| TypedClientError::InvalidAuthInfoValue)?;
+            Request::authinfo_pass(value).map_err(|_| ClientError::InvalidAuthInfoValue)?;
         self.execute_raw_exchange(request).await
     }
 
     /// Send a STARTTLS request and return the owned raw response frame.
-    pub async fn starttls(&self) -> Result<OwnedResponse, TypedClientError> {
+    pub async fn starttls(&self) -> Result<OwnedResponse, ClientError> {
         self.execute_raw(Request::starttls()).await
     }
 
     /// Send a STARTTLS request and return the completed raw request/response pair.
-    pub async fn starttls_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+    pub async fn starttls_exchange(&self) -> Result<OwnedExchange, ClientError> {
         self.execute_raw_exchange(Request::starttls()).await
     }
 
     /// Send an OVER request and return the owned raw response frame.
-    pub async fn over(&self, selector: impl AsRef<str>) -> Result<OwnedResponse, TypedClientError> {
-        let request =
-            Request::over(selector).map_err(|_| TypedClientError::InvalidArticleSelector)?;
+    pub async fn over(&self, selector: impl AsRef<str>) -> Result<OwnedResponse, ClientError> {
+        let request = Request::over(selector).map_err(|_| ClientError::InvalidArticleSelector)?;
         self.execute_raw(request).await
     }
 
@@ -583,19 +554,14 @@ impl Client {
     pub async fn over_exchange(
         &self,
         selector: impl AsRef<str>,
-    ) -> Result<OwnedExchange, TypedClientError> {
-        let request =
-            Request::over(selector).map_err(|_| TypedClientError::InvalidArticleSelector)?;
+    ) -> Result<OwnedExchange, ClientError> {
+        let request = Request::over(selector).map_err(|_| ClientError::InvalidArticleSelector)?;
         self.execute_raw_exchange(request).await
     }
 
     /// Send an XOVER request and return the owned raw response frame.
-    pub async fn xover(
-        &self,
-        selector: impl AsRef<str>,
-    ) -> Result<OwnedResponse, TypedClientError> {
-        let request =
-            Request::xover(selector).map_err(|_| TypedClientError::InvalidArticleSelector)?;
+    pub async fn xover(&self, selector: impl AsRef<str>) -> Result<OwnedResponse, ClientError> {
+        let request = Request::xover(selector).map_err(|_| ClientError::InvalidArticleSelector)?;
         self.execute_raw(request).await
     }
 
@@ -603,9 +569,8 @@ impl Client {
     pub async fn xover_exchange(
         &self,
         selector: impl AsRef<str>,
-    ) -> Result<OwnedExchange, TypedClientError> {
-        let request =
-            Request::xover(selector).map_err(|_| TypedClientError::InvalidArticleSelector)?;
+    ) -> Result<OwnedExchange, ClientError> {
+        let request = Request::xover(selector).map_err(|_| ClientError::InvalidArticleSelector)?;
         self.execute_raw_exchange(request).await
     }
 
@@ -614,8 +579,8 @@ impl Client {
         &self,
         header: impl AsRef<str>,
         selector: impl AsRef<str>,
-    ) -> Result<OwnedResponse, TypedClientError> {
-        let request = Request::hdr(header, selector).map_err(TypedClientError::from)?;
+    ) -> Result<OwnedResponse, ClientError> {
+        let request = Request::hdr(header, selector).map_err(ClientError::from)?;
         self.execute_raw(request).await
     }
 
@@ -624,8 +589,8 @@ impl Client {
         &self,
         header: impl AsRef<str>,
         selector: impl AsRef<str>,
-    ) -> Result<OwnedExchange, TypedClientError> {
-        let request = Request::hdr(header, selector).map_err(TypedClientError::from)?;
+    ) -> Result<OwnedExchange, ClientError> {
+        let request = Request::hdr(header, selector).map_err(ClientError::from)?;
         self.execute_raw_exchange(request).await
     }
 
@@ -634,8 +599,8 @@ impl Client {
         &self,
         header: impl AsRef<str>,
         selector: impl AsRef<str>,
-    ) -> Result<OwnedResponse, TypedClientError> {
-        let request = Request::xhdr(header, selector).map_err(TypedClientError::from)?;
+    ) -> Result<OwnedResponse, ClientError> {
+        let request = Request::xhdr(header, selector).map_err(ClientError::from)?;
         self.execute_raw(request).await
     }
 
@@ -644,28 +609,28 @@ impl Client {
         &self,
         header: impl AsRef<str>,
         selector: impl AsRef<str>,
-    ) -> Result<OwnedExchange, TypedClientError> {
-        let request = Request::xhdr(header, selector).map_err(TypedClientError::from)?;
+    ) -> Result<OwnedExchange, ClientError> {
+        let request = Request::xhdr(header, selector).map_err(ClientError::from)?;
         self.execute_raw_exchange(request).await
     }
 
     /// Send a LIST request and return the owned raw response frame.
-    pub async fn list(&self) -> Result<OwnedResponse, TypedClientError> {
+    pub async fn list(&self) -> Result<OwnedResponse, ClientError> {
         self.execute_raw(Request::list()).await
     }
 
     /// Send a LIST request and return the completed raw request/response pair.
-    pub async fn list_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+    pub async fn list_exchange(&self) -> Result<OwnedExchange, ClientError> {
         self.execute_raw_exchange(Request::list()).await
     }
 
     /// Send a LIST ACTIVE request and return the owned raw response frame.
-    pub async fn list_active(&self) -> Result<OwnedResponse, TypedClientError> {
+    pub async fn list_active(&self) -> Result<OwnedResponse, ClientError> {
         self.execute_raw(Request::list_active()).await
     }
 
     /// Send a LIST ACTIVE request and return the completed raw request/response pair.
-    pub async fn list_active_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+    pub async fn list_active_exchange(&self) -> Result<OwnedExchange, ClientError> {
         self.execute_raw_exchange(Request::list_active()).await
     }
 
@@ -673,9 +638,9 @@ impl Client {
     pub async fn list_active_wildmat(
         &self,
         wildmat: impl AsRef<str>,
-    ) -> Result<OwnedResponse, TypedClientError> {
+    ) -> Result<OwnedResponse, ClientError> {
         let request =
-            Request::list_active_wildmat(wildmat).map_err(|_| TypedClientError::InvalidWildmat)?;
+            Request::list_active_wildmat(wildmat).map_err(|_| ClientError::InvalidWildmat)?;
         self.execute_raw(request).await
     }
 
@@ -683,19 +648,19 @@ impl Client {
     pub async fn list_active_wildmat_exchange(
         &self,
         wildmat: impl AsRef<str>,
-    ) -> Result<OwnedExchange, TypedClientError> {
+    ) -> Result<OwnedExchange, ClientError> {
         let request =
-            Request::list_active_wildmat(wildmat).map_err(|_| TypedClientError::InvalidWildmat)?;
+            Request::list_active_wildmat(wildmat).map_err(|_| ClientError::InvalidWildmat)?;
         self.execute_raw_exchange(request).await
     }
 
     /// Send a LIST ACTIVE.TIMES request and return the owned raw response frame.
-    pub async fn list_active_times(&self) -> Result<OwnedResponse, TypedClientError> {
+    pub async fn list_active_times(&self) -> Result<OwnedResponse, ClientError> {
         self.execute_raw(Request::list_active_times()).await
     }
 
     /// Send a LIST ACTIVE.TIMES request and return the completed raw request/response pair.
-    pub async fn list_active_times_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+    pub async fn list_active_times_exchange(&self) -> Result<OwnedExchange, ClientError> {
         self.execute_raw_exchange(Request::list_active_times())
             .await
     }
@@ -704,9 +669,9 @@ impl Client {
     pub async fn list_active_times_wildmat(
         &self,
         wildmat: impl AsRef<str>,
-    ) -> Result<OwnedResponse, TypedClientError> {
-        let request = Request::list_active_times_wildmat(wildmat)
-            .map_err(|_| TypedClientError::InvalidWildmat)?;
+    ) -> Result<OwnedResponse, ClientError> {
+        let request =
+            Request::list_active_times_wildmat(wildmat).map_err(|_| ClientError::InvalidWildmat)?;
         self.execute_raw(request).await
     }
 
@@ -714,19 +679,19 @@ impl Client {
     pub async fn list_active_times_wildmat_exchange(
         &self,
         wildmat: impl AsRef<str>,
-    ) -> Result<OwnedExchange, TypedClientError> {
-        let request = Request::list_active_times_wildmat(wildmat)
-            .map_err(|_| TypedClientError::InvalidWildmat)?;
+    ) -> Result<OwnedExchange, ClientError> {
+        let request =
+            Request::list_active_times_wildmat(wildmat).map_err(|_| ClientError::InvalidWildmat)?;
         self.execute_raw_exchange(request).await
     }
 
     /// Send a LIST NEWSGROUPS request and return the owned raw response frame.
-    pub async fn list_newsgroups(&self) -> Result<OwnedResponse, TypedClientError> {
+    pub async fn list_newsgroups(&self) -> Result<OwnedResponse, ClientError> {
         self.execute_raw(Request::list_newsgroups()).await
     }
 
     /// Send a LIST NEWSGROUPS request and return the completed raw request/response pair.
-    pub async fn list_newsgroups_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+    pub async fn list_newsgroups_exchange(&self) -> Result<OwnedExchange, ClientError> {
         self.execute_raw_exchange(Request::list_newsgroups()).await
     }
 
@@ -734,9 +699,9 @@ impl Client {
     pub async fn list_newsgroups_wildmat(
         &self,
         wildmat: impl AsRef<str>,
-    ) -> Result<OwnedResponse, TypedClientError> {
-        let request = Request::list_newsgroups_wildmat(wildmat)
-            .map_err(|_| TypedClientError::InvalidWildmat)?;
+    ) -> Result<OwnedResponse, ClientError> {
+        let request =
+            Request::list_newsgroups_wildmat(wildmat).map_err(|_| ClientError::InvalidWildmat)?;
         self.execute_raw(request).await
     }
 
@@ -744,118 +709,118 @@ impl Client {
     pub async fn list_newsgroups_wildmat_exchange(
         &self,
         wildmat: impl AsRef<str>,
-    ) -> Result<OwnedExchange, TypedClientError> {
-        let request = Request::list_newsgroups_wildmat(wildmat)
-            .map_err(|_| TypedClientError::InvalidWildmat)?;
+    ) -> Result<OwnedExchange, ClientError> {
+        let request =
+            Request::list_newsgroups_wildmat(wildmat).map_err(|_| ClientError::InvalidWildmat)?;
         self.execute_raw_exchange(request).await
     }
 
     /// Send a LIST OVERVIEW.FMT request and return the owned raw response frame.
-    pub async fn list_overview_fmt(&self) -> Result<OwnedResponse, TypedClientError> {
+    pub async fn list_overview_fmt(&self) -> Result<OwnedResponse, ClientError> {
         self.execute_raw(Request::list_overview_fmt()).await
     }
 
     /// Send a LIST OVERVIEW.FMT request and return the completed raw request/response pair.
-    pub async fn list_overview_fmt_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+    pub async fn list_overview_fmt_exchange(&self) -> Result<OwnedExchange, ClientError> {
         self.execute_raw_exchange(Request::list_overview_fmt())
             .await
     }
 
     /// Send a LIST HEADERS request and return the owned raw response frame.
-    pub async fn list_headers(&self) -> Result<OwnedResponse, TypedClientError> {
+    pub async fn list_headers(&self) -> Result<OwnedResponse, ClientError> {
         self.execute_raw(Request::list_headers()).await
     }
 
     /// Send a LIST HEADERS request and return the completed raw request/response pair.
-    pub async fn list_headers_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+    pub async fn list_headers_exchange(&self) -> Result<OwnedExchange, ClientError> {
         self.execute_raw_exchange(Request::list_headers()).await
     }
 
     /// Send a LIST DISTRIB.PATS request and return the owned raw response frame.
-    pub async fn list_distrib_pats(&self) -> Result<OwnedResponse, TypedClientError> {
+    pub async fn list_distrib_pats(&self) -> Result<OwnedResponse, ClientError> {
         self.execute_raw(Request::list_distrib_pats()).await
     }
 
     /// Send a LIST DISTRIB.PATS request and return the completed raw request/response pair.
-    pub async fn list_distrib_pats_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+    pub async fn list_distrib_pats_exchange(&self) -> Result<OwnedExchange, ClientError> {
         self.execute_raw_exchange(Request::list_distrib_pats())
             .await
     }
 
     /// Send a HELP request and return the owned raw response frame.
-    pub async fn help(&self) -> Result<OwnedResponse, TypedClientError> {
+    pub async fn help(&self) -> Result<OwnedResponse, ClientError> {
         self.execute_raw(Request::help()).await
     }
 
     /// Send a HELP request and return the completed raw request/response pair.
-    pub async fn help_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+    pub async fn help_exchange(&self) -> Result<OwnedExchange, ClientError> {
         self.execute_raw_exchange(Request::help()).await
     }
 
     /// Send a CAPABILITIES request and return the owned raw response frame.
-    pub async fn capabilities(&self) -> Result<OwnedResponse, TypedClientError> {
+    pub async fn capabilities(&self) -> Result<OwnedResponse, ClientError> {
         self.execute_raw(Request::capabilities()).await
     }
 
     /// Send a CAPABILITIES request and return the completed raw request/response pair.
-    pub async fn capabilities_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+    pub async fn capabilities_exchange(&self) -> Result<OwnedExchange, ClientError> {
         self.execute_raw_exchange(Request::capabilities()).await
     }
 
     /// Send a DATE request and return the owned raw response frame.
-    pub async fn date(&self) -> Result<OwnedResponse, TypedClientError> {
+    pub async fn date(&self) -> Result<OwnedResponse, ClientError> {
         self.execute_raw(Request::date()).await
     }
 
     /// Send a DATE request and return the completed raw request/response pair.
-    pub async fn date_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+    pub async fn date_exchange(&self) -> Result<OwnedExchange, ClientError> {
         self.execute_raw_exchange(Request::date()).await
     }
 
     /// Send a MODE READER request and return the owned raw response frame.
-    pub async fn mode_reader(&self) -> Result<OwnedResponse, TypedClientError> {
+    pub async fn mode_reader(&self) -> Result<OwnedResponse, ClientError> {
         self.execute_raw(Request::mode_reader()).await
     }
 
     /// Send a MODE READER request and return the completed raw request/response pair.
-    pub async fn mode_reader_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+    pub async fn mode_reader_exchange(&self) -> Result<OwnedExchange, ClientError> {
         self.execute_raw_exchange(Request::mode_reader()).await
     }
 
     /// Send a QUIT request and return the owned raw response frame.
-    pub async fn quit(&self) -> Result<OwnedResponse, TypedClientError> {
+    pub async fn quit(&self) -> Result<OwnedResponse, ClientError> {
         self.execute_raw(Request::quit()).await
     }
 
     /// Send a QUIT request and return the completed raw request/response pair.
-    pub async fn quit_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+    pub async fn quit_exchange(&self) -> Result<OwnedExchange, ClientError> {
         self.execute_raw_exchange(Request::quit()).await
     }
 
     /// Access the lower-level raw-frame connection.
     #[must_use]
-    pub fn connection(&self) -> &TypedClientConnection {
+    pub fn connection(&self) -> &ClientConnection {
         &self.connection
     }
 }
 
 /// One TCP connection exposing request-specific async methods.
 #[derive(Debug, Clone)]
-pub struct TypedClientConnection {
+pub struct ClientConnection {
     inner: Arc<ConnectionHandle>,
 }
 
-impl TypedClientConnection {
+impl ClientConnection {
     /// Connect and consume the NNTP greeting.
-    pub async fn connect(addr: SocketAddr) -> Result<Self, TypedClientError> {
-        Self::connect_with_options(addr, TypedClientOptions::default()).await
+    pub async fn connect(addr: SocketAddr) -> Result<Self, ClientError> {
+        Self::connect_with_options(addr, ClientOptions::default()).await
     }
 
     /// Connect with explicit socket and buffer options.
     pub async fn connect_with_options(
         addr: SocketAddr,
-        options: TypedClientOptions,
-    ) -> Result<Self, TypedClientError> {
+        options: ClientOptions,
+    ) -> Result<Self, ClientError> {
         let mut stream = crate::connect_client_socket(
             addr,
             options.nodelay,
@@ -901,7 +866,7 @@ impl TypedClientConnection {
     pub async fn article(
         &self,
         message_id: MessageId<'static>,
-    ) -> Result<OwnedResponse, TypedClientError> {
+    ) -> Result<OwnedResponse, ClientError> {
         self.execute(Request::Article {
             article_ref: ArticleRef::MessageId(message_id),
         })
@@ -912,7 +877,7 @@ impl TypedClientConnection {
     pub async fn article_exchange(
         &self,
         message_id: MessageId<'static>,
-    ) -> Result<OwnedExchange, TypedClientError> {
+    ) -> Result<OwnedExchange, ClientError> {
         self.execute_exchange(Request::Article {
             article_ref: ArticleRef::MessageId(message_id),
         })
@@ -920,7 +885,7 @@ impl TypedClientConnection {
     }
 
     /// Send an ARTICLE request for the current article and return the owned response frame.
-    pub async fn article_current(&self) -> Result<OwnedResponse, TypedClientError> {
+    pub async fn article_current(&self) -> Result<OwnedResponse, ClientError> {
         self.execute(Request::article_current()).await
     }
 
@@ -928,14 +893,14 @@ impl TypedClientConnection {
     pub async fn article_selector(
         &self,
         selector: impl AsRef<str>,
-    ) -> Result<OwnedResponse, TypedClientError> {
-        let request = Request::article_selector(selector)
-            .map_err(|_| TypedClientError::InvalidArticleSelector)?;
+    ) -> Result<OwnedResponse, ClientError> {
+        let request =
+            Request::article_selector(selector).map_err(|_| ClientError::InvalidArticleSelector)?;
         self.execute(request).await
     }
 
     /// Send an ARTICLE request for the current article and return the completed request/response pair.
-    pub async fn article_current_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+    pub async fn article_current_exchange(&self) -> Result<OwnedExchange, ClientError> {
         self.execute_exchange(Request::article_current()).await
     }
 
@@ -943,17 +908,14 @@ impl TypedClientConnection {
     pub async fn article_selector_exchange(
         &self,
         selector: impl AsRef<str>,
-    ) -> Result<OwnedExchange, TypedClientError> {
-        let request = Request::article_selector(selector)
-            .map_err(|_| TypedClientError::InvalidArticleSelector)?;
+    ) -> Result<OwnedExchange, ClientError> {
+        let request =
+            Request::article_selector(selector).map_err(|_| ClientError::InvalidArticleSelector)?;
         self.execute_exchange(request).await
     }
 
     /// Send a BODY request and return the owned response frame.
-    pub async fn body(
-        &self,
-        message_id: MessageId<'static>,
-    ) -> Result<OwnedResponse, TypedClientError> {
+    pub async fn body(&self, message_id: MessageId<'static>) -> Result<OwnedResponse, ClientError> {
         self.execute(Request::Body {
             article_ref: ArticleRef::MessageId(message_id),
         })
@@ -964,7 +926,7 @@ impl TypedClientConnection {
     pub async fn body_exchange(
         &self,
         message_id: MessageId<'static>,
-    ) -> Result<OwnedExchange, TypedClientError> {
+    ) -> Result<OwnedExchange, ClientError> {
         self.execute_exchange(Request::Body {
             article_ref: ArticleRef::MessageId(message_id),
         })
@@ -972,7 +934,7 @@ impl TypedClientConnection {
     }
 
     /// Send a BODY request for the current article and return the owned response frame.
-    pub async fn body_current(&self) -> Result<OwnedResponse, TypedClientError> {
+    pub async fn body_current(&self) -> Result<OwnedResponse, ClientError> {
         self.execute(Request::body_current()).await
     }
 
@@ -980,14 +942,14 @@ impl TypedClientConnection {
     pub async fn body_selector(
         &self,
         selector: impl AsRef<str>,
-    ) -> Result<OwnedResponse, TypedClientError> {
-        let request = Request::body_selector(selector)
-            .map_err(|_| TypedClientError::InvalidArticleSelector)?;
+    ) -> Result<OwnedResponse, ClientError> {
+        let request =
+            Request::body_selector(selector).map_err(|_| ClientError::InvalidArticleSelector)?;
         self.execute(request).await
     }
 
     /// Send a BODY request for the current article and return the completed request/response pair.
-    pub async fn body_current_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+    pub async fn body_current_exchange(&self) -> Result<OwnedExchange, ClientError> {
         self.execute_exchange(Request::body_current()).await
     }
 
@@ -995,17 +957,14 @@ impl TypedClientConnection {
     pub async fn body_selector_exchange(
         &self,
         selector: impl AsRef<str>,
-    ) -> Result<OwnedExchange, TypedClientError> {
-        let request = Request::body_selector(selector)
-            .map_err(|_| TypedClientError::InvalidArticleSelector)?;
+    ) -> Result<OwnedExchange, ClientError> {
+        let request =
+            Request::body_selector(selector).map_err(|_| ClientError::InvalidArticleSelector)?;
         self.execute_exchange(request).await
     }
 
     /// Send a HEAD request and return the owned response frame.
-    pub async fn head(
-        &self,
-        message_id: MessageId<'static>,
-    ) -> Result<OwnedResponse, TypedClientError> {
+    pub async fn head(&self, message_id: MessageId<'static>) -> Result<OwnedResponse, ClientError> {
         self.execute(Request::Head {
             article_ref: ArticleRef::MessageId(message_id),
         })
@@ -1016,7 +975,7 @@ impl TypedClientConnection {
     pub async fn head_exchange(
         &self,
         message_id: MessageId<'static>,
-    ) -> Result<OwnedExchange, TypedClientError> {
+    ) -> Result<OwnedExchange, ClientError> {
         self.execute_exchange(Request::Head {
             article_ref: ArticleRef::MessageId(message_id),
         })
@@ -1024,7 +983,7 @@ impl TypedClientConnection {
     }
 
     /// Send a HEAD request for the current article and return the owned response frame.
-    pub async fn head_current(&self) -> Result<OwnedResponse, TypedClientError> {
+    pub async fn head_current(&self) -> Result<OwnedResponse, ClientError> {
         self.execute(Request::head_current()).await
     }
 
@@ -1032,14 +991,14 @@ impl TypedClientConnection {
     pub async fn head_selector(
         &self,
         selector: impl AsRef<str>,
-    ) -> Result<OwnedResponse, TypedClientError> {
-        let request = Request::head_selector(selector)
-            .map_err(|_| TypedClientError::InvalidArticleSelector)?;
+    ) -> Result<OwnedResponse, ClientError> {
+        let request =
+            Request::head_selector(selector).map_err(|_| ClientError::InvalidArticleSelector)?;
         self.execute(request).await
     }
 
     /// Send a HEAD request for the current article and return the completed request/response pair.
-    pub async fn head_current_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+    pub async fn head_current_exchange(&self) -> Result<OwnedExchange, ClientError> {
         self.execute_exchange(Request::head_current()).await
     }
 
@@ -1047,17 +1006,14 @@ impl TypedClientConnection {
     pub async fn head_selector_exchange(
         &self,
         selector: impl AsRef<str>,
-    ) -> Result<OwnedExchange, TypedClientError> {
-        let request = Request::head_selector(selector)
-            .map_err(|_| TypedClientError::InvalidArticleSelector)?;
+    ) -> Result<OwnedExchange, ClientError> {
+        let request =
+            Request::head_selector(selector).map_err(|_| ClientError::InvalidArticleSelector)?;
         self.execute_exchange(request).await
     }
 
     /// Send a STAT request and return the owned response frame.
-    pub async fn stat(
-        &self,
-        message_id: MessageId<'static>,
-    ) -> Result<OwnedResponse, TypedClientError> {
+    pub async fn stat(&self, message_id: MessageId<'static>) -> Result<OwnedResponse, ClientError> {
         self.execute(Request::Stat {
             article_ref: ArticleRef::MessageId(message_id),
         })
@@ -1068,7 +1024,7 @@ impl TypedClientConnection {
     pub async fn stat_exchange(
         &self,
         message_id: MessageId<'static>,
-    ) -> Result<OwnedExchange, TypedClientError> {
+    ) -> Result<OwnedExchange, ClientError> {
         self.execute_exchange(Request::Stat {
             article_ref: ArticleRef::MessageId(message_id),
         })
@@ -1076,7 +1032,7 @@ impl TypedClientConnection {
     }
 
     /// Send a STAT request for the current article and return the owned response frame.
-    pub async fn stat_current(&self) -> Result<OwnedResponse, TypedClientError> {
+    pub async fn stat_current(&self) -> Result<OwnedResponse, ClientError> {
         self.execute(Request::stat_current()).await
     }
 
@@ -1084,14 +1040,14 @@ impl TypedClientConnection {
     pub async fn stat_selector(
         &self,
         selector: impl AsRef<str>,
-    ) -> Result<OwnedResponse, TypedClientError> {
-        let request = Request::stat_selector(selector)
-            .map_err(|_| TypedClientError::InvalidArticleSelector)?;
+    ) -> Result<OwnedResponse, ClientError> {
+        let request =
+            Request::stat_selector(selector).map_err(|_| ClientError::InvalidArticleSelector)?;
         self.execute(request).await
     }
 
     /// Send a STAT request for the current article and return the completed request/response pair.
-    pub async fn stat_current_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+    pub async fn stat_current_exchange(&self) -> Result<OwnedExchange, ClientError> {
         self.execute_exchange(Request::stat_current()).await
     }
 
@@ -1099,17 +1055,14 @@ impl TypedClientConnection {
     pub async fn stat_selector_exchange(
         &self,
         selector: impl AsRef<str>,
-    ) -> Result<OwnedExchange, TypedClientError> {
-        let request = Request::stat_selector(selector)
-            .map_err(|_| TypedClientError::InvalidArticleSelector)?;
+    ) -> Result<OwnedExchange, ClientError> {
+        let request =
+            Request::stat_selector(selector).map_err(|_| ClientError::InvalidArticleSelector)?;
         self.execute_exchange(request).await
     }
 
     /// Send a GROUP request and return the owned response frame.
-    pub async fn group(
-        &self,
-        group: GroupName<'static>,
-    ) -> Result<OwnedResponse, TypedClientError> {
+    pub async fn group(&self, group: GroupName<'static>) -> Result<OwnedResponse, ClientError> {
         self.execute(Request::Group { group }).await
     }
 
@@ -1117,23 +1070,18 @@ impl TypedClientConnection {
     pub async fn group_exchange(
         &self,
         group: GroupName<'static>,
-    ) -> Result<OwnedExchange, TypedClientError> {
+    ) -> Result<OwnedExchange, ClientError> {
         self.execute_exchange(Request::Group { group }).await
     }
 
     /// Send a LISTGROUP request and return the owned response frame.
-    pub async fn listgroup(
-        &self,
-        group: GroupName<'static>,
-    ) -> Result<OwnedResponse, TypedClientError> {
-        self.execute(
-            Request::listgroup(group.as_str()).map_err(|_| TypedClientError::InvalidGroupName)?,
-        )
-        .await
+    pub async fn listgroup(&self, group: GroupName<'static>) -> Result<OwnedResponse, ClientError> {
+        self.execute(Request::listgroup(group.as_str()).map_err(|_| ClientError::InvalidGroupName)?)
+            .await
     }
 
     /// Send a LISTGROUP request for the current selected group and return the owned response frame.
-    pub async fn listgroup_current(&self) -> Result<OwnedResponse, TypedClientError> {
+    pub async fn listgroup_current(&self) -> Result<OwnedResponse, ClientError> {
         self.execute(Request::listgroup_current()).await
     }
 
@@ -1141,10 +1089,10 @@ impl TypedClientConnection {
     pub async fn listgroup_range(
         &self,
         range: ListGroupRange<'static>,
-    ) -> Result<OwnedResponse, TypedClientError> {
+    ) -> Result<OwnedResponse, ClientError> {
         self.execute(
             Request::listgroup_range(range.as_str())
-                .map_err(|_| TypedClientError::InvalidListGroupRange)?,
+                .map_err(|_| ClientError::InvalidListGroupRange)?,
         )
         .await
     }
@@ -1154,10 +1102,10 @@ impl TypedClientConnection {
         &self,
         group: GroupName<'static>,
         range: ListGroupRange<'static>,
-    ) -> Result<OwnedResponse, TypedClientError> {
+    ) -> Result<OwnedResponse, ClientError> {
         self.execute(
             Request::listgroup_group_range(group.as_str(), range.as_str())
-                .map_err(TypedClientError::from)?,
+                .map_err(ClientError::from)?,
         )
         .await
     }
@@ -1166,15 +1114,15 @@ impl TypedClientConnection {
     pub async fn listgroup_exchange(
         &self,
         group: GroupName<'static>,
-    ) -> Result<OwnedExchange, TypedClientError> {
+    ) -> Result<OwnedExchange, ClientError> {
         self.execute_exchange(
-            Request::listgroup(group.as_str()).map_err(|_| TypedClientError::InvalidGroupName)?,
+            Request::listgroup(group.as_str()).map_err(|_| ClientError::InvalidGroupName)?,
         )
         .await
     }
 
     /// Send a LISTGROUP request for the current selected group and return the completed request/response pair.
-    pub async fn listgroup_current_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+    pub async fn listgroup_current_exchange(&self) -> Result<OwnedExchange, ClientError> {
         self.execute_exchange(Request::listgroup_current()).await
     }
 
@@ -1182,10 +1130,10 @@ impl TypedClientConnection {
     pub async fn listgroup_range_exchange(
         &self,
         range: ListGroupRange<'static>,
-    ) -> Result<OwnedExchange, TypedClientError> {
+    ) -> Result<OwnedExchange, ClientError> {
         self.execute_exchange(
             Request::listgroup_range(range.as_str())
-                .map_err(|_| TypedClientError::InvalidListGroupRange)?,
+                .map_err(|_| ClientError::InvalidListGroupRange)?,
         )
         .await
     }
@@ -1195,31 +1143,31 @@ impl TypedClientConnection {
         &self,
         group: GroupName<'static>,
         range: ListGroupRange<'static>,
-    ) -> Result<OwnedExchange, TypedClientError> {
+    ) -> Result<OwnedExchange, ClientError> {
         self.execute_exchange(
             Request::listgroup_group_range(group.as_str(), range.as_str())
-                .map_err(TypedClientError::from)?,
+                .map_err(ClientError::from)?,
         )
         .await
     }
 
     /// Send a LAST request and return the owned response frame.
-    pub async fn last(&self) -> Result<OwnedResponse, TypedClientError> {
+    pub async fn last(&self) -> Result<OwnedResponse, ClientError> {
         self.execute(Request::Last).await
     }
 
     /// Send a LAST request and return the completed request/response pair.
-    pub async fn last_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+    pub async fn last_exchange(&self) -> Result<OwnedExchange, ClientError> {
         self.execute_exchange(Request::Last).await
     }
 
     /// Send a NEXT request and return the owned response frame.
-    pub async fn next(&self) -> Result<OwnedResponse, TypedClientError> {
+    pub async fn next(&self) -> Result<OwnedResponse, ClientError> {
         self.execute(Request::Next).await
     }
 
     /// Send a NEXT request and return the completed request/response pair.
-    pub async fn next_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+    pub async fn next_exchange(&self) -> Result<OwnedExchange, ClientError> {
         self.execute_exchange(Request::Next).await
     }
 
@@ -1229,7 +1177,7 @@ impl TypedClientConnection {
         date: NntpDate<'static>,
         time: NntpTime<'static>,
         gmt: bool,
-    ) -> Result<OwnedResponse, TypedClientError> {
+    ) -> Result<OwnedResponse, ClientError> {
         self.execute(Request::NewGroups { date, time, gmt }).await
     }
 
@@ -1239,7 +1187,7 @@ impl TypedClientConnection {
         date: NntpDate<'static>,
         time: NntpTime<'static>,
         gmt: bool,
-    ) -> Result<OwnedExchange, TypedClientError> {
+    ) -> Result<OwnedExchange, ClientError> {
         self.execute_exchange(Request::NewGroups { date, time, gmt })
             .await
     }
@@ -1251,7 +1199,7 @@ impl TypedClientConnection {
         date: NntpDate<'static>,
         time: NntpTime<'static>,
         gmt: bool,
-    ) -> Result<OwnedResponse, TypedClientError> {
+    ) -> Result<OwnedResponse, ClientError> {
         self.execute(Request::NewNews {
             wildmat,
             date,
@@ -1268,7 +1216,7 @@ impl TypedClientConnection {
         date: NntpDate<'static>,
         time: NntpTime<'static>,
         gmt: bool,
-    ) -> Result<OwnedExchange, TypedClientError> {
+    ) -> Result<OwnedExchange, ClientError> {
         self.execute_exchange(Request::NewNews {
             wildmat,
             date,
@@ -1279,12 +1227,12 @@ impl TypedClientConnection {
     }
 
     /// Send a POST request and return the owned response frame.
-    pub async fn post(&self) -> Result<OwnedResponse, TypedClientError> {
+    pub async fn post(&self) -> Result<OwnedResponse, ClientError> {
         self.execute(Request::Post).await
     }
 
     /// Send a POST request and return the completed request/response pair.
-    pub async fn post_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+    pub async fn post_exchange(&self) -> Result<OwnedExchange, ClientError> {
         self.execute_exchange(Request::Post).await
     }
 
@@ -1292,7 +1240,7 @@ impl TypedClientConnection {
     pub async fn ihave(
         &self,
         message_id: MessageId<'static>,
-    ) -> Result<OwnedResponse, TypedClientError> {
+    ) -> Result<OwnedResponse, ClientError> {
         self.execute(Request::Ihave { message_id }).await
     }
 
@@ -1300,7 +1248,7 @@ impl TypedClientConnection {
     pub async fn ihave_exchange(
         &self,
         message_id: MessageId<'static>,
-    ) -> Result<OwnedExchange, TypedClientError> {
+    ) -> Result<OwnedExchange, ClientError> {
         self.execute_exchange(Request::Ihave { message_id }).await
     }
 
@@ -1308,7 +1256,7 @@ impl TypedClientConnection {
     pub async fn check(
         &self,
         message_id: MessageId<'static>,
-    ) -> Result<OwnedResponse, TypedClientError> {
+    ) -> Result<OwnedResponse, ClientError> {
         self.execute(Request::Check { message_id }).await
     }
 
@@ -1316,7 +1264,7 @@ impl TypedClientConnection {
     pub async fn check_exchange(
         &self,
         message_id: MessageId<'static>,
-    ) -> Result<OwnedExchange, TypedClientError> {
+    ) -> Result<OwnedExchange, ClientError> {
         self.execute_exchange(Request::Check { message_id }).await
     }
 
@@ -1325,7 +1273,7 @@ impl TypedClientConnection {
         &self,
         message_id: MessageId<'static>,
         article: ArticleTransfer<'static>,
-    ) -> Result<OwnedResponse, TypedClientError> {
+    ) -> Result<OwnedResponse, ClientError> {
         self.execute(Request::TakeThis {
             message_id,
             article,
@@ -1338,7 +1286,7 @@ impl TypedClientConnection {
         &self,
         message_id: MessageId<'static>,
         article: ArticleTransfer<'static>,
-    ) -> Result<OwnedExchange, TypedClientError> {
+    ) -> Result<OwnedExchange, ClientError> {
         self.execute_exchange(Request::TakeThis {
             message_id,
             article,
@@ -1350,7 +1298,7 @@ impl TypedClientConnection {
     pub async fn authinfo_user(
         &self,
         value: AuthInfoValue<'static>,
-    ) -> Result<OwnedResponse, TypedClientError> {
+    ) -> Result<OwnedResponse, ClientError> {
         self.execute(Request::AuthInfo {
             kind: crate::protocol::AuthInfoKind::User,
             value,
@@ -1362,7 +1310,7 @@ impl TypedClientConnection {
     pub async fn authinfo_user_exchange(
         &self,
         value: AuthInfoValue<'static>,
-    ) -> Result<OwnedExchange, TypedClientError> {
+    ) -> Result<OwnedExchange, ClientError> {
         self.execute_exchange(Request::AuthInfo {
             kind: crate::protocol::AuthInfoKind::User,
             value,
@@ -1374,7 +1322,7 @@ impl TypedClientConnection {
     pub async fn authinfo_pass(
         &self,
         value: AuthInfoValue<'static>,
-    ) -> Result<OwnedResponse, TypedClientError> {
+    ) -> Result<OwnedResponse, ClientError> {
         self.execute(Request::AuthInfo {
             kind: crate::protocol::AuthInfoKind::Pass,
             value,
@@ -1386,7 +1334,7 @@ impl TypedClientConnection {
     pub async fn authinfo_pass_exchange(
         &self,
         value: AuthInfoValue<'static>,
-    ) -> Result<OwnedExchange, TypedClientError> {
+    ) -> Result<OwnedExchange, ClientError> {
         self.execute_exchange(Request::AuthInfo {
             kind: crate::protocol::AuthInfoKind::Pass,
             value,
@@ -1395,12 +1343,12 @@ impl TypedClientConnection {
     }
 
     /// Send a STARTTLS request and return the owned response frame.
-    pub async fn starttls(&self) -> Result<OwnedResponse, TypedClientError> {
+    pub async fn starttls(&self) -> Result<OwnedResponse, ClientError> {
         self.execute(Request::StartTls).await
     }
 
     /// Send a STARTTLS request and return the completed request/response pair.
-    pub async fn starttls_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+    pub async fn starttls_exchange(&self) -> Result<OwnedExchange, ClientError> {
         self.execute_exchange(Request::StartTls).await
     }
 
@@ -1408,7 +1356,7 @@ impl TypedClientConnection {
     pub async fn over(
         &self,
         selector: ArticleSelector<'static>,
-    ) -> Result<OwnedResponse, TypedClientError> {
+    ) -> Result<OwnedResponse, ClientError> {
         self.execute(Request::Over { selector }).await
     }
 
@@ -1416,7 +1364,7 @@ impl TypedClientConnection {
     pub async fn over_exchange(
         &self,
         selector: ArticleSelector<'static>,
-    ) -> Result<OwnedExchange, TypedClientError> {
+    ) -> Result<OwnedExchange, ClientError> {
         self.execute_exchange(Request::Over { selector }).await
     }
 
@@ -1424,7 +1372,7 @@ impl TypedClientConnection {
     pub async fn xover(
         &self,
         selector: ArticleSelector<'static>,
-    ) -> Result<OwnedResponse, TypedClientError> {
+    ) -> Result<OwnedResponse, ClientError> {
         self.execute(Request::Xover { selector }).await
     }
 
@@ -1432,7 +1380,7 @@ impl TypedClientConnection {
     pub async fn xover_exchange(
         &self,
         selector: ArticleSelector<'static>,
-    ) -> Result<OwnedExchange, TypedClientError> {
+    ) -> Result<OwnedExchange, ClientError> {
         self.execute_exchange(Request::Xover { selector }).await
     }
 
@@ -1441,7 +1389,7 @@ impl TypedClientConnection {
         &self,
         header: HeaderName<'static>,
         selector: ArticleSelector<'static>,
-    ) -> Result<OwnedResponse, TypedClientError> {
+    ) -> Result<OwnedResponse, ClientError> {
         self.execute(Request::Hdr { header, selector }).await
     }
 
@@ -1450,7 +1398,7 @@ impl TypedClientConnection {
         &self,
         header: HeaderName<'static>,
         selector: ArticleSelector<'static>,
-    ) -> Result<OwnedExchange, TypedClientError> {
+    ) -> Result<OwnedExchange, ClientError> {
         self.execute_exchange(Request::Hdr { header, selector })
             .await
     }
@@ -1460,7 +1408,7 @@ impl TypedClientConnection {
         &self,
         header: HeaderName<'static>,
         selector: ArticleSelector<'static>,
-    ) -> Result<OwnedResponse, TypedClientError> {
+    ) -> Result<OwnedResponse, ClientError> {
         self.execute(Request::Xhdr { header, selector }).await
     }
 
@@ -1469,28 +1417,28 @@ impl TypedClientConnection {
         &self,
         header: HeaderName<'static>,
         selector: ArticleSelector<'static>,
-    ) -> Result<OwnedExchange, TypedClientError> {
+    ) -> Result<OwnedExchange, ClientError> {
         self.execute_exchange(Request::Xhdr { header, selector })
             .await
     }
 
     /// Send a LIST request and return the owned response frame.
-    pub async fn list(&self) -> Result<OwnedResponse, TypedClientError> {
+    pub async fn list(&self) -> Result<OwnedResponse, ClientError> {
         self.execute(Request::List).await
     }
 
     /// Send a LIST request and return the completed request/response pair.
-    pub async fn list_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+    pub async fn list_exchange(&self) -> Result<OwnedExchange, ClientError> {
         self.execute_exchange(Request::List).await
     }
 
     /// Send a LIST ACTIVE request and return the owned response frame.
-    pub async fn list_active(&self) -> Result<OwnedResponse, TypedClientError> {
+    pub async fn list_active(&self) -> Result<OwnedResponse, ClientError> {
         self.execute(Request::list_active()).await
     }
 
     /// Send a LIST ACTIVE request and return the completed request/response pair.
-    pub async fn list_active_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+    pub async fn list_active_exchange(&self) -> Result<OwnedExchange, ClientError> {
         self.execute_exchange(Request::list_active()).await
     }
 
@@ -1498,7 +1446,7 @@ impl TypedClientConnection {
     pub async fn list_active_wildmat(
         &self,
         wildmat: Wildmat<'static>,
-    ) -> Result<OwnedResponse, TypedClientError> {
+    ) -> Result<OwnedResponse, ClientError> {
         self.execute(Request::ListVariant {
             kind: crate::protocol::ListKind::Active,
             wildmat: Some(wildmat),
@@ -1510,7 +1458,7 @@ impl TypedClientConnection {
     pub async fn list_active_wildmat_exchange(
         &self,
         wildmat: Wildmat<'static>,
-    ) -> Result<OwnedExchange, TypedClientError> {
+    ) -> Result<OwnedExchange, ClientError> {
         self.execute_exchange(Request::ListVariant {
             kind: crate::protocol::ListKind::Active,
             wildmat: Some(wildmat),
@@ -1519,12 +1467,12 @@ impl TypedClientConnection {
     }
 
     /// Send a LIST ACTIVE.TIMES request and return the owned response frame.
-    pub async fn list_active_times(&self) -> Result<OwnedResponse, TypedClientError> {
+    pub async fn list_active_times(&self) -> Result<OwnedResponse, ClientError> {
         self.execute(Request::list_active_times()).await
     }
 
     /// Send a LIST ACTIVE.TIMES request and return the completed request/response pair.
-    pub async fn list_active_times_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+    pub async fn list_active_times_exchange(&self) -> Result<OwnedExchange, ClientError> {
         self.execute_exchange(Request::list_active_times()).await
     }
 
@@ -1532,7 +1480,7 @@ impl TypedClientConnection {
     pub async fn list_active_times_wildmat(
         &self,
         wildmat: Wildmat<'static>,
-    ) -> Result<OwnedResponse, TypedClientError> {
+    ) -> Result<OwnedResponse, ClientError> {
         self.execute(Request::ListVariant {
             kind: crate::protocol::ListKind::ActiveTimes,
             wildmat: Some(wildmat),
@@ -1544,7 +1492,7 @@ impl TypedClientConnection {
     pub async fn list_active_times_wildmat_exchange(
         &self,
         wildmat: Wildmat<'static>,
-    ) -> Result<OwnedExchange, TypedClientError> {
+    ) -> Result<OwnedExchange, ClientError> {
         self.execute_exchange(Request::ListVariant {
             kind: crate::protocol::ListKind::ActiveTimes,
             wildmat: Some(wildmat),
@@ -1553,12 +1501,12 @@ impl TypedClientConnection {
     }
 
     /// Send a LIST NEWSGROUPS request and return the owned response frame.
-    pub async fn list_newsgroups(&self) -> Result<OwnedResponse, TypedClientError> {
+    pub async fn list_newsgroups(&self) -> Result<OwnedResponse, ClientError> {
         self.execute(Request::list_newsgroups()).await
     }
 
     /// Send a LIST NEWSGROUPS request and return the completed request/response pair.
-    pub async fn list_newsgroups_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+    pub async fn list_newsgroups_exchange(&self) -> Result<OwnedExchange, ClientError> {
         self.execute_exchange(Request::list_newsgroups()).await
     }
 
@@ -1566,7 +1514,7 @@ impl TypedClientConnection {
     pub async fn list_newsgroups_wildmat(
         &self,
         wildmat: Wildmat<'static>,
-    ) -> Result<OwnedResponse, TypedClientError> {
+    ) -> Result<OwnedResponse, ClientError> {
         self.execute(Request::ListVariant {
             kind: crate::protocol::ListKind::Newsgroups,
             wildmat: Some(wildmat),
@@ -1578,7 +1526,7 @@ impl TypedClientConnection {
     pub async fn list_newsgroups_wildmat_exchange(
         &self,
         wildmat: Wildmat<'static>,
-    ) -> Result<OwnedExchange, TypedClientError> {
+    ) -> Result<OwnedExchange, ClientError> {
         self.execute_exchange(Request::ListVariant {
             kind: crate::protocol::ListKind::Newsgroups,
             wildmat: Some(wildmat),
@@ -1587,97 +1535,94 @@ impl TypedClientConnection {
     }
 
     /// Send a LIST OVERVIEW.FMT request and return the owned response frame.
-    pub async fn list_overview_fmt(&self) -> Result<OwnedResponse, TypedClientError> {
+    pub async fn list_overview_fmt(&self) -> Result<OwnedResponse, ClientError> {
         self.execute(Request::list_overview_fmt()).await
     }
 
     /// Send a LIST OVERVIEW.FMT request and return the completed request/response pair.
-    pub async fn list_overview_fmt_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+    pub async fn list_overview_fmt_exchange(&self) -> Result<OwnedExchange, ClientError> {
         self.execute_exchange(Request::list_overview_fmt()).await
     }
 
     /// Send a LIST HEADERS request and return the owned response frame.
-    pub async fn list_headers(&self) -> Result<OwnedResponse, TypedClientError> {
+    pub async fn list_headers(&self) -> Result<OwnedResponse, ClientError> {
         self.execute(Request::list_headers()).await
     }
 
     /// Send a LIST HEADERS request and return the completed request/response pair.
-    pub async fn list_headers_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+    pub async fn list_headers_exchange(&self) -> Result<OwnedExchange, ClientError> {
         self.execute_exchange(Request::list_headers()).await
     }
 
     /// Send a LIST DISTRIB.PATS request and return the owned response frame.
-    pub async fn list_distrib_pats(&self) -> Result<OwnedResponse, TypedClientError> {
+    pub async fn list_distrib_pats(&self) -> Result<OwnedResponse, ClientError> {
         self.execute(Request::list_distrib_pats()).await
     }
 
     /// Send a LIST DISTRIB.PATS request and return the completed request/response pair.
-    pub async fn list_distrib_pats_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+    pub async fn list_distrib_pats_exchange(&self) -> Result<OwnedExchange, ClientError> {
         self.execute_exchange(Request::list_distrib_pats()).await
     }
 
     /// Send a HELP request and return the owned response frame.
-    pub async fn help(&self) -> Result<OwnedResponse, TypedClientError> {
+    pub async fn help(&self) -> Result<OwnedResponse, ClientError> {
         self.execute(Request::Help).await
     }
 
     /// Send a HELP request and return the completed request/response pair.
-    pub async fn help_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+    pub async fn help_exchange(&self) -> Result<OwnedExchange, ClientError> {
         self.execute_exchange(Request::Help).await
     }
 
     /// Send a CAPABILITIES request and return the owned response frame.
-    pub async fn capabilities(&self) -> Result<OwnedResponse, TypedClientError> {
+    pub async fn capabilities(&self) -> Result<OwnedResponse, ClientError> {
         self.execute(Request::Capabilities).await
     }
 
     /// Send a CAPABILITIES request and return the completed request/response pair.
-    pub async fn capabilities_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+    pub async fn capabilities_exchange(&self) -> Result<OwnedExchange, ClientError> {
         self.execute_exchange(Request::Capabilities).await
     }
 
     /// Send a DATE request and return the owned response frame.
-    pub async fn date(&self) -> Result<OwnedResponse, TypedClientError> {
+    pub async fn date(&self) -> Result<OwnedResponse, ClientError> {
         self.execute(Request::Date).await
     }
 
     /// Send a DATE request and return the completed request/response pair.
-    pub async fn date_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+    pub async fn date_exchange(&self) -> Result<OwnedExchange, ClientError> {
         self.execute_exchange(Request::Date).await
     }
 
     /// Send a MODE READER request and return the owned response frame.
-    pub async fn mode_reader(&self) -> Result<OwnedResponse, TypedClientError> {
+    pub async fn mode_reader(&self) -> Result<OwnedResponse, ClientError> {
         self.execute(Request::ModeReader).await
     }
 
     /// Send a MODE READER request and return the completed request/response pair.
-    pub async fn mode_reader_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+    pub async fn mode_reader_exchange(&self) -> Result<OwnedExchange, ClientError> {
         self.execute_exchange(Request::ModeReader).await
     }
 
     /// Send a QUIT request and return the owned response frame.
-    pub async fn quit(&self) -> Result<OwnedResponse, TypedClientError> {
+    pub async fn quit(&self) -> Result<OwnedResponse, ClientError> {
         self.execute(Request::Quit).await
     }
 
     /// Send a QUIT request and return the completed request/response pair.
-    pub async fn quit_exchange(&self) -> Result<OwnedExchange, TypedClientError> {
+    pub async fn quit_exchange(&self) -> Result<OwnedExchange, ClientError> {
         self.execute_exchange(Request::Quit).await
     }
 
-    /// Execute a typed request on this connection.
-    pub async fn execute(
-        &self,
-        request: Request<'static>,
-    ) -> Result<OwnedResponse, TypedClientError> {
+    /// Execute a client request on this connection.
+    pub async fn execute(&self, request: Request<'static>) -> Result<OwnedResponse, ClientError> {
         self.queue_request(request).await?.receive().await
     }
 
     pub(crate) async fn queue_request(
         &self,
         request: Request<'static>,
-    ) -> Result<PendingResponse, TypedClientError> {
+    ) -> Result<PendingResponse, ClientError> {
         let (response_tx, response_rx) = oneshot::channel();
         self.inner
             .request_tx
@@ -1686,7 +1631,7 @@ impl TypedClientConnection {
                 response_tx,
             })
             .await
-            .map_err(|_| TypedClientError::ConnectionClosed)?;
+            .map_err(|_| ClientError::ConnectionClosed)?;
 
         Ok(PendingResponse {
             inner: self.inner.clone(),
@@ -1697,7 +1642,7 @@ impl TypedClientConnection {
     pub(crate) async fn queue_request_exchange(
         &self,
         request: Request<'static>,
-    ) -> Result<PendingExchange, TypedClientError> {
+    ) -> Result<PendingExchange, ClientError> {
         let (response_tx, response_rx) = oneshot::channel();
         self.inner
             .request_tx
@@ -1706,7 +1651,7 @@ impl TypedClientConnection {
                 response_tx,
             })
             .await
-            .map_err(|_| TypedClientError::ConnectionClosed)?;
+            .map_err(|_| ClientError::ConnectionClosed)?;
 
         Ok(PendingExchange {
             inner: self.inner.clone(),
@@ -1714,11 +1659,11 @@ impl TypedClientConnection {
         })
     }
 
-    /// Execute a typed request and return the completed request/response pair.
+    /// Execute a client request and return the completed request/response pair.
     pub async fn execute_exchange(
         &self,
         request: Request<'static>,
-    ) -> Result<OwnedExchange, TypedClientError> {
+    ) -> Result<OwnedExchange, ClientError> {
         self.queue_request_exchange(request).await?.receive().await
     }
 }
@@ -1738,7 +1683,7 @@ struct ConnectionHandle {
     reader_task: JoinHandle<()>,
 }
 
-/// Owned response bytes for the typed client path.
+/// Owned response bytes for the client path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnedResponse {
     kind: RequestKind,
@@ -1779,7 +1724,7 @@ impl OwnedResponse {
     }
 }
 
-/// Owned request/response pair for the typed connection surface.
+/// Owned request/response pair for the client connection surface.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnedExchange {
     request: Request<'static>,
@@ -1787,7 +1732,7 @@ pub struct OwnedExchange {
 }
 
 impl OwnedExchange {
-    /// Original typed request.
+    /// Original client request.
     #[must_use]
     pub const fn request(&self) -> &Request<'static> {
         &self.request
@@ -1806,7 +1751,7 @@ impl OwnedExchange {
     }
 }
 
-/// Owned typed article-style response that reparses the zero-copy article view on demand.
+/// Owned client article-style response that reparses the zero-copy article view on demand.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnedArticle {
     response: OwnedResponse,
@@ -1842,14 +1787,14 @@ impl OwnedArticle {
         &self.response
     }
 
-    /// Consume the typed article-style wrapper and return the raw response.
+    /// Consume the client article-style wrapper and return the raw response.
     #[must_use]
     pub fn into_response(self) -> OwnedResponse {
         self.response
     }
 }
 
-/// Owned request/article-response pair for the high-level typed client surface.
+/// Owned request/article-response pair for the high-level client surface.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnedArticleExchange {
     request: Request<'static>,
@@ -1857,19 +1802,19 @@ pub struct OwnedArticleExchange {
 }
 
 impl OwnedArticleExchange {
-    /// Original typed request.
+    /// Original client request.
     #[must_use]
     pub const fn request(&self) -> &Request<'static> {
         &self.request
     }
 
-    /// Completed typed article-style response.
+    /// Completed client article-style response.
     #[must_use]
     pub const fn article(&self) -> &OwnedArticle {
         &self.article
     }
 
-    /// Consume the exchange into its original request and typed article-style response.
+    /// Consume the exchange into its original request and client article-style response.
     #[must_use]
     pub fn into_parts(self) -> (Request<'static>, OwnedArticle) {
         (self.request, self.article)
@@ -1877,7 +1822,7 @@ impl OwnedArticleExchange {
 }
 
 impl TryFrom<OwnedExchange> for OwnedArticleExchange {
-    type Error = TypedClientError;
+    type Error = ClientError;
 
     fn try_from(exchange: OwnedExchange) -> Result<Self, Self::Error> {
         let article = OwnedArticle::try_from(exchange.response)?;
@@ -1889,20 +1834,20 @@ impl TryFrom<OwnedExchange> for OwnedArticleExchange {
 }
 
 impl TryFrom<OwnedResponse> for OwnedArticle {
-    type Error = TypedClientError;
+    type Error = ClientError;
 
     fn try_from(response: OwnedResponse) -> Result<Self, Self::Error> {
         if let Err(source) = response.parse_article() {
-            return Err(TypedClientError::UnexpectedArticleResponse { response, source });
+            return Err(ClientError::UnexpectedArticleResponse { response, source });
         }
 
         Ok(Self { response })
     }
 }
 
-/// Errors from the typed client prototype.
+/// Errors from the client prototype.
 #[derive(Debug)]
-pub enum TypedClientError {
+pub enum ClientError {
     Io(io::Error),
     UnexpectedEof,
     InvalidStatusLine,
@@ -1931,7 +1876,7 @@ pub enum TypedClientError {
     },
 }
 
-impl fmt::Display for TypedClientError {
+impl fmt::Display for ClientError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(err) => write!(f, "{err}"),
@@ -1967,15 +1912,15 @@ impl fmt::Display for TypedClientError {
     }
 }
 
-impl std::error::Error for TypedClientError {}
+impl std::error::Error for ClientError {}
 
-impl From<io::Error> for TypedClientError {
+impl From<io::Error> for ClientError {
     fn from(value: io::Error) -> Self {
         Self::Io(value)
     }
 }
 
-impl From<SharedEngineError> for TypedClientError {
+impl From<SharedEngineError> for ClientError {
     fn from(value: SharedEngineError) -> Self {
         match value {
             SharedEngineError::UnexpectedEof => Self::UnexpectedEof,
@@ -1986,7 +1931,7 @@ impl From<SharedEngineError> for TypedClientError {
     }
 }
 
-impl From<crate::protocol::InvalidHeaderQuery> for TypedClientError {
+impl From<crate::protocol::InvalidHeaderQuery> for ClientError {
     fn from(value: crate::protocol::InvalidHeaderQuery) -> Self {
         match value {
             crate::protocol::InvalidHeaderQuery::Header(_) => Self::InvalidHeaderName,
@@ -1995,7 +1940,7 @@ impl From<crate::protocol::InvalidHeaderQuery> for TypedClientError {
     }
 }
 
-impl From<crate::protocol::InvalidDiscoveryArguments> for TypedClientError {
+impl From<crate::protocol::InvalidDiscoveryArguments> for ClientError {
     fn from(value: crate::protocol::InvalidDiscoveryArguments) -> Self {
         match value {
             crate::protocol::InvalidDiscoveryArguments::Wildmat(_) => Self::InvalidWildmat,
@@ -2005,19 +1950,19 @@ impl From<crate::protocol::InvalidDiscoveryArguments> for TypedClientError {
     }
 }
 
-impl From<crate::protocol::InvalidAuthInfoValue> for TypedClientError {
+impl From<crate::protocol::InvalidAuthInfoValue> for ClientError {
     fn from(_: crate::protocol::InvalidAuthInfoValue) -> Self {
         Self::InvalidAuthInfoValue
     }
 }
 
-impl From<crate::protocol::InvalidListGroupRange> for TypedClientError {
+impl From<crate::protocol::InvalidListGroupRange> for ClientError {
     fn from(_: crate::protocol::InvalidListGroupRange) -> Self {
         Self::InvalidListGroupRange
     }
 }
 
-impl From<crate::protocol::InvalidListGroupRangeOrGroupName> for TypedClientError {
+impl From<crate::protocol::InvalidListGroupRangeOrGroupName> for ClientError {
     fn from(value: crate::protocol::InvalidListGroupRangeOrGroupName) -> Self {
         match value {
             crate::protocol::InvalidListGroupRangeOrGroupName::Range(_) => {
@@ -2042,7 +1987,7 @@ impl ResponseDecoder {
         }
     }
 
-    fn push(&mut self, buffer: &[u8]) -> Result<DecodeProgress, TypedClientError> {
+    fn push(&mut self, buffer: &[u8]) -> Result<DecodeProgress, ClientError> {
         match self.inner.decode(buffer) {
             ResponseFrameParse::Complete(response) => Ok(DecodeProgress::Complete {
                 status: response.status(),
@@ -2051,7 +1996,7 @@ impl ResponseDecoder {
                 content_end: response.content_end(),
             }),
             ResponseFrameParse::NeedMore => Ok(DecodeProgress::NeedMore),
-            ResponseFrameParse::Invalid => Err(TypedClientError::InvalidStatusLine),
+            ResponseFrameParse::Invalid => Err(ClientError::InvalidStatusLine),
         }
     }
 }
@@ -2091,7 +2036,7 @@ impl StreamingResponseDecoder {
         }
     }
 
-    fn push(&mut self, chunk: &[u8]) -> Result<StreamingDecodeProgress, TypedClientError> {
+    fn push(&mut self, chunk: &[u8]) -> Result<StreamingDecodeProgress, ClientError> {
         let mut content_start = 0;
         let status = match self.status {
             Some(status) => status,
@@ -2099,7 +2044,7 @@ impl StreamingResponseDecoder {
                 let mut consumed = 0;
                 while consumed < chunk.len() {
                     if self.status_len == self.status_buf.len() {
-                        return Err(TypedClientError::InvalidStatusLine);
+                        return Err(ClientError::InvalidStatusLine);
                     }
                     self.status_buf[self.status_len] = chunk[consumed];
                     self.status_len += 1;
@@ -2120,7 +2065,7 @@ impl StreamingResponseDecoder {
                         }
                         ResponseInitialParse::NeedMore => {}
                         ResponseInitialParse::Invalid => {
-                            return Err(TypedClientError::InvalidStatusLine);
+                            return Err(ClientError::InvalidStatusLine);
                         }
                     }
                 }
@@ -2219,13 +2164,13 @@ enum StreamingDecodeProgress {
 pub fn bench_streaming_decode_response(
     kind: RequestKind,
     response: &[u8],
-) -> Result<(StatusCode, usize), TypedClientError> {
+) -> Result<(StatusCode, usize), ClientError> {
     let mut decoder = StreamingResponseDecoder::new(kind);
     match decoder.push(response)? {
         StreamingDecodeProgress::Complete {
             status, consumed, ..
         } => Ok((status, consumed)),
-        StreamingDecodeProgress::NeedMore { .. } => Err(TypedClientError::UnexpectedEof),
+        StreamingDecodeProgress::NeedMore { .. } => Err(ClientError::UnexpectedEof),
     }
 }
 
@@ -2242,7 +2187,7 @@ pub(crate) struct PendingResponse {
 }
 
 impl PendingResponse {
-    pub(crate) async fn receive(self) -> Result<OwnedResponse, TypedClientError> {
+    pub(crate) async fn receive(self) -> Result<OwnedResponse, ClientError> {
         let response = match self.response_rx.await {
             Ok(response) => response,
             Err(_) => {
@@ -2252,12 +2197,12 @@ impl PendingResponse {
                     .lock()
                     .await
                     .clone()
-                    .map(TypedClientError::from)
-                    .unwrap_or(TypedClientError::ConnectionClosed));
+                    .map(ClientError::from)
+                    .unwrap_or(ClientError::ConnectionClosed));
             }
         };
 
-        match response.map_err(TypedClientError::from)?.response {
+        match response.map_err(ClientError::from)?.response {
             CompletedResponse::Owned(response) => Ok(response),
         }
     }
@@ -2270,7 +2215,7 @@ pub(crate) struct PendingExchange {
 }
 
 impl PendingExchange {
-    pub(crate) async fn receive(self) -> Result<OwnedExchange, TypedClientError> {
+    pub(crate) async fn receive(self) -> Result<OwnedExchange, ClientError> {
         let response = match self.response_rx.await {
             Ok(response) => response,
             Err(_) => {
@@ -2280,12 +2225,12 @@ impl PendingExchange {
                     .lock()
                     .await
                     .clone()
-                    .map(TypedClientError::from)
-                    .unwrap_or(TypedClientError::ConnectionClosed));
+                    .map(ClientError::from)
+                    .unwrap_or(ClientError::ConnectionClosed));
             }
         };
 
-        let completed = response.map_err(TypedClientError::from)?;
+        let completed = response.map_err(ClientError::from)?;
         match completed.response {
             CompletedResponse::Owned(response) => Ok(OwnedExchange {
                 request: completed.request,
@@ -2348,7 +2293,7 @@ impl DrainedResponseReader {
         &mut self,
         reader: &mut R,
         kind: RequestKind,
-    ) -> Result<DrainedResponse, TypedClientError>
+    ) -> Result<DrainedResponse, ClientError>
     where
         R: AsyncRead + Unpin,
     {
@@ -2408,7 +2353,7 @@ impl DrainedResponseReader {
             .await?;
 
             if read == 0 {
-                return Err(TypedClientError::UnexpectedEof);
+                return Err(ClientError::UnexpectedEof);
             }
 
             self.pending_len += read;
@@ -2419,7 +2364,7 @@ impl DrainedResponseReader {
         &mut self,
         reader: &mut R,
         kind: RequestKind,
-    ) -> Result<DrainedResponseFrame<'_>, TypedClientError>
+    ) -> Result<DrainedResponseFrame<'_>, ClientError>
     where
         R: AsyncRead + Unpin,
     {
@@ -2476,7 +2421,7 @@ impl DrainedResponseReader {
             .await?;
 
             if read == 0 {
-                return Err(TypedClientError::UnexpectedEof);
+                return Err(ClientError::UnexpectedEof);
             }
 
             self.pending_len += read;
@@ -2996,7 +2941,7 @@ async fn run_reader_task(
                         let _ = response_tx.send(Ok(CompletedRequest { request, response }));
                         break;
                     }
-                    Err(TypedClientError::InvalidStatusLine) => {
+                    Err(ClientError::InvalidStatusLine) => {
                         let error = SharedEngineError::InvalidStatusLine;
                         let _ = response_tx.send(Err(error.clone()));
                         writer_abort.abort();
@@ -3004,7 +2949,7 @@ async fn run_reader_task(
                         return;
                     }
                     Err(err) => {
-                        let error = shared_engine_error_from_typed(err);
+                        let error = shared_engine_error_from_client(err);
                         let _ = response_tx.send(Err(error.clone()));
                         writer_abort.abort();
                         poison_reader_engine(&poisoned, &mut inflight_rx, error).await;
@@ -3050,7 +2995,7 @@ async fn read_into_pending<R>(
     pending_read: &mut Vec<u8>,
     pending_len: usize,
     read_chunk_bytes: usize,
-) -> Result<usize, TypedClientError>
+) -> Result<usize, ClientError>
 where
     R: AsyncRead + Unpin,
 {
@@ -3067,9 +3012,7 @@ where
                 }
                 std::task::Poll::Ready(Ok(read))
             }
-            std::task::Poll::Ready(Err(err)) => {
-                std::task::Poll::Ready(Err(TypedClientError::Io(err)))
-            }
+            std::task::Poll::Ready(Err(err)) => std::task::Poll::Ready(Err(ClientError::Io(err))),
             std::task::Poll::Pending => std::task::Poll::Pending,
         }
     })
@@ -3160,34 +3103,34 @@ async fn store_poisoned(
     }
 }
 
-fn shared_engine_error_from_typed(err: TypedClientError) -> SharedEngineError {
+fn shared_engine_error_from_client(err: ClientError) -> SharedEngineError {
     match err {
-        TypedClientError::Io(err) => SharedEngineError::Io {
+        ClientError::Io(err) => SharedEngineError::Io {
             kind: err.kind(),
             message: err.to_string(),
         },
-        TypedClientError::UnexpectedEof => SharedEngineError::UnexpectedEof,
-        TypedClientError::InvalidStatusLine => SharedEngineError::InvalidStatusLine,
-        TypedClientError::ConnectionClosed => SharedEngineError::ConnectionClosed,
-        TypedClientError::InvalidMessageId
-        | TypedClientError::MissingMessageId
-        | TypedClientError::InvalidGroupName
-        | TypedClientError::MissingGroupName
-        | TypedClientError::InvalidWildmat
-        | TypedClientError::MissingWildmat
-        | TypedClientError::InvalidDate
-        | TypedClientError::MissingDate
-        | TypedClientError::InvalidTime
-        | TypedClientError::MissingTime
-        | TypedClientError::InvalidAuthInfoValue
-        | TypedClientError::MissingAuthInfoValue
-        | TypedClientError::MissingArticleBody
-        | TypedClientError::InvalidHeaderName
-        | TypedClientError::MissingHeaderName
-        | TypedClientError::InvalidArticleSelector
-        | TypedClientError::MissingArticleSelector
-        | TypedClientError::InvalidListGroupRange
-        | TypedClientError::UnexpectedArticleResponse { .. } => SharedEngineError::ConnectionClosed,
+        ClientError::UnexpectedEof => SharedEngineError::UnexpectedEof,
+        ClientError::InvalidStatusLine => SharedEngineError::InvalidStatusLine,
+        ClientError::ConnectionClosed => SharedEngineError::ConnectionClosed,
+        ClientError::InvalidMessageId
+        | ClientError::MissingMessageId
+        | ClientError::InvalidGroupName
+        | ClientError::MissingGroupName
+        | ClientError::InvalidWildmat
+        | ClientError::MissingWildmat
+        | ClientError::InvalidDate
+        | ClientError::MissingDate
+        | ClientError::InvalidTime
+        | ClientError::MissingTime
+        | ClientError::InvalidAuthInfoValue
+        | ClientError::MissingAuthInfoValue
+        | ClientError::MissingArticleBody
+        | ClientError::InvalidHeaderName
+        | ClientError::MissingHeaderName
+        | ClientError::InvalidArticleSelector
+        | ClientError::MissingArticleSelector
+        | ClientError::InvalidListGroupRange
+        | ClientError::UnexpectedArticleResponse { .. } => SharedEngineError::ConnectionClosed,
     }
 }
 
@@ -3437,7 +3380,7 @@ mod tests {
             assert!(
                 matches!(
                     ResponseDecoder::new(RequestKind::Article).push(input),
-                    Err(TypedClientError::InvalidStatusLine)
+                    Err(ClientError::InvalidStatusLine)
                 ),
                 "{input:?}"
             );
@@ -3456,7 +3399,7 @@ mod tests {
             assert!(
                 matches!(
                     ResponseDecoder::new(RequestKind::Article).push(input),
-                    Err(TypedClientError::InvalidStatusLine)
+                    Err(ClientError::InvalidStatusLine)
                 ),
                 "{input:?}"
             );
@@ -3488,14 +3431,14 @@ mod tests {
         );
         assert!(matches!(
             ResponseDecoder::new(RequestKind::Stat).push(&too_long_complete),
-            Err(TypedClientError::InvalidStatusLine)
+            Err(ClientError::InvalidStatusLine)
         ));
 
         let mut too_long_incomplete = Vec::from(b"223 ".as_slice());
         too_long_incomplete.resize(crate::protocol::MAX_INITIAL_RESPONSE_LINE_BYTES, b'x');
         assert!(matches!(
             ResponseDecoder::new(RequestKind::Stat).push(&too_long_incomplete),
-            Err(TypedClientError::InvalidStatusLine)
+            Err(ClientError::InvalidStatusLine)
         ));
     }
 
@@ -3524,7 +3467,7 @@ mod tests {
         let mut decoder = StreamingResponseDecoder::new(RequestKind::Stat);
         assert!(matches!(
             decoder.push(&too_long),
-            Err(TypedClientError::InvalidStatusLine)
+            Err(ClientError::InvalidStatusLine)
         ));
     }
 
@@ -3697,7 +3640,7 @@ mod tests {
         // https://www.rfc-editor.org/rfc/rfc3977#section-3.1
         assert!(matches!(
             ResponseDecoder::new(RequestKind::Article).push(b"210 foo\nboo \r\n"),
-            Err(TypedClientError::InvalidStatusLine)
+            Err(ClientError::InvalidStatusLine)
         ));
     }
 
@@ -3845,7 +3788,7 @@ mod tests {
 
             prop_assert!(matches!(
                 ResponseDecoder::new(RequestKind::Article).push(&frame),
-                Err(TypedClientError::InvalidStatusLine),
+                Err(ClientError::InvalidStatusLine),
             ));
         }
 
@@ -4225,45 +4168,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn typed_connection_fetches_article_and_parses_zero_copy_view() {
+    async fn client_connection_fetches_article_and_parses_zero_copy_view() {
         let listener = crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            stream.write_all(b"201 typed ready\r\n").await.unwrap();
-            assert_read_request(&mut stream, b"ARTICLE <typed@test>\r\n").await;
+            stream.write_all(b"201 client ready\r\n").await.unwrap();
+            assert_read_request(&mut stream, b"ARTICLE <client@test>\r\n").await;
 
             stream
                 .write_all(
-                    b"220 1 <typed@test> article follows\r\nSubject: Typed\r\n\r\npayload\r\n.\r\n",
+                    b"220 1 <client@test> article follows\r\nSubject: Client\r\n\r\npayload\r\n.\r\n",
                 )
                 .await
                 .unwrap();
         });
 
-        let connection = TypedClientConnection::connect(addr).await.unwrap();
+        let connection = ClientConnection::connect(addr).await.unwrap();
         let response = connection
-            .article(MessageId::from_str_or_wrap("typed@test").unwrap())
+            .article(MessageId::from_str_or_wrap("client@test").unwrap())
             .await
             .unwrap();
         let article = response.parse_article().unwrap();
 
         assert_eq!(response.kind(), RequestKind::Article);
         assert_eq!(response.status().as_u16(), 220);
-        assert_eq!(article.message_id.as_str(), "<typed@test>");
-        assert_eq!(article.headers.unwrap().get("Subject"), Some(&b"Typed"[..]));
+        assert_eq!(article.message_id.as_str(), "<client@test>");
+        assert_eq!(
+            article.headers.unwrap().get("Subject"),
+            Some(&b"Client"[..])
+        );
         assert_eq!(article.body, Some(&b"payload\r\n"[..]));
 
         server.await.unwrap();
     }
 
     #[tokio::test]
-    async fn typed_connection_supports_current_and_numeric_article_selectors() {
+    async fn client_connection_supports_current_and_numeric_article_selectors() {
         let listener = crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            stream.write_all(b"201 typed ready\r\n").await.unwrap();
+            stream.write_all(b"201 client ready\r\n").await.unwrap();
             assert_read_request(&mut stream, b"ARTICLE\r\n").await;
             stream
                 .write_all(
@@ -4278,7 +4224,7 @@ mod tests {
                 .unwrap();
         });
 
-        let connection = TypedClientConnection::connect(addr).await.unwrap();
+        let connection = ClientConnection::connect(addr).await.unwrap();
         let current = connection.article_current().await.unwrap();
         let body = connection.body_selector("42").await.unwrap();
 
@@ -4299,12 +4245,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn typed_connection_fetches_head_and_stat_frames() {
+    async fn client_connection_fetches_head_and_stat_frames() {
         let listener = crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            stream.write_all(b"201 typed ready\r\n").await.unwrap();
+            stream.write_all(b"201 client ready\r\n").await.unwrap();
             assert_read_request(&mut stream, b"HEAD <head@test>\r\n").await;
             stream
                 .write_all(b"221 1 <head@test> article retrieved\r\nSubject: Head\r\n.\r\n")
@@ -4317,7 +4263,7 @@ mod tests {
                 .unwrap();
         });
 
-        let connection = TypedClientConnection::connect(addr).await.unwrap();
+        let connection = ClientConnection::connect(addr).await.unwrap();
         let head = connection
             .head(MessageId::from_str_or_wrap("head@test").unwrap())
             .await
@@ -4349,12 +4295,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn typed_connection_returns_single_line_article_error_frame() {
+    async fn client_connection_returns_single_line_article_error_frame() {
         let listener = crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            stream.write_all(b"201 typed ready\r\n").await.unwrap();
+            stream.write_all(b"201 client ready\r\n").await.unwrap();
             assert_read_request(&mut stream, b"ARTICLE <missing@test>\r\n").await;
 
             stream
@@ -4363,7 +4309,7 @@ mod tests {
                 .unwrap();
         });
 
-        let connection = TypedClientConnection::connect(addr).await.unwrap();
+        let connection = ClientConnection::connect(addr).await.unwrap();
         let response = connection
             .article(MessageId::from_str_or_wrap("missing@test").unwrap())
             .await
@@ -4380,12 +4326,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn typed_connection_execute_exchange_returns_request_and_response() {
+    async fn client_connection_execute_exchange_returns_request_and_response() {
         let listener = crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            stream.write_all(b"201 typed ready\r\n").await.unwrap();
+            stream.write_all(b"201 client ready\r\n").await.unwrap();
             assert_read_request(&mut stream, b"BODY <pair@test>\r\n").await;
 
             stream
@@ -4394,7 +4340,7 @@ mod tests {
                 .unwrap();
         });
 
-        let connection = TypedClientConnection::connect(addr).await.unwrap();
+        let connection = ClientConnection::connect(addr).await.unwrap();
         let exchange = connection
             .body_exchange(MessageId::from_str_or_wrap("pair@test").unwrap())
             .await
@@ -4414,12 +4360,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn typed_connection_exchange_into_parts_returns_literal_pair() {
+    async fn client_connection_exchange_into_parts_returns_literal_pair() {
         let listener = crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            stream.write_all(b"201 typed ready\r\n").await.unwrap();
+            stream.write_all(b"201 client ready\r\n").await.unwrap();
             assert_read_request(&mut stream, b"STAT <parts@test>\r\n").await;
 
             stream
@@ -4428,7 +4374,7 @@ mod tests {
                 .unwrap();
         });
 
-        let connection = TypedClientConnection::connect(addr).await.unwrap();
+        let connection = ClientConnection::connect(addr).await.unwrap();
         let exchange = connection
             .stat_exchange(MessageId::from_str_or_wrap("parts@test").unwrap())
             .await
@@ -4450,12 +4396,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn typed_connection_fetches_list_family_and_general_raw_frames() {
+    async fn client_connection_fetches_list_family_and_general_raw_frames() {
         let listener = crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            stream.write_all(b"201 typed ready\r\n").await.unwrap();
+            stream.write_all(b"201 client ready\r\n").await.unwrap();
             assert_read_request(&mut stream, b"LIST\r\n").await;
             stream.write_all(crate::LIST_RESPONSE).await.unwrap();
             assert_read_request(&mut stream, b"LIST ACTIVE\r\n").await;
@@ -4513,7 +4459,7 @@ mod tests {
             stream.write_all(crate::QUIT_RESPONSE).await.unwrap();
         });
 
-        let connection = TypedClientConnection::connect(addr).await.unwrap();
+        let connection = ClientConnection::connect(addr).await.unwrap();
         let list = connection.list().await.unwrap();
         let list_active = connection.list_active().await.unwrap();
         let list_active_times = connection.list_active_times().await.unwrap();
@@ -4608,12 +4554,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn typed_connection_fetches_group_listgroup_last_and_next_frames() {
+    async fn client_connection_fetches_group_listgroup_last_and_next_frames() {
         let listener = crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            stream.write_all(b"201 typed ready\r\n").await.unwrap();
+            stream.write_all(b"201 client ready\r\n").await.unwrap();
             assert_read_request(&mut stream, b"GROUP alt.test\r\n").await;
             stream.write_all(crate::GROUP_RESPONSE).await.unwrap();
             assert_read_request(&mut stream, b"LISTGROUP\r\n").await;
@@ -4628,7 +4574,7 @@ mod tests {
             stream.write_all(crate::NEXT_RESPONSE).await.unwrap();
         });
 
-        let connection = TypedClientConnection::connect(addr).await.unwrap();
+        let connection = ClientConnection::connect(addr).await.unwrap();
         let group = connection
             .group(GroupName::from_owned("alt.test").unwrap())
             .await
@@ -4671,12 +4617,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn typed_connection_fetches_newgroups_and_newnews_frames() {
+    async fn client_connection_fetches_newgroups_and_newnews_frames() {
         let listener = crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            stream.write_all(b"201 typed ready\r\n").await.unwrap();
+            stream.write_all(b"201 client ready\r\n").await.unwrap();
             assert_read_request(&mut stream, b"NEWGROUPS 20260101 000000 GMT\r\n").await;
             stream.write_all(crate::NEWGROUPS_RESPONSE).await.unwrap();
             assert_read_request(
@@ -4687,7 +4633,7 @@ mod tests {
             stream.write_all(crate::NEWNEWS_RESPONSE).await.unwrap();
         });
 
-        let connection = TypedClientConnection::connect(addr).await.unwrap();
+        let connection = ClientConnection::connect(addr).await.unwrap();
         let newgroups = connection
             .newgroups(
                 NntpDate::from_owned("20260101").unwrap(),
@@ -4717,12 +4663,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn typed_connection_fetches_remaining_rfc_frames() {
+    async fn client_connection_fetches_remaining_rfc_frames() {
         let listener = crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            stream.write_all(b"201 typed ready\r\n").await.unwrap();
+            stream.write_all(b"201 client ready\r\n").await.unwrap();
             assert_read_request(&mut stream, b"POST\r\n").await;
             stream.write_all(crate::POST_RESPONSE).await.unwrap();
             assert_read_request(&mut stream, b"IHAVE <ihave@test>\r\n").await;
@@ -4743,7 +4689,7 @@ mod tests {
             stream.write_all(crate::STARTTLS_RESPONSE).await.unwrap();
         });
 
-        let connection = TypedClientConnection::connect(addr).await.unwrap();
+        let connection = ClientConnection::connect(addr).await.unwrap();
         let post = connection.post().await.unwrap();
         let ihave = connection
             .ihave(MessageId::from_str_or_wrap("ihave@test").unwrap())
@@ -4789,12 +4735,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn typed_connection_fetches_hdr_and_xhdr_frames() {
+    async fn client_connection_fetches_hdr_and_xhdr_frames() {
         let listener = crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            stream.write_all(b"201 typed ready\r\n").await.unwrap();
+            stream.write_all(b"201 client ready\r\n").await.unwrap();
             assert_read_request(&mut stream, b"HDR Subject 1-10\r\n").await;
             stream.write_all(crate::HDR_RESPONSE).await.unwrap();
             assert_read_request(&mut stream, b"HDR Message-ID <headers@test>\r\n").await;
@@ -4805,7 +4751,7 @@ mod tests {
             stream.write_all(crate::XHDR_RESPONSE).await.unwrap();
         });
 
-        let connection = TypedClientConnection::connect(addr).await.unwrap();
+        let connection = ClientConnection::connect(addr).await.unwrap();
         let hdr_range = connection
             .hdr(
                 HeaderName::from_owned("Subject").unwrap(),
@@ -4852,12 +4798,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn typed_connection_fetches_over_and_xover_frames() {
+    async fn client_connection_fetches_over_and_xover_frames() {
         let listener = crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            stream.write_all(b"201 typed ready\r\n").await.unwrap();
+            stream.write_all(b"201 client ready\r\n").await.unwrap();
             assert_read_request(&mut stream, b"OVER 1-10\r\n").await;
             stream.write_all(crate::OVER_RESPONSE).await.unwrap();
             assert_read_request(&mut stream, b"OVER <overview@test>\r\n").await;
@@ -4868,7 +4814,7 @@ mod tests {
             stream.write_all(crate::XOVER_RESPONSE).await.unwrap();
         });
 
-        let connection = TypedClientConnection::connect(addr).await.unwrap();
+        let connection = ClientConnection::connect(addr).await.unwrap();
         let over_range = connection
             .over(ArticleSelector::from_owned("1-10").unwrap())
             .await
@@ -4903,12 +4849,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn client_article_returns_typed_owned_article_surface() {
+    async fn client_article_returns_owned_article_surface() {
         let listener = crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            stream.write_all(b"201 typed ready\r\n").await.unwrap();
+            stream.write_all(b"201 client ready\r\n").await.unwrap();
             assert_read_request(&mut stream, b"ARTICLE <surface@test>\r\n").await;
 
             stream
@@ -4936,12 +4882,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn client_article_exchange_returns_request_and_typed_article() {
+    async fn client_article_exchange_returns_request_and_article() {
         let listener = crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            stream.write_all(b"201 typed ready\r\n").await.unwrap();
+            stream.write_all(b"201 client ready\r\n").await.unwrap();
             assert_read_request(&mut stream, b"ARTICLE <exchange@test>\r\n").await;
 
             stream
@@ -4976,7 +4922,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            stream.write_all(b"201 typed ready\r\n").await.unwrap();
+            stream.write_all(b"201 client ready\r\n").await.unwrap();
             assert_read_request(&mut stream, b"ARTICLE <pair-surface@test>\r\n").await;
 
             stream
@@ -5016,7 +4962,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            stream.write_all(b"201 typed ready\r\n").await.unwrap();
+            stream.write_all(b"201 client ready\r\n").await.unwrap();
             assert_read_request(&mut stream, b"ARTICLE\r\n").await;
             stream
                 .write_all(
@@ -5057,7 +5003,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            stream.write_all(b"201 typed ready\r\n").await.unwrap();
+            stream.write_all(b"201 client ready\r\n").await.unwrap();
             assert_read_request(&mut stream, b"LIST\r\n").await;
             stream.write_all(crate::LIST_RESPONSE).await.unwrap();
             assert_read_request(&mut stream, b"LIST ACTIVE\r\n").await;
@@ -5157,7 +5103,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            stream.write_all(b"201 typed ready\r\n").await.unwrap();
+            stream.write_all(b"201 client ready\r\n").await.unwrap();
             assert_read_request(&mut stream, b"GROUP alt.test\r\n").await;
             stream.write_all(crate::GROUP_RESPONSE).await.unwrap();
             assert_read_request(&mut stream, b"LISTGROUP\r\n").await;
@@ -5206,7 +5152,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            stream.write_all(b"201 typed ready\r\n").await.unwrap();
+            stream.write_all(b"201 client ready\r\n").await.unwrap();
             assert_read_request(&mut stream, b"NEWGROUPS 20260101 000000 GMT\r\n").await;
             stream.write_all(crate::NEWGROUPS_RESPONSE).await.unwrap();
             assert_read_request(
@@ -5249,7 +5195,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            stream.write_all(b"201 typed ready\r\n").await.unwrap();
+            stream.write_all(b"201 client ready\r\n").await.unwrap();
             assert_read_request(&mut stream, b"POST\r\n").await;
             stream.write_all(crate::POST_RESPONSE).await.unwrap();
             assert_read_request(&mut stream, b"IHAVE <ihave-surface@test>\r\n").await;
@@ -5310,7 +5256,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            stream.write_all(b"201 typed ready\r\n").await.unwrap();
+            stream.write_all(b"201 client ready\r\n").await.unwrap();
             assert_read_request(&mut stream, b"HDR Subject 1-10\r\n").await;
             stream.write_all(crate::HDR_RESPONSE).await.unwrap();
             assert_read_request(&mut stream, b"HDR Message-ID <headers@test>\r\n").await;
@@ -5355,7 +5301,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            stream.write_all(b"201 typed ready\r\n").await.unwrap();
+            stream.write_all(b"201 client ready\r\n").await.unwrap();
             assert_read_request(&mut stream, b"OVER 1-10\r\n").await;
             stream.write_all(crate::OVER_RESPONSE).await.unwrap();
             assert_read_request(&mut stream, b"OVER <overview@test>\r\n").await;
@@ -5392,12 +5338,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn client_head_and_stat_return_typed_article_surface() {
+    async fn client_head_and_stat_return_article_surface() {
         let listener = crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            stream.write_all(b"201 typed ready\r\n").await.unwrap();
+            stream.write_all(b"201 client ready\r\n").await.unwrap();
             assert_read_request(&mut stream, b"HEAD <head-surface@test>\r\n").await;
             stream
                 .write_all(
@@ -5434,12 +5380,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn client_execute_exchange_accepts_typed_request_directly() {
+    async fn client_execute_exchange_accepts_request_directly() {
         let listener = crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            stream.write_all(b"201 typed ready\r\n").await.unwrap();
+            stream.write_all(b"201 client ready\r\n").await.unwrap();
             assert_read_request(&mut stream, b"BODY <direct@test>\r\n").await;
 
             stream
@@ -5465,12 +5411,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn client_article_reports_unexpected_single_line_error_as_typed_error() {
+    async fn client_article_reports_unexpected_single_line_error_as_client_error() {
         let listener = crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            stream.write_all(b"201 typed ready\r\n").await.unwrap();
+            stream.write_all(b"201 client ready\r\n").await.unwrap();
             assert_read_request(&mut stream, b"ARTICLE <missing-surface@test>\r\n").await;
 
             stream
@@ -5481,21 +5427,18 @@ mod tests {
 
         let client = Client::connect(addr).await.unwrap();
         let err = client.article("missing-surface@test").await.unwrap_err();
-        assert!(matches!(
-            err,
-            TypedClientError::UnexpectedArticleResponse { .. }
-        ));
+        assert!(matches!(err, ClientError::UnexpectedArticleResponse { .. }));
 
         server.await.unwrap();
     }
 
     #[tokio::test]
-    async fn typed_connection_supports_concurrent_request_futures_on_one_connection() {
+    async fn client_connection_supports_concurrent_request_futures_on_one_connection() {
         let listener = crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            stream.write_all(b"201 typed ready\r\n").await.unwrap();
+            stream.write_all(b"201 client ready\r\n").await.unwrap();
 
             let mut scratch = [0_u8; 128];
             let mut pending = Vec::new();
@@ -5521,7 +5464,7 @@ mod tests {
                 .unwrap();
         });
 
-        let connection = TypedClientConnection::connect(addr).await.unwrap();
+        let connection = ClientConnection::connect(addr).await.unwrap();
         let (first, second) = tokio::join!(
             connection.article(MessageId::from_str_or_wrap("first@test").unwrap()),
             connection.body(MessageId::from_str_or_wrap("second@test").unwrap())
@@ -5536,12 +5479,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cloned_typed_connection_shares_one_engine() {
+    async fn cloned_client_connection_shares_one_engine() {
         let listener = crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            stream.write_all(b"201 typed ready\r\n").await.unwrap();
+            stream.write_all(b"201 client ready\r\n").await.unwrap();
 
             let mut pending = Vec::new();
             let mut scratch = [0_u8; 128];
@@ -5568,7 +5511,7 @@ mod tests {
                 .unwrap();
         });
 
-        let connection = TypedClientConnection::connect(addr).await.unwrap();
+        let connection = ClientConnection::connect(addr).await.unwrap();
         let clone = connection.clone();
         let (first, second) = tokio::join!(
             connection.article(MessageId::from_str_or_wrap("clone-a@test").unwrap()),

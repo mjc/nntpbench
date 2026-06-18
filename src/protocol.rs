@@ -1,4 +1,4 @@
-//! Typed NNTP protocol helpers.
+//! Client NNTP protocol helpers.
 
 use std::borrow::Cow;
 use std::fmt::{self, Write as FmtWrite};
@@ -1870,7 +1870,7 @@ fn validate_auth_info_value(value: &str) -> Result<(), InvalidAuthInfoValue> {
     Ok(())
 }
 
-/// AUTHINFO command families currently supported by the typed surface.
+/// AUTHINFO command families currently supported by the client surface.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AuthInfoKind {
@@ -1888,7 +1888,7 @@ impl AuthInfoKind {
     }
 }
 
-/// LIST subcommands currently supported by the typed surface.
+/// LIST subcommands currently supported by the client surface.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ListKind {
@@ -2112,7 +2112,7 @@ fn parse_two_digits(bytes: &[u8]) -> Option<u8> {
     Some(tens * 10 + ones)
 }
 
-/// Typed request kind for the currently-supported command set.
+/// Client request kind for the currently-supported command set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestKind {
     Article,
@@ -2321,7 +2321,7 @@ fn responses_for_request(kind: RequestKind) -> impl Iterator<Item = ResponseDesc
         .filter(move |descriptor| descriptor.kind == kind)
 }
 
-/// Typed client request for the current typed NNTP surface.
+/// Client client request for the current client NNTP surface.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request<'a> {
     Article {
@@ -4412,7 +4412,7 @@ mod tests {
     #[test]
     fn request_kind_multiline_expectation_matches_supported_responses() {
         // RFC 3977 sections 3.2 and 9.4 make response framing protocol
-        // metadata, not a typed-client concern. This matrix also covers the
+        // metadata, not a client concern. This matrix also covers the
         // command-dependent 211 exception called out in RFC 3977 section 3.2.
         assert!(RequestKind::Article.expects_multiline_response(StatusCode(220)));
         assert!(RequestKind::Head.expects_multiline_response(StatusCode(221)));
