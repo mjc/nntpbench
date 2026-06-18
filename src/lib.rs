@@ -8298,6 +8298,18 @@ mod tests {
                         frame: b"111 server date follows\r\n",
                     },
                     ResponseFrameCase {
+                        name: "generic 401 rejects missing capability label",
+                        reference: "RFC 3977 sections 3.2.1 and 9.4.2 https://www.rfc-editor.org/rfc/rfc3977#section-9.4.2",
+                        kind: RequestKind::Article,
+                        frame: b"401\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "generic 401 rejects invalid capability label",
+                        reference: "RFC 3977 sections 3.2.1 and 9.4.2 https://www.rfc-editor.org/rfc/rfc3977#section-9.4.2",
+                        kind: RequestKind::Capabilities,
+                        frame: b"401 READER_required\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "GROUP rejects multiline payload",
                         reference: "RFC 3977 section 6.1.1 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.1",
                         kind: RequestKind::Group,

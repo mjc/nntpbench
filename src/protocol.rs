@@ -2361,6 +2361,7 @@ fn validate_response_initial_line(kind: RequestKind, status: StatusCode, line: &
 
     match (kind, status.as_u16()) {
         (RequestKind::Date, 111) => validate_date_response_argument(&line[4..line.len() - 2]),
+        (_, 401) => validate_capability_label_response_argument(&line[4..line.len() - 2]),
         (RequestKind::Group | RequestKind::ListGroup, 211) => {
             validate_group_response_arguments(&line[4..line.len() - 2])
         }
@@ -2460,6 +2461,13 @@ fn validate_message_id_response_argument(value: &[u8]) -> bool {
     std::str::from_utf8(tokens[0])
         .ok()
         .is_some_and(|message_id| MessageId::from_borrowed(message_id).is_ok())
+}
+
+fn validate_capability_label_response_argument(value: &[u8]) -> bool {
+    let Some((tokens, _trailing_text)) = split_required_response_tokens::<1>(value) else {
+        return false;
+    };
+    validate_ascii_token(tokens[0], validate_keyword)
 }
 
 fn validate_sasl_response_argument(value: &[u8], allow_zero_length: bool) -> bool {
@@ -5127,6 +5135,60 @@ mod tests {
                 RequestKind::ListGroup,
                 b"211 3 1 3 alt.test extra\nbad\r\n.\r\n".as_slice(),
             ),
+        ] {
+            assert!(
+                matches!(
+                    ResponseFrame::parse(kind, input),
+                    ResponseFrameParse::Invalid
+                ),
+                "{kind:?} {input:?}"
+            );
+            assert!(
+                matches!(
+                    ResponseInitial::parse(kind, input),
+                    ResponseInitialParse::Invalid
+                ),
+                "{kind:?} {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn generic_401_response_frame_validates_rfc_capability_label_argument() {
+        // RFC 3977 sections 3.2.1 and 9.4.2 define the generic 401 response
+        // as exactly status and one capability-label argument before any
+        // optional trailing comment.
+        for (kind, input) in [
+            (
+                RequestKind::Article,
+                b"401 READER mode required\r\n".as_slice(),
+            ),
+            (
+                RequestKind::Capabilities,
+                b"401 MODE-READER required\r\n".as_slice(),
+            ),
+        ] {
+            assert!(
+                matches!(
+                    ResponseFrame::parse(kind, input),
+                    ResponseFrameParse::Complete(response)
+                        if response.status() == StatusCode(401)
+                ),
+                "{kind:?} {input:?}"
+            );
+            assert!(
+                matches!(
+                    ResponseInitial::parse(kind, input),
+                    ResponseInitialParse::Complete(initial) if initial.status() == StatusCode(401)
+                ),
+                "{kind:?} {input:?}"
+            );
+        }
+
+        for (kind, input) in [
+            (RequestKind::Article, b"401\r\n".as_slice()),
+            (RequestKind::Article, b"401 1READER required\r\n".as_slice()),
+            (RequestKind::Date, b"401 READER_required\r\n".as_slice()),
         ] {
             assert!(
                 matches!(
