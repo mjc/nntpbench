@@ -2306,11 +2306,13 @@ static RESPONSE_DESCRIPTORS: &[ResponseDescriptor] = &[
     // RFC 4644 streaming extension commands.
     response_descriptor(RequestKind::Check, 238, ResponseFraming::SingleLine),
     response_descriptor(RequestKind::TakeThis, 239, ResponseFraming::SingleLine),
-    // RFC 4643 AUTHINFO USER/PASS extension.
+    // RFC 4643 AUTHINFO USER/PASS and SASL extension.
     response_descriptor(RequestKind::AuthInfoUser, 381, ResponseFraming::SingleLine),
     response_descriptor(RequestKind::AuthInfoUser, 281, ResponseFraming::SingleLine),
     response_descriptor(RequestKind::AuthInfoPass, 281, ResponseFraming::SingleLine),
     response_descriptor(RequestKind::AuthInfo, 281, ResponseFraming::SingleLine),
+    response_descriptor(RequestKind::AuthInfo, 283, ResponseFraming::SingleLine),
+    response_descriptor(RequestKind::AuthInfo, 383, ResponseFraming::SingleLine),
     // RFC 3977 section 5 connection/session commands and RFC 4642 STARTTLS.
     response_descriptor(RequestKind::Capabilities, 101, ResponseFraming::Multiline),
     response_descriptor(RequestKind::ModeReader, 200, ResponseFraming::SingleLine),
@@ -4565,12 +4567,45 @@ mod tests {
         assert!(!RequestKind::AuthInfoUser.expects_multiline_response(StatusCode(381)));
         assert!(!RequestKind::AuthInfoPass.expects_multiline_response(StatusCode(281)));
         assert!(!RequestKind::AuthInfo.expects_multiline_response(StatusCode(281)));
+        assert!(!RequestKind::AuthInfo.expects_multiline_response(StatusCode(283)));
+        assert!(!RequestKind::AuthInfo.expects_multiline_response(StatusCode(383)));
         assert!(!RequestKind::StartTls.expects_multiline_response(StatusCode(382)));
         assert!(RequestKind::Capabilities.expects_multiline_response(StatusCode(101)));
         assert!(!RequestKind::Date.expects_multiline_response(StatusCode(111)));
         assert!(!RequestKind::ModeReader.expects_multiline_response(StatusCode(201)));
         assert!(!RequestKind::Quit.expects_multiline_response(StatusCode(205)));
         assert!(!RequestKind::Article.expects_multiline_response(StatusCode(430)));
+    }
+
+    #[test]
+    fn authinfo_sasl_response_frames_follow_rfc4643_codes() {
+        // RFC 4643 section 4 defines AUTHINFO SASL 281, 283, and 383 as
+        // single-line responses; 283 and 383 carry one challenge argument.
+        for (wire, status) in [
+            (
+                b"281 authentication accepted\r\n".as_slice(),
+                StatusCode(281),
+            ),
+            (
+                b"283 c2VydmVyLWZpbmFsLWRhdGE=\r\n".as_slice(),
+                StatusCode(283),
+            ),
+            (
+                b"383 c2VydmVyLWNoYWxsZW5nZQ==\r\n".as_slice(),
+                StatusCode(383),
+            ),
+            (b"383 \r\n".as_slice(), StatusCode(383)),
+        ] {
+            let ResponseFrameParse::Complete(frame) =
+                ResponseFrame::parse(RequestKind::AuthInfo, wire)
+            else {
+                panic!("AUTHINFO SASL response frame did not parse: {wire:?}");
+            };
+            assert_eq!(frame.kind(), RequestKind::AuthInfo);
+            assert_eq!(frame.status(), status);
+            assert_eq!(frame.bytes(), wire);
+            assert!(frame.content().is_empty());
+        }
     }
 
     #[test]
