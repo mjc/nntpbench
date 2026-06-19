@@ -6331,6 +6331,30 @@ mod tests {
                     expected: LISTGROUP_EMPTY_RESPONSE,
                 },
                 ServerResponseCase {
+                    name: "LISTGROUP rejects zero range start",
+                    reference: "RFC 3977 sections 6.1 and 6.1.2 cap article numbers to 1..2147483647 https://www.rfc-editor.org/rfc/rfc3977#section-6.1",
+                    input: b"LISTGROUP alt.test 0\r\n",
+                    expected: b"501 command syntax error\r\n",
+                },
+                ServerResponseCase {
+                    name: "LISTGROUP rejects zero range end",
+                    reference: "RFC 3977 sections 6.1 and 6.1.2 cap article numbers to 1..2147483647 https://www.rfc-editor.org/rfc/rfc3977#section-6.1",
+                    input: b"LISTGROUP alt.test 1-0\r\n",
+                    expected: b"501 command syntax error\r\n",
+                },
+                ServerResponseCase {
+                    name: "LISTGROUP rejects range above RFC max article number",
+                    reference: "RFC 3977 sections 6.1 and 6.1.2 cap article numbers at 2147483647 https://www.rfc-editor.org/rfc/rfc3977#section-6.1",
+                    input: b"LISTGROUP alt.test 2147483648\r\n",
+                    expected: b"501 command syntax error\r\n",
+                },
+                ServerResponseCase {
+                    name: "LISTGROUP rejects too many arguments",
+                    reference: "RFC 3977 section 6.1.2 permits at most group and range arguments https://www.rfc-editor.org/rfc/rfc3977#section-6.1.2",
+                    input: b"LISTGROUP alt.test 1-2 extra\r\n",
+                    expected: b"501 command syntax error\r\n",
+                },
+                ServerResponseCase {
                     name: "LISTGROUP single numeric-looking argument is a group name",
                     reference: "RFC 3977 section 6.1.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.2",
                     input: b"GROUP alt.test\r\nLISTGROUP 3-2\r\n",
