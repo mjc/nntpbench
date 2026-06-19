@@ -8621,12 +8621,6 @@ mod tests {
                         frame: b"225 headers follow\r\n1 \r\n2 value\r\n.\r\n",
                     },
                     ResponseFrameCase {
-                        name: "HDR accepts omitted separator for empty hdr-content",
-                        reference: "RFC 3977 section 8.5.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.2",
-                        kind: RequestKind::Hdr,
-                        frame: b"225 headers follow\r\n1\r\n2 value\r\n.\r\n",
-                    },
-                    ResponseFrameCase {
                         name: "HDR accepts byte-oriented S-NONTAB hdr-content",
                         reference: "RFC 3977 sections 8.5.1, 9.4.3, and 10.2 https://www.rfc-editor.org/rfc/rfc3977#section-10.2",
                         kind: RequestKind::Hdr,
@@ -9682,6 +9676,12 @@ mod tests {
                         reference: "RFC 3977 sections 8.5.1, 9.4.3, and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.4.3",
                         kind: RequestKind::Hdr,
                         frame: b"225 headers follow\r\n1 value\0bad\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "HDR rejects missing space before empty hdr-content",
+                        reference: "RFC 3977 section 9.4.3 defines HDR rows as article-number SP hdr-content https://www.rfc-editor.org/rfc/rfc3977#section-9.4.3",
+                        kind: RequestKind::Hdr,
+                        frame: b"225 headers follow\r\n1\r\n2 value\r\n.\r\n",
                     },
                     ResponseFrameCase {
                         name: "HDR rejects overlong article number",
