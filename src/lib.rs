@@ -5263,6 +5263,24 @@ mod tests {
                     expected: b"420 no current article selected\r\n",
                 },
                 ServerResponseCase {
+                    name: "HEAD current in empty group",
+                    reference: "RFC 3977 section 6.2.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.2.2",
+                    input: b"GROUP empty.test\r\nHEAD\r\n",
+                    expected: b"420 no current article selected\r\n",
+                },
+                ServerResponseCase {
+                    name: "BODY current in empty group",
+                    reference: "RFC 3977 section 6.2.3 https://www.rfc-editor.org/rfc/rfc3977#section-6.2.3",
+                    input: b"GROUP empty.test\r\nBODY\r\n",
+                    expected: b"420 no current article selected\r\n",
+                },
+                ServerResponseCase {
+                    name: "STAT current in empty group",
+                    reference: "RFC 3977 section 6.2.4 https://www.rfc-editor.org/rfc/rfc3977#section-6.2.4",
+                    input: b"GROUP empty.test\r\nSTAT\r\n",
+                    expected: b"420 no current article selected\r\n",
+                },
+                ServerResponseCase {
                     name: "LAST in empty group",
                     reference: "RFC 3977 section 6.1.3 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.3",
                     input: b"GROUP empty.test\r\nLAST\r\n",
@@ -5284,6 +5302,12 @@ mod tests {
                     name: "HDR current in empty group",
                     reference: "RFC 3977 section 8.5.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.2",
                     input: b"GROUP empty.test\r\nHDR Subject\r\n",
+                    expected: b"420 no current article selected\r\n",
+                },
+                ServerResponseCase {
+                    name: "XHDR current in empty group",
+                    reference: "RFC 2980 section 2.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.6",
+                    input: b"GROUP empty.test\r\nXHDR Subject\r\n",
                     expected: b"420 no current article selected\r\n",
                 },
                 ServerResponseCase {
@@ -6435,6 +6459,12 @@ mod tests {
                     expected: b"412 no newsgroup selected\r\n",
                 },
                 ServerResponseCase {
+                    name: "OVER current article before GROUP",
+                    reference: "RFC 3977 sections 8.3.1 and 8.3.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.3.1",
+                    input: b"OVER\r\n",
+                    expected: b"412 no newsgroup selected\r\n",
+                },
+                ServerResponseCase {
                     name: "OVER range selector before GROUP",
                     reference: "RFC 3977 section 8.3.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.3.2",
                     input: b"OVER 1-3\r\n",
@@ -6453,6 +6483,12 @@ mod tests {
                     expected: b"412 no newsgroup selected\r\n",
                 },
                 ServerResponseCase {
+                    name: "HDR current article before GROUP",
+                    reference: "RFC 3977 sections 8.5.1 and 8.5.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.1",
+                    input: b"HDR Subject\r\n",
+                    expected: b"412 no newsgroup selected\r\n",
+                },
+                ServerResponseCase {
                     name: "HDR range selector before GROUP",
                     reference: "RFC 3977 section 8.5.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.2",
                     input: b"HDR Subject 1-3\r\n",
@@ -6462,6 +6498,12 @@ mod tests {
                     name: "XHDR range selector before GROUP",
                     reference: "RFC 2980 section 2.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.6",
                     input: b"XHDR Subject 1-3\r\n",
+                    expected: b"412 no newsgroup selected\r\n",
+                },
+                ServerResponseCase {
+                    name: "XHDR current article before GROUP",
+                    reference: "RFC 2980 section 2.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.6",
+                    input: b"XHDR Subject\r\n",
                     expected: b"412 no newsgroup selected\r\n",
                 },
             ])
