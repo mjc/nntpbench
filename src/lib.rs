@@ -292,7 +292,7 @@ const DEFAULT_SOCKET_BUFFER: usize = 1024 * 1024;
 #[cfg(not(target_os = "macos"))]
 const DEFAULT_SOCKET_BUFFER: usize = HIGH_THROUGHPUT_SOCKET_BUFFER;
 const TCP_LINGER_TIMEOUT: Duration = Duration::from_secs(5);
-const FAR_FUTURE_DATE_KEY: u32 = 99_991_231;
+const FAR_FUTURE_DATETIME_KEY: u64 = 99_991_231_235_959;
 #[cfg(target_os = "linux")]
 const TCP_USER_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -1742,8 +1742,8 @@ where
         }
         RequestKind::NewGroups => {
             let response = if command_args(command, command_lines)
-                .and_then(newgroups_date_key)
-                .is_some_and(|date| date >= FAR_FUTURE_DATE_KEY)
+                .and_then(newgroups_datetime_key)
+                .is_some_and(|datetime| datetime >= FAR_FUTURE_DATETIME_KEY)
             {
                 NEWGROUPS_EMPTY_RESPONSE
             } else {
@@ -3284,7 +3284,7 @@ fn wildmat_pattern_matches(pattern: &str, group: &str) -> bool {
 }
 
 fn newnews_response(args: &[u8]) -> &'static [u8] {
-    if newnews_date_key(args).is_some_and(|date| date >= FAR_FUTURE_DATE_KEY) {
+    if newnews_datetime_key(args).is_some_and(|datetime| datetime >= FAR_FUTURE_DATETIME_KEY) {
         return NEWNEWS_EMPTY_RESPONSE;
     }
     let wildmat = first_command_arg(args).unwrap_or_default();
@@ -3295,14 +3295,25 @@ fn newnews_response(args: &[u8]) -> &'static [u8] {
     }
 }
 
-fn newgroups_date_key(args: &[u8]) -> Option<u32> {
+fn newgroups_datetime_key(args: &[u8]) -> Option<u64> {
     let date = first_command_arg(args)?;
-    normalized_nntp_date_key(date, current_utc_year())
+    let time = nth_command_arg(args, 1)?;
+    normalized_nntp_datetime_key(date, time, current_utc_year())
 }
 
-fn newnews_date_key(args: &[u8]) -> Option<u32> {
+fn newnews_datetime_key(args: &[u8]) -> Option<u64> {
     let date = nth_command_arg(args, 1)?;
-    normalized_nntp_date_key(date, current_utc_year())
+    let time = nth_command_arg(args, 2)?;
+    normalized_nntp_datetime_key(date, time, current_utc_year())
+}
+
+fn normalized_nntp_datetime_key(date: &[u8], time: &[u8], current_year: u16) -> Option<u64> {
+    let date = u64::from(normalized_nntp_date_key(date, current_year)?);
+    if time.len() != 6 || !time.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let time = u64::from(parse_ascii_decimal_u32(time)?);
+    Some(date * 1_000_000 + time)
 }
 
 fn normalized_nntp_date_key(date: &[u8], current_year: u16) -> Option<u32> {
@@ -3338,6 +3349,12 @@ fn normalized_nntp_date_key(date: &[u8], current_year: u16) -> Option<u32> {
 fn parse_ascii_decimal(value: &[u8]) -> Option<u16> {
     value.iter().try_fold(0_u16, |acc, byte| {
         Some(acc * 10 + u16::from(byte.checked_sub(b'0')?))
+    })
+}
+
+fn parse_ascii_decimal_u32(value: &[u8]) -> Option<u32> {
+    value.iter().try_fold(0_u32, |acc, byte| {
+        Some(acc * 10 + u32::from(byte.checked_sub(b'0')?))
     })
 }
 
@@ -5794,6 +5811,9 @@ mod tests {
                 run_session_with_input(test_config(), b"NEWNEWS alt.* 700101 000000 GMT\r\n").await;
             let (previous_century_output, _) =
                 run_session_with_input(test_config(), b"NEWNEWS alt.* 991231 235959 GMT\r\n").await;
+            let (same_day_before_cutoff_output, _) =
+                run_session_with_input(test_config(), b"NEWNEWS alt.* 99991231 235958 GMT\r\n")
+                    .await;
             let (future_output, _) =
                 run_session_with_input(test_config(), b"NEWNEWS alt.* 99991231 235959 GMT\r\n")
                     .await;
@@ -5806,6 +5826,11 @@ mod tests {
                 without_greeting(&old_output),
                 without_greeting(&future_output),
                 "RFC 3977 NEWNEWS should depend on requested date/time, not return a fixture"
+            );
+            assert_ne!(
+                without_greeting(&same_day_before_cutoff_output),
+                without_greeting(&future_output),
+                "RFC 3977 NEWNEWS should use HHMMSS, not just the yyyymmdd date"
             );
         }
 
@@ -6074,12 +6099,19 @@ mod tests {
             // https://www.rfc-editor.org/rfc/rfc3977#section-7.3
             let (old_output, _) =
                 run_session_with_input(test_config(), b"NEWGROUPS 700101 000000 GMT\r\n").await;
+            let (same_day_before_cutoff_output, _) =
+                run_session_with_input(test_config(), b"NEWGROUPS 99991231 235958 GMT\r\n").await;
             let (future_output, _) =
                 run_session_with_input(test_config(), b"NEWGROUPS 99991231 235959 GMT\r\n").await;
             assert_ne!(
                 without_greeting(&old_output),
                 without_greeting(&future_output),
                 "RFC 3977 NEWGROUPS should depend on requested date/time, not return a fixture"
+            );
+            assert_ne!(
+                without_greeting(&same_day_before_cutoff_output),
+                without_greeting(&future_output),
+                "RFC 3977 NEWGROUPS should use HHMMSS, not just the yyyymmdd date"
             );
         }
 
@@ -6104,6 +6136,12 @@ mod tests {
                     expected: NEWGROUPS_RESPONSE,
                 },
                 ServerResponseCase {
+                    name: "NEWGROUPS same future date before cutoff still has results",
+                    reference: "RFC 3977 section 7.3.2 https://www.rfc-editor.org/rfc/rfc3977#section-7.3.2",
+                    input: b"NEWGROUPS 99991231 235958 GMT\r\n",
+                    expected: NEWGROUPS_RESPONSE,
+                },
+                ServerResponseCase {
                     name: "NEWGROUPS empty list after explicit future timestamp",
                     reference: "RFC 3977 section 7.3.2 https://www.rfc-editor.org/rfc/rfc3977#section-7.3.2",
                     input: b"NEWGROUPS 99991231 235959 GMT\r\n",
@@ -6123,6 +6161,14 @@ mod tests {
             assert_eq!(normalized_nntp_date_key(b"260101", 2026), Some(20260101));
             assert_eq!(normalized_nntp_date_key(b"270101", 2026), Some(19270101));
             assert_eq!(normalized_nntp_date_key(b"20260101", 2026), Some(20260101));
+            assert_eq!(
+                normalized_nntp_datetime_key(b"991231", b"235959", 2026),
+                Some(19991231235959)
+            );
+            assert_eq!(
+                normalized_nntp_datetime_key(b"99991231", b"235959", 2026),
+                Some(99991231235959)
+            );
         }
 
         #[tokio::test]
