@@ -8917,6 +8917,18 @@ mod tests {
                         frame: b"205\r\n",
                     },
                     ResponseFrameCase {
+                        name: "MODE READER accepts posting-permitted response",
+                        reference: "RFC 3977 section 5.3.2 defines 200 for posting permitted after MODE READER https://www.rfc-editor.org/rfc/rfc3977#section-5.3.2",
+                        kind: RequestKind::ModeReader,
+                        frame: b"200 posting permitted\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "MODE READER accepts posting-prohibited response",
+                        reference: "RFC 3977 section 5.3.2 defines 201 for posting prohibited after MODE READER https://www.rfc-editor.org/rfc/rfc3977#section-5.3.2",
+                        kind: RequestKind::ModeReader,
+                        frame: b"201 posting prohibited\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "DATE accepts timestamp plus trailing comment",
                         reference: "RFC 3977 sections 7.1 and 9.4.1 https://www.rfc-editor.org/rfc/rfc3977#section-9.4.1",
                         kind: RequestKind::Date,
@@ -9510,6 +9522,18 @@ mod tests {
                         reference: "RFC 3977 section 5.4.2 says QUIT MUST NOT generate response codes other than 205 or argument-syntax 501 https://www.rfc-editor.org/rfc/rfc3977#section-5.4.2",
                         kind: RequestKind::Quit,
                         frame: b"502 service unavailable\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "MODE READER rejects CAPABILITIES success response",
+                        reference: "RFC 3977 section 5.3.2 limits MODE READER success responses to 200 or 201 https://www.rfc-editor.org/rfc/rfc3977#section-5.3.2",
+                        kind: RequestKind::ModeReader,
+                        frame: b"101 capability list follows\r\nVERSION 2\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "MODE READER rejects QUIT success response",
+                        reference: "RFC 3977 section 5.3.2 limits MODE READER success responses to 200 or 201 https://www.rfc-editor.org/rfc/rfc3977#section-5.3.2",
+                        kind: RequestKind::ModeReader,
+                        frame: b"205 closing connection\r\n",
                     },
                     ResponseFrameCase {
                         name: "HEAD rejects unknown mandatory command response",
