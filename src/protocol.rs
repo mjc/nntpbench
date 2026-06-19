@@ -2677,9 +2677,8 @@ fn validate_multiline_response_content(
                 .ok()
                 .is_some_and(|message_id| MessageId::from_borrowed(message_id).is_ok())
         }),
-        RequestKind::Over | RequestKind::Xover => {
-            validate_crlf_lines(content, validate_overview_response_line)
-        }
+        RequestKind::Over => validate_crlf_lines(content, validate_overview_response_line),
+        RequestKind::Xover => validate_crlf_lines(content, validate_xover_response_line),
         RequestKind::Hdr => validate_crlf_lines(content, validate_header_response_line),
         RequestKind::Xhdr => validate_crlf_lines(content, validate_xhdr_response_line),
         RequestKind::Capabilities => validate_capabilities_response_content(content),
@@ -3016,6 +3015,14 @@ fn validate_p_char_token(value: &[u8]) -> bool {
 }
 
 fn validate_overview_response_line(line: &[u8]) -> bool {
+    validate_overview_response_line_with_min_fields(line, 1)
+}
+
+fn validate_xover_response_line(line: &[u8]) -> bool {
+    validate_overview_response_line_with_min_fields(line, 7)
+}
+
+fn validate_overview_response_line_with_min_fields(line: &[u8], minimum_fields: usize) -> bool {
     let Some(tab) = memchr::memchr(b'\t', line) else {
         return false;
     };
@@ -3037,7 +3044,7 @@ fn validate_overview_response_line(line: &[u8]) -> bool {
         }
     }
 
-    field_count >= 1
+    field_count >= minimum_fields
 }
 
 fn validate_overview_optional_field(field: &[u8]) -> bool {
@@ -6268,7 +6275,8 @@ mod tests {
             ),
             (
                 RequestKind::Xover,
-                b"224 overview follows\r\n1\tSubject\r\n.\r\n".as_slice(),
+                b"224 overview follows\r\n1\tSubject\tfrom@test\tdate\t<one@test>\trefs\t123\t4\r\n.\r\n"
+                    .as_slice(),
             ),
             (
                 RequestKind::Xover,

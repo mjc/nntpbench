@@ -8524,12 +8524,6 @@ mod tests {
                         frame: b"224 overview follows\r\n1\tSubject only\r\n2\tSubject\tfrom@test\tdate\t<two@test>\r\n.\r\n",
                     },
                     ResponseFrameCase {
-                        name: "XOVER accepts omitted trailing overview fields",
-                        reference: "RFC 2980 section 2.8 and RFC 3977 section 8.3.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.3.2",
-                        kind: RequestKind::Xover,
-                        frame: b"224 overview follows\r\n1\tSubject only\r\n.\r\n",
-                    },
-                    ResponseFrameCase {
                         name: "OVER accepts empty bytes and lines metadata fields",
                         reference: "RFC 3977 sections 8.3.2 and 9.4.3 https://www.rfc-editor.org/rfc/rfc3977#section-8.3.2",
                         kind: RequestKind::Over,
@@ -9417,6 +9411,18 @@ mod tests {
                         reference: "RFC 2980 section 2.8 https://www.rfc-editor.org/rfc/rfc2980#section-2.8",
                         kind: RequestKind::Xover,
                         frame: b"224 overview follows\r\none\tSubject\tfrom@test\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "XOVER rejects missing legacy overview fields",
+                        reference: "RFC 2980 section 2.8 requires subject, author, date, message-id, references, byte count, and line count https://www.rfc-editor.org/rfc/rfc2980#section-2.8",
+                        kind: RequestKind::Xover,
+                        frame: b"224 overview follows\r\n1\tSubject\tfrom@test\tdate\t<one@test>\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "XOVER rejects omitted trailing byte and line fields",
+                        reference: "RFC 2980 section 2.8 requires null fields instead of omitted required fields https://www.rfc-editor.org/rfc/rfc2980#section-2.8",
+                        kind: RequestKind::Xover,
+                        frame: b"224 overview follows\r\n1\tSubject\tfrom@test\tdate\t<one@test>\trefs\r\n.\r\n",
                     },
                     ResponseFrameCase {
                         name: "XOVER rejects labeled lines metadata field",
