@@ -9167,6 +9167,12 @@ mod tests {
                         frame: b"215 information follows\r\nalt.test 1715907600 \r\n.\r\n",
                     },
                     ResponseFrameCase {
+                        name: "LIST ACTIVE.TIMES rejects UTF-8 BOM in creator text",
+                        reference: "RFC 3977 sections 3.1, 7.6.4, and 9.6 https://www.rfc-editor.org/rfc/rfc3977#section-3.1",
+                        kind: RequestKind::ListActiveTimes,
+                        frame: b"215 information follows\r\nalt.test 1715907600 admin\xef\xbb\xbftest\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "LIST NEWSGROUPS rejects invalid group name line",
                         reference: "RFC 3977 section 7.6.6 https://www.rfc-editor.org/rfc/rfc3977#section-7.6.6",
                         kind: RequestKind::ListNewsgroups,
@@ -9257,10 +9263,22 @@ mod tests {
                         frame: b"215 distribution patterns\r\n1:*:local world\r\n.\r\n",
                     },
                     ResponseFrameCase {
+                        name: "LIST DISTRIB.PATS rejects UTF-8 BOM in distribution token",
+                        reference: "RFC 3977 sections 3.1, 7.6.5, and 9.6 https://www.rfc-editor.org/rfc/rfc3977#section-3.1",
+                        kind: RequestKind::ListDistribPats,
+                        frame: b"215 distribution patterns\r\n1:*:local\xef\xbb\xbfworld\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "CAPABILITIES rejects invalid capability argument token",
                         reference: "RFC 3977 sections 5.2 and 9.5 https://www.rfc-editor.org/rfc/rfc3977#section-5.2",
                         kind: RequestKind::Capabilities,
                         frame: b"101 Capability list:\r\nVERSION 2\r\nBAD \0TOKEN\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "CAPABILITIES rejects UTF-8 BOM in capability argument token",
+                        reference: "RFC 3977 sections 3.1, 5.2, and 9.5 https://www.rfc-editor.org/rfc/rfc3977#section-3.1",
+                        kind: RequestKind::Capabilities,
+                        frame: b"101 Capability list:\r\nVERSION 2\r\nIMPLEMENTATION caf\xef\xbb\xbfbuild\r\n.\r\n",
                     },
                     ResponseFrameCase {
                         name: "CAPABILITIES rejects reserved line with invalid token",

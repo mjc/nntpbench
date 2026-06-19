@@ -2833,7 +2833,8 @@ fn skip_one_or_more_spaces(value: &[u8]) -> Option<&[u8]> {
 fn validate_u_text(value: &[u8]) -> bool {
     std::str::from_utf8(value).is_ok_and(|text| {
         let mut chars = text.chars();
-        chars.next().is_some_and(is_p_char) && chars.all(|ch| !matches!(ch, '\0' | '\r' | '\n'))
+        chars.next().is_some_and(is_p_char)
+            && chars.all(|ch| !matches!(ch, '\0' | '\r' | '\n' | '\u{feff}'))
     })
 }
 
@@ -2845,7 +2846,7 @@ fn validate_u_chars(value: &[u8]) -> bool {
 }
 
 fn is_p_char(ch: char) -> bool {
-    !ch.is_ascii() || ('\x21'..='\x7e').contains(&ch)
+    ch != '\u{feff}' && (!ch.is_ascii() || ('\x21'..='\x7e').contains(&ch))
 }
 
 fn validate_newsgroups_response_line(line: &[u8]) -> bool {
