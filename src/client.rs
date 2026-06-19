@@ -483,6 +483,16 @@ impl Client {
         self.execute_raw(request).await
     }
 
+    /// Send an AUTHINFO USER request with byte-oriented RFC 4643 B-CHAR data.
+    pub async fn authinfo_user_bytes(
+        &self,
+        value: impl AsRef<[u8]>,
+    ) -> Result<OwnedResponse, ClientError> {
+        let request =
+            Request::authinfo_user_bytes(value).map_err(|_| ClientError::InvalidAuthInfoValue)?;
+        self.execute_raw(request).await
+    }
+
     /// Send an AUTHINFO USER request and return the completed raw request/response pair.
     pub async fn authinfo_user_exchange(
         &self,
@@ -490,6 +500,16 @@ impl Client {
     ) -> Result<OwnedExchange, ClientError> {
         let request =
             Request::authinfo_user(value).map_err(|_| ClientError::InvalidAuthInfoValue)?;
+        self.execute_raw_exchange(request).await
+    }
+
+    /// Send an AUTHINFO USER request with byte-oriented RFC 4643 B-CHAR data.
+    pub async fn authinfo_user_bytes_exchange(
+        &self,
+        value: impl AsRef<[u8]>,
+    ) -> Result<OwnedExchange, ClientError> {
+        let request =
+            Request::authinfo_user_bytes(value).map_err(|_| ClientError::InvalidAuthInfoValue)?;
         self.execute_raw_exchange(request).await
     }
 
@@ -503,6 +523,16 @@ impl Client {
         self.execute_raw(request).await
     }
 
+    /// Send an AUTHINFO PASS request with byte-oriented RFC 4643 B-CHAR data.
+    pub async fn authinfo_pass_bytes(
+        &self,
+        value: impl AsRef<[u8]>,
+    ) -> Result<OwnedResponse, ClientError> {
+        let request =
+            Request::authinfo_pass_bytes(value).map_err(|_| ClientError::InvalidAuthInfoValue)?;
+        self.execute_raw(request).await
+    }
+
     /// Send an AUTHINFO PASS request and return the completed raw request/response pair.
     pub async fn authinfo_pass_exchange(
         &self,
@@ -510,6 +540,16 @@ impl Client {
     ) -> Result<OwnedExchange, ClientError> {
         let request =
             Request::authinfo_pass(value).map_err(|_| ClientError::InvalidAuthInfoValue)?;
+        self.execute_raw_exchange(request).await
+    }
+
+    /// Send an AUTHINFO PASS request with byte-oriented RFC 4643 B-CHAR data.
+    pub async fn authinfo_pass_bytes_exchange(
+        &self,
+        value: impl AsRef<[u8]>,
+    ) -> Result<OwnedExchange, ClientError> {
+        let request =
+            Request::authinfo_pass_bytes(value).map_err(|_| ClientError::InvalidAuthInfoValue)?;
         self.execute_raw_exchange(request).await
     }
 
@@ -2325,7 +2365,7 @@ where
             article,
         } => write_takethis_request_wire(writer, message_id, article).await,
         Request::AuthInfo { kind, value } => {
-            write_authinfo_request_wire(writer, *kind, value.as_str()).await
+            write_authinfo_request_wire(writer, *kind, value.as_bytes()).await
         }
         Request::StartTls => write_simple_request_wire(writer, b"STARTTLS").await,
         Request::List => write_simple_request_wire(writer, b"LIST").await,
@@ -2559,7 +2599,7 @@ where
 async fn write_authinfo_request_wire<W>(
     writer: &mut W,
     kind: AuthInfoKind,
-    value: &str,
+    value: &[u8],
 ) -> io::Result<()>
 where
     W: AsyncWrite + Unpin,
@@ -2570,7 +2610,7 @@ where
             IoSlice::new(b"AUTHINFO "),
             IoSlice::new(kind.as_wire()),
             IoSlice::new(b" "),
-            IoSlice::new(value.as_bytes()),
+            IoSlice::new(value),
             IoSlice::new(crate::CRLF),
         ],
     )

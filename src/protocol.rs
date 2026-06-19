@@ -1837,12 +1837,19 @@ fn is_wildmat_exact_or_utf8_non_ascii(byte: u8) -> bool {
 
 /// Validated AUTHINFO argument value.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct AuthInfoValue<'a>(Cow<'a, str>);
+pub struct AuthInfoValue<'a>(Cow<'a, [u8]>);
 
 impl<'a> AuthInfoValue<'a> {
     /// Construct a borrowed AUTHINFO value after validation.
     pub fn from_borrowed(value: &'a str) -> Result<Self, InvalidAuthInfoValue> {
-        validate_auth_info_value(value)?;
+        Self::from_borrowed_bytes(value.as_bytes())
+    }
+
+    /// Construct a borrowed byte-oriented AUTHINFO value after validation.
+    pub fn from_borrowed_bytes(value: &'a [u8]) -> Result<Self, InvalidAuthInfoValue> {
+        if !validate_auth_info_value_bytes(value) {
+            return Err(InvalidAuthInfoValue);
+        }
         Ok(Self(Cow::Borrowed(value)))
     }
 
@@ -1851,27 +1858,47 @@ impl<'a> AuthInfoValue<'a> {
         value: impl AsRef<str>,
     ) -> Result<AuthInfoValue<'static>, InvalidAuthInfoValue> {
         let value = value.as_ref();
-        validate_auth_info_value(value)?;
-        Ok(AuthInfoValue(Cow::Owned(value.to_owned())))
+        Self::from_owned_bytes(value.as_bytes())
+    }
+
+    /// Construct an owned byte-oriented AUTHINFO value after validation.
+    pub fn from_owned_bytes(
+        value: impl AsRef<[u8]>,
+    ) -> Result<AuthInfoValue<'static>, InvalidAuthInfoValue> {
+        let value = value.as_ref();
+        if !validate_auth_info_value_bytes(value) {
+            return Err(InvalidAuthInfoValue);
+        }
+        Ok(AuthInfoValue(Cow::Owned(value.to_vec())))
     }
 
     /// Borrow the validated string.
+    ///
+    /// # Panics
+    ///
+    /// Panics if this AUTHINFO value was constructed from non-UTF-8 bytes.
+    /// Use [`Self::try_as_str`] or [`Self::as_bytes`] for byte-oriented values.
     #[must_use]
     pub fn as_str(&self) -> &str {
+        self.try_as_str()
+            .expect("AUTHINFO value is not valid UTF-8")
+    }
+
+    /// Borrow the validated string if it is valid UTF-8.
+    #[must_use]
+    pub fn try_as_str(&self) -> Option<&str> {
+        std::str::from_utf8(&self.0).ok()
+    }
+
+    /// Borrow the validated byte string.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InvalidAuthInfoValue;
-
-fn validate_auth_info_value(value: &str) -> Result<(), InvalidAuthInfoValue> {
-    if !validate_auth_info_value_bytes(value.as_bytes()) {
-        return Err(InvalidAuthInfoValue);
-    }
-
-    Ok(())
-}
 
 fn validate_auth_info_value_bytes(value: &[u8]) -> bool {
     !value.is_empty()
@@ -3484,7 +3511,7 @@ impl<'a> Request<'a> {
                 article,
             } => write_transfer_request_wire(output, b"TAKETHIS ", message_id, article),
             Self::AuthInfo { kind, value } => {
-                write_authinfo_request_wire(output, *kind, value.as_str())
+                write_authinfo_request_wire(output, *kind, value.as_bytes())
             }
             Self::StartTls => write_simple_request_wire(output, b"STARTTLS"),
             Self::List => write_simple_request_wire(output, b"LIST"),
@@ -4153,11 +4180,27 @@ impl Request<'static> {
         })
     }
 
+    /// Build an AUTHINFO USER request from byte-oriented RFC 4643 B-CHAR data.
+    pub fn authinfo_user_bytes(value: impl AsRef<[u8]>) -> Result<Self, InvalidAuthInfoValue> {
+        Ok(Self::AuthInfo {
+            kind: AuthInfoKind::User,
+            value: AuthInfoValue::from_owned_bytes(value)?,
+        })
+    }
+
     /// Build an AUTHINFO PASS request.
     pub fn authinfo_pass(value: impl AsRef<str>) -> Result<Self, InvalidAuthInfoValue> {
         Ok(Self::AuthInfo {
             kind: AuthInfoKind::Pass,
             value: AuthInfoValue::from_owned(value)?,
+        })
+    }
+
+    /// Build an AUTHINFO PASS request from byte-oriented RFC 4643 B-CHAR data.
+    pub fn authinfo_pass_bytes(value: impl AsRef<[u8]>) -> Result<Self, InvalidAuthInfoValue> {
+        Ok(Self::AuthInfo {
+            kind: AuthInfoKind::Pass,
+            value: AuthInfoValue::from_owned_bytes(value)?,
         })
     }
 
@@ -5055,14 +5098,14 @@ where
     write_crlf(output);
 }
 
-fn write_authinfo_request_wire<W>(output: &mut W, kind: AuthInfoKind, value: &str)
+fn write_authinfo_request_wire<W>(output: &mut W, kind: AuthInfoKind, value: &[u8])
 where
     W: Write,
 {
     write_bytes(output, b"AUTHINFO ");
     write_bytes(output, kind.as_wire());
     write_bytes(output, b" ");
-    write_bytes(output, value.as_bytes());
+    write_bytes(output, value);
     write_crlf(output);
 }
 
@@ -5302,10 +5345,26 @@ mod tests {
                 .as_str(),
             "user\x01name"
         );
+        assert_eq!(
+            AuthInfoValue::from_borrowed_bytes(b"user\xffname")
+                .unwrap()
+                .as_bytes(),
+            b"user\xffname"
+        );
+        assert_eq!(
+            AuthInfoValue::from_owned_bytes(b"pass\xffword")
+                .unwrap()
+                .as_bytes(),
+            b"pass\xffword"
+        );
         assert!(AuthInfoValue::from_borrowed("").is_err());
+        assert!(AuthInfoValue::from_borrowed_bytes(b"").is_err());
         assert!(AuthInfoValue::from_borrowed("bad\0value").is_err());
         assert!(AuthInfoValue::from_borrowed("bad\rvalue").is_err());
         assert!(AuthInfoValue::from_borrowed("bad\nvalue").is_err());
+        assert!(AuthInfoValue::from_borrowed_bytes(b"bad\0value").is_err());
+        assert!(AuthInfoValue::from_borrowed_bytes(b"bad\rvalue").is_err());
+        assert!(AuthInfoValue::from_borrowed_bytes(b"bad\nvalue").is_err());
     }
 
     #[test]
@@ -6659,6 +6718,14 @@ mod tests {
             kind: AuthInfoKind::Pass,
             value: AuthInfoValue::from_borrowed("pass-word").unwrap(),
         };
+        let authinfo_user_bytes = Request::AuthInfo {
+            kind: AuthInfoKind::User,
+            value: AuthInfoValue::from_borrowed_bytes(b"user\xffname").unwrap(),
+        };
+        let authinfo_pass_bytes = Request::AuthInfo {
+            kind: AuthInfoKind::Pass,
+            value: AuthInfoValue::from_borrowed_bytes(b"pass\xffword").unwrap(),
+        };
         let starttls = Request::StartTls;
         let list = Request::List;
         let list_active = Request::ListVariant {
@@ -6813,6 +6880,16 @@ mod tests {
         assert_eq!(wire, b"AUTHINFO PASS pass-word\r\n");
 
         wire.clear();
+        authinfo_user_bytes.write_wire_to(&mut wire);
+        assert_eq!(authinfo_user_bytes.kind(), RequestKind::AuthInfoUser);
+        assert_eq!(wire, b"AUTHINFO USER user\xffname\r\n");
+
+        wire.clear();
+        authinfo_pass_bytes.write_wire_to(&mut wire);
+        assert_eq!(authinfo_pass_bytes.kind(), RequestKind::AuthInfoPass);
+        assert_eq!(wire, b"AUTHINFO PASS pass\xffword\r\n");
+
+        wire.clear();
         starttls.write_wire_to(&mut wire);
         assert_eq!(starttls.kind(), RequestKind::StartTls);
         assert_eq!(wire, b"STARTTLS\r\n");
@@ -6911,6 +6988,8 @@ mod tests {
         let takethis = Request::takethis("take@test", b"Subject: one\r\n\r\nbody").unwrap();
         let authinfo_user = Request::authinfo_user("user-name").unwrap();
         let authinfo_pass = Request::authinfo_pass("pass-word").unwrap();
+        let authinfo_user_bytes = Request::authinfo_user_bytes(b"user\xffname").unwrap();
+        let authinfo_pass_bytes = Request::authinfo_pass_bytes(b"pass\xffword").unwrap();
         let starttls = Request::starttls();
         let list = Request::list();
         let list_active = Request::list_active();
@@ -7042,6 +7121,18 @@ mod tests {
                 .auth_info()
                 .map(|(kind, value)| (kind, value.as_str())),
             Some((AuthInfoKind::Pass, "pass-word"))
+        );
+        assert_eq!(
+            authinfo_user_bytes
+                .auth_info()
+                .map(|(kind, value)| (kind, value.as_bytes())),
+            Some((AuthInfoKind::User, &b"user\xffname"[..]))
+        );
+        assert_eq!(
+            authinfo_pass_bytes
+                .auth_info()
+                .map(|(kind, value)| (kind, value.as_bytes())),
+            Some((AuthInfoKind::Pass, &b"pass\xffword"[..]))
         );
         assert_eq!(starttls.kind(), RequestKind::StartTls);
         assert!(starttls.message_id().is_none());

@@ -7380,6 +7380,26 @@ mod tests {
                         "RFC 3977 sections 4.1 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-4.1",
                         Wildmat::from_borrowed("comp.lang.rust.é").is_ok(),
                     ),
+                    (
+                        "AUTHINFO USER value accepts non-UTF-8 B-CHAR bytes",
+                        "RFC 4643 sections 2.3.1 and 3.1 https://www.rfc-editor.org/rfc/rfc4643#section-3.1",
+                        AuthInfoValue::from_borrowed_bytes(b"bench\xffuser").is_ok(),
+                    ),
+                    (
+                        "AUTHINFO PASS request accepts non-UTF-8 B-CHAR bytes",
+                        "RFC 4643 sections 2.3.1 and 3.1 https://www.rfc-editor.org/rfc/rfc4643#section-3.1",
+                        Request::authinfo_pass_bytes(b"pass\xffword").is_ok(),
+                    ),
+                    (
+                        "AUTHINFO USER byte value rejects NUL",
+                        "RFC 4643 section 3.5 https://www.rfc-editor.org/rfc/rfc4643#section-3.5",
+                        AuthInfoValue::from_borrowed_bytes(b"bench\0user").is_err(),
+                    ),
+                    (
+                        "AUTHINFO PASS byte value rejects CR",
+                        "RFC 4643 section 3.5 https://www.rfc-editor.org/rfc/rfc4643#section-3.5",
+                        AuthInfoValue::from_borrowed_bytes(b"pass\rword").is_err(),
+                    ),
                 ]);
             }
         }
