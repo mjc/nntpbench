@@ -7836,6 +7836,18 @@ mod tests {
                     expected: OVER_3_RESPONSE,
                 },
                 ServerResponseCase {
+                    name: "OVER current article follows NEXT navigation",
+                    reference: "RFC 3977 sections 6.1.4 and 8.3.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.3.2",
+                    input: b"GROUP alt.test\r\nNEXT\r\nOVER\r\n",
+                    expected: OVER_2_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "XOVER current article follows LAST navigation",
+                    reference: "RFC 2980 section 2.8 and RFC 3977 section 6.1.3 https://www.rfc-editor.org/rfc/rfc2980#section-2.8",
+                    input: b"GROUP alt.test\r\nARTICLE 3\r\nLAST\r\nXOVER\r\n",
+                    expected: OVER_2_RESPONSE,
+                },
+                ServerResponseCase {
                     name: "HDR current article follows ARTICLE 2",
                     reference: "RFC 3977 section 8.5.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.2",
                     input: b"GROUP alt.test\r\nARTICLE 2\r\nHDR Subject\r\n",
@@ -7878,6 +7890,12 @@ mod tests {
                     expected: HDR_BYTES_3_RESPONSE,
                 },
                 ServerResponseCase {
+                    name: "HDR current article follows NEXT navigation",
+                    reference: "RFC 3977 sections 6.1.4 and 8.5.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.2",
+                    input: b"GROUP alt.test\r\nNEXT\r\nHDR Subject\r\n",
+                    expected: HDR_SUBJECT_2_RESPONSE,
+                },
+                ServerResponseCase {
                     name: "XHDR current article follows ARTICLE 2",
                     reference: "RFC 2980 section 2.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.6",
                     input: b"GROUP alt.test\r\nARTICLE 2\r\nXHDR Subject\r\n",
@@ -7888,6 +7906,12 @@ mod tests {
                     reference: "RFC 2980 section 2.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.6",
                     input: b"GROUP alt.test\r\nARTICLE 3\r\nXHDR Subject\r\n",
                     expected: XHDR_SUBJECT_3_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "XHDR current article follows LAST navigation",
+                    reference: "RFC 2980 section 2.6 and RFC 3977 section 6.1.3 https://www.rfc-editor.org/rfc/rfc2980#section-2.6",
+                    input: b"GROUP alt.test\r\nARTICLE 3\r\nLAST\r\nXHDR Subject\r\n",
+                    expected: XHDR_SUBJECT_2_RESPONSE,
                 },
                 ServerResponseCase {
                     name: "XHDR From uses selected header field",
