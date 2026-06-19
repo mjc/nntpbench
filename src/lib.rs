@@ -9296,10 +9296,28 @@ mod tests {
                         frame: b"215 overview format follows\r\nSubject:\r\nFrom:\r\nDate:\r\nMessage-ID:\r\nReferences:\r\n:bytes\r\n:lines\r\nXref:full\r\n:x-article-number\r\n.\r\n",
                     },
                     ResponseFrameCase {
+                        name: "LIST OVERVIEW.FMT accepts uppercase full optional header marker",
+                        reference: "RFC 3977 section 8.4 says the full suffix may use uppercase, lowercase, or mixed case https://www.rfc-editor.org/rfc/rfc3977#section-8.4",
+                        kind: RequestKind::ListOverviewFmt,
+                        frame: b"215 overview format follows\r\nSubject:\r\nFrom:\r\nDate:\r\nMessage-ID:\r\nReferences:\r\nBytes:\r\nLines:\r\nDistribution:FULL\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "LIST HEADERS accepts all-headers marker with metadata names",
                         reference: "RFC 3977 section 8.6.2 permits LIST HEADERS to advertise all headers with ':' and metadata names https://www.rfc-editor.org/rfc/rfc3977#section-8.6.2",
                         kind: RequestKind::ListHeaders,
                         frame: b"215 headers supported\r\n:\r\n:bytes\r\n:lines\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "LIST HEADERS accepts empty field list",
+                        reference: "RFC 3977 section 8.6.2 says the LIST HEADERS list may be empty https://www.rfc-editor.org/rfc/rfc3977#section-8.6.2",
+                        kind: RequestKind::ListHeaders,
+                        frame: b"215 headers supported\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "LIST HEADERS accepts metadata-only field list",
+                        reference: "RFC 3977 section 8.6.2 says metadata item names include the leading colon https://www.rfc-editor.org/rfc/rfc3977#section-8.6.2",
+                        kind: RequestKind::ListHeaders,
+                        frame: b"215 headers supported\r\n:bytes\r\n:lines\r\n.\r\n",
                     },
                     ResponseFrameCase {
                         name: "LIST DISTRIB.PATS accepts priority wildmat distribution triples",
@@ -10353,6 +10371,24 @@ mod tests {
                         frame: b"215 overview format follows\r\nSubject:\r\nFrom:\r\nDate:\r\nMessage-ID:\r\nReferences:\r\n:bytes\r\n:lines\r\nXref:\r\n.\r\n",
                     },
                     ResponseFrameCase {
+                        name: "LIST OVERVIEW.FMT rejects leading space before fixed field",
+                        reference: "RFC 3977 section 8.4 says the first seven LIST OVERVIEW.FMT lines are exact except for case and have no leading spaces https://www.rfc-editor.org/rfc/rfc3977#section-8.4",
+                        kind: RequestKind::ListOverviewFmt,
+                        frame: b"215 overview format follows\r\n Subject:\r\nFrom:\r\nDate:\r\nMessage-ID:\r\nReferences:\r\n:bytes\r\n:lines\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "LIST OVERVIEW.FMT rejects trailing space after fixed field",
+                        reference: "RFC 3977 section 8.4 says LIST OVERVIEW.FMT output has no leading or trailing spaces https://www.rfc-editor.org/rfc/rfc3977#section-8.4",
+                        kind: RequestKind::ListOverviewFmt,
+                        frame: b"215 overview format follows\r\nSubject: \r\nFrom:\r\nDate:\r\nMessage-ID:\r\nReferences:\r\n:bytes\r\n:lines\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "LIST OVERVIEW.FMT rejects trailing space after optional full marker",
+                        reference: "RFC 3977 section 8.4 says LIST OVERVIEW.FMT output has no leading or trailing spaces https://www.rfc-editor.org/rfc/rfc3977#section-8.4",
+                        kind: RequestKind::ListOverviewFmt,
+                        frame: b"215 overview format follows\r\nSubject:\r\nFrom:\r\nDate:\r\nMessage-ID:\r\nReferences:\r\n:bytes\r\n:lines\r\nXref:full \r\n.\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "LIST OVERVIEW.FMT rejects unstuffed dot-prefixed extension metadata",
                         reference: "RFC 3977 sections 3.1.1, 8.4, and 9.6 require dot-prefixed multiline data lines to be dot-stuffed https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1",
                         kind: RequestKind::ListOverviewFmt,
@@ -10375,6 +10411,24 @@ mod tests {
                         reference: "RFC 3977 sections 3.1.1 and 8.6.2 require dot-prefixed multiline data lines to be dot-stuffed https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1",
                         kind: RequestKind::ListHeaders,
                         frame: b"215 headers supported\r\n.Subject\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "LIST HEADERS rejects leading space before field name",
+                        reference: "RFC 3977 section 8.6.2 says LIST HEADERS lines contain field names without leading spaces https://www.rfc-editor.org/rfc/rfc3977#section-8.6.2",
+                        kind: RequestKind::ListHeaders,
+                        frame: b"215 headers supported\r\n Subject\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "LIST HEADERS rejects trailing space after field name",
+                        reference: "RFC 3977 section 8.6.2 lists field names without trailing spaces https://www.rfc-editor.org/rfc/rfc3977#section-8.6.2",
+                        kind: RequestKind::ListHeaders,
+                        frame: b"215 headers supported\r\nSubject \r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "LIST HEADERS rejects trailing space after metadata item",
+                        reference: "RFC 3977 section 8.6.2 says metadata item names include the leading colon but not trailing spaces https://www.rfc-editor.org/rfc/rfc3977#section-8.6.2",
+                        kind: RequestKind::ListHeaders,
+                        frame: b"215 headers supported\r\n:bytes \r\n.\r\n",
                     },
                     ResponseFrameCase {
                         name: "LIST DISTRIB.PATS rejects non-numeric priority",
