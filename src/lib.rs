@@ -8495,6 +8495,12 @@ mod tests {
                         expected: b"205 closing connection\r\n",
                     },
                     ServerResponseCase {
+                        name: "QUIT closes before pipelined command",
+                        reference: "RFC 3977 section 5.4.2 requires QUIT to acknowledge and close the connection https://www.rfc-editor.org/rfc/rfc3977#section-5.4.2",
+                        input: b"QUIT\r\nDATE\r\n",
+                        expected: b"205 closing connection\r\n",
+                    },
+                    ServerResponseCase {
                         name: "unknown command rejects too-short keyword syntax",
                         reference: "RFC 3977 sections 3.2.1 and 9.2 define unknown-command 500 only for syntactically valid commands https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
                         input: b"XY\r\n",
