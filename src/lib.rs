@@ -6852,12 +6852,6 @@ mod tests {
                     "RFC 3977 sections 9.2 and 6.2.2 https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
                 ),
                 (
-                    "DATE accepts EOL trailing whitespace",
-                    b"DATE \t\r\n",
-                    RequestKind::Date,
-                    "RFC 3977 sections 9.2 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
-                ),
-                (
                     "LIST accepts TAB before subcommand",
                     b"LIST\tACTIVE\r\n",
                     RequestKind::ListActive,
@@ -6899,6 +6893,16 @@ mod tests {
         #[test]
         fn rfc3977_red_request_line_rejects_invalid_command_shapes_matrix() {
             assert_red_request_line_unknown_cases(&[
+                (
+                    "DATE rejects dangling WS before EOL",
+                    b"DATE \t\r\n",
+                    "RFC 3977 section 9.2 command = keyword *(WS token) https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
+                ),
+                (
+                    "GROUP rejects dangling WS after argument",
+                    b"GROUP alt.test \r\n",
+                    "RFC 3977 section 9.2 command = keyword *(WS token) https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
+                ),
                 (
                     "LAST argument",
                     b"LAST 1\r\n",
@@ -6957,15 +6961,15 @@ mod tests {
             // RFC 3977 section 3.1 limits command lines to 512 octets,
             // including the terminating CRLF, and command arguments to 497 octets:
             // https://www.rfc-editor.org/rfc/rfc3977#section-3.1
-            let mut exact = b"QUIT".to_vec();
-            exact.resize(
-                protocol::MAX_INITIAL_RESPONSE_LINE_BYTES - crate::CRLF.len(),
-                b' ',
-            );
+            let mut exact = b"CAPABILITIES ".to_vec();
+            exact.extend(std::iter::repeat_n(
+                b'A',
+                protocol::MAX_COMMAND_ARGUMENT_BYTES,
+            ));
             exact.extend_from_slice(crate::CRLF);
             assert_eq!(
                 RequestLine::parse(&exact).kind(),
-                RequestKind::Quit,
+                RequestKind::Capabilities,
                 "RFC 3977 permits command lines at the 512-octet boundary"
             );
 
@@ -7965,12 +7969,6 @@ mod tests {
                         "RFC 3977 section 9.2 https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
                     ),
                     (
-                        "DATE trailing EOL spaces",
-                        b"DATE  \r\n",
-                        RequestKind::Date,
-                        "RFC 3977 section 9.2 https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
-                    ),
-                    (
                         "GROUP multiple token separators",
                         b"GROUP  alt.test\r\n",
                         RequestKind::Group,
@@ -7992,12 +7990,6 @@ mod tests {
                         "HEAD double space before selector",
                         b"HEAD  1\r\n",
                         RequestKind::Head,
-                        "RFC 3977 section 9.2 https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
-                    ),
-                    (
-                        "GROUP trailing EOL space after argument",
-                        b"GROUP alt.test \r\n",
-                        RequestKind::Group,
                         "RFC 3977 section 9.2 https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
                     ),
                     (
@@ -8042,6 +8034,16 @@ mod tests {
             #[test]
             fn rfc3977_red_request_line_grammar_matrix() {
                 assert_red_request_line_unknown_cases(&[
+                    (
+                        "DATE dangling WS before EOL",
+                        b"DATE  \r\n",
+                        "RFC 3977 section 9.2 command = keyword *(WS token) https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
+                    ),
+                    (
+                        "GROUP dangling WS after argument",
+                        b"GROUP alt.test \r\n",
+                        "RFC 3977 section 9.2 command = keyword *(WS token) https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
+                    ),
                     (
                         "ARTICLE extra argument",
                         b"ARTICLE <a@b> extra\r\n",
@@ -8137,6 +8139,18 @@ mod tests {
             #[tokio::test]
             async fn rfc3977_red_server_syntax_response_matrix() {
                 assert_red_server_response_cases(&[
+                    ServerResponseCase {
+                        name: "DATE dangling WS before EOL",
+                        reference: "RFC 3977 section 9.2 command = keyword *(WS token) https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
+                        input: b"DATE \t\r\n",
+                        expected: b"501 command syntax error\r\n",
+                    },
+                    ServerResponseCase {
+                        name: "GROUP dangling WS after argument",
+                        reference: "RFC 3977 section 9.2 command = keyword *(WS token) https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
+                        input: b"GROUP alt.test \r\n",
+                        expected: b"501 command syntax error\r\n",
+                    },
                     ServerResponseCase {
                         name: "LIST unknown keyword with trailing token",
                         reference: "RFC 3977 section 7.6 https://www.rfc-editor.org/rfc/rfc3977#section-7.6",

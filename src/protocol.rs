@@ -4352,7 +4352,6 @@ impl<'a> RequestLine<'a> {
                 args: &[],
             };
         };
-        let line = trim_command_eol_ws(line);
         if command_spacing_is_invalid(line) {
             return Self {
                 kind: RequestKind::Unknown,
@@ -4568,6 +4567,7 @@ fn classify_request_kind(verb: &[u8], args: &[u8]) -> RequestKind {
 fn command_spacing_is_invalid(line: &[u8]) -> bool {
     line.is_empty()
         || line.first().is_some_and(|byte| is_command_ws(*byte))
+        || line.last().is_some_and(|byte| is_command_ws(*byte))
         || line
             .iter()
             .any(|byte| byte.is_ascii_whitespace() && !is_command_ws(*byte))
@@ -4575,14 +4575,6 @@ fn command_spacing_is_invalid(line: &[u8]) -> bool {
 
 fn is_command_ws(byte: u8) -> bool {
     matches!(byte, b' ' | b'\t')
-}
-
-fn trim_command_eol_ws(line: &[u8]) -> &[u8] {
-    let end = line
-        .iter()
-        .rposition(|byte| !is_command_ws(*byte))
-        .map_or(0, |index| index + 1);
-    &line[..end]
 }
 
 fn skip_command_ws(line: &[u8]) -> &[u8] {
@@ -5445,7 +5437,10 @@ mod tests {
             RequestLine::parse(b"MODE  READER\r\n").kind(),
             RequestKind::ModeReader
         );
-        assert_eq!(RequestLine::parse(b"DATE \t\r\n").kind(), RequestKind::Date);
+        assert_eq!(
+            RequestLine::parse(b"DATE \t\r\n").kind(),
+            RequestKind::Unknown
+        );
         assert_eq!(RequestLine::parse(b"QUIT\r\n").kind(), RequestKind::Quit);
         assert_eq!(RequestLine::parse(b"HEAD 1\r\n").kind(), RequestKind::Head);
         assert_eq!(
@@ -5498,7 +5493,6 @@ mod tests {
                 RequestKind::ListDistribPats,
             ),
             (b"DATE".as_slice(), RequestKind::Date),
-            (b"DATE \t".as_slice(), RequestKind::Date),
             (b"HELP".as_slice(), RequestKind::Help),
             (b"CAPABILITIES".as_slice(), RequestKind::Capabilities),
             (b"MODE READER".as_slice(), RequestKind::ModeReader),
