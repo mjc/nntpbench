@@ -8855,6 +8855,18 @@ mod tests {
                         frame: b"215 information follows\r\nalt.test  1715907600   admin test creator\r\n.\r\n",
                     },
                     ResponseFrameCase {
+                        name: "LIST ACTIVE.TIMES accepts UTF-8 U-TEXT creator",
+                        reference: "RFC 3977 sections 7.6.4 and 9.6 define newsgroup-creator as U-TEXT https://www.rfc-editor.org/rfc/rfc3977#section-9.6",
+                        kind: RequestKind::ListActiveTimes,
+                        frame: b"215 information follows\r\nalt.test 1715907600 caf\xc3\xa9-admin\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "LIST ACTIVE.TIMES accepts U-CHAR controls after leading P-CHAR",
+                        reference: "RFC 3977 sections 7.6.4 and 9.6 define U-TEXT as P-CHAR followed by U-CHARs https://www.rfc-editor.org/rfc/rfc3977#section-9.6",
+                        kind: RequestKind::ListActiveTimes,
+                        frame: b"215 information follows\r\nalt.test 1715907600 admin\x01creator\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "LIST NEWSGROUPS accepts byte-oriented S-TEXT description",
                         reference: "RFC 3977 sections 7.6.6 and 9.6 https://www.rfc-editor.org/rfc/rfc3977#section-9.6",
                         kind: RequestKind::ListNewsgroups,
