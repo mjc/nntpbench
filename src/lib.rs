@@ -8120,6 +8120,16 @@ mod tests {
                         ArticleRef::from_selector("0001").is_ok(),
                     ),
                     (
+                        "article reference selector accepts RFC maximum with 16-digit leading-zero form",
+                        "RFC 3977 section 6.1 permits leading zeroes but caps article numbers at 2,147,483,647 https://www.rfc-editor.org/rfc/rfc3977#section-6.1",
+                        ArticleRef::from_selector("0000002147483647").is_ok(),
+                    ),
+                    (
+                        "article reference selector rejects 17-digit token",
+                        "RFC 3977 section 9.8 limits article-number to 16 digits https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
+                        ArticleRef::from_selector("00000002147483647").is_err(),
+                    ),
+                    (
                         "article selector accepts leading-zero number",
                         "RFC 3977 sections 3.2.1 and 3.6 https://www.rfc-editor.org/rfc/rfc3977#section-3.6",
                         ArticleSelector::from_borrowed("0002").is_ok(),
@@ -8185,6 +8195,11 @@ mod tests {
                         ArticleSelector::from_borrowed("1-2147483648").is_err(),
                     ),
                     (
+                        "article selector rejects 17-digit range endpoint",
+                        "RFC 3977 section 9.8 limits article-number to 16 digits https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
+                        ArticleSelector::from_borrowed("1-00000002147483647").is_err(),
+                    ),
+                    (
                         "LISTGROUP range accepts open-ended range",
                         "RFC 3977 section 6.1.2 defines range = article-number '-' [article-number] https://www.rfc-editor.org/rfc/rfc3977#section-6.1.2",
                         ListGroupRange::from_borrowed("1-").is_ok(),
@@ -8205,6 +8220,11 @@ mod tests {
                         ListGroupRange::from_borrowed("1-0002").is_ok(),
                     ),
                     (
+                        "LISTGROUP range accepts RFC maximum with 16-digit leading-zero form",
+                        "RFC 3977 sections 6.1 and 6.1.2 permit leading zeroes but cap article numbers at 2,147,483,647 https://www.rfc-editor.org/rfc/rfc3977#section-6.1",
+                        ListGroupRange::from_borrowed("0000002147483647").is_ok(),
+                    ),
+                    (
                         "LISTGROUP range rejects zero start",
                         "RFC 3977 sections 3.6 and 6.1.2 require article-number to be non-zero https://www.rfc-editor.org/rfc/rfc3977#section-3.6",
                         ListGroupRange::from_borrowed("0-10").is_err(),
@@ -8218,6 +8238,11 @@ mod tests {
                         "LISTGROUP range rejects over max endpoint",
                         "RFC 3977 section 6.1 caps article numbers at 2,147,483,647 https://www.rfc-editor.org/rfc/rfc3977#section-6.1",
                         ListGroupRange::from_borrowed("1-2147483648").is_err(),
+                    ),
+                    (
+                        "LISTGROUP range rejects 17-digit article number",
+                        "RFC 3977 section 9.8 limits article-number to 16 digits https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
+                        ListGroupRange::from_borrowed("00000002147483647").is_err(),
                     ),
                     (
                         "date accepts earliest RFC 3977 four-digit year",
@@ -8313,6 +8338,26 @@ mod tests {
                         "wildmat accepts ! as comma pattern negation marker",
                         "RFC 3977 sections 4.1 and 4.2 https://www.rfc-editor.org/rfc/rfc3977#section-4.1",
                         Wildmat::from_borrowed("alt.*,!alt.test").is_ok(),
+                    ),
+                    (
+                        "wildmat rejects empty first pattern",
+                        "RFC 3977 section 4.1 defines wildmat as one or more wildmat-pattern values https://www.rfc-editor.org/rfc/rfc3977#section-4.1",
+                        Wildmat::from_borrowed(",alt.*").is_err(),
+                    ),
+                    (
+                        "wildmat rejects trailing empty pattern",
+                        "RFC 3977 section 4.1 defines wildmat-pattern as one or more wildmat-item values https://www.rfc-editor.org/rfc/rfc3977#section-4.1",
+                        Wildmat::from_borrowed("alt.*,").is_err(),
+                    ),
+                    (
+                        "wildmat rejects empty negated pattern",
+                        "RFC 3977 section 4.1 requires a pattern after the comma negation marker https://www.rfc-editor.org/rfc/rfc3977#section-4.1",
+                        Wildmat::from_borrowed("alt.*,!").is_err(),
+                    ),
+                    (
+                        "wildmat rejects adjacent comma empty pattern",
+                        "RFC 3977 section 4.1 requires each comma-separated pattern to be non-empty https://www.rfc-editor.org/rfc/rfc3977#section-4.1",
+                        Wildmat::from_borrowed("alt.*,,comp.*").is_err(),
                     ),
                     (
                         "wildmat accepts UTF-8 non-ASCII exact text",
