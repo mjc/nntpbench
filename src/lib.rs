@@ -5488,6 +5488,50 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn rfc3977_compliance_last_next_preserve_current_article_on_errors() {
+            // RFC 3977 sections 6.1.3 and 6.1.4 define 421/422 as failed
+            // navigation responses, and section 6.2 defines 423 as a failed
+            // numeric selector response. These failures must not move the
+            // current article:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-6.1.3
+            // https://www.rfc-editor.org/rfc/rfc3977#section-6.1.4
+            // https://www.rfc-editor.org/rfc/rfc3977#section-6.2
+            assert_red_server_response_tail_cases(&[
+                ServerResponseCase {
+                    name: "failed numeric ARTICLE keeps current for LAST",
+                    reference: "RFC 3977 sections 6.1.3 and 6.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.3",
+                    input: b"GROUP alt.test\r\nARTICLE 2\r\nARTICLE 999\r\nLAST\r\n",
+                    expected: LAST_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "failed numeric HEAD keeps current for NEXT",
+                    reference: "RFC 3977 sections 6.1.4 and 6.2.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.4",
+                    input: b"GROUP alt.test\r\nARTICLE 2\r\nHEAD 999\r\nNEXT\r\n",
+                    expected: NAVIGATION_ARTICLE_3_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "LAST failure at first article keeps current for NEXT",
+                    reference: "RFC 3977 sections 6.1.3 and 6.1.4 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.3",
+                    input: b"GROUP alt.test\r\nLAST\r\nNEXT\r\n",
+                    expected: NEXT_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "NEXT failure at last article keeps current for LAST",
+                    reference: "RFC 3977 sections 6.1.3 and 6.1.4 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.4",
+                    input: b"GROUP alt.test\r\nARTICLE 3\r\nNEXT\r\nLAST\r\n",
+                    expected: NAVIGATION_ARTICLE_2_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "message-id ARTICLE does not change current for NEXT",
+                    reference: "RFC 3977 sections 6.1.4 and 6.2.1 https://www.rfc-editor.org/rfc/rfc3977#section-6.2.1",
+                    input: b"GROUP alt.test\r\nARTICLE 2\r\nARTICLE <msgid@example.invalid>\r\nNEXT\r\n",
+                    expected: NAVIGATION_ARTICLE_3_RESPONSE,
+                },
+            ])
+            .await;
+        }
+
+        #[tokio::test]
         async fn rfc3977_compliance_article_numeric_before_group_returns_412() {
             // RFC 3977 section 6.2 requires numeric article selectors to fail
             // with 412 when no group is selected:
