@@ -128,9 +128,11 @@ pub const LIST_DISTRIB_PATS_RESPONSE: &[u8] =
     b"215 distribution patterns\r\n1:*:world\r\n2:*.local:local\r\n.\r\n";
 pub const GROUP_RESPONSE: &[u8] = b"211 3 1 3 alt.test\r\n";
 const GROUP_COMP_RESPONSE: &[u8] = b"211 1 1 1 comp.lang.rust\r\n";
+const GROUP_EMPTY_RESPONSE: &[u8] = b"211 0 0 0 empty.test\r\n";
 pub const LISTGROUP_RESPONSE: &[u8] = b"211 3 1 3 alt.test\r\n1\r\n2\r\n3\r\n.\r\n";
 const LISTGROUP_COMP_RESPONSE: &[u8] = b"211 1 1 1 comp.lang.rust\r\n1\r\n.\r\n";
 const LISTGROUP_COMP_EMPTY_RESPONSE: &[u8] = b"211 1 1 1 comp.lang.rust\r\n.\r\n";
+const LISTGROUP_EMPTY_GROUP_RESPONSE: &[u8] = b"211 0 0 0 empty.test\r\n.\r\n";
 const LISTGROUP_EMPTY_RESPONSE: &[u8] = b"211 3 1 3 alt.test\r\n.\r\n";
 const LISTGROUP_2_3_RESPONSE: &[u8] = b"211 3 1 3 alt.test\r\n2\r\n3\r\n.\r\n";
 pub const LAST_RESPONSE: &[u8] =
@@ -1338,6 +1340,7 @@ enum BatchOutcome {
 enum FixtureGroup {
     AltTest,
     CompLangRust,
+    EmptyTest,
 }
 
 #[derive(Debug, Default)]
@@ -1646,7 +1649,7 @@ where
             };
             session_state.group_selected = true;
             session_state.selected_group = Some(group);
-            session_state.current_article = Some(1);
+            session_state.current_article = group.first_article();
             write_response(
                 writer,
                 pending_write,
@@ -1666,7 +1669,7 @@ where
                 .unwrap_or(FixtureGroup::AltTest);
             session_state.group_selected = true;
             session_state.selected_group = Some(group);
-            session_state.current_article = Some(1);
+            session_state.current_article = group.first_article();
             write_response(
                 writer,
                 pending_write,
@@ -3616,6 +3619,8 @@ fn fixture_group_from_name(name: &[u8]) -> Option<FixtureGroup> {
         Some(FixtureGroup::AltTest)
     } else if name.eq_ignore_ascii_case(b"comp.lang.rust") {
         Some(FixtureGroup::CompLangRust)
+    } else if name.eq_ignore_ascii_case(b"empty.test") {
+        Some(FixtureGroup::EmptyTest)
     } else {
         None
     }
@@ -3626,6 +3631,14 @@ impl FixtureGroup {
         match self {
             Self::AltTest => 3,
             Self::CompLangRust => 1,
+            Self::EmptyTest => 0,
+        }
+    }
+
+    const fn first_article(self) -> Option<u64> {
+        match self {
+            Self::AltTest | Self::CompLangRust => Some(1),
+            Self::EmptyTest => None,
         }
     }
 }
@@ -3643,6 +3656,7 @@ fn group_response_for_group(group: FixtureGroup) -> &'static [u8] {
     match group {
         FixtureGroup::AltTest => GROUP_RESPONSE,
         FixtureGroup::CompLangRust => GROUP_COMP_RESPONSE,
+        FixtureGroup::EmptyTest => GROUP_EMPTY_RESPONSE,
     }
 }
 
@@ -3676,6 +3690,9 @@ fn listgroup_response_for_args(args: &[u8], current_group: Option<FixtureGroup>)
     }
     let group = listgroup_selected_group(args, current_group).unwrap_or(FixtureGroup::AltTest);
     let range = listgroup_range_arg(args);
+    if group == FixtureGroup::EmptyTest {
+        return LISTGROUP_EMPTY_GROUP_RESPONSE;
+    }
     if group == FixtureGroup::CompLangRust {
         if range.is_some_and(|range| !listgroup_range_selects_articles(range, group)) {
             return LISTGROUP_COMP_EMPTY_RESPONSE;
@@ -5132,6 +5149,12 @@ mod tests {
                     expected: GROUP_COMP_RESPONSE,
                 },
                 ServerResponseCase {
+                    name: "GROUP empty.test makes current article invalid",
+                    reference: "RFC 3977 section 6.1.1 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.1",
+                    input: b"GROUP empty.test\r\n",
+                    expected: b"211 0 0 0 empty.test\r\n",
+                },
+                ServerResponseCase {
                     name: "GROUP valid but nonexistent group returns 411",
                     reference: "RFC 3977 section 6.1.1 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.1",
                     input: b"GROUP example.valid\r\n",
@@ -5144,6 +5167,12 @@ mod tests {
                     expected: LISTGROUP_COMP_RESPONSE,
                 },
                 ServerResponseCase {
+                    name: "LISTGROUP empty.test returns empty selected group",
+                    reference: "RFC 3977 section 6.1.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.2",
+                    input: b"LISTGROUP empty.test\r\n",
+                    expected: b"211 0 0 0 empty.test\r\n.\r\n",
+                },
+                ServerResponseCase {
                     name: "LISTGROUP valid but nonexistent group returns 411",
                     reference: "RFC 3977 section 6.1.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.2",
                     input: b"LISTGROUP example.valid\r\n",
@@ -5154,6 +5183,12 @@ mod tests {
                     reference: "RFC 3977 section 6.1.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.2",
                     input: b"GROUP comp.lang.rust\r\nLISTGROUP\r\n",
                     expected: b"211 1 1 1 comp.lang.rust\r\n211 1 1 1 comp.lang.rust\r\n1\r\n.\r\n",
+                },
+                ServerResponseCase {
+                    name: "current LISTGROUP follows selected empty.test",
+                    reference: "RFC 3977 section 6.1.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.2",
+                    input: b"GROUP empty.test\r\nLISTGROUP\r\n",
+                    expected: b"211 0 0 0 empty.test\r\n211 0 0 0 empty.test\r\n.\r\n",
                 },
             ])
             .await;
@@ -5170,6 +5205,36 @@ mod tests {
                     reference: "RFC 3977 section 6.1.4 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.4",
                     input: b"GROUP comp.lang.rust\r\nNEXT\r\n",
                     expected: b"421 no next article in this group\r\n",
+                },
+                ServerResponseCase {
+                    name: "ARTICLE current in empty group",
+                    reference: "RFC 3977 section 6.2.1 https://www.rfc-editor.org/rfc/rfc3977#section-6.2.1",
+                    input: b"GROUP empty.test\r\nARTICLE\r\n",
+                    expected: b"420 no current article selected\r\n",
+                },
+                ServerResponseCase {
+                    name: "LAST in empty group",
+                    reference: "RFC 3977 section 6.1.3 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.3",
+                    input: b"GROUP empty.test\r\nLAST\r\n",
+                    expected: b"420 no current article selected\r\n",
+                },
+                ServerResponseCase {
+                    name: "NEXT in empty group",
+                    reference: "RFC 3977 section 6.1.4 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.4",
+                    input: b"GROUP empty.test\r\nNEXT\r\n",
+                    expected: b"420 no current article selected\r\n",
+                },
+                ServerResponseCase {
+                    name: "OVER current in empty group",
+                    reference: "RFC 3977 section 8.3.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.3.2",
+                    input: b"GROUP empty.test\r\nOVER\r\n",
+                    expected: b"420 no current article selected\r\n",
+                },
+                ServerResponseCase {
+                    name: "HDR current in empty group",
+                    reference: "RFC 3977 section 8.5.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.2",
+                    input: b"GROUP empty.test\r\nHDR Subject\r\n",
+                    expected: b"420 no current article selected\r\n",
                 },
                 ServerResponseCase {
                     name: "ARTICLE outside one-article group",
