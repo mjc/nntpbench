@@ -6138,6 +6138,61 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn rfc4644_compliance_streaming_unavailable_state_and_body_matrix() {
+            // RFC 4644 section 2 requires STREAMING capability advertisement
+            // before clients use CHECK/TAKETHIS. This reader server omits that
+            // capability, so selected group/current article state must not
+            // enable streaming, and pipelined TAKETHIS bodies must be discarded
+            // without 238/239/431/438/439 streaming semantics:
+            // https://www.rfc-editor.org/rfc/rfc4644#section-2
+            assert_red_server_response_tail_cases(&[
+                ServerResponseCase {
+                    name: "CHECK remains unavailable after MODE READER",
+                    reference: "RFC 4644 section 2 https://www.rfc-editor.org/rfc/rfc4644#section-2",
+                    input: b"MODE READER\r\nCHECK <check@test>\r\n",
+                    expected: b"502 command unavailable\r\n",
+                },
+                ServerResponseCase {
+                    name: "CHECK remains unavailable after GROUP",
+                    reference: "RFC 4644 section 2 https://www.rfc-editor.org/rfc/rfc4644#section-2",
+                    input: b"GROUP alt.test\r\nCHECK <check@test>\r\n",
+                    expected: b"502 command unavailable\r\n",
+                },
+                ServerResponseCase {
+                    name: "CHECK remains unavailable after current article",
+                    reference: "RFC 4644 section 2 https://www.rfc-editor.org/rfc/rfc4644#section-2",
+                    input: b"GROUP alt.test\r\nARTICLE 2\r\nCHECK <check@test>\r\n",
+                    expected: b"502 command unavailable\r\n",
+                },
+                ServerResponseCase {
+                    name: "TAKETHIS remains unavailable after MODE READER",
+                    reference: "RFC 4644 section 2 https://www.rfc-editor.org/rfc/rfc4644#section-2",
+                    input: b"MODE READER\r\nTAKETHIS <take@test>\r\nHeader: value\r\n\r\nbody\r\n.\r\n",
+                    expected: b"502 command unavailable\r\n",
+                },
+                ServerResponseCase {
+                    name: "TAKETHIS remains unavailable after GROUP",
+                    reference: "RFC 4644 section 2 https://www.rfc-editor.org/rfc/rfc4644#section-2",
+                    input: b"GROUP alt.test\r\nTAKETHIS <take@test>\r\nHeader: value\r\n\r\nbody\r\n.\r\n",
+                    expected: b"502 command unavailable\r\n",
+                },
+                ServerResponseCase {
+                    name: "TAKETHIS discards pipelined body before QUIT",
+                    reference: "RFC 4644 section 2 and RFC 3977 section 3.1.1 https://www.rfc-editor.org/rfc/rfc4644#section-2",
+                    input: b"TAKETHIS <take@test>\r\nHeader: value\r\n\r\nbody\r\n.\r\nQUIT\r\n",
+                    expected: b"205 closing connection\r\n",
+                },
+                ServerResponseCase {
+                    name: "lowercase TAKETHIS discards pipelined body before QUIT",
+                    reference: "RFC 4644 section 2 and RFC 3977 section 3.1.1 https://www.rfc-editor.org/rfc/rfc4644#section-2",
+                    input: b"takethis <take@test>\r\nHeader: value\r\n\r\nbody\r\n.\r\nQUIT\r\n",
+                    expected: b"205 closing connection\r\n",
+                },
+            ])
+            .await;
+        }
+
+        #[tokio::test]
         async fn rfc2980_compliance_xhdr_uses_221_response_code() {
             // RFC 2980 section 2.6 specifies XHDR responses with response code
             // 221, not the RFC 3977 HDR 225 code:
