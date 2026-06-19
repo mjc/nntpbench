@@ -4902,7 +4902,7 @@ mod tests {
                 ),
                 (
                     "ARTICLE article number over RFC maximum",
-                    b"220 2147483648 <over-max@test>\r\nSubject: bad\r\n\r\nbody\r\n.\r\n"
+                    b"220 10000000000000000 <over-max@test>\r\nSubject: bad\r\n\r\nbody\r\n.\r\n"
                         .as_slice(),
                 ),
                 (
@@ -4932,6 +4932,20 @@ mod tests {
                     "{name}: RFC 3977 article-family success line should reject invalid arguments"
                 );
             }
+        }
+
+        #[test]
+        fn rfc3977_red_article_parser_accepts_rfc_max_article_number() {
+            // RFC 3977 section 9.8 defines article-number as 1*16DIGIT:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-9.8
+            let article = Article::parse(
+                b"220 9999999999999999 <max@test>\r\nSubject: max\r\n\r\nbody\r\n.\r\n",
+            )
+            .unwrap();
+            assert_eq!(
+                article.article_number,
+                Some(ArticleNumber::from(protocol::MAX_ARTICLE_NUMBER))
+            );
         }
 
         #[test]
@@ -7872,6 +7886,11 @@ mod tests {
                         ArticleSelector::from_borrowed("10-1").is_ok(),
                     ),
                     (
+                        "article selector accepts RFC 16-digit maximum",
+                        "RFC 3977 section 9.8 defines article-number as 1*16DIGIT https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
+                        ArticleSelector::from_borrowed("9999999999999999").is_ok(),
+                    ),
+                    (
                         "article selector rejects double hyphen range",
                         "RFC 3977 section 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
                         ArticleSelector::from_borrowed("1--10").is_err(),
@@ -7884,7 +7903,7 @@ mod tests {
                     (
                         "article selector rejects over max article number",
                         "RFC 3977 section 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
-                        ArticleSelector::from_borrowed("2147483648").is_err(),
+                        ArticleSelector::from_borrowed("10000000000000000").is_err(),
                     ),
                     (
                         "LISTGROUP range accepts reversed range as empty",
@@ -8048,6 +8067,24 @@ mod tests {
                         b"BODY\t1\r\n",
                         RequestKind::Body,
                         "RFC 3977 section 9.2 https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
+                    ),
+                    (
+                        "ARTICLE accepts RFC 16-digit maximum article-number",
+                        b"ARTICLE 9999999999999999\r\n",
+                        RequestKind::Article,
+                        "RFC 3977 section 9.8 defines article-number as 1*16DIGIT https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
+                    ),
+                    (
+                        "OVER accepts RFC 16-digit maximum article-number",
+                        b"OVER 9999999999999999\r\n",
+                        RequestKind::Over,
+                        "RFC 3977 sections 8.3.1 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
+                    ),
+                    (
+                        "LISTGROUP accepts RFC 16-digit maximum range",
+                        b"LISTGROUP 9999999999999999\r\n",
+                        RequestKind::ListGroup,
+                        "RFC 3977 sections 6.1.2 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
                     ),
                     (
                         "LIST tab separator",
@@ -8921,9 +8958,9 @@ mod tests {
                     },
                     ResponseFrameCase {
                         name: "NEXT rejects article number over RFC maximum",
-                        reference: "RFC 3977 section 3.6 https://www.rfc-editor.org/rfc/rfc3977#section-3.6",
+                        reference: "RFC 3977 section 9.8 defines article-number as 1*16DIGIT https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
                         kind: RequestKind::Next,
-                        frame: b"223 2147483648 <stat@test> article exists\r\n",
+                        frame: b"223 10000000000000000 <stat@test> article exists\r\n",
                     },
                     ResponseFrameCase {
                         name: "ARTICLE rejects STAT success code",
@@ -9125,15 +9162,15 @@ mod tests {
                     },
                     ResponseFrameCase {
                         name: "GROUP rejects high-water article number over RFC maximum",
-                        reference: "RFC 3977 sections 3.6 and 6.1.1 https://www.rfc-editor.org/rfc/rfc3977#section-3.6",
+                        reference: "RFC 3977 sections 6.1.1 and 9.8 define article-number as 1*16DIGIT https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
                         kind: RequestKind::Group,
-                        frame: b"211 3 1 2147483648 alt.test\r\n",
+                        frame: b"211 3 1 10000000000000000 alt.test\r\n",
                     },
                     ResponseFrameCase {
                         name: "GROUP rejects article count over RFC maximum",
-                        reference: "RFC 3977 sections 3.6 and 6.1.1 https://www.rfc-editor.org/rfc/rfc3977#section-3.6",
+                        reference: "RFC 3977 sections 6.1.1 and 9.8 define article-number as 1*16DIGIT https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
                         kind: RequestKind::Group,
-                        frame: b"211 2147483648 1 3 alt.test\r\n",
+                        frame: b"211 10000000000000000 1 3 alt.test\r\n",
                     },
                     ResponseFrameCase {
                         name: "GROUP rejects non-empty count larger than high-low window",
@@ -9551,9 +9588,9 @@ mod tests {
                     },
                     ResponseFrameCase {
                         name: "OVER rejects article number over RFC maximum",
-                        reference: "RFC 3977 sections 3.6 and 8.3.1 https://www.rfc-editor.org/rfc/rfc3977#section-3.6",
+                        reference: "RFC 3977 sections 8.3.1 and 9.8 define article-number as 1*16DIGIT https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
                         kind: RequestKind::Over,
-                        frame: b"224 overview follows\r\n2147483648\tSubject\tfrom@test\r\n.\r\n",
+                        frame: b"224 overview follows\r\n10000000000000000\tSubject\tfrom@test\r\n.\r\n",
                     },
                     ResponseFrameCase {
                         name: "OVER rejects labeled bytes metadata field",
@@ -9623,9 +9660,9 @@ mod tests {
                     },
                     ResponseFrameCase {
                         name: "HDR rejects article number over RFC maximum",
-                        reference: "RFC 3977 sections 3.6 and 8.5.1 https://www.rfc-editor.org/rfc/rfc3977#section-3.6",
+                        reference: "RFC 3977 sections 8.5.1 and 9.8 define article-number as 1*16DIGIT https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
                         kind: RequestKind::Hdr,
-                        frame: b"225 headers follow\r\n2147483648 value\r\n.\r\n",
+                        frame: b"225 headers follow\r\n10000000000000000 value\r\n.\r\n",
                     },
                     ResponseFrameCase {
                         name: "XHDR rejects body row without numeric article number",
@@ -10388,7 +10425,7 @@ mod tests {
     #[test]
     fn client_request_for_command_uses_message_id_after_numeric_article_range() {
         let request = client_request_for_command(
-            i32::MAX as u64 + 1,
+            protocol::MAX_ARTICLE_NUMBER + 1,
             0,
             ClientCommandMix::Article,
             None,
@@ -10400,19 +10437,25 @@ mod tests {
         match request {
             Request::Article { article_ref } => assert_eq!(
                 article_ref.message_id().map(MessageId::as_str),
-                Some("<bench.2147483648@nntpbench.local>")
+                Some("<bench.10000000000000000@nntpbench.local>")
             ),
             other => panic!("expected message-id ARTICLE fallback, got {other:?}"),
         }
 
-        let request =
-            client_request_for_command(i32::MAX as u64 + 2, 0, ClientCommandMix::Body, None, 0, 1)
-                .unwrap();
+        let request = client_request_for_command(
+            protocol::MAX_ARTICLE_NUMBER + 2,
+            0,
+            ClientCommandMix::Body,
+            None,
+            0,
+            1,
+        )
+        .unwrap();
 
         match request {
             Request::Body { article_ref } => assert_eq!(
                 article_ref.message_id().map(MessageId::as_str),
-                Some("<bench.2147483649@nntpbench.local>")
+                Some("<bench.10000000000000001@nntpbench.local>")
             ),
             other => panic!("expected message-id BODY fallback, got {other:?}"),
         }
