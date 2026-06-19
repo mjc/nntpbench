@@ -168,7 +168,7 @@ const NAVIGATION_ARTICLE_2_RESPONSE: &[u8] =
 const NAVIGATION_ARTICLE_3_RESPONSE: &[u8] =
     b"223 3 <article.3@alt.test> article retrieved - request text separately\r\n";
 pub const NEWGROUPS_RESPONSE: &[u8] =
-    b"231 list of new newsgroups follows\r\ncomp.lang.rust 0000000001 0000000001 y\r\nalt.test 0000000003 0000000001 y\r\n.\r\n";
+    b"231 list of new newsgroups follows\r\ncomp.lang.rust 0000000001 0000000001 y\r\nalt.test 0000000003 0000000001 y\r\nempty.test 0000000000 0000000000 y\r\n.\r\n";
 const NEWGROUPS_EMPTY_RESPONSE: &[u8] = b"231 list of new newsgroups follows\r\n.\r\n";
 pub const NEWNEWS_RESPONSE: &[u8] =
     b"230 list of new articles follows\r\n<one@alt.test>\r\n<two@alt.test>\r\n.\r\n";
