@@ -9176,6 +9176,12 @@ mod tests {
                         frame: b"215 list of newsgroups follows\r\nalt.test  3   1    y\r\n.\r\n",
                     },
                     ResponseFrameCase {
+                        name: "LIST ACTIVE accepts leading-zero water marks",
+                        reference: "RFC 3977 sections 7.6.3 and 9.8 permit leading zeroes in article-number fields https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
+                        kind: RequestKind::ListActive,
+                        frame: b"215 list of newsgroups follows\r\nalt.test 0000000003 0000000001 y\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "GROUP accepts RFC empty group water-mark encodings",
                         reference: "RFC 3977 section 6.1.1.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.1.2",
                         kind: RequestKind::Group,
@@ -9218,6 +9224,12 @@ mod tests {
                         frame: b"231 list of new newsgroups follows\r\nalt.test  3   1    y\r\n.\r\n",
                     },
                     ResponseFrameCase {
+                        name: "NEWGROUPS accepts leading-zero active row water marks",
+                        reference: "RFC 3977 sections 7.3, 7.6.3, and 9.8 permit leading zeroes in article-number fields https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
+                        kind: RequestKind::NewGroups,
+                        frame: b"231 list of new newsgroups follows\r\nalt.test 0000000003 0000000001 y\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "NEWNEWS accepts message-id body lines",
                         reference: "RFC 3977 section 7.4.2 says NEWNEWS returns message-id lines https://www.rfc-editor.org/rfc/rfc3977#section-7.4.2",
                         kind: RequestKind::NewNews,
@@ -9258,6 +9270,18 @@ mod tests {
                         reference: "RFC 3977 sections 7.6.6 and 9.6 https://www.rfc-editor.org/rfc/rfc3977#section-9.6",
                         kind: RequestKind::ListNewsgroups,
                         frame: b"215 information follows\r\nalt.test \x01control-prefixed\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "LIST NEWSGROUPS accepts TAB as response WS separator",
+                        reference: "RFC 3977 sections 7.6.6, 9.2, and 9.6 define NEWSGROUPS rows with WS before S-TEXT https://www.rfc-editor.org/rfc/rfc3977#section-9.6",
+                        kind: RequestKind::ListNewsgroups,
+                        frame: b"215 information follows\r\nalt.test\tGeneral Usenet testing\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "LIST DISTRIB.PATS accepts colon inside distribution token",
+                        reference: "RFC 3977 sections 7.6.5 and 9.6 define distribution as token https://www.rfc-editor.org/rfc/rfc3977#section-9.6",
+                        kind: RequestKind::ListDistribPats,
+                        frame: b"215 distribution patterns\r\n1:*:local:world\r\n.\r\n",
                     },
                     ResponseFrameCase {
                         name: "LIST OVERVIEW.FMT accepts legacy Bytes and Lines fields",
@@ -10185,6 +10209,12 @@ mod tests {
                         frame: b"215 list of newsgroups follows\r\nalt.test 12345678901234567 1 y\r\n.\r\n",
                     },
                     ResponseFrameCase {
+                        name: "LIST ACTIVE rejects high-water article number over RFC maximum",
+                        reference: "RFC 3977 sections 6.1, 7.6.3, and 9.8 cap article numbers at 2,147,483,647 https://www.rfc-editor.org/rfc/rfc3977#section-6.1",
+                        kind: RequestKind::ListActive,
+                        frame: b"215 list of newsgroups follows\r\nalt.test 2147483648 1 y\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "LIST ACTIVE rejects high below low outside empty-group encoding",
                         reference: "RFC 3977 sections 6.1.1.2 and 7.6.3 https://www.rfc-editor.org/rfc/rfc3977#section-7.6.3",
                         kind: RequestKind::ListActive,
@@ -10213,6 +10243,12 @@ mod tests {
                         reference: "RFC 3977 section 7.6.4 https://www.rfc-editor.org/rfc/rfc3977#section-7.6.4",
                         kind: RequestKind::ListActiveTimes,
                         frame: b"215 information follows\r\nalt.test yesterday admin@test\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "LIST ACTIVE.TIMES rejects TAB field separator",
+                        reference: "RFC 3977 sections 7.6.4 and 9.6 define ACTIVE.TIMES rows with SPA separators https://www.rfc-editor.org/rfc/rfc3977#section-9.6",
+                        kind: RequestKind::ListActiveTimes,
+                        frame: b"215 information follows\r\nalt.test\t1715907600 admin@test\r\n.\r\n",
                     },
                     ResponseFrameCase {
                         name: "LIST ACTIVE.TIMES rejects creator text without leading P-CHAR",
@@ -10251,6 +10287,12 @@ mod tests {
                         frame: b"215 information follows\r\nalt.test \r\n.\r\n",
                     },
                     ResponseFrameCase {
+                        name: "LIST NEWSGROUPS rejects TAB-only empty description",
+                        reference: "RFC 3977 sections 7.6.6 and 9.6 define newsgroup-description as S-TEXT https://www.rfc-editor.org/rfc/rfc3977#section-9.6",
+                        kind: RequestKind::ListNewsgroups,
+                        frame: b"215 information follows\r\nalt.test\t\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "LIST NEWSGROUPS rejects description without leading S-CHAR",
                         reference: "RFC 3977 sections 7.6.6 and 9.6 https://www.rfc-editor.org/rfc/rfc3977#section-9.6",
                         kind: RequestKind::ListNewsgroups,
@@ -10261,6 +10303,18 @@ mod tests {
                         reference: "RFC 3977 sections 7.3 and 7.6.3 https://www.rfc-editor.org/rfc/rfc3977#section-7.3",
                         kind: RequestKind::NewGroups,
                         frame: b"231 list of new newsgroups follows\r\nalt.test 3 1 bad\tstatus\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "NEWGROUPS rejects TAB active row field separator",
+                        reference: "RFC 3977 sections 7.3, 7.6.3, and 9.6 use active-groups-list rows with SPA separators https://www.rfc-editor.org/rfc/rfc3977#section-9.6",
+                        kind: RequestKind::NewGroups,
+                        frame: b"231 list of new newsgroups follows\r\nalt.test\t3 1 y\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "NEWGROUPS rejects low-water article number over RFC maximum",
+                        reference: "RFC 3977 sections 6.1, 7.3, and 7.6.3 cap article numbers at 2,147,483,647 https://www.rfc-editor.org/rfc/rfc3977#section-6.1",
+                        kind: RequestKind::NewGroups,
+                        frame: b"231 list of new newsgroups follows\r\nalt.test 3 2147483648 y\r\n.\r\n",
                     },
                     ResponseFrameCase {
                         name: "NEWGROUPS rejects extra active row field",
