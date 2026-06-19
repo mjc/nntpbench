@@ -4872,7 +4872,7 @@ mod tests {
         }
 
         #[test]
-        fn rfc3977_red_article_parser_unstuffs_dot_prefixed_body_lines() {
+        fn rfc3977_compliance_article_parser_unstuffs_dot_prefixed_body_lines() {
             // RFC 3977 section 3.1.1 requires clients to remove one leading dot
             // from dot-stuffed data lines in multi-line data blocks:
             // https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1
@@ -4904,7 +4904,7 @@ mod tests {
         }
 
         #[test]
-        fn rfc3977_red_article_parser_rejects_unstuffed_dot_prefixed_body_lines() {
+        fn rfc3977_compliance_article_parser_rejects_unstuffed_dot_prefixed_body_lines() {
             // RFC 3977 section 3.1.1 requires any data line beginning with "."
             // inside a multi-line data block to be dot-stuffed; a line containing
             // only "." is the terminator, not content:
@@ -4931,7 +4931,7 @@ mod tests {
         }
 
         #[test]
-        fn rfc3977_red_article_parser_rejects_bare_lf_or_cr_in_body_lines() {
+        fn rfc3977_compliance_article_parser_rejects_bare_lf_or_cr_in_body_lines() {
             // RFC 3977 section 3.1.1 defines each multi-line data block line as
             // B-CHAR *B-CHAR CRLF, and section 9.7 excludes CR and LF from B-CHAR:
             // https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1
@@ -4963,7 +4963,7 @@ mod tests {
         }
 
         #[test]
-        fn rfc3977_red_article_parser_rejects_invalid_success_line_arguments() {
+        fn rfc3977_compliance_article_parser_rejects_invalid_success_line_arguments() {
             // RFC 3977 sections 6.2.1 through 6.2.4 define successful
             // ARTICLE/HEAD/BODY/STAT responses as status, article number,
             // and message-id, with response arguments separated by single spaces:
@@ -5016,7 +5016,7 @@ mod tests {
         }
 
         #[test]
-        fn rfc3977_red_article_parser_accepts_rfc_max_article_number() {
+        fn rfc3977_compliance_article_parser_accepts_rfc_max_article_number() {
             // RFC 3977 section 6.1 caps article numbers at 2,147,483,647
             // while permitting leading zeroes up to 16 digits:
             // https://www.rfc-editor.org/rfc/rfc3977#section-6.1
@@ -5031,7 +5031,7 @@ mod tests {
         }
 
         #[test]
-        fn rfc3977_red_article_parser_rejects_header_without_required_space() {
+        fn rfc3977_compliance_article_parser_rejects_header_without_required_space() {
             // RFC 3977 section 3.6 defines article header lines as a header
             // name, colon, space, header content, and CRLF in that order:
             // https://www.rfc-editor.org/rfc/rfc3977#section-3.6
@@ -5061,7 +5061,7 @@ mod tests {
         }
 
         #[test]
-        fn rfc3977_red_article_parser_accepts_header_content_after_colon_crlf_space() {
+        fn rfc3977_compliance_article_parser_accepts_header_content_after_colon_crlf_space() {
             // RFC 3977 section 9.7 defines a header as header-name ":"
             // [CRLF] SP header-content CRLF, so header content may start on
             // the next physical line after a colon-CRLF-space sequence:
@@ -5092,7 +5092,7 @@ mod tests {
         }
 
         #[test]
-        fn rfc3977_red_article_parser_rejects_empty_folded_header_line() {
+        fn rfc3977_compliance_article_parser_rejects_empty_folded_header_line() {
             // RFC 3977 section 3.6 permits folded header lines but requires
             // some octet other than space or tab between any two CRLF pairs:
             // https://www.rfc-editor.org/rfc/rfc3977#section-3.6
@@ -5114,7 +5114,7 @@ mod tests {
         }
 
         #[test]
-        fn rfc3977_red_article_parser_rejects_missing_header_block() {
+        fn rfc3977_compliance_article_parser_rejects_missing_header_block() {
             // RFC 3977 section 3.6 requires articles to contain one or more
             // header lines. Section 9.4.3 also defines HEAD content as
             // 1*header:
@@ -5137,7 +5137,7 @@ mod tests {
         }
 
         #[test]
-        fn rfc3977_red_article_parser_rejects_nul_octets() {
+        fn rfc3977_compliance_article_parser_rejects_nul_octets() {
             // RFC 3977 section 3.6 says an article MUST NOT include NUL, and
             // section 9.8 excludes NUL from B-CHAR multiline data:
             // https://www.rfc-editor.org/rfc/rfc3977#section-3.6
@@ -5168,7 +5168,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc3977_red_server_returns_501_for_syntax_error_not_article_body() {
+        async fn rfc3977_compliance_server_returns_501_for_syntax_error_not_article_body() {
             // RFC 3977 sections 3.2.1 and 6.2.1 reserve 501 for command syntax
             // errors. A malformed ARTICLE line must not be treated as a valid fetch:
             // https://www.rfc-editor.org/rfc/rfc3977#section-3.2.1
@@ -5178,7 +5178,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc3977_red_group_and_listgroup_responses_match_selected_group() {
+        async fn rfc3977_compliance_group_and_listgroup_responses_match_selected_group() {
             // RFC 3977 sections 6.1.1 and 6.1.2 require GROUP and LISTGROUP
             // responses to describe the requested selected group, not a fixed
             // fixture group:
@@ -5237,7 +5237,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc3977_red_selected_group_article_bounds_are_enforced() {
+        async fn rfc3977_compliance_selected_group_article_bounds_are_enforced() {
             // RFC 3977 sections 6.1, 6.2, and 8 require article-number
             // selectors and navigation to be scoped to the selected group:
             // https://www.rfc-editor.org/rfc/rfc3977#section-6.1
@@ -5349,7 +5349,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc3977_red_last_before_group_returns_412_no_group_selected() {
+        async fn rfc3977_compliance_last_before_group_returns_412_no_group_selected() {
             // RFC 3977 section 6.1.3 defines 412 when LAST is used before a group
             // has been selected:
             // https://www.rfc-editor.org/rfc/rfc3977#section-6.1.3
@@ -5359,7 +5359,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc3977_red_next_before_group_returns_412_no_group_selected() {
+        async fn rfc3977_compliance_next_before_group_returns_412_no_group_selected() {
             // RFC 3977 section 6.1.4 defines 412 when NEXT is used before a group
             // has been selected:
             // https://www.rfc-editor.org/rfc/rfc3977#section-6.1.4
@@ -5369,7 +5369,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc3977_red_last_next_current_article_state_matrix() {
+        async fn rfc3977_compliance_last_next_current_article_state_matrix() {
             // RFC 3977 sections 6.1.1, 6.1.3, and 6.1.4 require GROUP to set
             // the current article to the first article, then LAST/NEXT must
             // apply first/last article edge responses:
@@ -5405,7 +5405,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc3977_red_last_next_move_relative_to_current_article() {
+        async fn rfc3977_compliance_last_next_move_relative_to_current_article() {
             // RFC 3977 sections 6.1.3 and 6.1.4 define LAST and NEXT as moving
             // to the previous or next article relative to the current article,
             // not as fixed jumps to one canned article number:
@@ -5441,7 +5441,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc3977_red_article_numeric_before_group_returns_412() {
+        async fn rfc3977_compliance_article_numeric_before_group_returns_412() {
             // RFC 3977 section 6.2 requires numeric article selectors to fail
             // with 412 when no group is selected:
             // https://www.rfc-editor.org/rfc/rfc3977#section-6.2.1
@@ -5475,7 +5475,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc3977_red_article_file_backend_preserves_selector_state_and_errors() {
+        async fn rfc3977_compliance_article_file_backend_preserves_selector_state_and_errors() {
             // RFC 3977 section 6.2.1 keeps numeric ARTICLE selectors scoped to
             // the selected group even when articles are served from a local store:
             // https://www.rfc-editor.org/rfc/rfc3977#section-6.2.1
@@ -5539,7 +5539,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc3977_red_article_family_numeric_selectors_echo_selected_article() {
+        async fn rfc3977_compliance_article_family_numeric_selectors_echo_selected_article() {
             // RFC 3977 sections 6.2.1 through 6.2.4 require successful
             // ARTICLE/HEAD/BODY/STAT responses to include the selected article
             // number and message-id, not a fixed fixture identity:
@@ -5594,7 +5594,8 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc3977_red_article_family_message_id_selectors_do_not_change_current_article() {
+        async fn rfc3977_compliance_article_family_message_id_selectors_do_not_change_current_article()
+         {
             // RFC 3977 section 6.2 requires message-id forms to return the
             // requested message-id with article number 0 when group membership
             // is not asserted, and to leave current group/article state alone:
@@ -5643,7 +5644,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc3977_red_posting_disabled_returns_440_for_post() {
+        async fn rfc3977_compliance_posting_disabled_returns_440_for_post() {
             // RFC 3977 section 6.3.1 defines 440 when posting is not permitted:
             // https://www.rfc-editor.org/rfc/rfc3977#section-6.3.1
             let input = b"POST\r\n";
@@ -5652,7 +5653,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc3977_red_ihave_rejected_on_reader_server_without_transfer_state() {
+        async fn rfc3977_compliance_ihave_rejected_on_reader_server_without_transfer_state() {
             // RFC 3977 section 6.3.2 defines IHAVE transfer responses including
             // 435/436 rejections. A mock reader server should not invite transfer:
             // https://www.rfc-editor.org/rfc/rfc3977#section-6.3.2
@@ -5662,7 +5663,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc3977_red_newgroups_invalid_date_returns_501() {
+        async fn rfc3977_compliance_newgroups_invalid_date_returns_501() {
             // RFC 3977 sections 7.3.1 and 9.8 require syntactically valid date
             // and time arguments:
             // https://www.rfc-editor.org/rfc/rfc3977#section-7.3.1
@@ -5672,7 +5673,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc3977_red_newnews_invalid_wildmat_returns_501() {
+        async fn rfc3977_compliance_newnews_invalid_wildmat_returns_501() {
             // RFC 3977 sections 4 and 7.4.1 require a valid wildmat argument:
             // https://www.rfc-editor.org/rfc/rfc3977#section-7.4.1
             let input = b"NEWNEWS ! 20260101 000000 GMT\r\n";
@@ -5681,7 +5682,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc3977_red_date_response_reflects_current_utc_date() {
+        async fn rfc3977_compliance_date_response_reflects_current_utc_date() {
             // RFC 3977 section 7.1 says DATE returns the server's current date
             // and time in UTC, not a fixed fixture timestamp:
             // https://www.rfc-editor.org/rfc/rfc3977#section-7.1
@@ -5693,7 +5694,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc3977_red_over_invalid_selector_returns_501() {
+        async fn rfc3977_compliance_over_invalid_selector_returns_501() {
             // RFC 3977 sections 8.3.1 and 9.8 require an article range,
             // message-id, or current article selector for OVER:
             // https://www.rfc-editor.org/rfc/rfc3977#section-8.3.1
@@ -5703,7 +5704,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc3977_red_hdr_invalid_header_name_returns_501() {
+        async fn rfc3977_compliance_hdr_invalid_header_name_returns_501() {
             // RFC 3977 section 8.5.1 requires a valid header field name.
             // A trailing colon is not part of the field-name token:
             // https://www.rfc-editor.org/rfc/rfc3977#section-8.5.1
@@ -5713,7 +5714,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc3977_red_hdr_accepts_metadata_names_with_leading_colon() {
+        async fn rfc3977_compliance_hdr_accepts_metadata_names_with_leading_colon() {
             // RFC 3977 section 8.5.2 permits metadata item names with a leading
             // colon, such as ":bytes":
             // https://www.rfc-editor.org/rfc/rfc3977#section-8.5.2
@@ -5727,7 +5728,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc3977_red_capabilities_do_not_advertise_unavailable_extensions() {
+        async fn rfc3977_compliance_capabilities_do_not_advertise_unavailable_extensions() {
             // RFC 3977 section 3.3 requires CAPABILITIES to describe available
             // protocol extensions. RFC 4642 STARTTLS, RFC 4643 SASL, and RFC 4644
             // STREAMING must not be advertised when their commands are unavailable.
@@ -5774,7 +5775,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc3977_red_capabilities_after_mode_reader_still_omit_mode_reader() {
+        async fn rfc3977_compliance_capabilities_after_mode_reader_still_omit_mode_reader() {
             // RFC 3977 section 3.4.2 requires reading mode to advertise READER and
             // not advertise MODE-READER after a successful MODE READER command:
             // https://www.rfc-editor.org/rfc/rfc3977#section-3.4.2
@@ -5790,7 +5791,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc4643_red_plaintext_user_pass_not_advertised_or_accepted() {
+        async fn rfc4643_compliance_plaintext_user_pass_not_advertised_or_accepted() {
             // RFC 4643 sections 2.1 and 2.3.2 say AUTHINFO USER/PASS should
             // not be advertised without an active strong encryption layer, and
             // PASS must not be implemented without TLS support. RFC 3977 section
@@ -5820,7 +5821,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc4642_red_starttls_without_tls_support_returns_502() {
+        async fn rfc4642_compliance_starttls_without_tls_support_returns_502() {
             // RFC 4642 section 2.2 requires STARTTLS to begin TLS negotiation after
             // a 382 response. A server that cannot negotiate TLS must reject it:
             // https://www.rfc-editor.org/rfc/rfc4642#section-2.2
@@ -5830,7 +5831,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc4643_red_authinfo_pass_before_tls_is_rejected() {
+        async fn rfc4643_compliance_authinfo_pass_before_tls_is_rejected() {
             // RFC 4643 section 2.3.2 says AUTHINFO PASS must not be
             // implemented without TLS support, and 483 reports an insufficiently
             // secure datastream:
@@ -5846,7 +5847,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc4643_red_authinfo_sasl_unavailable_with_valid_syntax() {
+        async fn rfc4643_compliance_authinfo_sasl_unavailable_with_valid_syntax() {
             // RFC 4643 section 2.1 says AUTHINFO without arguments means no
             // authentication commands are permitted in the current state.
             // Section 2.4.1 still allows AUTHINFO SASL to include an optional
@@ -5908,7 +5909,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc4643_red_authinfo_sasl_initial_response_may_exceed_512_octets() {
+        async fn rfc4643_compliance_authinfo_sasl_initial_response_may_exceed_512_octets() {
             // RFC 4643 section 2.4.1 raises the AUTHINFO SASL command-line
             // limit above RFC 3977's 512-octet base limit when an initial
             // response is present:
@@ -5929,7 +5930,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc4643_red_authinfo_sasl_rejects_malformed_initial_response() {
+        async fn rfc4643_compliance_authinfo_sasl_rejects_malformed_initial_response() {
             // RFC 4643 section 2.4.2 requires SASL initial responses to use
             // valid base64 syntax; padding cannot appear in the middle:
             // https://www.rfc-editor.org/rfc/rfc4643#section-2.4.2
@@ -5969,7 +5970,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc4643_red_authinfo_sasl_rejects_malformed_mechanism_names() {
+        async fn rfc4643_compliance_authinfo_sasl_rejects_malformed_mechanism_names() {
             // RFC 4643 section 2.2 uses SASL mechanism names. RFC 4422 section
             // 3.1 defines those names as 1 to 20 ASCII uppercase letters,
             // digits, hyphens, and underscores:
@@ -6005,7 +6006,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc4644_red_check_not_advertised_as_streaming_returns_502() {
+        async fn rfc4644_compliance_check_not_advertised_as_streaming_returns_502() {
             // RFC 4644 section 2 makes CHECK part of the streaming extension. A
             // server that does not advertise STREAMING should reject CHECK:
             // https://www.rfc-editor.org/rfc/rfc4644#section-2
@@ -6015,7 +6016,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc4644_red_takethis_not_advertised_as_streaming_returns_502() {
+        async fn rfc4644_compliance_takethis_not_advertised_as_streaming_returns_502() {
             // RFC 4644 section 2 makes TAKETHIS part of the streaming extension.
             // Without STREAMING capability advertisement, TAKETHIS is unavailable:
             // https://www.rfc-editor.org/rfc/rfc4644#section-2
@@ -6025,7 +6026,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc2980_red_xhdr_uses_221_response_code() {
+        async fn rfc2980_compliance_xhdr_uses_221_response_code() {
             // RFC 2980 section 2.6 specifies XHDR responses with response code
             // 221, not the RFC 3977 HDR 225 code:
             // https://www.rfc-editor.org/rfc/rfc2980#section-2.6
@@ -6042,7 +6043,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc3977_red_capabilities_keyword_argument_matrix() {
+        async fn rfc3977_compliance_capabilities_keyword_argument_matrix() {
             // RFC 3977 section 5.2 defines CAPABILITIES [keyword]. Unknown
             // keyword arguments still receive the normal 101 capability list,
             // while non-keyword or extra arguments are syntax errors:
@@ -6107,7 +6108,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc3977_red_posting_disabled_rejects_pipelined_body_before_next_command() {
+        async fn rfc3977_compliance_posting_disabled_rejects_pipelined_body_before_next_command() {
             // RFC 3977 section 6.3.1 requires 440 when posting is prohibited.
             // The mock server may still discard an already-sent body to recover
             // the next command, but it must not emit 340/240:
@@ -6122,7 +6123,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc3977_red_ihave_rejection_consumes_pipelined_body_before_next_command() {
+        async fn rfc3977_compliance_ihave_rejection_consumes_pipelined_body_before_next_command() {
             // RFC 3977 section 6.3.2 permits 435 when an article is not wanted.
             // The mock server may discard an already-sent body to recover the
             // next command, but it must not emit 335/235 when rejecting:
@@ -6137,7 +6138,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc3977_red_newnews_results_depend_on_requested_datetime() {
+        async fn rfc3977_compliance_newnews_results_depend_on_requested_datetime() {
             // RFC 3977 section 7.4 requires NEWNEWS results to be selected from
             // the supplied wildmat and date/time arguments:
             // https://www.rfc-editor.org/rfc/rfc3977#section-7.4
@@ -6169,7 +6170,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc3977_red_newnews_wildmat_filters_results() {
+        async fn rfc3977_compliance_newnews_wildmat_filters_results() {
             // RFC 3977 section 7.4 requires NEWNEWS to apply the supplied
             // wildmat to the groups searched for new articles:
             // https://www.rfc-editor.org/rfc/rfc3977#section-7.4
@@ -6209,7 +6210,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc3977_red_help_lists_supported_commands_consistently() {
+        async fn rfc3977_compliance_help_lists_supported_commands_consistently() {
             // RFC 3977 section 7.2 says HELP returns help text for commands that
             // are understood. The command names should match the actual syntax:
             // https://www.rfc-editor.org/rfc/rfc3977#section-7.2
@@ -6251,7 +6252,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc3977_red_listgroup_range_filters_article_numbers() {
+        async fn rfc3977_compliance_listgroup_range_filters_article_numbers() {
             // RFC 3977 section 6.1.2 says LISTGROUP's optional range limits the
             // article numbers returned in the multi-line body. If the end is
             // less than the start, or the range is beyond the selected group,
@@ -6293,7 +6294,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc3977_red_list_active_unknown_wildmat_filters_results() {
+        async fn rfc3977_compliance_list_active_unknown_wildmat_filters_results() {
             // RFC 3977 section 7.6.3 requires LIST ACTIVE to apply the optional
             // wildmat pattern to the returned newsgroups:
             // https://www.rfc-editor.org/rfc/rfc3977#section-7.6.3
@@ -6308,7 +6309,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc3977_red_list_active_times_unknown_wildmat_filters_results() {
+        async fn rfc3977_compliance_list_active_times_unknown_wildmat_filters_results() {
             // RFC 3977 section 7.6.4 requires LIST ACTIVE.TIMES to apply the
             // optional wildmat pattern:
             // https://www.rfc-editor.org/rfc/rfc3977#section-7.6.4
@@ -6323,7 +6324,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc3977_red_list_newsgroups_unknown_wildmat_filters_results() {
+        async fn rfc3977_compliance_list_newsgroups_unknown_wildmat_filters_results() {
             // RFC 3977 section 7.6.6 requires LIST NEWSGROUPS to apply the
             // optional wildmat pattern:
             // https://www.rfc-editor.org/rfc/rfc3977#section-7.6.6
@@ -6338,7 +6339,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc3977_red_list_wildmat_filters_matching_groups() {
+        async fn rfc3977_compliance_list_wildmat_filters_matching_groups() {
             // RFC 3977 sections 7.6.3, 7.6.4, and 7.6.6 require LIST wildmat
             // arguments to filter returned groups, not just validate syntax:
             // https://www.rfc-editor.org/rfc/rfc3977#section-7.6.3
@@ -6445,7 +6446,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc3977_red_newgroups_results_depend_on_requested_datetime() {
+        async fn rfc3977_compliance_newgroups_results_depend_on_requested_datetime() {
             // RFC 3977 section 7.3 requires NEWGROUPS results to be selected
             // from the supplied date/time arguments:
             // https://www.rfc-editor.org/rfc/rfc3977#section-7.3
@@ -6468,7 +6469,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc3977_red_newgroups_uses_active_group_line_format() {
+        async fn rfc3977_compliance_newgroups_uses_active_group_line_format() {
             // RFC 3977 section 7.3 says NEWGROUPS results use the same line
             // format as LIST ACTIVE. Section 7.6.3 defines those lines as
             // newsgroup high-water low-water status:
@@ -6504,7 +6505,7 @@ mod tests {
         }
 
         #[test]
-        fn rfc3977_red_short_date_century_mapping_matrix() {
+        fn rfc3977_compliance_short_date_century_mapping_matrix() {
             // RFC 3977 section 7.3.2 maps six-digit dates to the current
             // century when yy is <= the current year, and the previous
             // century otherwise:
@@ -6524,7 +6525,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc3977_red_overview_group_scoped_selectors_before_group_return_412() {
+        async fn rfc3977_compliance_overview_group_scoped_selectors_before_group_return_412() {
             // RFC 3977 sections 8.3.2 and 8.5.2 define numeric and range
             // overview/header selectors against the currently selected group:
             // https://www.rfc-editor.org/rfc/rfc3977#section-8.3.2
@@ -6588,7 +6589,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc3977_red_hdr_subject_omits_header_name_from_values() {
+        async fn rfc3977_compliance_hdr_subject_omits_header_name_from_values() {
             // RFC 3977 section 8.5 returns the requested header metadata value,
             // not a repeated "Header-Name:" prefix in each result line:
             // https://www.rfc-editor.org/rfc/rfc3977#section-8.5
@@ -6602,7 +6603,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc3977_red_hdr_message_id_returns_valid_message_id_values() {
+        async fn rfc3977_compliance_hdr_message_id_returns_valid_message_id_values() {
             // RFC 3977 section 8.5 returns the requested header metadata. When
             // Message-ID is requested, each value should use the message-id grammar:
             // https://www.rfc-editor.org/rfc/rfc3977#section-8.5
@@ -6616,7 +6617,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc3977_red_hdr_unsupported_fields_return_503() {
+        async fn rfc3977_compliance_hdr_unsupported_fields_return_503() {
             // RFC 3977 section 8.5.2 permits a server to restrict HDR to a
             // limited field set. When it does, unsupported valid fields must
             // return 503 instead of successful empty or fabricated results:
@@ -6651,7 +6652,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc3977_red_hdr_metadata_fields_return_metadata_values() {
+        async fn rfc3977_compliance_hdr_metadata_fields_return_metadata_values() {
             // RFC 3977 sections 8.1, 8.4, and 8.5 distinguish calculated
             // metadata items such as :bytes and :lines from header fields.
             // HDR must return the calculated metadata value, not a Subject
@@ -6700,7 +6701,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc3977_red_overview_and_header_numeric_selectors_filter_results() {
+        async fn rfc3977_compliance_overview_and_header_numeric_selectors_filter_results() {
             // RFC 3977 sections 8.3.2 and 8.5.2 require overview and header
             // metadata responses to match the supplied article-number selector:
             // https://www.rfc-editor.org/rfc/rfc3977#section-8.3.2
@@ -6746,7 +6747,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc3977_red_server_preserves_tab_separated_command_arguments() {
+        async fn rfc3977_compliance_server_preserves_tab_separated_command_arguments() {
             // RFC 3977 section 3.1 defines command arguments as separated by WS,
             // and section 9.8 defines WS as SP / TAB. Stateful server handling
             // must therefore preserve arguments for TAB-separated valid commands:
@@ -6788,7 +6789,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc3977_red_overview_and_header_range_selectors_filter_results() {
+        async fn rfc3977_compliance_overview_and_header_range_selectors_filter_results() {
             // RFC 3977 sections 8.3.2 and 8.5.2 apply article-range selectors
             // to overview and header metadata. Ranges must include every
             // matching article row, and a lower bound of 2 must not return
@@ -6963,7 +6964,8 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc3977_red_overview_and_header_message_id_selectors_use_zero_article_number() {
+        async fn rfc3977_compliance_overview_and_header_message_id_selectors_use_zero_article_number()
+         {
             // RFC 3977 sections 8.3.2 and 8.5.2 require message-id selectors
             // to return the selected article. When group membership is not
             // asserted, the article number is replaced with 0:
@@ -7041,7 +7043,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc2980_red_xhdr_subject_returns_subject_values_not_message_ids() {
+        async fn rfc2980_compliance_xhdr_subject_returns_subject_values_not_message_ids() {
             // RFC 2980 section 2.6 returns values for the requested header.
             // XHDR Subject must not return Message-ID-shaped values:
             // https://www.rfc-editor.org/rfc/rfc2980#section-2.6
@@ -7057,7 +7059,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc2980_red_xhdr_message_id_returns_valid_message_id_values() {
+        async fn rfc2980_compliance_xhdr_message_id_returns_valid_message_id_values() {
             // RFC 2980 section 2.6 returns values for the requested header.
             // Message-ID values should still satisfy the RFC 3977 message-id grammar:
             // https://www.rfc-editor.org/rfc/rfc2980#section-2.6
@@ -7073,7 +7075,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc3977_red_list_overview_fmt_with_arguments_returns_501() {
+        async fn rfc3977_compliance_list_overview_fmt_with_arguments_returns_501() {
             // RFC 3977 section 8.4 defines LIST OVERVIEW.FMT without arguments:
             // https://www.rfc-editor.org/rfc/rfc3977#section-8.4
             let input = b"LIST OVERVIEW.FMT extra\r\n";
@@ -7082,7 +7084,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc3977_red_list_headers_invalid_argument_returns_501() {
+        async fn rfc3977_compliance_list_headers_invalid_argument_returns_501() {
             // RFC 3977 section 8.6.1 only permits the MSGID and RANGE
             // arguments for LIST HEADERS:
             // https://www.rfc-editor.org/rfc/rfc3977#section-8.6
@@ -7092,7 +7094,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc3977_red_list_headers_accepts_msgid_and_range_arguments() {
+        async fn rfc3977_compliance_list_headers_accepts_msgid_and_range_arguments() {
             // RFC 3977 section 8.6.1 defines LIST HEADERS [MSGID|RANGE].
             // Section 8.6.2 says servers that do not vary HDR fields by form
             // must ignore either argument and return the same results:
@@ -7121,7 +7123,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc3977_red_list_distrib_pats_response_and_syntax_matrix() {
+        async fn rfc3977_compliance_list_distrib_pats_response_and_syntax_matrix() {
             // RFC 3977 section 9.6 defines LIST DISTRIB.PATS content as
             // priority:wildmat:distribution lines, and section 7.6.5 defines
             // the command without arguments:
@@ -7145,7 +7147,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc3977_red_too_long_command_line_returns_501() {
+        async fn rfc3977_compliance_too_long_command_line_returns_501() {
             // RFC 3977 section 3.1 limits command lines to 512 octets including
             // CRLF and separately limits command arguments to 497 octets. An
             // overlong command should get a 501 response, not a silent close:
@@ -7181,7 +7183,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc3977_red_bare_lf_command_line_returns_501_and_recovers() {
+        async fn rfc3977_compliance_bare_lf_command_line_returns_501_and_recovers() {
             // RFC 3977 section 3.1 requires command lines to end in CRLF. A bare
             // LF must be rejected as syntax and must not be recovered as DATE:
             // https://www.rfc-editor.org/rfc/rfc3977#section-3.1
@@ -7199,7 +7201,7 @@ mod tests {
         }
 
         #[test]
-        fn rfc3977_red_article_parser_rejects_stat_multiline_terminator() {
+        fn rfc3977_compliance_article_parser_rejects_stat_multiline_terminator() {
             // RFC 3977 section 6.2.4 defines STAT as a single-line response
             // with no multi-line data block:
             // https://www.rfc-editor.org/rfc/rfc3977#section-6.2.4
@@ -7207,7 +7209,7 @@ mod tests {
         }
 
         #[test]
-        fn rfc3977_red_request_line_accepts_rfc_ws_and_eol_matrix() {
+        fn rfc3977_compliance_request_line_accepts_rfc_ws_and_eol_matrix() {
             assert_red_request_line_known_cases(&[
                 (
                     "GROUP accepts TAB as WS separator",
@@ -7267,7 +7269,7 @@ mod tests {
         }
 
         #[test]
-        fn rfc3977_red_request_line_rejects_invalid_command_shapes_matrix() {
+        fn rfc3977_compliance_request_line_rejects_invalid_command_shapes_matrix() {
             assert_red_request_line_unknown_cases(&[
                 (
                     "LAST argument",
@@ -7323,7 +7325,7 @@ mod tests {
         }
 
         #[test]
-        fn rfc3977_red_request_line_length_limit_matrix() {
+        fn rfc3977_compliance_request_line_length_limit_matrix() {
             // RFC 3977 section 3.1 limits command lines to 512 octets,
             // including the terminating CRLF, and command arguments to 497 octets:
             // https://www.rfc-editor.org/rfc/rfc3977#section-3.1
@@ -7390,7 +7392,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc3977_red_server_selector_and_state_response_matrix() {
+        async fn rfc3977_compliance_server_selector_and_state_response_matrix() {
             assert_red_server_response_cases(&[
                 ServerResponseCase {
                     name: "GROUP unknown group",
@@ -7713,7 +7715,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc3977_red_server_list_and_discovery_syntax_matrix() {
+        async fn rfc3977_compliance_server_list_and_discovery_syntax_matrix() {
             assert_red_server_response_cases(&[
                 ServerResponseCase {
                     name: "DATE with argument",
@@ -7918,7 +7920,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc3977_red_server_post_auth_and_streaming_syntax_matrix() {
+        async fn rfc3977_compliance_server_post_auth_and_streaming_syntax_matrix() {
             assert_red_server_response_cases(&[
                 ServerResponseCase {
                     name: "POST with argument",
@@ -7997,7 +7999,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc4643_red_authinfo_user_pass_accept_b_char_values() {
+        async fn rfc4643_compliance_authinfo_user_pass_accept_b_char_values() {
             assert_red_server_response_cases(&[
                 ServerResponseCase {
                     name: "AUTHINFO USER value with space",
@@ -8022,7 +8024,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rfc4642_red_starttls_with_buffered_plaintext_still_returns_502() {
+        async fn rfc4642_compliance_starttls_with_buffered_plaintext_still_returns_502() {
             // RFC 4642 section 2.2 requires a 382 response to begin actual TLS
             // negotiation. A server without TLS support must not emit 382 just
             // because another plaintext command is already buffered:
@@ -8040,7 +8042,7 @@ mod tests {
             use super::*;
 
             #[test]
-            fn rfc3977_red_value_validation_matrix() {
+            fn rfc3977_compliance_value_validation_matrix() {
                 assert!(
                     [
                         (
@@ -8446,7 +8448,7 @@ mod tests {
             use super::*;
 
             #[test]
-            fn rfc3977_red_request_line_valid_ws_matrix() {
+            fn rfc3977_compliance_request_line_valid_ws_matrix() {
                 assert_red_request_line_known_cases(&[
                     (
                         "GROUP tab separator",
@@ -8554,7 +8556,7 @@ mod tests {
             }
 
             #[test]
-            fn rfc3977_red_request_line_grammar_matrix() {
+            fn rfc3977_compliance_request_line_grammar_matrix() {
                 assert_red_request_line_unknown_cases(&[
                     (
                         "ARTICLE extra argument",
@@ -8699,7 +8701,7 @@ mod tests {
             use super::*;
 
             #[tokio::test]
-            async fn rfc3977_red_server_syntax_response_matrix() {
+            async fn rfc3977_compliance_server_syntax_response_matrix() {
                 assert_red_server_response_cases(&[
                     ServerResponseCase {
                         name: "QUIT accepts trailing EOL whitespace",
@@ -8944,7 +8946,7 @@ mod tests {
             use super::*;
 
             #[test]
-            fn rfc3977_red_response_frame_valid_shape_matrix() {
+            fn rfc3977_compliance_response_frame_valid_shape_matrix() {
                 assert_red_response_frame_valid_cases(&[
                     ResponseFrameCase {
                         name: "QUIT accepts bare generic status line",
@@ -9545,7 +9547,7 @@ mod tests {
             }
 
             #[test]
-            fn rfc4643_red_authinfo_sasl_long_response_line_matrix() {
+            fn rfc4643_compliance_authinfo_sasl_long_response_line_matrix() {
                 // RFC 4643 sections 2.4.1 and 7.2 allow AUTHINFO SASL 283 and
                 // 383 response lines to exceed the RFC 3977 512-octet response
                 // initial-line limit when carrying SASL challenge data:
@@ -9587,7 +9589,7 @@ mod tests {
             }
 
             #[test]
-            fn rfc3977_red_single_line_response_consumes_only_initial_line() {
+            fn rfc3977_compliance_single_line_response_consumes_only_initial_line() {
                 // RFC 3977 sections 3.1 and 9.4 define single-line responses
                 // as complete at the response initial-line CRLF. Extra bytes
                 // may be the next pipelined response and must remain unconsumed:
@@ -9629,7 +9631,7 @@ mod tests {
             }
 
             #[test]
-            fn rfc3977_red_response_frame_validation_matrix() {
+            fn rfc3977_compliance_response_frame_validation_matrix() {
                 assert_red_response_frame_invalid_cases(&[
                     ResponseFrameCase {
                         name: "response status rejects 000 class",
@@ -11388,7 +11390,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rfc3977_red_read_greeting_status_matrix() {
+    async fn rfc3977_compliance_read_greeting_status_matrix() {
         // RFC 3977 section 5.1 allows only 200, 201, 400, and 502 as initial
         // connection greeting codes. 200 and 201 are service-ready states;
         // 400 and 502 require the server to close and must not be treated as
@@ -12893,7 +12895,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rfc3977_red_read_command_batch_rejects_unstuffed_dot_takethis_body_line() {
+    async fn rfc3977_compliance_read_command_batch_rejects_unstuffed_dot_takethis_body_line() {
         // RFC 3977 section 3.1.1 requires a data line beginning with "." in a
         // command-continuation body to be dot-stuffed. A single-dot-prefixed
         // content line is invalid, while "." CRLF alone is the terminator:
@@ -13327,7 +13329,8 @@ mod tests {
     }
 
     #[test]
-    fn rfc3977_red_for_each_request_line_in_batch_rejects_unstuffed_dot_takethis_body_line() {
+    fn rfc3977_compliance_for_each_request_line_in_batch_rejects_unstuffed_dot_takethis_body_line()
+    {
         // RFC 3977 section 3.1.1 requires dot-prefixed data lines in command
         // continuations to be dot-stuffed. The batch scanner must not expose an
         // invalid TAKETHIS body as a complete command followed by pipelined input:

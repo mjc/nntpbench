@@ -5893,7 +5893,7 @@ mod tests {
     }
 
     #[test]
-    fn rfc3977_red_response_framing_error_status_matrix() {
+    fn rfc3977_compliance_response_framing_error_status_matrix() {
         // RFC 3977 section 3.2.1 defines generic errors as single-line
         // responses, but command-specific errors are valid only for commands
         // that list them. RFC 3977 section 5.2.2 also restricts CAPABILITIES
@@ -7205,7 +7205,7 @@ mod tests {
     }
 
     #[test]
-    fn rfc3977_red_request_builders_cover_current_over_and_hdr_forms() {
+    fn rfc3977_compliance_request_builders_cover_current_over_and_hdr_forms() {
         // RFC 3977 sections 8.3.1 and 8.5.1 define OVER and HDR forms that
         // omit the selector and use the current article:
         // https://www.rfc-editor.org/rfc/rfc3977#section-8.3.1
