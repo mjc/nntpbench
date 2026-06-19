@@ -8983,6 +8983,24 @@ mod tests {
                         frame: b"101 capability list follows\r\nVERSION 2\r\nSTARTTLS\r\nSTREAMING\r\nAUTHINFO USER SASL\r\nSASL CRAM-MD5 DIGEST-MD5 GSSAPI PLAIN EXTERNAL\r\n.\r\n",
                     },
                     ResponseFrameCase {
+                        name: "CAPABILITIES accepts multiple VERSION tokens",
+                        reference: "RFC 3977 section 5.2.2 allows VERSION to list one or more supported protocol versions https://www.rfc-editor.org/rfc/rfc3977#section-5.2.2",
+                        kind: RequestKind::Capabilities,
+                        frame: b"101 capability list follows\r\nVERSION 2 3\r\nREADER\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "CAPABILITIES accepts mode switching and posting capability labels",
+                        reference: "RFC 3977 sections 3.4.2, 5.2, 6.3.1, and 6.3.2 define MODE-READER, POST, and IHAVE capabilities https://www.rfc-editor.org/rfc/rfc3977#section-3.4.2",
+                        kind: RequestKind::Capabilities,
+                        frame: b"101 capability list follows\r\nVERSION 2\r\nMODE-READER\r\nPOST\r\nIHAVE\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "CAPABILITIES accepts reader LIST OVER HDR and NEWNEWS arguments",
+                        reference: "RFC 3977 sections 5.2, 7.6, 8.3, and 8.5 define argument-bearing reader capability labels https://www.rfc-editor.org/rfc/rfc3977#section-5.2",
+                        kind: RequestKind::Capabilities,
+                        frame: b"101 capability list follows\r\nVERSION 2\r\nLIST ACTIVE ACTIVE.TIMES DISTRIB.PATS NEWSGROUPS OVERVIEW.FMT HEADERS\r\nOVER MSGID\r\nHDR\r\nNEWNEWS\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "CAPABILITIES accepts reserved future line",
                         reference: "RFC 3977 section 3.3.1 says clients must ignore capability lines beginning with non-letters https://www.rfc-editor.org/rfc/rfc3977#section-3.3.1",
                         kind: RequestKind::Capabilities,
