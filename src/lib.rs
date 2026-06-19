@@ -5735,14 +5735,33 @@ mod tests {
             // that are supported by the server.
             // Section 3.4.2 also reserves MODE-READER for mode-switching transit
             // mode; this server offers reader commands immediately:
+            // Sections 5.2, 7.6, 8.3, and 8.5 require advertised LIST, OVER,
+            // HDR, and NEWNEWS forms to match the implemented reader surface:
             // https://www.rfc-editor.org/rfc/rfc3977#section-3.3
+            // https://www.rfc-editor.org/rfc/rfc3977#section-5.2
             // https://www.rfc-editor.org/rfc/rfc4643#section-2.1
             // https://www.rfc-editor.org/rfc/rfc3977#section-3.4.2
             let (output, _) = run_session_with_input(test_config(), b"CAPABILITIES\r\n").await;
             let text = String::from_utf8_lossy(without_greeting(&output));
+            let required = [
+                "101 Capability list:\r\n",
+                "VERSION 2\r\n",
+                "READER\r\n",
+                "LIST ACTIVE ACTIVE.TIMES DISTRIB.PATS NEWSGROUPS OVERVIEW.FMT HEADERS\r\n",
+                "OVER MSGID\r\n",
+                "HDR\r\n",
+                "NEWNEWS\r\n",
+                ".\r\n",
+            ];
+            for line in required {
+                assert!(
+                    text.contains(line),
+                    "missing required RFC 3977 capability line {line:?}, got {text:?}"
+                );
+            }
             assert!(
-                text.contains("VERSION 2") && text.contains("READER\r\n"),
-                "missing required RFC 3977 base/reader capabilities, got {text:?}"
+                text == String::from_utf8_lossy(CAPABILITIES_RESPONSE),
+                "RFC 3977 CAPABILITIES output should advertise exactly the supported reader extensions, got {text:?}"
             );
             assert!(
                 !text.contains("AUTHINFO")
