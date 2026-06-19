@@ -7983,6 +7983,12 @@ mod tests {
                         frame: b"225 headers follow\r\n1\r\n2 value\r\n.\r\n",
                     },
                     ResponseFrameCase {
+                        name: "HDR accepts byte-oriented S-NONTAB hdr-content",
+                        reference: "RFC 3977 sections 8.5.1, 9.4.3, and 10.2 https://www.rfc-editor.org/rfc/rfc3977#section-10.2",
+                        kind: RequestKind::Hdr,
+                        frame: b"225 headers follow\r\n1 caf\xe9\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "XHDR accepts message-id response row key",
                         reference: "RFC 2980 section 2.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.6",
                         kind: RequestKind::Xhdr,
@@ -8011,6 +8017,18 @@ mod tests {
                         reference: "RFC 3977 sections 8.3.2 and 9.4.3 https://www.rfc-editor.org/rfc/rfc3977#section-8.3.2",
                         kind: RequestKind::Over,
                         frame: b"224 overview follows\r\n1\tSubject\tfrom@test\tdate\t<one@test>\t\t\t\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "OVER accepts byte-oriented mandatory overview hdr-content",
+                        reference: "RFC 3977 sections 8.3.2, 9.4.3, and 10.2 https://www.rfc-editor.org/rfc/rfc3977#section-10.2",
+                        kind: RequestKind::Over,
+                        frame: b"224 overview follows\r\n1\tcaf\xe9\tfrom@test\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "OVER accepts byte-oriented labeled optional overview field",
+                        reference: "RFC 3977 sections 8.3.2, 9.4.3, and 10.2 https://www.rfc-editor.org/rfc/rfc3977#section-10.2",
+                        kind: RequestKind::Over,
+                        frame: b"224 overview follows\r\n1\tSubject\tfrom@test\tdate\t<one@test>\t\t1\t1\tXref: caf\xe9\r\n.\r\n",
                     },
                     ResponseFrameCase {
                         name: "XOVER accepts empty bytes metadata with numeric lines",
