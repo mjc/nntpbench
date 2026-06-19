@@ -2323,7 +2323,7 @@ fn is_specific_error_status_for_request(kind: RequestKind, code: u16) -> bool {
         RequestKind::Article | RequestKind::Body | RequestKind::Head | RequestKind::Stat => {
             matches!(code, 412 | 420 | 423 | 430)
         }
-        RequestKind::Group => matches!(code, 411 | 412),
+        RequestKind::Group => code == 411,
         RequestKind::ListGroup => matches!(code, 411 | 412),
         RequestKind::Last => matches!(code, 412 | 420 | 422),
         RequestKind::Next => matches!(code, 412 | 420 | 421),

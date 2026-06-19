@@ -8952,6 +8952,12 @@ mod tests {
                         frame: b"223 1 stat@test article exists\r\n",
                     },
                     ResponseFrameCase {
+                        name: "GROUP rejects no-current-group response",
+                        reference: "RFC 3977 section 6.1.1 lists 411, not 412, for unsuccessful GROUP selection https://www.rfc-editor.org/rfc/rfc3977#section-6.1.1",
+                        kind: RequestKind::Group,
+                        frame: b"412 no newsgroup selected\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "NEXT rejects non-numeric article number",
                         reference: "RFC 3977 section 6.1.4 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.4",
                         kind: RequestKind::Next,
