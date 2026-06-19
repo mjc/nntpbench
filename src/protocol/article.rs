@@ -1555,6 +1555,15 @@ fn validate_headers(data: &[u8]) -> Result<(), ArticleParseError> {
                 ));
             }
         }
+        if colon_pos + 1 == line.len() {
+            if data.get(line_end + crate::CRLF.len()) == Some(&b' ') {
+                pos = line_end + crate::CRLF.len();
+                continue;
+            }
+            return Err(ArticleParseError::InvalidHeader(
+                InvalidHeaderReason::MissingSpaceAfterColon,
+            ));
+        }
         if line.get(colon_pos + 1) != Some(&b' ') {
             return Err(ArticleParseError::InvalidHeader(
                 InvalidHeaderReason::MissingSpaceAfterColon,

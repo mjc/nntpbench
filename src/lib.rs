@@ -4537,10 +4537,49 @@ mod tests {
                     "HEAD header field",
                     b"221 1 <space@test>\r\nSubject:good\r\n.\r\n".as_slice(),
                 ),
+                (
+                    "ARTICLE folded header missing required SP after colon CRLF",
+                    b"220 1 <space@test>\r\nSubject:\r\n\tgood\r\n\r\nbody\r\n.\r\n".as_slice(),
+                ),
+                (
+                    "HEAD folded header missing required SP after colon CRLF",
+                    b"221 1 <space@test>\r\nSubject:\r\n\tgood\r\n.\r\n".as_slice(),
+                ),
             ] {
                 assert!(
                     Article::parse(input).is_err(),
                     "{name}: RFC 3977 article header field should require SP after colon"
+                );
+            }
+        }
+
+        #[test]
+        fn rfc3977_red_article_parser_accepts_header_content_after_colon_crlf_space() {
+            // RFC 3977 section 9.7 defines a header as header-name ":"
+            // [CRLF] SP header-content CRLF, so header content may start on
+            // the next physical line after a colon-CRLF-space sequence:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-9.7
+            for (name, input, expected) in [
+                (
+                    "ARTICLE header content starts after colon CRLF SP",
+                    b"220 1 <fold@test>\r\nSubject:\r\n folded subject\r\n\r\nbody\r\n.\r\n"
+                        .as_slice(),
+                    b"folded subject".as_slice(),
+                ),
+                (
+                    "HEAD header content starts after colon CRLF SP",
+                    b"221 1 <fold@test>\r\nSubject:\r\n folded subject\r\n.\r\n".as_slice(),
+                    b"folded subject".as_slice(),
+                ),
+            ] {
+                let article = Article::parse(input).unwrap();
+                assert_eq!(
+                    article
+                        .headers
+                        .as_ref()
+                        .and_then(|headers| headers.get("Subject")),
+                    Some(expected),
+                    "{name}: RFC 3977 header parser should accept colon CRLF SP content"
                 );
             }
         }
