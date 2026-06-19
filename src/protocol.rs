@@ -4614,6 +4614,9 @@ fn command_spacing_is_invalid(line: &[u8]) -> bool {
         || line
             .iter()
             .any(|byte| byte.is_ascii_whitespace() && !is_command_ws(*byte))
+        || line
+            .windows(2)
+            .any(|window| is_command_ws(window[0]) && is_command_ws(window[1]))
 }
 
 fn is_command_ws(byte: u8) -> bool {
@@ -5478,7 +5481,7 @@ mod tests {
         );
         assert_eq!(
             RequestLine::parse(b"MODE  READER\r\n").kind(),
-            RequestKind::ModeReader
+            RequestKind::Unknown
         );
         assert_eq!(
             RequestLine::parse(b"DATE \t\r\n").kind(),
@@ -5504,7 +5507,6 @@ mod tests {
             (b"ARTICLE 12345".as_slice(), RequestKind::Article),
             (b"GROUP alt.test".as_slice(), RequestKind::Group),
             (b"GROUP\talt.test".as_slice(), RequestKind::Group),
-            (b"GROUP  alt.test".as_slice(), RequestKind::Group),
             (b"LISTGROUP".as_slice(), RequestKind::ListGroup),
             (b"LISTGROUP alt.test".as_slice(), RequestKind::ListGroup),
             (b"LISTGROUP 1-".as_slice(), RequestKind::ListGroup),
@@ -5540,7 +5542,6 @@ mod tests {
             (b"CAPABILITIES".as_slice(), RequestKind::Capabilities),
             (b"MODE READER".as_slice(), RequestKind::ModeReader),
             (b"MODE\tREADER".as_slice(), RequestKind::ModeReader),
-            (b"MODE  READER".as_slice(), RequestKind::ModeReader),
             (b"QUIT".as_slice(), RequestKind::Quit),
             (b"OVER 1-10".as_slice(), RequestKind::Over),
             (b"XOVER 1-10".as_slice(), RequestKind::Xover),
@@ -5556,10 +5557,6 @@ mod tests {
             ),
             (
                 b"NEWNEWS * 20260101 000000 GMT".as_slice(),
-                RequestKind::NewNews,
-            ),
-            (
-                b"NEWNEWS\t*\t20260101  000000\tGMT".as_slice(),
                 RequestKind::NewNews,
             ),
             (

@@ -6927,22 +6927,10 @@ mod tests {
                     "RFC 3977 sections 9.2 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
                 ),
                 (
-                    "HEAD accepts repeated SP as WS separator",
-                    b"HEAD  1\r\n",
-                    RequestKind::Head,
-                    "RFC 3977 sections 9.2 and 6.2.2 https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
-                ),
-                (
                     "LIST accepts TAB before subcommand",
                     b"LIST\tACTIVE\r\n",
                     RequestKind::ListActive,
                     "RFC 3977 sections 7.6 and 9.2 https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
-                ),
-                (
-                    "NEWNEWS accepts mixed WS separators",
-                    b"NEWNEWS\talt.*  20260101\t000000 GMT\r\n",
-                    RequestKind::NewNews,
-                    "RFC 3977 sections 7.4.1 and 9.2 https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
                 ),
                 (
                     "AUTHINFO accepts TAB between subcommand and value",
@@ -8050,12 +8038,6 @@ mod tests {
                         "RFC 3977 section 9.2 https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
                     ),
                     (
-                        "GROUP multiple token separators",
-                        b"GROUP  alt.test\r\n",
-                        RequestKind::Group,
-                        "RFC 3977 section 9.2 https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
-                    ),
-                    (
                         "GROUP accepts wildmat-exact punctuation",
                         b"GROUP alt:test/with@punct\r\n",
                         RequestKind::Group,
@@ -8065,12 +8047,6 @@ mod tests {
                         "BODY tab separator",
                         b"BODY\t1\r\n",
                         RequestKind::Body,
-                        "RFC 3977 section 9.2 https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
-                    ),
-                    (
-                        "HEAD double space before selector",
-                        b"HEAD  1\r\n",
-                        RequestKind::Head,
                         "RFC 3977 section 9.2 https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
                     ),
                     (
@@ -8123,6 +8099,26 @@ mod tests {
                     (
                         "GROUP dangling WS after argument",
                         b"GROUP alt.test \r\n",
+                        "RFC 3977 section 9.2 command = keyword *(WS token) https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
+                    ),
+                    (
+                        "GROUP repeated WS creates empty token",
+                        b"GROUP  alt.test\r\n",
+                        "RFC 3977 section 9.2 command = keyword *(WS token) https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
+                    ),
+                    (
+                        "HEAD repeated WS before selector creates empty token",
+                        b"HEAD  1\r\n",
+                        "RFC 3977 section 9.2 command = keyword *(WS token) https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
+                    ),
+                    (
+                        "MODE repeated WS before READER creates empty token",
+                        b"MODE  READER\r\n",
+                        "RFC 3977 section 9.2 command = keyword *(WS token) https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
+                    ),
+                    (
+                        "NEWNEWS repeated WS before time creates empty token",
+                        b"NEWNEWS * 20260101  000000 GMT\r\n",
                         "RFC 3977 section 9.2 command = keyword *(WS token) https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
                     ),
                     (
