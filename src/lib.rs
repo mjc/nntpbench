@@ -7523,6 +7523,18 @@ mod tests {
                     expected: b"215 list of newsgroups follows\r\ncomp.lang.rust 0000000001 0000000001 y\r\n.\r\n223 2 <article.2@nntpbench.local> article retrieved\r\n",
                 },
                 ServerResponseCase {
+                    name: "LISTGROUP selects group and first current article",
+                    reference: "RFC 3977 section 6.1.2 says LISTGROUP selects a newsgroup and returns its article numbers https://www.rfc-editor.org/rfc/rfc3977#section-6.1.2",
+                    input: b"LISTGROUP comp.lang.rust\r\nSTAT\r\n",
+                    expected: STAT_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "LISTGROUP empty group selects group without current article",
+                    reference: "RFC 3977 section 6.1.2 says LISTGROUP selects a newsgroup and returns its article numbers https://www.rfc-editor.org/rfc/rfc3977#section-6.1.2",
+                    input: b"LISTGROUP empty.test\r\nSTAT\r\n",
+                    expected: b"420 no current article selected\r\n",
+                },
+                ServerResponseCase {
                     name: "OVER current article follows ARTICLE 2",
                     reference: "RFC 3977 section 8.3.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.3.2",
                     input: b"GROUP alt.test\r\nARTICLE 2\r\nOVER\r\n",
