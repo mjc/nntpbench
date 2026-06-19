@@ -6680,6 +6680,18 @@ mod tests {
                     expected: NEWGROUPS_RESPONSE,
                 },
                 ServerResponseCase {
+                    name: "NEWGROUPS accepts omitted GMT flag",
+                    reference: "RFC 3977 section 7.3.1 defines GMT as optional https://www.rfc-editor.org/rfc/rfc3977#section-7.3.1",
+                    input: b"NEWGROUPS 700101 000000\r\n",
+                    expected: NEWGROUPS_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "NEWGROUPS accepts lowercase GMT token",
+                    reference: "RFC 3977 sections 7.3.1 and 9.8 define GMT as a keyword token https://www.rfc-editor.org/rfc/rfc3977#section-7.3.1",
+                    input: b"NEWGROUPS 700101 000000 gmt\r\n",
+                    expected: NEWGROUPS_RESPONSE,
+                },
+                ServerResponseCase {
                     name: "NEWGROUPS six-digit 99 maps to previous century",
                     reference: "RFC 3977 section 7.3.2 https://www.rfc-editor.org/rfc/rfc3977#section-7.3.2",
                     input: b"NEWGROUPS 991231 235959 GMT\r\n",
@@ -8027,6 +8039,30 @@ mod tests {
                     reference: "RFC 3977 section 7.3.2 https://www.rfc-editor.org/rfc/rfc3977#section-7.3.2",
                     input: b"NEWGROUPS 20260431 000000 GMT\r\n",
                     expected: NEWGROUPS_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "NEWGROUPS rejects zero month",
+                    reference: "RFC 3977 section 7.3.2 defines months 01-12 https://www.rfc-editor.org/rfc/rfc3977#section-7.3.2",
+                    input: b"NEWGROUPS 20260001 000000 GMT\r\n",
+                    expected: b"501 command syntax error\r\n",
+                },
+                ServerResponseCase {
+                    name: "NEWGROUPS rejects zero day",
+                    reference: "RFC 3977 section 7.3.2 defines days 01-31 https://www.rfc-editor.org/rfc/rfc3977#section-7.3.2",
+                    input: b"NEWGROUPS 20260100 000000 GMT\r\n",
+                    expected: b"501 command syntax error\r\n",
+                },
+                ServerResponseCase {
+                    name: "NEWGROUPS rejects minute 60",
+                    reference: "RFC 3977 section 7.3.2 defines minutes 00-59 https://www.rfc-editor.org/rfc/rfc3977#section-7.3.2",
+                    input: b"NEWGROUPS 20260101 006000 GMT\r\n",
+                    expected: b"501 command syntax error\r\n",
+                },
+                ServerResponseCase {
+                    name: "NEWGROUPS rejects second 61",
+                    reference: "RFC 3977 section 7.3.2 defines seconds 00-60 https://www.rfc-editor.org/rfc/rfc3977#section-7.3.2",
+                    input: b"NEWGROUPS 20260101 000061 GMT\r\n",
+                    expected: b"501 command syntax error\r\n",
                 },
                 ServerResponseCase {
                     name: "NEWNEWS accepts RFC bounded day without Gregorian validation",
