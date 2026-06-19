@@ -1461,11 +1461,12 @@ where
             }
             if config.article_dir.is_some() {
                 let message_id = command_lines.and_then(|lines| command_message_id(command, lines));
+                let article_id = command.article_id.or(session_state.current_article);
                 if write_stored_article_response(
                     writer,
                     pending_write,
                     config,
-                    command.article_id,
+                    article_id,
                     message_id.as_ref(),
                     session_stats,
                     article_path,
@@ -1480,7 +1481,7 @@ where
                 write_response(
                     writer,
                     pending_write,
-                    article_not_found_response(command.article_id, message_id.as_ref()),
+                    article_not_found_response(article_id, message_id.as_ref()),
                     session_stats,
                 )
                 .await?;
@@ -5616,9 +5617,14 @@ mod tests {
 
             let (output, _) = run_session_with_input(
                 config,
-                b"GROUP alt.test\r\nARTICLE 2\r\nARTICLE <stored@ngPost>\r\nSTAT\r\n",
+                b"GROUP alt.test\r\nARTICLE 2\r\nARTICLE\r\nARTICLE <stored@ngPost>\r\nSTAT\r\n",
             )
             .await;
+            assert!(
+                without_greeting(&output).windows(response.len()).count() >= 2,
+                "RFC 3977 current ARTICLE must read the selected stored article, got {:?}",
+                String::from_utf8_lossy(without_greeting(&output))
+            );
             assert!(
                 without_greeting(&output)
                     .ends_with(b"223 2 <article.2@nntpbench.local> article retrieved\r\n"),
@@ -5660,6 +5666,21 @@ mod tests {
                     "ARTICLE current selector after GROUP",
                     b"GROUP alt.test\r\nARTICLE\r\n".as_slice(),
                     b"220 1 <article.1@nntpbench.local> article follows\r\n".as_slice(),
+                ),
+                (
+                    "HEAD current selector after ARTICLE 2",
+                    b"GROUP alt.test\r\nARTICLE 2\r\nHEAD\r\n".as_slice(),
+                    b"221 2 <article.2@nntpbench.local> article retrieved\r\n".as_slice(),
+                ),
+                (
+                    "BODY current selector after ARTICLE 2",
+                    b"GROUP alt.test\r\nARTICLE 2\r\nBODY\r\n".as_slice(),
+                    b"222 2 <article.2@nntpbench.local> body follows\r\n".as_slice(),
+                ),
+                (
+                    "STAT current selector after ARTICLE 2",
+                    b"GROUP alt.test\r\nARTICLE 2\r\nSTAT\r\n".as_slice(),
+                    b"223 2 <article.2@nntpbench.local> article retrieved\r\n".as_slice(),
                 ),
             ] {
                 let (output, _) = run_session_with_input(test_config(), input).await;
