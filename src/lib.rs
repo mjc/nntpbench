@@ -101,25 +101,49 @@ pub const GREETING: &[u8] = b"201 nntpbench mock server ready\r\n";
 pub const MODE_READER_RESPONSE: &[u8] = b"201 posting not permitted\r\n";
 pub const DATE_RESPONSE: &[u8] = b"111 20260602120000\r\n";
 pub const LIST_RESPONSE: &[u8] =
+    b"215 list of newsgroups follows\r\ncomp.lang.rust 0000000001 0000000001 y\r\nalt.test 0000000003 0000000001 y\r\nempty.test 0000000000 0000000000 y\r\n.\r\n";
+const LIST_ACTIVE_COMP_ALT_RESPONSE: &[u8] =
     b"215 list of newsgroups follows\r\ncomp.lang.rust 0000000001 0000000001 y\r\nalt.test 0000000003 0000000001 y\r\n.\r\n";
 const LIST_ACTIVE_COMP_RESPONSE: &[u8] =
     b"215 list of newsgroups follows\r\ncomp.lang.rust 0000000001 0000000001 y\r\n.\r\n";
 const LIST_ACTIVE_ALT_RESPONSE: &[u8] =
     b"215 list of newsgroups follows\r\nalt.test 0000000003 0000000001 y\r\n.\r\n";
+const LIST_ACTIVE_EMPTY_GROUP_RESPONSE: &[u8] =
+    b"215 list of newsgroups follows\r\nempty.test 0000000000 0000000000 y\r\n.\r\n";
+const LIST_ACTIVE_COMP_EMPTY_GROUP_RESPONSE: &[u8] =
+    b"215 list of newsgroups follows\r\ncomp.lang.rust 0000000001 0000000001 y\r\nempty.test 0000000000 0000000000 y\r\n.\r\n";
+const LIST_ACTIVE_ALT_EMPTY_GROUP_RESPONSE: &[u8] =
+    b"215 list of newsgroups follows\r\nalt.test 0000000003 0000000001 y\r\nempty.test 0000000000 0000000000 y\r\n.\r\n";
 const LIST_EMPTY_RESPONSE: &[u8] = b"215 list of newsgroups follows\r\n.\r\n";
 pub const LIST_ACTIVE_TIMES_RESPONSE: &[u8] =
+    b"215 information follows\r\ncomp.lang.rust 1715904000 admin@nntpbench.local\r\nalt.test 1715907600 admin@nntpbench.local\r\nempty.test 1715911200 admin@nntpbench.local\r\n.\r\n";
+const LIST_ACTIVE_TIMES_COMP_ALT_RESPONSE: &[u8] =
     b"215 information follows\r\ncomp.lang.rust 1715904000 admin@nntpbench.local\r\nalt.test 1715907600 admin@nntpbench.local\r\n.\r\n";
 const LIST_ACTIVE_TIMES_COMP_RESPONSE: &[u8] =
     b"215 information follows\r\ncomp.lang.rust 1715904000 admin@nntpbench.local\r\n.\r\n";
 const LIST_ACTIVE_TIMES_ALT_RESPONSE: &[u8] =
     b"215 information follows\r\nalt.test 1715907600 admin@nntpbench.local\r\n.\r\n";
+const LIST_ACTIVE_TIMES_EMPTY_GROUP_RESPONSE: &[u8] =
+    b"215 information follows\r\nempty.test 1715911200 admin@nntpbench.local\r\n.\r\n";
+const LIST_ACTIVE_TIMES_COMP_EMPTY_GROUP_RESPONSE: &[u8] =
+    b"215 information follows\r\ncomp.lang.rust 1715904000 admin@nntpbench.local\r\nempty.test 1715911200 admin@nntpbench.local\r\n.\r\n";
+const LIST_ACTIVE_TIMES_ALT_EMPTY_GROUP_RESPONSE: &[u8] =
+    b"215 information follows\r\nalt.test 1715907600 admin@nntpbench.local\r\nempty.test 1715911200 admin@nntpbench.local\r\n.\r\n";
 const LIST_INFO_EMPTY_RESPONSE: &[u8] = b"215 information follows\r\n.\r\n";
 pub const LIST_NEWSGROUPS_RESPONSE: &[u8] =
+    b"215 information follows\r\ncomp.lang.rust The Rust programming language\r\nalt.test Synthetic benchmark group\r\nempty.test Empty synthetic benchmark group\r\n.\r\n";
+const LIST_NEWSGROUPS_COMP_ALT_RESPONSE: &[u8] =
     b"215 information follows\r\ncomp.lang.rust The Rust programming language\r\nalt.test Synthetic benchmark group\r\n.\r\n";
 const LIST_NEWSGROUPS_COMP_RESPONSE: &[u8] =
     b"215 information follows\r\ncomp.lang.rust The Rust programming language\r\n.\r\n";
 const LIST_NEWSGROUPS_ALT_RESPONSE: &[u8] =
     b"215 information follows\r\nalt.test Synthetic benchmark group\r\n.\r\n";
+const LIST_NEWSGROUPS_EMPTY_GROUP_RESPONSE: &[u8] =
+    b"215 information follows\r\nempty.test Empty synthetic benchmark group\r\n.\r\n";
+const LIST_NEWSGROUPS_COMP_EMPTY_GROUP_RESPONSE: &[u8] =
+    b"215 information follows\r\ncomp.lang.rust The Rust programming language\r\nempty.test Empty synthetic benchmark group\r\n.\r\n";
+const LIST_NEWSGROUPS_ALT_EMPTY_GROUP_RESPONSE: &[u8] =
+    b"215 information follows\r\nalt.test Synthetic benchmark group\r\nempty.test Empty synthetic benchmark group\r\n.\r\n";
 pub const LIST_OVERVIEW_FMT_RESPONSE: &[u8] =
     b"215 Order of fields in overview database\r\nSubject:\r\nFrom:\r\nDate:\r\nMessage-ID:\r\nReferences:\r\n:bytes\r\n:lines\r\n.\r\n";
 pub const LIST_HEADERS_RESPONSE: &[u8] =
@@ -3201,11 +3225,16 @@ fn command_arg_count(args: &[u8]) -> usize {
 fn list_active_response(args: &[u8]) -> &'static [u8] {
     let matches_comp = args.is_empty() || wildmat_matches(args, b"comp.lang.rust");
     let matches_alt = args.is_empty() || wildmat_matches(args, b"alt.test");
-    match (matches_comp, matches_alt) {
-        (true, true) => LIST_RESPONSE,
-        (true, false) => LIST_ACTIVE_COMP_RESPONSE,
-        (false, true) => LIST_ACTIVE_ALT_RESPONSE,
-        (false, false) => LIST_EMPTY_RESPONSE,
+    let matches_empty = args.is_empty() || wildmat_matches(args, b"empty.test");
+    match (matches_comp, matches_alt, matches_empty) {
+        (true, true, true) => LIST_RESPONSE,
+        (true, true, false) => LIST_ACTIVE_COMP_ALT_RESPONSE,
+        (true, false, true) => LIST_ACTIVE_COMP_EMPTY_GROUP_RESPONSE,
+        (true, false, false) => LIST_ACTIVE_COMP_RESPONSE,
+        (false, true, true) => LIST_ACTIVE_ALT_EMPTY_GROUP_RESPONSE,
+        (false, true, false) => LIST_ACTIVE_ALT_RESPONSE,
+        (false, false, true) => LIST_ACTIVE_EMPTY_GROUP_RESPONSE,
+        (false, false, false) => LIST_EMPTY_RESPONSE,
     }
 }
 
@@ -3231,36 +3260,57 @@ fn strip_list_variant_args<'a>(args: &'a [u8], keyword: &[u8]) -> &'a [u8] {
 }
 
 fn list_active_times_response(args: &[u8]) -> &'static [u8] {
-    list_info_response_for_groups(
-        args,
-        LIST_ACTIVE_TIMES_RESPONSE,
-        LIST_ACTIVE_TIMES_COMP_RESPONSE,
-        LIST_ACTIVE_TIMES_ALT_RESPONSE,
-    )
+    list_info_response_for_groups(args, LIST_ACTIVE_TIMES_RESPONSES)
 }
 
 fn list_newsgroups_response(args: &[u8]) -> &'static [u8] {
-    list_info_response_for_groups(
-        args,
-        LIST_NEWSGROUPS_RESPONSE,
-        LIST_NEWSGROUPS_COMP_RESPONSE,
-        LIST_NEWSGROUPS_ALT_RESPONSE,
-    )
+    list_info_response_for_groups(args, LIST_NEWSGROUPS_RESPONSES)
 }
 
-fn list_info_response_for_groups(
-    args: &[u8],
+#[derive(Clone, Copy)]
+struct ListInfoResponses {
     full: &'static [u8],
+    comp_alt: &'static [u8],
     comp: &'static [u8],
     alt: &'static [u8],
-) -> &'static [u8] {
+    empty: &'static [u8],
+    comp_empty: &'static [u8],
+    alt_empty: &'static [u8],
+}
+
+const LIST_ACTIVE_TIMES_RESPONSES: ListInfoResponses = ListInfoResponses {
+    full: LIST_ACTIVE_TIMES_RESPONSE,
+    comp_alt: LIST_ACTIVE_TIMES_COMP_ALT_RESPONSE,
+    comp: LIST_ACTIVE_TIMES_COMP_RESPONSE,
+    alt: LIST_ACTIVE_TIMES_ALT_RESPONSE,
+    empty: LIST_ACTIVE_TIMES_EMPTY_GROUP_RESPONSE,
+    comp_empty: LIST_ACTIVE_TIMES_COMP_EMPTY_GROUP_RESPONSE,
+    alt_empty: LIST_ACTIVE_TIMES_ALT_EMPTY_GROUP_RESPONSE,
+};
+
+const LIST_NEWSGROUPS_RESPONSES: ListInfoResponses = ListInfoResponses {
+    full: LIST_NEWSGROUPS_RESPONSE,
+    comp_alt: LIST_NEWSGROUPS_COMP_ALT_RESPONSE,
+    comp: LIST_NEWSGROUPS_COMP_RESPONSE,
+    alt: LIST_NEWSGROUPS_ALT_RESPONSE,
+    empty: LIST_NEWSGROUPS_EMPTY_GROUP_RESPONSE,
+    comp_empty: LIST_NEWSGROUPS_COMP_EMPTY_GROUP_RESPONSE,
+    alt_empty: LIST_NEWSGROUPS_ALT_EMPTY_GROUP_RESPONSE,
+};
+
+fn list_info_response_for_groups(args: &[u8], responses: ListInfoResponses) -> &'static [u8] {
     let matches_comp = args.is_empty() || wildmat_matches(args, b"comp.lang.rust");
     let matches_alt = args.is_empty() || wildmat_matches(args, b"alt.test");
-    match (matches_comp, matches_alt) {
-        (true, true) => full,
-        (true, false) => comp,
-        (false, true) => alt,
-        (false, false) => LIST_INFO_EMPTY_RESPONSE,
+    let matches_empty = args.is_empty() || wildmat_matches(args, b"empty.test");
+    match (matches_comp, matches_alt, matches_empty) {
+        (true, true, true) => responses.full,
+        (true, true, false) => responses.comp_alt,
+        (true, false, true) => responses.comp_empty,
+        (true, false, false) => responses.comp,
+        (false, true, true) => responses.alt_empty,
+        (false, true, false) => responses.alt,
+        (false, false, true) => responses.empty,
+        (false, false, false) => LIST_INFO_EMPTY_RESPONSE,
     }
 }
 
@@ -6211,10 +6261,16 @@ mod tests {
                     expected: LIST_ACTIVE_ALT_RESPONSE,
                 },
                 ServerResponseCase {
+                    name: "LIST ACTIVE empty wildmat",
+                    reference: "RFC 3977 section 7.6.3 https://www.rfc-editor.org/rfc/rfc3977#section-7.6.3",
+                    input: b"LIST ACTIVE empty.*\r\n",
+                    expected: b"215 list of newsgroups follows\r\nempty.test 0000000000 0000000000 y\r\n.\r\n",
+                },
+                ServerResponseCase {
                     name: "LIST ACTIVE rightmost negated wildmat excludes alt",
                     reference: "RFC 3977 sections 4.2 and 7.6.3 https://www.rfc-editor.org/rfc/rfc3977#section-4.2",
                     input: b"LIST ACTIVE *,!alt.*\r\n",
-                    expected: LIST_ACTIVE_COMP_RESPONSE,
+                    expected: b"215 list of newsgroups follows\r\ncomp.lang.rust 0000000001 0000000001 y\r\nempty.test 0000000000 0000000000 y\r\n.\r\n",
                 },
                 ServerResponseCase {
                     name: "LIST ACTIVE rightmost positive wildmat re-includes alt",
@@ -6241,6 +6297,12 @@ mod tests {
                     expected: LIST_ACTIVE_TIMES_ALT_RESPONSE,
                 },
                 ServerResponseCase {
+                    name: "LIST ACTIVE.TIMES empty wildmat",
+                    reference: "RFC 3977 section 7.6.4 https://www.rfc-editor.org/rfc/rfc3977#section-7.6.4",
+                    input: b"LIST ACTIVE.TIMES empty.*\r\n",
+                    expected: b"215 information follows\r\nempty.test 1715911200 admin@nntpbench.local\r\n.\r\n",
+                },
+                ServerResponseCase {
                     name: "LIST NEWSGROUPS comp wildmat",
                     reference: "RFC 3977 section 7.6.6 https://www.rfc-editor.org/rfc/rfc3977#section-7.6.6",
                     input: b"LIST NEWSGROUPS comp.lang.*\r\n",
@@ -6250,13 +6312,19 @@ mod tests {
                     name: "LIST NEWSGROUPS rightmost negated wildmat excludes comp",
                     reference: "RFC 3977 sections 4.2 and 7.6.6 https://www.rfc-editor.org/rfc/rfc3977#section-4.2",
                     input: b"LIST NEWSGROUPS *,!comp.*\r\n",
-                    expected: LIST_NEWSGROUPS_ALT_RESPONSE,
+                    expected: LIST_NEWSGROUPS_ALT_EMPTY_GROUP_RESPONSE,
                 },
                 ServerResponseCase {
                     name: "LIST NEWSGROUPS alt wildmat",
                     reference: "RFC 3977 section 7.6.6 https://www.rfc-editor.org/rfc/rfc3977#section-7.6.6",
                     input: b"LIST NEWSGROUPS alt.*\r\n",
                     expected: LIST_NEWSGROUPS_ALT_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "LIST NEWSGROUPS empty wildmat",
+                    reference: "RFC 3977 section 7.6.6 https://www.rfc-editor.org/rfc/rfc3977#section-7.6.6",
+                    input: b"LIST NEWSGROUPS empty.*\r\n",
+                    expected: b"215 information follows\r\nempty.test Empty synthetic benchmark group\r\n.\r\n",
                 },
             ])
             .await;
