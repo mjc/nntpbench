@@ -2568,16 +2568,26 @@ fn parse_response_article_number(value: &[u8]) -> Option<u64> {
 }
 
 fn validate_group_watermarks(count: u64, low: u64, high: u64) -> bool {
+    if low == 0 {
+        return count == 0 && high == 0;
+    }
     if count == 0 {
         return high >= low || high.checked_add(1) == Some(low);
     }
 
-    low != 0
-        && high >= low
+    high >= low
         && high
             .checked_sub(low)
             .and_then(|span| span.checked_add(1))
             .is_some_and(|maximum_count| count <= maximum_count)
+}
+
+fn validate_group_watermark_pair(low: u64, high: u64) -> bool {
+    if low == 0 {
+        return high == 0;
+    }
+
+    high >= low || high.checked_add(1) == Some(low)
 }
 
 fn validate_article_status_response_arguments(value: &[u8], allow_zero_number: bool) -> bool {
@@ -2756,7 +2766,7 @@ fn validate_active_response_line(line: &[u8]) -> bool {
     std::str::from_utf8(group)
         .ok()
         .is_some_and(|group| GroupName::from_borrowed(group).is_ok())
-        && (high >= low || high.checked_add(1) == Some(low))
+        && validate_group_watermark_pair(low, high)
         && validate_active_status_token(status)
 }
 

@@ -9023,6 +9023,12 @@ mod tests {
                         frame: b"211 0 4000 3998 alt.empty\r\n",
                     },
                     ResponseFrameCase {
+                        name: "GROUP rejects zero low water mark outside all-zero empty group",
+                        reference: "RFC 3977 sections 3.6 and 6.1.1.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.1.2",
+                        kind: RequestKind::Group,
+                        frame: b"211 0 0 3 alt.empty\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "GROUP rejects non-empty summary with zero water marks",
                         reference: "RFC 3977 sections 3.6 and 6.1.1.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.1.2",
                         kind: RequestKind::Group,
@@ -9135,6 +9141,12 @@ mod tests {
                         reference: "RFC 3977 sections 6.1.1.2 and 7.6.3 https://www.rfc-editor.org/rfc/rfc3977#section-7.6.3",
                         kind: RequestKind::ListActive,
                         frame: b"215 list of newsgroups follows\r\nalt.empty 3998 4000 y\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "LIST ACTIVE rejects zero low water mark outside all-zero empty group",
+                        reference: "RFC 3977 sections 3.6, 6.1.1.2, and 7.6.3 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.1.2",
+                        kind: RequestKind::ListActive,
+                        frame: b"215 list of newsgroups follows\r\nalt.empty 3 0 y\r\n.\r\n",
                     },
                     ResponseFrameCase {
                         name: "LIST ACTIVE rejects tab field separator",
