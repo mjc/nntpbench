@@ -8738,6 +8738,42 @@ mod tests {
                         expected: b"500 unknown command\r\n",
                     },
                     ServerResponseCase {
+                        name: "unknown command without arguments returns 500",
+                        reference: "RFC 3977 sections 3.2.1 and 9.2 define 500 for syntactically valid unknown commands https://www.rfc-editor.org/rfc/rfc3977#section-3.2.1",
+                        input: b"XYZZY\r\n",
+                        expected: b"500 unknown command\r\n",
+                    },
+                    ServerResponseCase {
+                        name: "unknown command accepts tab-separated P-CHAR tokens",
+                        reference: "RFC 3977 sections 3.2.1, 9.2, and 9.8 define unknown extension command arguments as P-CHAR tokens separated by WS https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
+                        input: b"XYZZY one\tTwo-3.\r\n",
+                        expected: b"500 unknown command\r\n",
+                    },
+                    ServerResponseCase {
+                        name: "unknown command accepts punctuation P-CHAR token",
+                        reference: "RFC 3977 sections 3.2.1 and 9.8 define P-CHAR as visible characters for command arguments https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
+                        input: b"XYZZY !~\r\n",
+                        expected: b"500 unknown command\r\n",
+                    },
+                    ServerResponseCase {
+                        name: "unknown command accepts UTF-8 P-CHAR token",
+                        reference: "RFC 3977 sections 3.1 and 9.8 allow UTF-8 non-ASCII P-CHAR command arguments except BOM https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
+                        input: b"XYZZY caf\xc3\xa9\r\n",
+                        expected: b"500 unknown command\r\n",
+                    },
+                    ServerResponseCase {
+                        name: "unknown extension keyword with hyphen returns 500",
+                        reference: "RFC 3977 sections 3.2.1 and 9.8 permit command keywords with hyphen after the initial ALPHA https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
+                        input: b"X-FOO token\r\n",
+                        expected: b"500 unknown command\r\n",
+                    },
+                    ServerResponseCase {
+                        name: "unknown extension keyword with dot returns 500",
+                        reference: "RFC 3977 sections 3.2.1 and 9.8 permit command keywords with dot after the initial ALPHA https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
+                        input: b"X.FOO token\r\n",
+                        expected: b"500 unknown command\r\n",
+                    },
+                    ServerResponseCase {
                         name: "LIST unknown keyword with trailing token",
                         reference: "RFC 3977 section 7.6 https://www.rfc-editor.org/rfc/rfc3977#section-7.6",
                         input: b"LIST FROBNICATE extra\r\n",
