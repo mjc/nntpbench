@@ -3309,7 +3309,7 @@ fn validate_known_capability_response_line(label: &[u8], mut rest: &[u8]) -> Opt
             let Some((token, next)) = split_response_ws_token(rest) else {
                 return Some(false);
             };
-            if !validate_capability_argument_token(token) {
+            if !token.eq_ignore_ascii_case(b"USER") && !token.eq_ignore_ascii_case(b"SASL") {
                 return Some(false);
             }
             rest = next;

@@ -8603,10 +8603,10 @@ mod tests {
                         frame: b"101 capability list follows\r\nVERSION 2\r\n1RESERVED future-token\r\n.\r\n",
                     },
                     ResponseFrameCase {
-                        name: "CAPABILITIES accepts future AUTHINFO arguments",
-                        reference: "RFC 4643 section 2.1 https://www.rfc-editor.org/rfc/rfc4643#section-2.1",
+                        name: "CAPABILITIES accepts bare AUTHINFO capability",
+                        reference: "RFC 4643 section 3.4 defines AUTHINFO as followed by zero or more USER/SASL variants https://www.rfc-editor.org/rfc/rfc4643#section-3.4",
                         kind: RequestKind::Capabilities,
-                        frame: b"101 capability list follows\r\nVERSION 2\r\nAUTHINFO USER FUTURE-AUTH\r\n.\r\n",
+                        frame: b"101 capability list follows\r\nVERSION 2\r\nAUTHINFO\r\n.\r\n",
                     },
                     ResponseFrameCase {
                         name: "HELP accepts UTF-8 multiline text",
@@ -9532,6 +9532,18 @@ mod tests {
                         reference: "RFC 4643 sections 2.1 and 3.4 https://www.rfc-editor.org/rfc/rfc4643#section-2.1",
                         kind: RequestKind::Capabilities,
                         frame: b"101 Capability list:\r\nVERSION 2\r\nAUTHINFO USER BAD\0TOKEN\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "CAPABILITIES rejects unknown AUTHINFO variant",
+                        reference: "RFC 4643 section 3.4 defines authinfo-variant as USER or SASL https://www.rfc-editor.org/rfc/rfc4643#section-3.4",
+                        kind: RequestKind::Capabilities,
+                        frame: b"101 Capability list:\r\nVERSION 2\r\nAUTHINFO USER FUTURE-AUTH\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "CAPABILITIES rejects PASS AUTHINFO variant",
+                        reference: "RFC 4643 section 3.4 advertises USER/PASS authentication with the USER variant only https://www.rfc-editor.org/rfc/rfc4643#section-3.4",
+                        kind: RequestKind::Capabilities,
+                        frame: b"101 Capability list:\r\nVERSION 2\r\nAUTHINFO PASS\r\n.\r\n",
                     },
                     ResponseFrameCase {
                         name: "CAPABILITIES rejects SASL without mechanisms",
