@@ -3028,7 +3028,7 @@ fn validate_p_char_token(value: &[u8]) -> bool {
 }
 
 fn validate_overview_response_line(line: &[u8]) -> bool {
-    validate_overview_response_line_with_min_fields(line, 1, validate_overview_optional_field)
+    validate_overview_response_line_with_min_fields(line, 7, validate_overview_optional_field)
 }
 
 fn validate_xover_response_line(line: &[u8]) -> bool {
@@ -6275,7 +6275,7 @@ mod tests {
             ),
             (
                 RequestKind::Over,
-                b"224 overview follows\r\n1\tSubject\r\n2\tSubject\tfrom@test\tdate\t<two@test>\r\n.\r\n"
+                b"224 overview follows\r\n1\tSubject\tfrom@test\tdate\t<one@test>\t\t1\t1\r\n2\tSubject\tfrom@test\tdate\t<two@test>\t\t2\t2\r\n.\r\n"
                     .as_slice(),
             ),
             (

@@ -8645,10 +8645,10 @@ mod tests {
                         frame: b"221 headers follow\r\n(none)\r\n.\r\n",
                     },
                     ResponseFrameCase {
-                        name: "OVER accepts omitted trailing overview fields",
-                        reference: "RFC 3977 sections 8.3.2 and 9.4.3 https://www.rfc-editor.org/rfc/rfc3977#section-8.3.2",
+                        name: "OVER accepts omitted trailing optional overview fields",
+                        reference: "RFC 3977 section 8.3.2 allows optional fields after the first eight overview fields to be omitted https://www.rfc-editor.org/rfc/rfc3977#section-8.3.2",
                         kind: RequestKind::Over,
-                        frame: b"224 overview follows\r\n1\tSubject only\r\n2\tSubject\tfrom@test\tdate\t<two@test>\r\n.\r\n",
+                        frame: b"224 overview follows\r\n1\tSubject\tfrom@test\tdate\t<one@test>\t\t1\t1\r\n.\r\n",
                     },
                     ResponseFrameCase {
                         name: "OVER accepts empty bytes and lines metadata fields",
@@ -8660,7 +8660,7 @@ mod tests {
                         name: "OVER accepts byte-oriented mandatory overview hdr-content",
                         reference: "RFC 3977 sections 8.3.2, 9.4.3, and 10.2 https://www.rfc-editor.org/rfc/rfc3977#section-10.2",
                         kind: RequestKind::Over,
-                        frame: b"224 overview follows\r\n1\tcaf\xe9\tfrom@test\r\n.\r\n",
+                        frame: b"224 overview follows\r\n1\tcaf\xe9\tfrom@test\tdate\t<one@test>\t\t1\t1\r\n.\r\n",
                     },
                     ResponseFrameCase {
                         name: "OVER accepts byte-oriented labeled optional overview field",
@@ -9586,6 +9586,12 @@ mod tests {
                         reference: "RFC 3977 section 8.3.1 https://www.rfc-editor.org/rfc/rfc3977#section-8.3.1",
                         kind: RequestKind::Over,
                         frame: b"224 overview follows\r\n1 Subject without tabs\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "OVER rejects omitted required overview fields",
+                        reference: "RFC 3977 section 8.3.2 says the first eight overview fields are mandatory https://www.rfc-editor.org/rfc/rfc3977#section-8.3.2",
+                        kind: RequestKind::Over,
+                        frame: b"224 overview follows\r\n1\tSubject only\r\n2\tSubject\tfrom@test\tdate\t<two@test>\r\n.\r\n",
                     },
                     ResponseFrameCase {
                         name: "OVER rejects unlabeled optional overview field",
