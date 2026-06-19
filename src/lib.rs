@@ -5237,6 +5237,53 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn rfc3977_compliance_group_state_matrix_is_stable_with_article_dir() {
+            // RFC 3977 section 6.1.1 defines GROUP in terms of the selected
+            // group state. Enabling a local article backend must not change the
+            // selected group's count/low/high summary or 411 handling:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-6.1.1
+            let article_dir = unique_temp_dir("rfc-group-article-dir");
+            fs::create_dir_all(&article_dir).unwrap();
+
+            let mut args = test_args();
+            args.article_dir = Some(article_dir.clone());
+            let config = Arc::new(ServerConfig::from_args(args));
+
+            assert_red_server_response_cases_with_config(
+                config,
+                &[
+                    ServerResponseCase {
+                        name: "GROUP alt.test with article_dir",
+                        reference: "RFC 3977 section 6.1.1 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.1",
+                        input: b"GROUP alt.test\r\n",
+                        expected: GROUP_RESPONSE,
+                    },
+                    ServerResponseCase {
+                        name: "GROUP comp.lang.rust with article_dir",
+                        reference: "RFC 3977 section 6.1.1 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.1",
+                        input: b"GROUP comp.lang.rust\r\n",
+                        expected: GROUP_COMP_RESPONSE,
+                    },
+                    ServerResponseCase {
+                        name: "GROUP empty.test with article_dir",
+                        reference: "RFC 3977 section 6.1.1 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.1",
+                        input: b"GROUP empty.test\r\n",
+                        expected: GROUP_EMPTY_RESPONSE,
+                    },
+                    ServerResponseCase {
+                        name: "GROUP nonexistent group with article_dir",
+                        reference: "RFC 3977 section 6.1.1 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.1",
+                        input: b"GROUP example.valid\r\n",
+                        expected: b"411 no such newsgroup\r\n",
+                    },
+                ],
+            )
+            .await;
+
+            fs::remove_dir_all(article_dir).unwrap();
+        }
+
+        #[tokio::test]
         async fn rfc3977_compliance_selected_group_article_bounds_are_enforced() {
             // RFC 3977 sections 6.1, 6.2, and 8 require article-number
             // selectors and navigation to be scoped to the selected group:
