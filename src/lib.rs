@@ -6250,6 +6250,67 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn rfc3977_compliance_post_ihave_unavailable_across_reader_states() {
+            // RFC 3977 sections 6.3.1 and 6.3.2 keep POST/IHAVE availability
+            // independent from selected group and current article state. A reader
+            // server that does not accept posting/transfer must keep returning
+            // 440/435, and pipelined bodies must not cause 340/335 continuations:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-6.3.1
+            // https://www.rfc-editor.org/rfc/rfc3977#section-6.3.2
+            assert_red_server_response_tail_cases(&[
+                ServerResponseCase {
+                    name: "POST remains disabled after MODE READER",
+                    reference: "RFC 3977 section 6.3.1 https://www.rfc-editor.org/rfc/rfc3977#section-6.3.1",
+                    input: b"MODE READER\r\nPOST\r\n",
+                    expected: b"440 posting not permitted\r\n",
+                },
+                ServerResponseCase {
+                    name: "POST remains disabled after GROUP",
+                    reference: "RFC 3977 section 6.3.1 https://www.rfc-editor.org/rfc/rfc3977#section-6.3.1",
+                    input: b"GROUP alt.test\r\nPOST\r\n",
+                    expected: b"440 posting not permitted\r\n",
+                },
+                ServerResponseCase {
+                    name: "POST remains disabled after current article is selected",
+                    reference: "RFC 3977 section 6.3.1 https://www.rfc-editor.org/rfc/rfc3977#section-6.3.1",
+                    input: b"GROUP alt.test\r\nARTICLE 2\r\nPOST\r\n",
+                    expected: b"440 posting not permitted\r\n",
+                },
+                ServerResponseCase {
+                    name: "IHAVE remains unavailable after MODE READER",
+                    reference: "RFC 3977 section 6.3.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.3.2",
+                    input: b"MODE READER\r\nIHAVE <article@test>\r\n",
+                    expected: b"435 article not wanted\r\n",
+                },
+                ServerResponseCase {
+                    name: "IHAVE remains unavailable after GROUP",
+                    reference: "RFC 3977 section 6.3.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.3.2",
+                    input: b"GROUP alt.test\r\nIHAVE <article@test>\r\n",
+                    expected: b"435 article not wanted\r\n",
+                },
+                ServerResponseCase {
+                    name: "IHAVE remains unavailable after current article is selected",
+                    reference: "RFC 3977 section 6.3.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.3.2",
+                    input: b"GROUP alt.test\r\nARTICLE 2\r\nIHAVE <article@test>\r\n",
+                    expected: b"435 article not wanted\r\n",
+                },
+                ServerResponseCase {
+                    name: "POST discards lower-case pipelined article body before QUIT",
+                    reference: "RFC 3977 section 6.3.1 https://www.rfc-editor.org/rfc/rfc3977#section-6.3.1",
+                    input: b"post\r\nSubject: one\r\n\r\nbody\r\n.\r\nQUIT\r\n",
+                    expected: b"205 closing connection\r\n",
+                },
+                ServerResponseCase {
+                    name: "IHAVE discards lower-case pipelined article body before QUIT",
+                    reference: "RFC 3977 section 6.3.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.3.2",
+                    input: b"ihave <article@test>\r\nSubject: one\r\n\r\nbody\r\n.\r\nQUIT\r\n",
+                    expected: b"205 closing connection\r\n",
+                },
+            ])
+            .await;
+        }
+
+        #[tokio::test]
         async fn rfc3977_compliance_newnews_results_depend_on_requested_datetime() {
             // RFC 3977 section 7.4 requires NEWNEWS results to be selected from
             // the supplied wildmat and date/time arguments:
