@@ -9350,6 +9350,12 @@ mod tests {
                         frame: b"100 help follows\r\nCommands include CAPABILITIES\r\nUTF-8 caf\xc3\xa9\r\n.\r\n",
                     },
                     ResponseFrameCase {
+                        name: "HELP accepts dot-stuffed text line",
+                        reference: "RFC 3977 sections 3.1.1 and 7.2 require dot-stuffing for dot-prefixed multiline data lines https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1",
+                        kind: RequestKind::Help,
+                        frame: b"100 help follows\r\n..dot-prefixed help text\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "HDR accepts empty hdr-content after required space",
                         reference: "RFC 3977 sections 8.5.1 and 9.4.3 https://www.rfc-editor.org/rfc/rfc3977#section-9.4.3",
                         kind: RequestKind::Hdr,
@@ -9901,6 +9907,12 @@ mod tests {
                         reference: "RFC 3977 section 7.2 https://www.rfc-editor.org/rfc/rfc3977#section-7.2",
                         kind: RequestKind::Help,
                         frame: b"100 help follows\r\ninvalid caf\xe9\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "HELP rejects unstuffed dot-prefixed text line",
+                        reference: "RFC 3977 sections 3.1.1 and 7.2 require dot-prefixed multiline data lines to be dot-stuffed https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1",
+                        kind: RequestKind::Help,
+                        frame: b"100 help follows\r\n.dot-prefixed help text\r\n.\r\n",
                     },
                     ResponseFrameCase {
                         name: "LIST rejects CAPABILITIES success code",

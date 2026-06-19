@@ -2710,10 +2710,6 @@ fn validate_generic_multiline_response_content(content: &[u8]) -> bool {
 }
 
 fn validate_generic_multiline_response_line(line: &[u8]) -> bool {
-    if line.starts_with(b".") && !line.starts_with(b"..") {
-        return false;
-    }
-
     line.iter()
         .all(|byte| !matches!(*byte, b'\0' | b'\r' | b'\n'))
 }
@@ -2759,7 +2755,11 @@ fn validate_crlf_lines(content: &[u8], mut validate: impl FnMut(&[u8]) -> bool) 
         let Some(line_end) = strict_crlf_line_content_end_from(content, offset) else {
             return false;
         };
-        if !validate(&content[offset..line_end]) {
+        let line = &content[offset..line_end];
+        if line.starts_with(b".") && !line.starts_with(b"..") {
+            return false;
+        }
+        if !validate(line) {
             return false;
         }
         offset = line_end + crate::CRLF.len();
