@@ -8776,6 +8776,24 @@ mod tests {
                         frame: b"502 service unavailable\r\n",
                     },
                     ResponseFrameCase {
+                        name: "HEAD rejects unknown mandatory command response",
+                        reference: "RFC 3977 section 3.2.1 and Appendix B say servers MUST NOT generate 500 for mandatory commands https://www.rfc-editor.org/rfc/rfc3977#section-3.2.1",
+                        kind: RequestKind::Head,
+                        frame: b"500 unknown command\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "HELP rejects unknown mandatory command response",
+                        reference: "RFC 3977 section 3.2.1 and Appendix B say servers MUST NOT generate 500 for mandatory commands https://www.rfc-editor.org/rfc/rfc3977#section-3.2.1",
+                        kind: RequestKind::Help,
+                        frame: b"500 unknown command\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "STAT rejects unknown mandatory command response",
+                        reference: "RFC 3977 section 3.2.1 and Appendix B say servers MUST NOT generate 500 for mandatory commands https://www.rfc-editor.org/rfc/rfc3977#section-3.2.1",
+                        kind: RequestKind::Stat,
+                        frame: b"500 unknown command\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "AUTHINFO USER rejects authentication required 480",
                         reference: "RFC 4643 section 2.3 https://www.rfc-editor.org/rfc/rfc4643#section-2.3",
                         kind: RequestKind::AuthInfoUser,

@@ -2288,6 +2288,13 @@ fn is_generic_error_status_for_request(kind: RequestKind, code: u16) -> bool {
     if matches!(kind, RequestKind::Capabilities | RequestKind::Quit) {
         return code == 501;
     }
+    if matches!(
+        kind,
+        RequestKind::Head | RequestKind::Help | RequestKind::Stat
+    ) && code == 500
+    {
+        return false;
+    }
 
     // RFC 4642 section 2.2 and RFC 4643 section 2.3 explicitly forbid some
     // otherwise-generic authentication/security states for these commands.
