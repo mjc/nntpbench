@@ -8548,6 +8548,12 @@ mod tests {
                         frame: b"224 overview follows\r\n1\tSubject\tfrom@test\tdate\t<one@test>\t\t\t1\r\n.\r\n",
                     },
                     ResponseFrameCase {
+                        name: "XOVER accepts legacy unlabeled optional overview field",
+                        reference: "RFC 2980 sections 2.1.7 and 2.8 permit optional XOVER fields from LIST OVERVIEW.FMT without full header labels https://www.rfc-editor.org/rfc/rfc2980#section-2.8",
+                        kind: RequestKind::Xover,
+                        frame: b"224 overview follows\r\n1\tSubject\tfrom@test\tdate\t<one@test>\t\t1\t1\tnews.example.test!not-for-mail\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "AUTHINFO SASL 283 accepts trailing comment after challenge",
                         reference: "RFC 3977 section 9.4.1 and RFC 4643 section 3.3 https://www.rfc-editor.org/rfc/rfc3977#section-9.4.1",
                         kind: RequestKind::AuthInfo,
@@ -9429,12 +9435,6 @@ mod tests {
                         reference: "RFC 2980 section 2.8 and RFC 3977 sections 8.1.2 and 8.3.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.3.2",
                         kind: RequestKind::Xover,
                         frame: b"224 overview follows\r\n1\tSubject\tfrom@test\tdate\t<one@test>\t\t1\tlines 1\r\n.\r\n",
-                    },
-                    ResponseFrameCase {
-                        name: "XOVER rejects optional overview field without label separator",
-                        reference: "RFC 3977 sections 8.3.2 and 9.4.3 https://www.rfc-editor.org/rfc/rfc3977#section-9.4.3",
-                        kind: RequestKind::Xover,
-                        frame: b"224 overview follows\r\n1\tSubject\tfrom@test\tdate\t<one@test>\t\t1\t1\tXref:missing-space\r\n.\r\n",
                     },
                     ResponseFrameCase {
                         name: "XOVER rejects NUL in optional hdr-content",

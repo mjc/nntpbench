@@ -3015,14 +3015,18 @@ fn validate_p_char_token(value: &[u8]) -> bool {
 }
 
 fn validate_overview_response_line(line: &[u8]) -> bool {
-    validate_overview_response_line_with_min_fields(line, 1)
+    validate_overview_response_line_with_min_fields(line, 1, validate_overview_optional_field)
 }
 
 fn validate_xover_response_line(line: &[u8]) -> bool {
-    validate_overview_response_line_with_min_fields(line, 7)
+    validate_overview_response_line_with_min_fields(line, 7, validate_xover_optional_field)
 }
 
-fn validate_overview_response_line_with_min_fields(line: &[u8], minimum_fields: usize) -> bool {
+fn validate_overview_response_line_with_min_fields(
+    line: &[u8],
+    minimum_fields: usize,
+    validate_optional_field: fn(&[u8]) -> bool,
+) -> bool {
     let Some(tab) = memchr::memchr(b'\t', line) else {
         return false;
     };
@@ -3039,12 +3043,16 @@ fn validate_overview_response_line_with_min_fields(line: &[u8], minimum_fields: 
         if matches!(field_count, 6 | 7) && !field.is_empty() && !is_response_decimal_token(field) {
             return false;
         }
-        if field_count > 7 && !field.is_empty() && !validate_overview_optional_field(field) {
+        if field_count > 7 && !field.is_empty() && !validate_optional_field(field) {
             return false;
         }
     }
 
     field_count >= minimum_fields
+}
+
+fn validate_xover_optional_field(field: &[u8]) -> bool {
+    validate_hdr_content(field)
 }
 
 fn validate_overview_optional_field(field: &[u8]) -> bool {
@@ -6473,7 +6481,7 @@ mod tests {
             ),
             (
                 RequestKind::Xover,
-                b"224 overview follows\r\n1\tSubject\tfrom@test\tdate\t<one@test>\t\t1\t1\tXref:missing-space\r\n.\r\n"
+                b"224 overview follows\r\n1\tSubject\tfrom@test\tdate\t<one@test>\t\t1\t1\toptional\0bad\r\n.\r\n"
                     .as_slice(),
             ),
             (
