@@ -8837,6 +8837,18 @@ mod tests {
                         frame: b"231 list of new newsgroups follows\r\nalt.test  3   1    y\r\n.\r\n",
                     },
                     ResponseFrameCase {
+                        name: "NEWNEWS accepts message-id body lines",
+                        reference: "RFC 3977 section 7.4.2 says NEWNEWS returns message-id lines https://www.rfc-editor.org/rfc/rfc3977#section-7.4.2",
+                        kind: RequestKind::NewNews,
+                        frame: b"230 list of new articles follows\r\n<one@test>\r\n<two@test>\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "NEWNEWS accepts empty message-id list",
+                        reference: "RFC 3977 sections 7.4.2 and 3.1.1 permit an empty multiline response terminated by dot https://www.rfc-editor.org/rfc/rfc3977#section-7.4.2",
+                        kind: RequestKind::NewNews,
+                        frame: b"230 list of new articles follows\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "LIST ACTIVE.TIMES accepts one-or-more SP field separators",
                         reference: "RFC 3977 section 7.6.4 https://www.rfc-editor.org/rfc/rfc3977#section-7.6.4",
                         kind: RequestKind::ListActiveTimes,
