@@ -7517,6 +7517,12 @@ mod tests {
                     expected: b"201 posting not permitted\r\n223 2 <article.2@nntpbench.local> article retrieved\r\n",
                 },
                 ServerResponseCase {
+                    name: "LIST preserves current article",
+                    reference: "RFC 3977 section 7.6.1.2 says LIST must not change visible server state https://www.rfc-editor.org/rfc/rfc3977#section-7.6.1.2",
+                    input: b"GROUP alt.test\r\nARTICLE 2\r\nLIST ACTIVE comp.lang.*\r\nSTAT\r\n",
+                    expected: b"215 list of newsgroups follows\r\ncomp.lang.rust 0000000001 0000000001 y\r\n.\r\n223 2 <article.2@nntpbench.local> article retrieved\r\n",
+                },
+                ServerResponseCase {
                     name: "OVER current article follows ARTICLE 2",
                     reference: "RFC 3977 section 8.3.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.3.2",
                     input: b"GROUP alt.test\r\nARTICLE 2\r\nOVER\r\n",
