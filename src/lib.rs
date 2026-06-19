@@ -5862,6 +5862,30 @@ mod tests {
                     expected: b"502 command unavailable\r\n",
                 },
                 ServerResponseCase {
+                    name: "SASL one-character mechanism",
+                    reference: "RFC 4422 section 3.1 permits 1 to 20 character SASL mechanism names https://www.rfc-editor.org/rfc/rfc4422#section-3.1",
+                    input: b"AUTHINFO SASL X\r\n",
+                    expected: b"502 command unavailable\r\n",
+                },
+                ServerResponseCase {
+                    name: "SASL 20-character mechanism",
+                    reference: "RFC 4422 section 3.1 permits SASL mechanism names up to 20 characters https://www.rfc-editor.org/rfc/rfc4422#section-3.1",
+                    input: b"AUTHINFO SASL ABCDEFGHIJKLMNOPQRST\r\n",
+                    expected: b"502 command unavailable\r\n",
+                },
+                ServerResponseCase {
+                    name: "SASL mechanism accepts digits",
+                    reference: "RFC 4422 section 3.1 permits digits in SASL mechanism names https://www.rfc-editor.org/rfc/rfc4422#section-3.1",
+                    input: b"AUTHINFO SASL SCRAM-SHA-256\r\n",
+                    expected: b"502 command unavailable\r\n",
+                },
+                ServerResponseCase {
+                    name: "SASL mechanism accepts underscore",
+                    reference: "RFC 4422 section 3.1 permits underscore in SASL mechanism names https://www.rfc-editor.org/rfc/rfc4422#section-3.1",
+                    input: b"AUTHINFO SASL TEST_MECH\r\n",
+                    expected: b"502 command unavailable\r\n",
+                },
+                ServerResponseCase {
                     name: "SASL zero-length initial response marker",
                     reference: "RFC 4643 section 2.4.1 https://www.rfc-editor.org/rfc/rfc4643#section-2.4.1",
                     input: b"AUTHINFO SASL MADE-UP-MECHANISM =\r\n",
@@ -5871,6 +5895,12 @@ mod tests {
                     name: "SASL padded base64 initial response",
                     reference: "RFC 4643 section 2.4.1 https://www.rfc-editor.org/rfc/rfc4643#section-2.4.1",
                     input: b"AUTHINFO SASL MADE-UP-MECHANISM YQ==\r\n",
+                    expected: b"502 command unavailable\r\n",
+                },
+                ServerResponseCase {
+                    name: "SASL underscore mechanism with initial response",
+                    reference: "RFC 4643 section 2.4.1 and RFC 4422 section 3.1 https://www.rfc-editor.org/rfc/rfc4643#section-2.4.1",
+                    input: b"AUTHINFO SASL TEST_MECH YWJj\r\n",
                     expected: b"502 command unavailable\r\n",
                 },
             ])
