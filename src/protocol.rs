@@ -1452,12 +1452,18 @@ mod proptests {
             let hdr = Request::hdr(&header, &selector).unwrap();
             let xhdr = Request::xhdr(&header, &selector).unwrap();
             prop_assert_eq!(
-                hdr.header_query().map(|(header, selector)| (header.as_str(), selector.as_str())),
-                Some((header.as_str(), selector.as_str()))
+                hdr.header_query().map(|(header, selector)| (
+                    header.as_str(),
+                    selector.map(ArticleSelector::as_str)
+                )),
+                Some((header.as_str(), Some(selector.as_str())))
             );
             prop_assert_eq!(
-                xhdr.header_query().map(|(header, selector)| (header.as_str(), selector.as_str())),
-                Some((header.as_str(), selector.as_str()))
+                xhdr.header_query().map(|(header, selector)| (
+                    header.as_str(),
+                    selector.map(ArticleSelector::as_str)
+                )),
+                Some((header.as_str(), Some(selector.as_str())))
             );
 
             let ihave = Request::ihave(&message_id).unwrap();
@@ -3404,18 +3410,18 @@ pub enum Request<'a> {
     Last,
     Next,
     Over {
-        selector: ArticleSelector<'a>,
+        selector: Option<ArticleSelector<'a>>,
     },
     Xover {
         selector: ListGroupRange<'a>,
     },
     Hdr {
         header: HeaderName<'a>,
-        selector: ArticleSelector<'a>,
+        selector: Option<ArticleSelector<'a>>,
     },
     Xhdr {
         header: HeaderName<'a>,
-        selector: ArticleSelector<'a>,
+        selector: Option<ArticleSelector<'a>>,
     },
     NewGroups {
         date: NntpDate<'a>,
@@ -3524,17 +3530,19 @@ impl<'a> Request<'a> {
             }
             Self::Last => write_simple_request_wire(output, b"LAST"),
             Self::Next => write_simple_request_wire(output, b"NEXT"),
-            Self::Over { selector } => {
-                write_one_arg_request_wire(output, b"OVER ", selector.as_str())
-            }
+            Self::Over { selector } => write_optional_arg_request_wire(
+                output,
+                b"OVER",
+                selector.as_ref().map(ArticleSelector::as_str),
+            ),
             Self::Xover { selector } => {
                 write_one_arg_request_wire(output, b"XOVER ", selector.as_str())
             }
             Self::Hdr { header, selector } => {
-                write_two_arg_request_wire(output, b"HDR ", header.as_str(), selector.as_str())
+                write_header_query_request_wire(output, b"HDR", header.as_str(), selector.as_ref())
             }
             Self::Xhdr { header, selector } => {
-                write_two_arg_request_wire(output, b"XHDR ", header.as_str(), selector.as_str())
+                write_header_query_request_wire(output, b"XHDR", header.as_str(), selector.as_ref())
             }
             Self::NewGroups { date, time, gmt } => write_datetime_request_wire(
                 output,
@@ -3645,10 +3653,10 @@ impl<'a> Request<'a> {
 
     /// Borrow the validated header query arguments carried by this request, if any.
     #[must_use]
-    pub const fn header_query(&self) -> Option<(&HeaderName<'a>, &ArticleSelector<'a>)> {
+    pub const fn header_query(&self) -> Option<(&HeaderName<'a>, Option<&ArticleSelector<'a>>)> {
         match self {
             Self::Hdr { header, selector } | Self::Xhdr { header, selector } => {
-                Some((header, selector))
+                Some((header, selector.as_ref()))
             }
             Self::Article { .. }
             | Self::Body { .. }
@@ -3682,7 +3690,7 @@ impl<'a> Request<'a> {
     #[must_use]
     pub const fn overview_selector(&self) -> Option<&ArticleSelector<'a>> {
         match self {
-            Self::Over { selector } => Some(selector),
+            Self::Over { selector } => selector.as_ref(),
             Self::Article { .. }
             | Self::Body { .. }
             | Self::Head { .. }
@@ -4130,8 +4138,14 @@ impl Request<'static> {
     /// Build an OVER request.
     pub fn over(selector: impl AsRef<str>) -> Result<Self, InvalidArticleSelector> {
         Ok(Self::Over {
-            selector: ArticleSelector::from_owned(selector)?,
+            selector: Some(ArticleSelector::from_owned(selector)?),
         })
+    }
+
+    /// Build an OVER request targeting the current article.
+    #[must_use]
+    pub const fn over_current() -> Self {
+        Self::Over { selector: None }
     }
 
     /// Build an XOVER request.
@@ -4148,8 +4162,17 @@ impl Request<'static> {
     ) -> Result<Self, InvalidHeaderQuery> {
         Ok(Self::Hdr {
             header: HeaderName::from_owned(header).map_err(InvalidHeaderQuery::Header)?,
-            selector: ArticleSelector::from_owned(selector)
-                .map_err(InvalidHeaderQuery::Selector)?,
+            selector: Some(
+                ArticleSelector::from_owned(selector).map_err(InvalidHeaderQuery::Selector)?,
+            ),
+        })
+    }
+
+    /// Build an HDR request targeting the current article.
+    pub fn hdr_current(header: impl AsRef<str>) -> Result<Self, InvalidHeaderName> {
+        Ok(Self::Hdr {
+            header: HeaderName::from_owned(header)?,
+            selector: None,
         })
     }
 
@@ -4160,8 +4183,17 @@ impl Request<'static> {
     ) -> Result<Self, InvalidHeaderQuery> {
         Ok(Self::Xhdr {
             header: HeaderName::from_owned(header).map_err(InvalidHeaderQuery::Header)?,
-            selector: ArticleSelector::from_owned(selector)
-                .map_err(InvalidHeaderQuery::Selector)?,
+            selector: Some(
+                ArticleSelector::from_owned(selector).map_err(InvalidHeaderQuery::Selector)?,
+            ),
+        })
+    }
+
+    /// Build an XHDR request targeting the current article.
+    pub fn xhdr_current(header: impl AsRef<str>) -> Result<Self, InvalidHeaderName> {
+        Ok(Self::Xhdr {
+            header: HeaderName::from_owned(header)?,
+            selector: None,
         })
     }
 
@@ -5103,14 +5135,33 @@ where
     write_crlf(output);
 }
 
-fn write_two_arg_request_wire<W>(output: &mut W, verb: &[u8], left: &str, right: &str)
+fn write_optional_arg_request_wire<W>(output: &mut W, verb: &[u8], arg: Option<&str>)
 where
     W: Write,
 {
     write_bytes(output, verb);
-    write_bytes(output, left.as_bytes());
+    if let Some(arg) = arg {
+        write_bytes(output, b" ");
+        write_bytes(output, arg.as_bytes());
+    }
+    write_crlf(output);
+}
+
+fn write_header_query_request_wire<W>(
+    output: &mut W,
+    verb: &[u8],
+    header: &str,
+    selector: Option<&ArticleSelector<'_>>,
+) where
+    W: Write,
+{
+    write_bytes(output, verb);
     write_bytes(output, b" ");
-    write_bytes(output, right.as_bytes());
+    write_bytes(output, header.as_bytes());
+    if let Some(selector) = selector {
+        write_bytes(output, b" ");
+        write_bytes(output, selector.as_str().as_bytes());
+    }
     write_crlf(output);
 }
 
@@ -6735,19 +6786,22 @@ mod tests {
         let last = Request::Last;
         let next = Request::Next;
         let over = Request::Over {
-            selector: ArticleSelector::from_borrowed("1-10").unwrap(),
+            selector: Some(ArticleSelector::from_borrowed("1-10").unwrap()),
         };
+        let over_current = Request::over_current();
         let xover = Request::Xover {
             selector: ListGroupRange::from_borrowed("1-10").unwrap(),
         };
         let hdr = Request::Hdr {
             header: HeaderName::from_borrowed("Subject").unwrap(),
-            selector: ArticleSelector::from_borrowed("1-10").unwrap(),
+            selector: Some(ArticleSelector::from_borrowed("1-10").unwrap()),
         };
+        let hdr_current = Request::hdr_current("Subject").unwrap();
         let xhdr = Request::Xhdr {
             header: HeaderName::from_borrowed("Message-ID").unwrap(),
-            selector: ArticleSelector::from_borrowed("<a@b>").unwrap(),
+            selector: Some(ArticleSelector::from_borrowed("<a@b>").unwrap()),
         };
+        let xhdr_current = Request::xhdr_current("Message-ID").unwrap();
         let newgroups = Request::NewGroups {
             date: NntpDate::from_borrowed("20260101").unwrap(),
             time: NntpTime::from_borrowed("000000").unwrap(),
@@ -6884,6 +6938,11 @@ mod tests {
         assert_eq!(wire, b"OVER 1-10\r\n");
 
         wire.clear();
+        over_current.write_wire_to(&mut wire);
+        assert_eq!(over_current.kind(), RequestKind::Over);
+        assert_eq!(wire, b"OVER\r\n");
+
+        wire.clear();
         xover.write_wire_to(&mut wire);
         assert_eq!(xover.kind(), RequestKind::Xover);
         assert_eq!(wire, b"XOVER 1-10\r\n");
@@ -6894,9 +6953,19 @@ mod tests {
         assert_eq!(wire, b"HDR Subject 1-10\r\n");
 
         wire.clear();
+        hdr_current.write_wire_to(&mut wire);
+        assert_eq!(hdr_current.kind(), RequestKind::Hdr);
+        assert_eq!(wire, b"HDR Subject\r\n");
+
+        wire.clear();
         xhdr.write_wire_to(&mut wire);
         assert_eq!(xhdr.kind(), RequestKind::Xhdr);
         assert_eq!(wire, b"XHDR Message-ID <a@b>\r\n");
+
+        wire.clear();
+        xhdr_current.write_wire_to(&mut wire);
+        assert_eq!(xhdr_current.kind(), RequestKind::Xhdr);
+        assert_eq!(wire, b"XHDR Message-ID\r\n");
 
         wire.clear();
         newgroups.write_wire_to(&mut wire);
@@ -7018,6 +7087,34 @@ mod tests {
     }
 
     #[test]
+    fn rfc3977_red_request_builders_cover_current_over_and_hdr_forms() {
+        // RFC 3977 sections 8.3.1 and 8.5.1 define OVER and HDR forms that
+        // omit the selector and use the current article:
+        // https://www.rfc-editor.org/rfc/rfc3977#section-8.3.1
+        // https://www.rfc-editor.org/rfc/rfc3977#section-8.5.1
+        // RFC 2980 section 2.6 preserves the legacy XHDR current-article form:
+        // https://www.rfc-editor.org/rfc/rfc2980#section-2.6
+        let cases = [
+            (Request::over_current(), b"OVER\r\n".as_slice()),
+            (
+                Request::hdr_current("Subject").unwrap(),
+                b"HDR Subject\r\n".as_slice(),
+            ),
+            (
+                Request::xhdr_current("Message-ID").unwrap(),
+                b"XHDR Message-ID\r\n".as_slice(),
+            ),
+        ];
+
+        for (request, expected) in cases {
+            let mut wire = Vec::new();
+            request.write_wire_to(&mut wire);
+            assert_eq!(wire, expected);
+            assert_eq!(RequestLine::parse(expected).kind(), request.kind());
+        }
+    }
+
+    #[test]
     fn request_constructors_wrap_and_expose_message_ids() {
         let article = Request::article("a@b").unwrap();
         let article_current = Request::article_current();
@@ -7038,9 +7135,12 @@ mod tests {
         let last = Request::last();
         let next = Request::next();
         let over = Request::over("1-10").unwrap();
+        let over_current = Request::over_current();
         let xover = Request::xover("1-10").unwrap();
         let hdr = Request::hdr("Subject", "1-10").unwrap();
+        let hdr_current = Request::hdr_current("Subject").unwrap();
         let xhdr = Request::xhdr("Message-ID", "<g@h>").unwrap();
+        let xhdr_current = Request::xhdr_current("Message-ID").unwrap();
         let newgroups = Request::newgroups("20260101", "000000", true).unwrap();
         let newnews =
             Request::newnews("comp.lang.*,alt.test", "20260101", "000000", false).unwrap();
@@ -7112,19 +7212,35 @@ mod tests {
             over.overview_selector().map(ArticleSelector::as_str),
             Some("1-10")
         );
+        assert_eq!(over_current.kind(), RequestKind::Over);
+        assert!(over_current.overview_selector().is_none());
         assert_eq!(xover.kind(), RequestKind::Xover);
         assert!(xover.overview_selector().is_none());
         assert_eq!(hdr.kind(), RequestKind::Hdr);
         assert_eq!(
             hdr.header_query()
-                .map(|(header, selector)| (header.as_str(), selector.as_str())),
-            Some(("Subject", "1-10"))
+                .map(|(header, selector)| (header.as_str(), selector.map(ArticleSelector::as_str))),
+            Some(("Subject", Some("1-10")))
+        );
+        assert_eq!(hdr_current.kind(), RequestKind::Hdr);
+        assert_eq!(
+            hdr_current
+                .header_query()
+                .map(|(header, selector)| (header.as_str(), selector.map(ArticleSelector::as_str))),
+            Some(("Subject", None))
         );
         assert_eq!(xhdr.kind(), RequestKind::Xhdr);
         assert_eq!(
             xhdr.header_query()
-                .map(|(header, selector)| (header.as_str(), selector.as_str())),
-            Some(("Message-ID", "<g@h>"))
+                .map(|(header, selector)| (header.as_str(), selector.map(ArticleSelector::as_str))),
+            Some(("Message-ID", Some("<g@h>")))
+        );
+        assert_eq!(xhdr_current.kind(), RequestKind::Xhdr);
+        assert_eq!(
+            xhdr_current
+                .header_query()
+                .map(|(header, selector)| (header.as_str(), selector.map(ArticleSelector::as_str))),
+            Some(("Message-ID", None))
         );
         assert_eq!(newgroups.kind(), RequestKind::NewGroups);
         assert_eq!(
@@ -7252,7 +7368,9 @@ mod tests {
         assert!(Request::over("1 2").is_err());
         assert!(Request::xover("").is_err());
         assert!(Request::hdr("Bad Header", "1").is_err());
+        assert!(Request::hdr_current("Bad Header").is_err());
         assert!(Request::xhdr("Subject", "1 2").is_err());
+        assert!(Request::xhdr_current("Bad Header").is_err());
         assert!(Request::newgroups("20261301", "000000", true).is_err());
         assert!(Request::newnews("", "20260101", "000000", false).is_err());
         assert!(Request::list_active_wildmat("").is_err());

@@ -569,6 +569,11 @@ impl Client {
         self.execute_raw(request).await
     }
 
+    /// Send an OVER request for the current article and return the owned raw response frame.
+    pub async fn over_current(&self) -> Result<OwnedResponse, ClientError> {
+        self.execute_raw(Request::over_current()).await
+    }
+
     /// Send an OVER request and return the completed raw request/response pair.
     pub async fn over_exchange(
         &self,
@@ -576,6 +581,11 @@ impl Client {
     ) -> Result<OwnedExchange, ClientError> {
         let request = Request::over(selector).map_err(|_| ClientError::InvalidArticleSelector)?;
         self.execute_raw_exchange(request).await
+    }
+
+    /// Send an OVER request for the current article and return the completed raw request/response pair.
+    pub async fn over_current_exchange(&self) -> Result<OwnedExchange, ClientError> {
+        self.execute_raw_exchange(Request::over_current()).await
     }
 
     /// Send an XOVER request and return the owned raw response frame.
@@ -603,6 +613,12 @@ impl Client {
         self.execute_raw(request).await
     }
 
+    /// Send an HDR request for the current article and return the owned raw response frame.
+    pub async fn hdr_current(&self, header: impl AsRef<str>) -> Result<OwnedResponse, ClientError> {
+        let request = Request::hdr_current(header).map_err(|_| ClientError::InvalidHeaderName)?;
+        self.execute_raw(request).await
+    }
+
     /// Send an HDR request and return the completed raw request/response pair.
     pub async fn hdr_exchange(
         &self,
@@ -610,6 +626,15 @@ impl Client {
         selector: impl AsRef<str>,
     ) -> Result<OwnedExchange, ClientError> {
         let request = Request::hdr(header, selector).map_err(ClientError::from)?;
+        self.execute_raw_exchange(request).await
+    }
+
+    /// Send an HDR request for the current article and return the completed raw request/response pair.
+    pub async fn hdr_current_exchange(
+        &self,
+        header: impl AsRef<str>,
+    ) -> Result<OwnedExchange, ClientError> {
+        let request = Request::hdr_current(header).map_err(|_| ClientError::InvalidHeaderName)?;
         self.execute_raw_exchange(request).await
     }
 
@@ -623,6 +648,15 @@ impl Client {
         self.execute_raw(request).await
     }
 
+    /// Send an XHDR request for the current article and return the owned raw response frame.
+    pub async fn xhdr_current(
+        &self,
+        header: impl AsRef<str>,
+    ) -> Result<OwnedResponse, ClientError> {
+        let request = Request::xhdr_current(header).map_err(|_| ClientError::InvalidHeaderName)?;
+        self.execute_raw(request).await
+    }
+
     /// Send an XHDR request and return the completed raw request/response pair.
     pub async fn xhdr_exchange(
         &self,
@@ -630,6 +664,15 @@ impl Client {
         selector: impl AsRef<str>,
     ) -> Result<OwnedExchange, ClientError> {
         let request = Request::xhdr(header, selector).map_err(ClientError::from)?;
+        self.execute_raw_exchange(request).await
+    }
+
+    /// Send an XHDR request for the current article and return the completed raw request/response pair.
+    pub async fn xhdr_current_exchange(
+        &self,
+        header: impl AsRef<str>,
+    ) -> Result<OwnedExchange, ClientError> {
+        let request = Request::xhdr_current(header).map_err(|_| ClientError::InvalidHeaderName)?;
         self.execute_raw_exchange(request).await
     }
 
@@ -1352,7 +1395,15 @@ impl ClientConnection {
         &self,
         selector: ArticleSelector<'static>,
     ) -> Result<OwnedResponse, ClientError> {
-        self.execute(Request::Over { selector }).await
+        self.execute(Request::Over {
+            selector: Some(selector),
+        })
+        .await
+    }
+
+    /// Send an OVER request for the current article and return the owned response frame.
+    pub async fn over_current(&self) -> Result<OwnedResponse, ClientError> {
+        self.execute(Request::Over { selector: None }).await
     }
 
     /// Send an OVER request and return the completed request/response pair.
@@ -1360,7 +1411,16 @@ impl ClientConnection {
         &self,
         selector: ArticleSelector<'static>,
     ) -> Result<OwnedExchange, ClientError> {
-        self.execute_exchange(Request::Over { selector }).await
+        self.execute_exchange(Request::Over {
+            selector: Some(selector),
+        })
+        .await
+    }
+
+    /// Send an OVER request for the current article and return the completed request/response pair.
+    pub async fn over_current_exchange(&self) -> Result<OwnedExchange, ClientError> {
+        self.execute_exchange(Request::Over { selector: None })
+            .await
     }
 
     /// Send an XOVER request and return the owned response frame.
@@ -1385,7 +1445,23 @@ impl ClientConnection {
         header: HeaderName<'static>,
         selector: ArticleSelector<'static>,
     ) -> Result<OwnedResponse, ClientError> {
-        self.execute(Request::Hdr { header, selector }).await
+        self.execute(Request::Hdr {
+            header,
+            selector: Some(selector),
+        })
+        .await
+    }
+
+    /// Send an HDR request for the current article and return the owned response frame.
+    pub async fn hdr_current(
+        &self,
+        header: HeaderName<'static>,
+    ) -> Result<OwnedResponse, ClientError> {
+        self.execute(Request::Hdr {
+            header,
+            selector: None,
+        })
+        .await
     }
 
     /// Send an HDR request and return the completed request/response pair.
@@ -1394,8 +1470,23 @@ impl ClientConnection {
         header: HeaderName<'static>,
         selector: ArticleSelector<'static>,
     ) -> Result<OwnedExchange, ClientError> {
-        self.execute_exchange(Request::Hdr { header, selector })
-            .await
+        self.execute_exchange(Request::Hdr {
+            header,
+            selector: Some(selector),
+        })
+        .await
+    }
+
+    /// Send an HDR request for the current article and return the completed request/response pair.
+    pub async fn hdr_current_exchange(
+        &self,
+        header: HeaderName<'static>,
+    ) -> Result<OwnedExchange, ClientError> {
+        self.execute_exchange(Request::Hdr {
+            header,
+            selector: None,
+        })
+        .await
     }
 
     /// Send an XHDR request and return the owned response frame.
@@ -1404,7 +1495,23 @@ impl ClientConnection {
         header: HeaderName<'static>,
         selector: ArticleSelector<'static>,
     ) -> Result<OwnedResponse, ClientError> {
-        self.execute(Request::Xhdr { header, selector }).await
+        self.execute(Request::Xhdr {
+            header,
+            selector: Some(selector),
+        })
+        .await
+    }
+
+    /// Send an XHDR request for the current article and return the owned response frame.
+    pub async fn xhdr_current(
+        &self,
+        header: HeaderName<'static>,
+    ) -> Result<OwnedResponse, ClientError> {
+        self.execute(Request::Xhdr {
+            header,
+            selector: None,
+        })
+        .await
     }
 
     /// Send an XHDR request and return the completed request/response pair.
@@ -1413,8 +1520,23 @@ impl ClientConnection {
         header: HeaderName<'static>,
         selector: ArticleSelector<'static>,
     ) -> Result<OwnedExchange, ClientError> {
-        self.execute_exchange(Request::Xhdr { header, selector })
-            .await
+        self.execute_exchange(Request::Xhdr {
+            header,
+            selector: Some(selector),
+        })
+        .await
+    }
+
+    /// Send an XHDR request for the current article and return the completed request/response pair.
+    pub async fn xhdr_current_exchange(
+        &self,
+        header: HeaderName<'static>,
+    ) -> Result<OwnedExchange, ClientError> {
+        self.execute_exchange(Request::Xhdr {
+            header,
+            selector: None,
+        })
+        .await
     }
 
     /// Send a LIST request and return the owned response frame.
@@ -2329,16 +2451,23 @@ where
         Request::Last => write_simple_request_wire(writer, b"LAST").await,
         Request::Next => write_simple_request_wire(writer, b"NEXT").await,
         Request::Over { selector } => {
-            write_one_arg_request_wire(writer, b"OVER ", selector.as_str()).await
+            write_optional_arg_request_wire(
+                writer,
+                b"OVER",
+                selector.as_ref().map(ArticleSelector::as_str),
+            )
+            .await
         }
         Request::Xover { selector } => {
             write_one_arg_request_wire(writer, b"XOVER ", selector.as_str()).await
         }
         Request::Hdr { header, selector } => {
-            write_two_arg_request_wire(writer, b"HDR ", header.as_str(), selector.as_str()).await
+            write_header_query_request_wire(writer, b"HDR", header.as_str(), selector.as_ref())
+                .await
         }
         Request::Xhdr { header, selector } => {
-            write_two_arg_request_wire(writer, b"XHDR ", header.as_str(), selector.as_str()).await
+            write_header_query_request_wire(writer, b"XHDR", header.as_str(), selector.as_ref())
+                .await
         }
         Request::NewGroups { date, time, gmt } => {
             write_datetime_request_wire(writer, b"NEWGROUPS ", date.as_str(), time.as_str(), *gmt)
@@ -2460,6 +2589,30 @@ where
     .await
 }
 
+async fn write_optional_arg_request_wire<W>(
+    writer: &mut W,
+    verb: &[u8],
+    arg: Option<&str>,
+) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    if let Some(arg) = arg {
+        write_slices(
+            writer,
+            &mut [
+                IoSlice::new(verb),
+                IoSlice::new(b" "),
+                IoSlice::new(arg.as_bytes()),
+                IoSlice::new(crate::CRLF),
+            ],
+        )
+        .await
+    } else {
+        write_simple_request_wire(writer, verb).await
+    }
+}
+
 async fn write_two_arg_request_wire<W>(
     writer: &mut W,
     verb: &[u8],
@@ -2480,6 +2633,42 @@ where
         ],
     )
     .await
+}
+
+async fn write_header_query_request_wire<W>(
+    writer: &mut W,
+    verb: &[u8],
+    header: &str,
+    selector: Option<&ArticleSelector<'_>>,
+) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    if let Some(selector) = selector {
+        write_slices(
+            writer,
+            &mut [
+                IoSlice::new(verb),
+                IoSlice::new(b" "),
+                IoSlice::new(header.as_bytes()),
+                IoSlice::new(b" "),
+                IoSlice::new(selector.as_str().as_bytes()),
+                IoSlice::new(crate::CRLF),
+            ],
+        )
+        .await
+    } else {
+        write_slices(
+            writer,
+            &mut [
+                IoSlice::new(verb),
+                IoSlice::new(b" "),
+                IoSlice::new(header.as_bytes()),
+                IoSlice::new(crate::CRLF),
+            ],
+        )
+        .await
+    }
 }
 
 async fn write_listgroup_request_wire<W>(
@@ -4930,6 +5119,10 @@ mod tests {
             stream.write_all(crate::XHDR_RESPONSE).await.unwrap();
             assert_read_request(&mut stream, b"XHDR Message-ID <headers@test>\r\n").await;
             stream.write_all(crate::XHDR_RESPONSE).await.unwrap();
+            assert_read_request(&mut stream, b"HDR Subject\r\n").await;
+            stream.write_all(crate::HDR_RESPONSE).await.unwrap();
+            assert_read_request(&mut stream, b"XHDR Message-ID\r\n").await;
+            stream.write_all(crate::XHDR_RESPONSE).await.unwrap();
         });
 
         let client = Client::connect(addr).await.unwrap();
@@ -4940,6 +5133,8 @@ mod tests {
             .xhdr_exchange("Message-ID", "<headers@test>")
             .await
             .unwrap();
+        let hdr_current = client.hdr_current("Subject").await.unwrap();
+        let xhdr_current = client.xhdr_current("Message-ID").await.unwrap();
 
         assert_eq!(hdr_range.kind(), RequestKind::Hdr);
         assert_eq!(hdr_range.status().as_u16(), 225);
@@ -4951,11 +5146,15 @@ mod tests {
             xhdr_message_id
                 .request()
                 .header_query()
-                .map(|(header, selector)| (header.as_str(), selector.as_str())),
-            Some(("Message-ID", "<headers@test>"))
+                .map(|(header, selector)| (header.as_str(), selector.map(ArticleSelector::as_str))),
+            Some(("Message-ID", Some("<headers@test>")))
         );
         assert_eq!(xhdr_message_id.response().kind(), RequestKind::Xhdr);
         assert_eq!(xhdr_message_id.response().status().as_u16(), 221);
+        assert_eq!(hdr_current.kind(), RequestKind::Hdr);
+        assert_eq!(hdr_current.status().as_u16(), 225);
+        assert_eq!(xhdr_current.kind(), RequestKind::Xhdr);
+        assert_eq!(xhdr_current.status().as_u16(), 221);
 
         server.await.unwrap();
     }
@@ -4973,12 +5172,15 @@ mod tests {
             stream.write_all(crate::OVER_RESPONSE).await.unwrap();
             assert_read_request(&mut stream, b"XOVER 1-10\r\n").await;
             stream.write_all(crate::XOVER_RESPONSE).await.unwrap();
+            assert_read_request(&mut stream, b"OVER\r\n").await;
+            stream.write_all(crate::OVER_RESPONSE).await.unwrap();
         });
 
         let client = Client::connect(addr).await.unwrap();
         let over_range = client.over("1-10").await.unwrap();
         let over_message_id = client.over("<overview@test>").await.unwrap();
         let xover_range = client.xover("1-10").await.unwrap();
+        let over_current = client.over_current().await.unwrap();
         let xover_message_id = client.xover_exchange("<overview@test>").await;
 
         assert_eq!(over_range.kind(), RequestKind::Over);
@@ -4987,6 +5189,8 @@ mod tests {
         assert_eq!(over_message_id.status().as_u16(), 224);
         assert_eq!(xover_range.kind(), RequestKind::Xover);
         assert_eq!(xover_range.status().as_u16(), 224);
+        assert_eq!(over_current.kind(), RequestKind::Over);
+        assert_eq!(over_current.status().as_u16(), 224);
         assert!(matches!(
             xover_message_id,
             Err(ClientError::InvalidArticleSelector)

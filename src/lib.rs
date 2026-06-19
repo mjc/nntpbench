@@ -774,16 +774,29 @@ fn fetch_request(args: &FetchArgs) -> Result<Request<'static>, ClientError> {
             fetch_authinfo_request(args, |value| Request::authinfo_pass(value))
         }
         FetchRequestKind::Starttls => Ok(Request::starttls()),
-        FetchRequestKind::Over => fetch_selector_request(args, |selector| Request::over(selector)),
+        FetchRequestKind::Over => match args.selector.as_deref() {
+            Some(selector) => {
+                Request::over(selector).map_err(|_| ClientError::InvalidArticleSelector)
+            }
+            None => Ok(Request::over_current()),
+        },
         FetchRequestKind::Xover => {
             fetch_selector_request(args, |selector| Request::xover(selector))
         }
-        FetchRequestKind::Hdr => {
-            fetch_header_request(args, |header, selector| Request::hdr(header, selector))
-        }
-        FetchRequestKind::Xhdr => {
-            fetch_header_request(args, |header, selector| Request::xhdr(header, selector))
-        }
+        FetchRequestKind::Hdr => fetch_header_request(
+            args,
+            |header| {
+                Request::hdr_current(header).map_err(crate::protocol::InvalidHeaderQuery::Header)
+            },
+            |header, selector| Request::hdr(header, selector),
+        ),
+        FetchRequestKind::Xhdr => fetch_header_request(
+            args,
+            |header| {
+                Request::xhdr_current(header).map_err(crate::protocol::InvalidHeaderQuery::Header)
+            },
+            |header, selector| Request::xhdr(header, selector),
+        ),
         FetchRequestKind::List => Ok(Request::list()),
         FetchRequestKind::Help => Ok(Request::help()),
         FetchRequestKind::Capabilities => Ok(Request::capabilities()),
@@ -826,19 +839,24 @@ where
     Ok(build_current())
 }
 
-fn fetch_header_request<F>(args: &FetchArgs, build: F) -> Result<Request<'static>, ClientError>
+fn fetch_header_request<F, G>(
+    args: &FetchArgs,
+    build_current: F,
+    build_selector: G,
+) -> Result<Request<'static>, ClientError>
 where
-    F: FnOnce(&str, &str) -> Result<Request<'static>, crate::protocol::InvalidHeaderQuery>,
+    F: FnOnce(&str) -> Result<Request<'static>, crate::protocol::InvalidHeaderQuery>,
+    G: FnOnce(&str, &str) -> Result<Request<'static>, crate::protocol::InvalidHeaderQuery>,
 {
     let header = args
         .header
         .as_deref()
         .ok_or(ClientError::MissingHeaderName)?;
-    let selector = args
-        .selector
-        .as_deref()
-        .ok_or(ClientError::MissingArticleSelector)?;
-    build(header, selector).map_err(ClientError::from)
+    if let Some(selector) = args.selector.as_deref() {
+        build_selector(header, selector).map_err(ClientError::from)
+    } else {
+        build_current(header).map_err(ClientError::from)
+    }
 }
 
 fn fetch_group_request<F>(args: &FetchArgs, build: F) -> Result<Request<'static>, ClientError>
@@ -10983,6 +11001,18 @@ mod tests {
             let read = fifth.read(&mut request).await.unwrap();
             assert_eq!(&request[..read], b"HDR :bytes 1\r\n");
             fifth.write_all(HDR_RESPONSE).await.unwrap();
+
+            let (mut sixth, _) = listener.accept().await.unwrap();
+            sixth.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = sixth.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"HDR Subject\r\n");
+            sixth.write_all(HDR_RESPONSE).await.unwrap();
+
+            let (mut seventh, _) = listener.accept().await.unwrap();
+            seventh.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = seventh.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"XHDR Message-ID\r\n");
+            seventh.write_all(XHDR_RESPONSE).await.unwrap();
         });
 
         let mut hdr_range_args = test_fetch_args();
@@ -11035,6 +11065,26 @@ mod tests {
         assert_eq!(hdr_metadata.kind(), RequestKind::Hdr);
         assert_eq!(hdr_metadata.status().as_u16(), 225);
 
+        let mut hdr_current_args = test_fetch_args();
+        hdr_current_args.connect = addr;
+        hdr_current_args.request = FetchRequestKind::Hdr;
+        hdr_current_args.message_id = None;
+        hdr_current_args.header = Some("Subject".to_string());
+        hdr_current_args.selector = None;
+        let hdr_current = fetch_response(&hdr_current_args).await.unwrap();
+        assert_eq!(hdr_current.kind(), RequestKind::Hdr);
+        assert_eq!(hdr_current.status().as_u16(), 225);
+
+        let mut xhdr_current_args = test_fetch_args();
+        xhdr_current_args.connect = addr;
+        xhdr_current_args.request = FetchRequestKind::Xhdr;
+        xhdr_current_args.message_id = None;
+        xhdr_current_args.header = Some("Message-ID".to_string());
+        xhdr_current_args.selector = None;
+        let xhdr_current = fetch_response(&xhdr_current_args).await.unwrap();
+        assert_eq!(xhdr_current.kind(), RequestKind::Xhdr);
+        assert_eq!(xhdr_current.status().as_u16(), 221);
+
         server.await.unwrap();
     }
 
@@ -11062,6 +11112,12 @@ mod tests {
             let read = third.read(&mut request).await.unwrap();
             assert_eq!(&request[..read], b"XOVER 1-10\r\n");
             third.write_all(XOVER_RESPONSE).await.unwrap();
+
+            let (mut fourth, _) = listener.accept().await.unwrap();
+            fourth.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = fourth.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"OVER\r\n");
+            fourth.write_all(OVER_RESPONSE).await.unwrap();
         });
 
         let mut over_range_args = test_fetch_args();
@@ -11090,6 +11146,15 @@ mod tests {
         let xover_range = fetch_response(&xover_range_args).await.unwrap();
         assert_eq!(xover_range.kind(), RequestKind::Xover);
         assert_eq!(xover_range.status().as_u16(), 224);
+
+        let mut over_current_args = test_fetch_args();
+        over_current_args.connect = addr;
+        over_current_args.request = FetchRequestKind::Over;
+        over_current_args.message_id = None;
+        over_current_args.selector = None;
+        let over_current = fetch_response(&over_current_args).await.unwrap();
+        assert_eq!(over_current.kind(), RequestKind::Over);
+        assert_eq!(over_current.status().as_u16(), 224);
 
         server.await.unwrap();
     }
@@ -11429,18 +11494,18 @@ mod tests {
             ClientError::MissingHeaderName
         ));
 
-        args.header = Some("Subject".to_string());
+        args.header = Some("Bad Header".to_string());
         args.selector = None;
         assert!(matches!(
             fetch_response(&args).await.unwrap_err(),
-            ClientError::MissingArticleSelector
+            ClientError::InvalidHeaderName
         ));
     }
 
     #[tokio::test]
-    async fn fetch_response_rejects_missing_overview_selector() {
+    async fn fetch_response_rejects_missing_xover_selector() {
         let mut args = test_fetch_args();
-        args.request = FetchRequestKind::Over;
+        args.request = FetchRequestKind::Xover;
         args.message_id = None;
         args.selector = None;
 
