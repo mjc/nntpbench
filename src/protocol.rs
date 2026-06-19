@@ -3093,7 +3093,7 @@ fn validate_overview_optional_field(field: &[u8]) -> bool {
 }
 
 fn validate_header_response_line(line: &[u8]) -> bool {
-    validate_header_response_line_with_key(line, validate_response_article_number)
+    validate_header_response_line_with_key(line, validate_response_article_number, true)
 }
 
 fn validate_xhdr_response_line(line: &[u8]) -> bool {
@@ -3101,23 +3101,28 @@ fn validate_xhdr_response_line(line: &[u8]) -> bool {
         return true;
     }
 
-    validate_header_response_line_with_key(line, |key| {
-        validate_response_article_number(key)
-            || std::str::from_utf8(key)
-                .ok()
-                .is_some_and(|message_id| MessageId::from_borrowed(message_id).is_ok())
-    })
+    validate_header_response_line_with_key(
+        line,
+        |key| {
+            validate_response_article_number(key)
+                || std::str::from_utf8(key)
+                    .ok()
+                    .is_some_and(|message_id| MessageId::from_borrowed(message_id).is_ok())
+        },
+        false,
+    )
 }
 
 fn validate_header_response_line_with_key(
     line: &[u8],
     validate_key: impl FnOnce(&[u8]) -> bool,
+    allow_empty_without_space: bool,
 ) -> bool {
-    let Some(space) = memchr::memchr(b' ', line) else {
-        return false;
-    };
-
-    validate_key(&line[..space]) && validate_hdr_content(&line[space + 1..])
+    if let Some(space) = memchr::memchr(b' ', line) {
+        validate_key(&line[..space]) && validate_hdr_content(&line[space + 1..])
+    } else {
+        allow_empty_without_space && validate_key(line)
+    }
 }
 
 fn validate_hdr_content(value: &[u8]) -> bool {
