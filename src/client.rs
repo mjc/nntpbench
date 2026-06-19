@@ -594,6 +594,11 @@ impl Client {
         self.execute_raw(request).await
     }
 
+    /// Send an XOVER request for the current article and return the owned raw response frame.
+    pub async fn xover_current(&self) -> Result<OwnedResponse, ClientError> {
+        self.execute_raw(Request::xover_current()).await
+    }
+
     /// Send an XOVER request and return the completed raw request/response pair.
     pub async fn xover_exchange(
         &self,
@@ -601,6 +606,11 @@ impl Client {
     ) -> Result<OwnedExchange, ClientError> {
         let request = Request::xover(selector).map_err(|_| ClientError::InvalidArticleSelector)?;
         self.execute_raw_exchange(request).await
+    }
+
+    /// Send an XOVER request for the current article and return the completed raw request/response pair.
+    pub async fn xover_current_exchange(&self) -> Result<OwnedExchange, ClientError> {
+        self.execute_raw_exchange(Request::xover_current()).await
     }
 
     /// Send an HDR request and return the owned raw response frame.
@@ -1428,7 +1438,15 @@ impl ClientConnection {
         &self,
         selector: ListGroupRange<'static>,
     ) -> Result<OwnedResponse, ClientError> {
-        self.execute(Request::Xover { selector }).await
+        self.execute(Request::Xover {
+            selector: Some(selector),
+        })
+        .await
+    }
+
+    /// Send an XOVER request for the current article and return the owned response frame.
+    pub async fn xover_current(&self) -> Result<OwnedResponse, ClientError> {
+        self.execute(Request::Xover { selector: None }).await
     }
 
     /// Send an XOVER request and return the completed request/response pair.
@@ -1436,7 +1454,16 @@ impl ClientConnection {
         &self,
         selector: ListGroupRange<'static>,
     ) -> Result<OwnedExchange, ClientError> {
-        self.execute_exchange(Request::Xover { selector }).await
+        self.execute_exchange(Request::Xover {
+            selector: Some(selector),
+        })
+        .await
+    }
+
+    /// Send an XOVER request for the current article and return the completed request/response pair.
+    pub async fn xover_current_exchange(&self) -> Result<OwnedExchange, ClientError> {
+        self.execute_exchange(Request::Xover { selector: None })
+            .await
     }
 
     /// Send an HDR request and return the owned response frame.
@@ -2459,7 +2486,12 @@ where
             .await
         }
         Request::Xover { selector } => {
-            write_one_arg_request_wire(writer, b"XOVER ", selector.as_str()).await
+            write_optional_arg_request_wire(
+                writer,
+                b"XOVER",
+                selector.as_ref().map(ListGroupRange::as_str),
+            )
+            .await
         }
         Request::Hdr { header, selector } => {
             write_header_query_request_wire(writer, b"HDR", header.as_str(), selector.as_ref())
@@ -4670,6 +4702,8 @@ mod tests {
             stream.write_all(crate::OVER_RESPONSE).await.unwrap();
             assert_read_request(&mut stream, b"XOVER 1-10\r\n").await;
             stream.write_all(crate::XOVER_RESPONSE).await.unwrap();
+            assert_read_request(&mut stream, b"XOVER\r\n").await;
+            stream.write_all(crate::XOVER_RESPONSE).await.unwrap();
         });
 
         let connection = ClientConnection::connect(addr).await.unwrap();
@@ -4685,6 +4719,7 @@ mod tests {
             .xover(ListGroupRange::from_owned("1-10").unwrap())
             .await
             .unwrap();
+        let xover_current = connection.xover_current().await.unwrap();
 
         assert_eq!(over_range.kind(), RequestKind::Over);
         assert_eq!(over_range.status().as_u16(), 224);
@@ -4695,6 +4730,9 @@ mod tests {
         assert_eq!(xover_range.kind(), RequestKind::Xover);
         assert_eq!(xover_range.status().as_u16(), 224);
         assert_eq!(xover_range.as_bytes(), crate::XOVER_RESPONSE);
+        assert_eq!(xover_current.kind(), RequestKind::Xover);
+        assert_eq!(xover_current.status().as_u16(), 224);
+        assert_eq!(xover_current.as_bytes(), crate::XOVER_RESPONSE);
 
         server.await.unwrap();
     }
@@ -5174,6 +5212,8 @@ mod tests {
             stream.write_all(crate::XOVER_RESPONSE).await.unwrap();
             assert_read_request(&mut stream, b"OVER\r\n").await;
             stream.write_all(crate::OVER_RESPONSE).await.unwrap();
+            assert_read_request(&mut stream, b"XOVER\r\n").await;
+            stream.write_all(crate::XOVER_RESPONSE).await.unwrap();
         });
 
         let client = Client::connect(addr).await.unwrap();
@@ -5181,6 +5221,7 @@ mod tests {
         let over_message_id = client.over("<overview@test>").await.unwrap();
         let xover_range = client.xover("1-10").await.unwrap();
         let over_current = client.over_current().await.unwrap();
+        let xover_current = client.xover_current_exchange().await.unwrap();
         let xover_message_id = client.xover_exchange("<overview@test>").await;
 
         assert_eq!(over_range.kind(), RequestKind::Over);
@@ -5191,6 +5232,9 @@ mod tests {
         assert_eq!(xover_range.status().as_u16(), 224);
         assert_eq!(over_current.kind(), RequestKind::Over);
         assert_eq!(over_current.status().as_u16(), 224);
+        assert_eq!(xover_current.request(), &Request::xover_current());
+        assert_eq!(xover_current.response().kind(), RequestKind::Xover);
+        assert_eq!(xover_current.response().status().as_u16(), 224);
         assert!(matches!(
             xover_message_id,
             Err(ClientError::InvalidArticleSelector)

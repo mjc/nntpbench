@@ -806,9 +806,12 @@ fn fetch_request(args: &FetchArgs) -> Result<Request<'static>, ClientError> {
             }
             None => Ok(Request::over_current()),
         },
-        FetchRequestKind::Xover => {
-            fetch_selector_request(args, |selector| Request::xover(selector))
-        }
+        FetchRequestKind::Xover => match args.selector.as_deref() {
+            Some(selector) => {
+                Request::xover(selector).map_err(|_| ClientError::InvalidArticleSelector)
+            }
+            None => Ok(Request::xover_current()),
+        },
         FetchRequestKind::Hdr => fetch_header_request(
             args,
             |header| {
@@ -915,17 +918,6 @@ fn fetch_newnews_request(args: &FetchArgs) -> Result<Request<'static>, ClientErr
     let date = args.date.as_deref().ok_or(ClientError::MissingDate)?;
     let time = args.time.as_deref().ok_or(ClientError::MissingTime)?;
     Request::newnews(wildmat, date, time, args.gmt).map_err(ClientError::from)
-}
-
-fn fetch_selector_request<F>(args: &FetchArgs, build: F) -> Result<Request<'static>, ClientError>
-where
-    F: FnOnce(&str) -> Result<Request<'static>, crate::protocol::InvalidArticleSelector>,
-{
-    let selector = args
-        .selector
-        .as_deref()
-        .ok_or(ClientError::MissingArticleSelector)?;
-    build(selector).map_err(|_| ClientError::InvalidArticleSelector)
 }
 
 fn fetch_authinfo_request<F>(args: &FetchArgs, build: F) -> Result<Request<'static>, ClientError>
@@ -11293,6 +11285,12 @@ mod tests {
             let read = fourth.read(&mut request).await.unwrap();
             assert_eq!(&request[..read], b"OVER\r\n");
             fourth.write_all(OVER_RESPONSE).await.unwrap();
+
+            let (mut fifth, _) = listener.accept().await.unwrap();
+            fifth.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = fifth.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"XOVER\r\n");
+            fifth.write_all(XOVER_RESPONSE).await.unwrap();
         });
 
         let mut over_range_args = test_fetch_args();
@@ -11330,6 +11328,15 @@ mod tests {
         let over_current = fetch_response(&over_current_args).await.unwrap();
         assert_eq!(over_current.kind(), RequestKind::Over);
         assert_eq!(over_current.status().as_u16(), 224);
+
+        let mut xover_current_args = test_fetch_args();
+        xover_current_args.connect = addr;
+        xover_current_args.request = FetchRequestKind::Xover;
+        xover_current_args.message_id = None;
+        xover_current_args.selector = None;
+        let xover_current = fetch_response(&xover_current_args).await.unwrap();
+        assert_eq!(xover_current.kind(), RequestKind::Xover);
+        assert_eq!(xover_current.status().as_u16(), 224);
 
         server.await.unwrap();
     }
@@ -11678,15 +11685,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_response_rejects_missing_xover_selector() {
+    async fn fetch_response_rejects_invalid_xover_selector() {
         let mut args = test_fetch_args();
         args.request = FetchRequestKind::Xover;
         args.message_id = None;
-        args.selector = None;
+        args.selector = Some("<message-id-is-not-a-legacy-xover-range>".to_string());
 
         assert!(matches!(
             fetch_response(&args).await.unwrap_err(),
-            ClientError::MissingArticleSelector
+            ClientError::InvalidArticleSelector
         ));
     }
 

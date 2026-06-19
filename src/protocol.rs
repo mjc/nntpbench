@@ -3413,7 +3413,7 @@ pub enum Request<'a> {
         selector: Option<ArticleSelector<'a>>,
     },
     Xover {
-        selector: ListGroupRange<'a>,
+        selector: Option<ListGroupRange<'a>>,
     },
     Hdr {
         header: HeaderName<'a>,
@@ -3535,9 +3535,11 @@ impl<'a> Request<'a> {
                 b"OVER",
                 selector.as_ref().map(ArticleSelector::as_str),
             ),
-            Self::Xover { selector } => {
-                write_one_arg_request_wire(output, b"XOVER ", selector.as_str())
-            }
+            Self::Xover { selector } => write_optional_arg_request_wire(
+                output,
+                b"XOVER",
+                selector.as_ref().map(ListGroupRange::as_str),
+            ),
             Self::Hdr { header, selector } => {
                 write_header_query_request_wire(output, b"HDR", header.as_str(), selector.as_ref())
             }
@@ -4151,8 +4153,16 @@ impl Request<'static> {
     /// Build an XOVER request.
     pub fn xover(selector: impl AsRef<str>) -> Result<Self, InvalidArticleSelector> {
         Ok(Self::Xover {
-            selector: ListGroupRange::from_owned(selector).map_err(|_| InvalidArticleSelector)?,
+            selector: Some(
+                ListGroupRange::from_owned(selector).map_err(|_| InvalidArticleSelector)?,
+            ),
         })
+    }
+
+    /// Build an XOVER request targeting the current article.
+    #[must_use]
+    pub const fn xover_current() -> Self {
+        Self::Xover { selector: None }
     }
 
     /// Build an HDR request.
@@ -6790,7 +6800,7 @@ mod tests {
         };
         let over_current = Request::over_current();
         let xover = Request::Xover {
-            selector: ListGroupRange::from_borrowed("1-10").unwrap(),
+            selector: Some(ListGroupRange::from_borrowed("1-10").unwrap()),
         };
         let hdr = Request::Hdr {
             header: HeaderName::from_borrowed("Subject").unwrap(),
@@ -7092,10 +7102,13 @@ mod tests {
         // omit the selector and use the current article:
         // https://www.rfc-editor.org/rfc/rfc3977#section-8.3.1
         // https://www.rfc-editor.org/rfc/rfc3977#section-8.5.1
+        // RFC 2980 section 2.8 preserves the legacy XOVER current-article form:
+        // https://www.rfc-editor.org/rfc/rfc2980#section-2.8
         // RFC 2980 section 2.6 preserves the legacy XHDR current-article form:
         // https://www.rfc-editor.org/rfc/rfc2980#section-2.6
         let cases = [
             (Request::over_current(), b"OVER\r\n".as_slice()),
+            (Request::xover_current(), b"XOVER\r\n".as_slice()),
             (
                 Request::hdr_current("Subject").unwrap(),
                 b"HDR Subject\r\n".as_slice(),
@@ -7137,6 +7150,7 @@ mod tests {
         let over = Request::over("1-10").unwrap();
         let over_current = Request::over_current();
         let xover = Request::xover("1-10").unwrap();
+        let xover_current = Request::xover_current();
         let hdr = Request::hdr("Subject", "1-10").unwrap();
         let hdr_current = Request::hdr_current("Subject").unwrap();
         let xhdr = Request::xhdr("Message-ID", "<g@h>").unwrap();
@@ -7216,6 +7230,8 @@ mod tests {
         assert!(over_current.overview_selector().is_none());
         assert_eq!(xover.kind(), RequestKind::Xover);
         assert!(xover.overview_selector().is_none());
+        assert_eq!(xover_current.kind(), RequestKind::Xover);
+        assert!(xover_current.overview_selector().is_none());
         assert_eq!(hdr.kind(), RequestKind::Hdr);
         assert_eq!(
             hdr.header_query()
