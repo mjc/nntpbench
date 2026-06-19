@@ -167,6 +167,22 @@ const HDR_SUBJECT_2_RESPONSE: &[u8] = b"225 headers follow\r\n2 example two\r\n.
 const HDR_SUBJECT_3_RESPONSE: &[u8] = b"225 headers follow\r\n3 example three\r\n.\r\n";
 const HDR_SUBJECT_2_PLUS_RESPONSE: &[u8] =
     b"225 headers follow\r\n2 example two\r\n3 example three\r\n.\r\n";
+const HDR_FROM_RESPONSE: &[u8] =
+    b"225 headers follow\r\n1 one@example.com\r\n2 two@example.com\r\n.\r\n";
+const HDR_FROM_1_RESPONSE: &[u8] = b"225 headers follow\r\n1 one@example.com\r\n.\r\n";
+const HDR_FROM_2_RESPONSE: &[u8] = b"225 headers follow\r\n2 two@example.com\r\n.\r\n";
+const HDR_FROM_3_RESPONSE: &[u8] = b"225 headers follow\r\n3 three@example.com\r\n.\r\n";
+const HDR_DATE_RESPONSE: &[u8] = b"225 headers follow\r\n1 Fri, 16 May 2026 12:00:00 +0000\r\n2 Fri, 16 May 2026 12:00:01 +0000\r\n.\r\n";
+const HDR_DATE_1_RESPONSE: &[u8] =
+    b"225 headers follow\r\n1 Fri, 16 May 2026 12:00:00 +0000\r\n.\r\n";
+const HDR_DATE_2_RESPONSE: &[u8] =
+    b"225 headers follow\r\n2 Fri, 16 May 2026 12:00:01 +0000\r\n.\r\n";
+const HDR_DATE_3_RESPONSE: &[u8] =
+    b"225 headers follow\r\n3 Fri, 16 May 2026 12:00:02 +0000\r\n.\r\n";
+const HDR_REFERENCES_RESPONSE: &[u8] = b"225 headers follow\r\n1 \r\n2 <ref@example.com>\r\n.\r\n";
+const HDR_REFERENCES_1_RESPONSE: &[u8] = b"225 headers follow\r\n1 \r\n.\r\n";
+const HDR_REFERENCES_2_RESPONSE: &[u8] = b"225 headers follow\r\n2 <ref@example.com>\r\n.\r\n";
+const HDR_REFERENCES_3_RESPONSE: &[u8] = b"225 headers follow\r\n3 <two@example.com>\r\n.\r\n";
 pub const XHDR_RESPONSE: &[u8] = b"221 headers follow\r\n1 example one\r\n2 example two\r\n.\r\n";
 const XHDR_SUBJECT_MESSAGE_ID_RESPONSE: &[u8] =
     b"221 headers follow\r\n<one@example.com> example one\r\n.\r\n";
@@ -175,6 +191,22 @@ const XHDR_SUBJECT_2_RESPONSE: &[u8] = b"221 headers follow\r\n2 example two\r\n
 const XHDR_SUBJECT_3_RESPONSE: &[u8] = b"221 headers follow\r\n3 example three\r\n.\r\n";
 const XHDR_SUBJECT_2_PLUS_RESPONSE: &[u8] =
     b"221 headers follow\r\n2 example two\r\n3 example three\r\n.\r\n";
+const XHDR_FROM_RESPONSE: &[u8] =
+    b"221 headers follow\r\n1 one@example.com\r\n2 two@example.com\r\n.\r\n";
+const XHDR_FROM_1_RESPONSE: &[u8] = b"221 headers follow\r\n1 one@example.com\r\n.\r\n";
+const XHDR_FROM_2_RESPONSE: &[u8] = b"221 headers follow\r\n2 two@example.com\r\n.\r\n";
+const XHDR_FROM_3_RESPONSE: &[u8] = b"221 headers follow\r\n3 three@example.com\r\n.\r\n";
+const XHDR_DATE_RESPONSE: &[u8] = b"221 headers follow\r\n1 Fri, 16 May 2026 12:00:00 +0000\r\n2 Fri, 16 May 2026 12:00:01 +0000\r\n.\r\n";
+const XHDR_DATE_1_RESPONSE: &[u8] =
+    b"221 headers follow\r\n1 Fri, 16 May 2026 12:00:00 +0000\r\n.\r\n";
+const XHDR_DATE_2_RESPONSE: &[u8] =
+    b"221 headers follow\r\n2 Fri, 16 May 2026 12:00:01 +0000\r\n.\r\n";
+const XHDR_DATE_3_RESPONSE: &[u8] =
+    b"221 headers follow\r\n3 Fri, 16 May 2026 12:00:02 +0000\r\n.\r\n";
+const XHDR_REFERENCES_RESPONSE: &[u8] = b"221 headers follow\r\n1 \r\n2 <ref@example.com>\r\n.\r\n";
+const XHDR_REFERENCES_1_RESPONSE: &[u8] = b"221 headers follow\r\n1 \r\n.\r\n";
+const XHDR_REFERENCES_2_RESPONSE: &[u8] = b"221 headers follow\r\n2 <ref@example.com>\r\n.\r\n";
+const XHDR_REFERENCES_3_RESPONSE: &[u8] = b"221 headers follow\r\n3 <two@example.com>\r\n.\r\n";
 const HDR_MESSAGE_ID_RESPONSE: &[u8] =
     b"225 headers follow\r\n1 <one@example.com>\r\n2 <two@example.com>\r\n.\r\n";
 const HDR_MESSAGE_ID_MESSAGE_ID_RESPONSE: &[u8] =
@@ -3671,6 +3703,15 @@ fn hdr_response_for_args(args: &[u8]) -> &'static [u8] {
             }
             return HDR_MESSAGE_ID_RESPONSE;
         }
+        if header.eq_ignore_ascii_case(b"From") {
+            return hdr_from_response_for_selector(selector);
+        }
+        if header.eq_ignore_ascii_case(b"Date") {
+            return hdr_date_response_for_selector(selector);
+        }
+        if header.eq_ignore_ascii_case(b"References") {
+            return hdr_references_response_for_selector(selector);
+        }
         if header.eq_ignore_ascii_case(b":bytes") {
             if selector.is_some_and(overview_selector_is_message_id) {
                 return HDR_BYTES_MESSAGE_ID_RESPONSE;
@@ -3726,6 +3767,45 @@ fn hdr_response_for_args(args: &[u8]) -> &'static [u8] {
     HDR_RESPONSE
 }
 
+fn hdr_from_response_for_selector(selector: Option<&[u8]>) -> &'static [u8] {
+    if selector.is_some_and(overview_selector_selects_first_only) {
+        return HDR_FROM_1_RESPONSE;
+    }
+    if selector.is_some_and(overview_selector_selects_second_only) {
+        return HDR_FROM_2_RESPONSE;
+    }
+    if selector.is_some_and(overview_selector_selects_third_only) {
+        return HDR_FROM_3_RESPONSE;
+    }
+    HDR_FROM_RESPONSE
+}
+
+fn hdr_date_response_for_selector(selector: Option<&[u8]>) -> &'static [u8] {
+    if selector.is_some_and(overview_selector_selects_first_only) {
+        return HDR_DATE_1_RESPONSE;
+    }
+    if selector.is_some_and(overview_selector_selects_second_only) {
+        return HDR_DATE_2_RESPONSE;
+    }
+    if selector.is_some_and(overview_selector_selects_third_only) {
+        return HDR_DATE_3_RESPONSE;
+    }
+    HDR_DATE_RESPONSE
+}
+
+fn hdr_references_response_for_selector(selector: Option<&[u8]>) -> &'static [u8] {
+    if selector.is_some_and(overview_selector_selects_first_only) {
+        return HDR_REFERENCES_1_RESPONSE;
+    }
+    if selector.is_some_and(overview_selector_selects_second_only) {
+        return HDR_REFERENCES_2_RESPONSE;
+    }
+    if selector.is_some_and(overview_selector_selects_third_only) {
+        return HDR_REFERENCES_3_RESPONSE;
+    }
+    HDR_REFERENCES_RESPONSE
+}
+
 fn xhdr_response_for_args(args: &[u8]) -> &'static [u8] {
     let selector = overview_selector_arg(RequestKind::Xhdr, args);
     if let Some(header) = header_query_name_from_args(args) {
@@ -3746,6 +3826,15 @@ fn xhdr_response_for_args(args: &[u8]) -> &'static [u8] {
                 return XHDR_MESSAGE_ID_3_RESPONSE;
             }
             return XHDR_MESSAGE_ID_RESPONSE;
+        }
+        if header.eq_ignore_ascii_case(b"From") {
+            return xhdr_from_response_for_selector(selector);
+        }
+        if header.eq_ignore_ascii_case(b"Date") {
+            return xhdr_date_response_for_selector(selector);
+        }
+        if header.eq_ignore_ascii_case(b"References") {
+            return xhdr_references_response_for_selector(selector);
         }
         if header.eq_ignore_ascii_case(b":bytes") {
             if selector.is_some_and(overview_selector_is_message_id) {
@@ -3800,6 +3889,45 @@ fn xhdr_response_for_args(args: &[u8]) -> &'static [u8] {
         return XHDR_SUBJECT_3_RESPONSE;
     }
     XHDR_RESPONSE
+}
+
+fn xhdr_from_response_for_selector(selector: Option<&[u8]>) -> &'static [u8] {
+    if selector.is_some_and(overview_selector_selects_first_only) {
+        return XHDR_FROM_1_RESPONSE;
+    }
+    if selector.is_some_and(overview_selector_selects_second_only) {
+        return XHDR_FROM_2_RESPONSE;
+    }
+    if selector.is_some_and(overview_selector_selects_third_only) {
+        return XHDR_FROM_3_RESPONSE;
+    }
+    XHDR_FROM_RESPONSE
+}
+
+fn xhdr_date_response_for_selector(selector: Option<&[u8]>) -> &'static [u8] {
+    if selector.is_some_and(overview_selector_selects_first_only) {
+        return XHDR_DATE_1_RESPONSE;
+    }
+    if selector.is_some_and(overview_selector_selects_second_only) {
+        return XHDR_DATE_2_RESPONSE;
+    }
+    if selector.is_some_and(overview_selector_selects_third_only) {
+        return XHDR_DATE_3_RESPONSE;
+    }
+    XHDR_DATE_RESPONSE
+}
+
+fn xhdr_references_response_for_selector(selector: Option<&[u8]>) -> &'static [u8] {
+    if selector.is_some_and(overview_selector_selects_first_only) {
+        return XHDR_REFERENCES_1_RESPONSE;
+    }
+    if selector.is_some_and(overview_selector_selects_second_only) {
+        return XHDR_REFERENCES_2_RESPONSE;
+    }
+    if selector.is_some_and(overview_selector_selects_third_only) {
+        return XHDR_REFERENCES_3_RESPONSE;
+    }
+    XHDR_REFERENCES_RESPONSE
 }
 
 fn over_response(
@@ -3857,10 +3985,28 @@ fn current_header_args(args: &[u8], session_state: &SessionState) -> Option<&'st
             b"3" => Some(b"Subject 3"),
             _ => None,
         },
+        b"From" => match current {
+            b"1" => Some(b"From 1"),
+            b"2" => Some(b"From 2"),
+            b"3" => Some(b"From 3"),
+            _ => None,
+        },
+        b"Date" => match current {
+            b"1" => Some(b"Date 1"),
+            b"2" => Some(b"Date 2"),
+            b"3" => Some(b"Date 3"),
+            _ => None,
+        },
         b"Message-ID" => match current {
             b"1" => Some(b"Message-ID 1"),
             b"2" => Some(b"Message-ID 2"),
             b"3" => Some(b"Message-ID 3"),
+            _ => None,
+        },
+        b"References" => match current {
+            b"1" => Some(b"References 1"),
+            b"2" => Some(b"References 2"),
+            b"3" => Some(b"References 3"),
             _ => None,
         },
         b":bytes" => match current {
@@ -6917,6 +7063,24 @@ mod tests {
                     expected: HDR_SUBJECT_3_RESPONSE,
                 },
                 ServerResponseCase {
+                    name: "HDR From uses selected header field",
+                    reference: "RFC 3977 section 8.5.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.2",
+                    input: b"GROUP alt.test\r\nHDR From 1\r\n",
+                    expected: HDR_FROM_1_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "HDR Date uses selected header field",
+                    reference: "RFC 3977 section 8.5.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.2",
+                    input: b"GROUP alt.test\r\nHDR Date 3\r\n",
+                    expected: HDR_DATE_3_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "HDR References uses selected header field",
+                    reference: "RFC 3977 section 8.5.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.2",
+                    input: b"GROUP alt.test\r\nHDR References 2\r\n",
+                    expected: HDR_REFERENCES_2_RESPONSE,
+                },
+                ServerResponseCase {
                     name: "HDR metadata current article follows ARTICLE 2",
                     reference: "RFC 3977 section 8.5.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.2",
                     input: b"GROUP alt.test\r\nARTICLE 2\r\nHDR :bytes\r\n",
@@ -6939,6 +7103,24 @@ mod tests {
                     reference: "RFC 2980 section 2.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.6",
                     input: b"GROUP alt.test\r\nARTICLE 3\r\nXHDR Subject\r\n",
                     expected: XHDR_SUBJECT_3_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "XHDR From uses selected header field",
+                    reference: "RFC 2980 section 2.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.6",
+                    input: b"GROUP alt.test\r\nXHDR From 1\r\n",
+                    expected: XHDR_FROM_1_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "XHDR Date uses selected header field",
+                    reference: "RFC 2980 section 2.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.6",
+                    input: b"GROUP alt.test\r\nXHDR Date 2\r\n",
+                    expected: XHDR_DATE_2_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "XHDR References uses selected header field",
+                    reference: "RFC 2980 section 2.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.6",
+                    input: b"GROUP alt.test\r\nXHDR References 3\r\n",
+                    expected: XHDR_REFERENCES_3_RESPONSE,
                 },
                 ServerResponseCase {
                     name: "XHDR metadata current article follows ARTICLE 2",
