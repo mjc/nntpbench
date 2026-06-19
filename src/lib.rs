@@ -9594,6 +9594,12 @@ mod tests {
                         frame: b"224 overview follows\r\n1\tSubject only\r\n2\tSubject\tfrom@test\tdate\t<two@test>\r\n.\r\n",
                     },
                     ResponseFrameCase {
+                        name: "OVER rejects out-of-order overview rows",
+                        reference: "RFC 3977 section 8.3.2 requires overview lines sorted in numerical order of article number https://www.rfc-editor.org/rfc/rfc3977#section-8.3.2",
+                        kind: RequestKind::Over,
+                        frame: b"224 overview follows\r\n2\tSubject\tfrom@test\tdate\t<two@test>\t\t2\t2\r\n1\tSubject\tfrom@test\tdate\t<one@test>\t\t1\t1\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "OVER rejects unlabeled optional overview field",
                         reference: "RFC 3977 sections 8.3.2 and 9.4.3 https://www.rfc-editor.org/rfc/rfc3977#section-9.4.3",
                         kind: RequestKind::Over,

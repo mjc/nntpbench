@@ -2688,7 +2688,7 @@ fn validate_multiline_response_content(
                 .ok()
                 .is_some_and(|message_id| MessageId::from_borrowed(message_id).is_ok())
         }),
-        RequestKind::Over => validate_crlf_lines(content, validate_overview_response_line),
+        RequestKind::Over => validate_overview_response_content(content),
         RequestKind::Xover => validate_crlf_lines(content, validate_xover_response_line),
         RequestKind::Hdr => validate_crlf_lines(content, validate_header_response_line),
         RequestKind::Xhdr => validate_crlf_lines(content, validate_xhdr_response_line),
@@ -3027,41 +3027,52 @@ fn validate_p_char_token(value: &[u8]) -> bool {
     std::str::from_utf8(value).is_ok_and(|token| !token.is_empty() && token.chars().all(is_p_char))
 }
 
-fn validate_overview_response_line(line: &[u8]) -> bool {
-    validate_overview_response_line_with_min_fields(line, 7, validate_overview_optional_field)
-}
-
 fn validate_xover_response_line(line: &[u8]) -> bool {
     validate_overview_response_line_with_min_fields(line, 7, validate_xover_optional_field)
+        .is_some()
+}
+
+fn validate_overview_response_content(content: &[u8]) -> bool {
+    let mut previous = None;
+    validate_crlf_lines(content, |line| {
+        let Some(article_number) = validate_overview_response_line_with_min_fields(
+            line,
+            7,
+            validate_overview_optional_field,
+        ) else {
+            return false;
+        };
+        if previous.is_some_and(|previous| article_number <= previous) {
+            return false;
+        }
+        previous = Some(article_number);
+        true
+    })
 }
 
 fn validate_overview_response_line_with_min_fields(
     line: &[u8],
     minimum_fields: usize,
     validate_optional_field: fn(&[u8]) -> bool,
-) -> bool {
-    let Some(tab) = memchr::memchr(b'\t', line) else {
-        return false;
-    };
-    if !validate_response_article_number(&line[..tab]) {
-        return false;
-    }
+) -> Option<u64> {
+    let tab = memchr::memchr(b'\t', line)?;
+    let article_number = parse_response_article_number(&line[..tab])?;
 
     let mut field_count = 0usize;
     for field in line[tab + 1..].split(|byte| *byte == b'\t') {
         field_count += 1;
         if !validate_hdr_content(field) {
-            return false;
+            return None;
         }
         if matches!(field_count, 6 | 7) && !field.is_empty() && !is_response_decimal_token(field) {
-            return false;
+            return None;
         }
         if field_count > 7 && !field.is_empty() && !validate_optional_field(field) {
-            return false;
+            return None;
         }
     }
 
-    field_count >= minimum_fields
+    (field_count >= minimum_fields).then_some(article_number)
 }
 
 fn validate_xover_optional_field(field: &[u8]) -> bool {
