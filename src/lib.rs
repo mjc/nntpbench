@@ -8075,6 +8075,11 @@ mod tests {
                         HeaderName::from_borrowed("X_Trace/Path").is_ok(),
                     ),
                     (
+                        "HDR header-name rejects colon suffix",
+                        "RFC 3977 sections 8.5.1 and 9.8 define header-name as A-NOTCOLON characters https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
+                        HeaderName::from_borrowed("Subject:").is_err(),
+                    ),
+                    (
                         "HDR metadata name rejects bare colon",
                         "RFC 3977 section 8.5.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.2",
                         HeaderName::from_borrowed(":").is_err(),
@@ -8145,9 +8150,19 @@ mod tests {
                         ArticleSelector::from_borrowed("10-1").is_ok(),
                     ),
                     (
+                        "article selector accepts open-ended range",
+                        "RFC 3977 sections 6.1.2, 8.3.2, and 8.5.2 define range = article-number '-' [article-number] https://www.rfc-editor.org/rfc/rfc3977#section-6.1.2",
+                        ArticleSelector::from_borrowed("1-").is_ok(),
+                    ),
+                    (
                         "article selector accepts RFC maximum with 16-digit leading-zero form",
                         "RFC 3977 section 6.1 permits leading zeroes but caps article numbers at 2,147,483,647 https://www.rfc-editor.org/rfc/rfc3977#section-6.1",
                         ArticleSelector::from_borrowed("0000002147483647").is_ok(),
+                    ),
+                    (
+                        "article selector accepts RFC maximum range endpoint",
+                        "RFC 3977 section 6.1 permits article numbers up to 2,147,483,647 https://www.rfc-editor.org/rfc/rfc3977#section-6.1",
+                        ArticleSelector::from_borrowed("1-2147483647").is_ok(),
                     ),
                     (
                         "article selector rejects double hyphen range",
@@ -8165,6 +8180,16 @@ mod tests {
                         ArticleSelector::from_borrowed("2147483648").is_err(),
                     ),
                     (
+                        "article selector rejects over max range endpoint",
+                        "RFC 3977 section 6.1 caps article numbers at 2,147,483,647 https://www.rfc-editor.org/rfc/rfc3977#section-6.1",
+                        ArticleSelector::from_borrowed("1-2147483648").is_err(),
+                    ),
+                    (
+                        "LISTGROUP range accepts open-ended range",
+                        "RFC 3977 section 6.1.2 defines range = article-number '-' [article-number] https://www.rfc-editor.org/rfc/rfc3977#section-6.1.2",
+                        ListGroupRange::from_borrowed("1-").is_ok(),
+                    ),
+                    (
                         "LISTGROUP range accepts reversed range as empty",
                         "RFC 3977 section 6.1.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.2",
                         ListGroupRange::from_borrowed("10-1").is_ok(),
@@ -8178,6 +8203,21 @@ mod tests {
                         "LISTGROUP range accepts leading-zero endpoint",
                         "RFC 3977 sections 3.2.1 and 6.1.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.1.2",
                         ListGroupRange::from_borrowed("1-0002").is_ok(),
+                    ),
+                    (
+                        "LISTGROUP range rejects zero start",
+                        "RFC 3977 sections 3.6 and 6.1.2 require article-number to be non-zero https://www.rfc-editor.org/rfc/rfc3977#section-3.6",
+                        ListGroupRange::from_borrowed("0-10").is_err(),
+                    ),
+                    (
+                        "LISTGROUP range rejects zero endpoint",
+                        "RFC 3977 sections 3.6 and 6.1.2 require article-number to be non-zero https://www.rfc-editor.org/rfc/rfc3977#section-3.6",
+                        ListGroupRange::from_borrowed("1-0").is_err(),
+                    ),
+                    (
+                        "LISTGROUP range rejects over max endpoint",
+                        "RFC 3977 section 6.1 caps article numbers at 2,147,483,647 https://www.rfc-editor.org/rfc/rfc3977#section-6.1",
+                        ListGroupRange::from_borrowed("1-2147483648").is_err(),
                     ),
                     (
                         "date accepts earliest RFC 3977 four-digit year",
