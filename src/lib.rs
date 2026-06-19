@@ -638,7 +638,7 @@ pub struct FetchArgs {
     #[arg(long, default_value_t = true, action = ArgAction::Set)]
     pub gmt: bool,
 
-    /// Article selector for OVER/XOVER/HDR/XHDR requests, such as 1, 1-10, or <message@id>.
+    /// Article selector for OVER/HDR/XHDR requests; XOVER accepts only a range or current article.
     #[arg(long)]
     pub selector: Option<String>,
 
