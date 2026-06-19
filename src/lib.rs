@@ -155,46 +155,60 @@ pub const STARTTLS_RESPONSE: &[u8] = b"382 continue with TLS negotiation\r\n";
 pub const OVER_RESPONSE: &[u8] = b"224 Overview information follows\r\n1\tSubject one\tone@example.com\tFri, 16 May 2026 12:00:00 +0000\t<one@example.com>\t\t123\t4\r\n.\r\n";
 const OVER_MESSAGE_ID_RESPONSE: &[u8] = b"224 Overview information follows\r\n0\tSubject one\tone@example.com\tFri, 16 May 2026 12:00:00 +0000\t<one@example.com>\t\t123\t4\r\n.\r\n";
 const OVER_2_RESPONSE: &[u8] = b"224 Overview information follows\r\n2\tSubject two\ttwo@example.com\tFri, 16 May 2026 12:00:01 +0000\t<two@example.com>\t<ref@example.com>\t456\t8\r\n.\r\n";
+const OVER_2_PLUS_RESPONSE: &[u8] = b"224 Overview information follows\r\n2\tSubject two\ttwo@example.com\tFri, 16 May 2026 12:00:01 +0000\t<two@example.com>\t<ref@example.com>\t456\t8\r\n3\tSubject three\tthree@example.com\tFri, 16 May 2026 12:00:02 +0000\t<three@example.com>\t<two@example.com>\t789\t12\r\n.\r\n";
 const OVER_RANGE_RESPONSE: &[u8] = b"224 Overview information follows\r\n1\tSubject one\tone@example.com\tFri, 16 May 2026 12:00:00 +0000\t<one@example.com>\t\t123\t4\r\n2\tSubject two\ttwo@example.com\tFri, 16 May 2026 12:00:01 +0000\t<two@example.com>\t<ref@example.com>\t456\t8\r\n.\r\n";
+const OVER_ALL_RESPONSE: &[u8] = b"224 Overview information follows\r\n1\tSubject one\tone@example.com\tFri, 16 May 2026 12:00:00 +0000\t<one@example.com>\t\t123\t4\r\n2\tSubject two\ttwo@example.com\tFri, 16 May 2026 12:00:01 +0000\t<two@example.com>\t<ref@example.com>\t456\t8\r\n3\tSubject three\tthree@example.com\tFri, 16 May 2026 12:00:02 +0000\t<three@example.com>\t<two@example.com>\t789\t12\r\n.\r\n";
 pub const XOVER_RESPONSE: &[u8] = OVER_RANGE_RESPONSE;
 pub const HDR_RESPONSE: &[u8] = b"225 headers follow\r\n1 example one\r\n2 example two\r\n.\r\n";
 const HDR_SUBJECT_MESSAGE_ID_RESPONSE: &[u8] = b"225 headers follow\r\n0 example one\r\n.\r\n";
 const HDR_SUBJECT_1_RESPONSE: &[u8] = b"225 headers follow\r\n1 example one\r\n.\r\n";
 const HDR_SUBJECT_2_RESPONSE: &[u8] = b"225 headers follow\r\n2 example two\r\n.\r\n";
+const HDR_SUBJECT_2_PLUS_RESPONSE: &[u8] =
+    b"225 headers follow\r\n2 example two\r\n3 example three\r\n.\r\n";
 pub const XHDR_RESPONSE: &[u8] = b"221 headers follow\r\n1 example one\r\n2 example two\r\n.\r\n";
 const XHDR_SUBJECT_MESSAGE_ID_RESPONSE: &[u8] =
     b"221 headers follow\r\n<one@example.com> example one\r\n.\r\n";
 const XHDR_SUBJECT_1_RESPONSE: &[u8] = b"221 headers follow\r\n1 example one\r\n.\r\n";
 const XHDR_SUBJECT_2_RESPONSE: &[u8] = b"221 headers follow\r\n2 example two\r\n.\r\n";
+const XHDR_SUBJECT_2_PLUS_RESPONSE: &[u8] =
+    b"221 headers follow\r\n2 example two\r\n3 example three\r\n.\r\n";
 const HDR_MESSAGE_ID_RESPONSE: &[u8] =
     b"225 headers follow\r\n1 <one@example.com>\r\n2 <two@example.com>\r\n.\r\n";
 const HDR_MESSAGE_ID_MESSAGE_ID_RESPONSE: &[u8] =
     b"225 headers follow\r\n0 <one@example.com>\r\n.\r\n";
 const HDR_MESSAGE_ID_1_RESPONSE: &[u8] = b"225 headers follow\r\n1 <one@example.com>\r\n.\r\n";
 const HDR_MESSAGE_ID_2_RESPONSE: &[u8] = b"225 headers follow\r\n2 <two@example.com>\r\n.\r\n";
+const HDR_MESSAGE_ID_2_PLUS_RESPONSE: &[u8] =
+    b"225 headers follow\r\n2 <two@example.com>\r\n3 <three@example.com>\r\n.\r\n";
 const HDR_BYTES_RESPONSE: &[u8] = b"225 headers follow\r\n1 123\r\n2 456\r\n.\r\n";
 const HDR_BYTES_MESSAGE_ID_RESPONSE: &[u8] = b"225 headers follow\r\n0 123\r\n.\r\n";
 const HDR_BYTES_1_RESPONSE: &[u8] = b"225 headers follow\r\n1 123\r\n.\r\n";
 const HDR_BYTES_2_RESPONSE: &[u8] = b"225 headers follow\r\n2 456\r\n.\r\n";
+const HDR_BYTES_2_PLUS_RESPONSE: &[u8] = b"225 headers follow\r\n2 456\r\n3 789\r\n.\r\n";
 const HDR_LINES_RESPONSE: &[u8] = b"225 headers follow\r\n1 4\r\n2 8\r\n.\r\n";
 const HDR_LINES_MESSAGE_ID_RESPONSE: &[u8] = b"225 headers follow\r\n0 4\r\n.\r\n";
 const HDR_LINES_1_RESPONSE: &[u8] = b"225 headers follow\r\n1 4\r\n.\r\n";
 const HDR_LINES_2_RESPONSE: &[u8] = b"225 headers follow\r\n2 8\r\n.\r\n";
+const HDR_LINES_2_PLUS_RESPONSE: &[u8] = b"225 headers follow\r\n2 8\r\n3 12\r\n.\r\n";
 const XHDR_MESSAGE_ID_RESPONSE: &[u8] =
     b"221 headers follow\r\n1 <one@example.com>\r\n2 <two@example.com>\r\n.\r\n";
 const XHDR_MESSAGE_ID_MESSAGE_ID_RESPONSE: &[u8] =
     b"221 headers follow\r\n<one@example.com> <one@example.com>\r\n.\r\n";
 const XHDR_MESSAGE_ID_1_RESPONSE: &[u8] = b"221 headers follow\r\n1 <one@example.com>\r\n.\r\n";
 const XHDR_MESSAGE_ID_2_RESPONSE: &[u8] = b"221 headers follow\r\n2 <two@example.com>\r\n.\r\n";
+const XHDR_MESSAGE_ID_2_PLUS_RESPONSE: &[u8] =
+    b"221 headers follow\r\n2 <two@example.com>\r\n3 <three@example.com>\r\n.\r\n";
 const XHDR_BYTES_RESPONSE: &[u8] = b"221 headers follow\r\n1 123\r\n2 456\r\n.\r\n";
 const XHDR_BYTES_MESSAGE_ID_RESPONSE: &[u8] =
     b"221 headers follow\r\n<one@example.com> 123\r\n.\r\n";
 const XHDR_BYTES_1_RESPONSE: &[u8] = b"221 headers follow\r\n1 123\r\n.\r\n";
 const XHDR_BYTES_2_RESPONSE: &[u8] = b"221 headers follow\r\n2 456\r\n.\r\n";
+const XHDR_BYTES_2_PLUS_RESPONSE: &[u8] = b"221 headers follow\r\n2 456\r\n3 789\r\n.\r\n";
 const XHDR_LINES_RESPONSE: &[u8] = b"221 headers follow\r\n1 4\r\n2 8\r\n.\r\n";
 const XHDR_LINES_MESSAGE_ID_RESPONSE: &[u8] = b"221 headers follow\r\n<one@example.com> 4\r\n.\r\n";
 const XHDR_LINES_1_RESPONSE: &[u8] = b"221 headers follow\r\n1 4\r\n.\r\n";
 const XHDR_LINES_2_RESPONSE: &[u8] = b"221 headers follow\r\n2 8\r\n.\r\n";
+const XHDR_LINES_2_PLUS_RESPONSE: &[u8] = b"221 headers follow\r\n2 8\r\n3 12\r\n.\r\n";
 pub const HEAD_RESPONSE: &[u8] = b"221 1 <article.1@nntpbench.local> article retrieved\r\nPath: nntpbench.local!mock\r\nFrom: Bench User <bench@nntpbench.local>\r\nNewsgroups: alt.binaries.bench\r\nSubject: nntpbench synthetic article\r\nMessage-ID: <article.1@nntpbench.local>\r\nDate: Fri, 15 May 2026 00:00:00 +0000\r\n.\r\n";
 pub const STAT_RESPONSE: &[u8] = b"223 1 <article.1@nntpbench.local> article retrieved\r\n";
 pub const HELP_RESPONSE: &[u8] =
@@ -3377,10 +3391,14 @@ fn overview_selector_arg(kind: RequestKind, args: &[u8]) -> Option<&[u8]> {
 fn over_response_for_args(args: &[u8]) -> &'static [u8] {
     if overview_selector_is_message_id(args) {
         OVER_MESSAGE_ID_RESPONSE
-    } else if overview_selector_starts_at_second(args) {
-        OVER_2_RESPONSE
+    } else if overview_selector_includes_first_through_third(args) {
+        OVER_ALL_RESPONSE
     } else if overview_selector_includes_first_two(args) {
         OVER_RANGE_RESPONSE
+    } else if overview_selector_includes_second_and_third(args) {
+        OVER_2_PLUS_RESPONSE
+    } else if overview_selector_selects_second_only(args) {
+        OVER_2_RESPONSE
     } else {
         OVER_RESPONSE
     }
@@ -3391,24 +3409,43 @@ fn xover_response_for_args(args: &[u8]) -> &'static [u8] {
         OVER_RESPONSE
     } else if overview_selector_is_message_id(args) {
         OVER_MESSAGE_ID_RESPONSE
-    } else if overview_selector_starts_at_second(args) {
-        OVER_2_RESPONSE
+    } else if overview_selector_includes_first_through_third(args) {
+        OVER_ALL_RESPONSE
     } else if overview_selector_includes_first_two(args) {
         OVER_RANGE_RESPONSE
+    } else if overview_selector_includes_second_and_third(args) {
+        OVER_2_PLUS_RESPONSE
+    } else if overview_selector_selects_second_only(args) {
+        OVER_2_RESPONSE
     } else {
         XOVER_RESPONSE
     }
 }
 
-fn overview_selector_starts_at_second(selector: &[u8]) -> bool {
-    selector == b"2" || selector.starts_with(b"2-")
+fn overview_selector_selects_second_only(selector: &[u8]) -> bool {
+    if selector == b"2" {
+        return true;
+    }
+    listgroup_range_bounds(selector).is_some_and(|(start, end)| start == 2 && end == Some(2))
 }
 
 fn overview_selector_selects_first_only(selector: &[u8]) -> bool {
     selector == b"1"
 }
 
+fn overview_selector_includes_first_through_third(selector: &[u8]) -> bool {
+    overview_selector_range_covers(selector, 1, 3)
+}
+
 fn overview_selector_includes_first_two(selector: &[u8]) -> bool {
+    overview_selector_range_covers(selector, 1, 2)
+}
+
+fn overview_selector_includes_second_and_third(selector: &[u8]) -> bool {
+    overview_selector_range_covers(selector, 2, 3)
+}
+
+fn overview_selector_range_covers(selector: &[u8], first: u64, last: u64) -> bool {
     let Ok(selector) = std::str::from_utf8(selector) else {
         return false;
     };
@@ -3426,7 +3463,7 @@ fn overview_selector_includes_first_two(selector: &[u8]) -> bool {
             Err(_) => return false,
         }
     };
-    start <= 1 && end >= 2
+    start <= first && end >= last
 }
 
 fn overview_selector_is_range(selector: &[u8]) -> bool {
@@ -3603,7 +3640,10 @@ fn hdr_response_for_args(args: &[u8]) -> &'static [u8] {
             if selector.is_some_and(overview_selector_selects_first_only) {
                 return HDR_MESSAGE_ID_1_RESPONSE;
             }
-            if selector.is_some_and(overview_selector_starts_at_second) {
+            if selector.is_some_and(overview_selector_includes_second_and_third) {
+                return HDR_MESSAGE_ID_2_PLUS_RESPONSE;
+            }
+            if selector.is_some_and(overview_selector_selects_second_only) {
                 return HDR_MESSAGE_ID_2_RESPONSE;
             }
             return HDR_MESSAGE_ID_RESPONSE;
@@ -3615,7 +3655,10 @@ fn hdr_response_for_args(args: &[u8]) -> &'static [u8] {
             if selector.is_some_and(overview_selector_selects_first_only) {
                 return HDR_BYTES_1_RESPONSE;
             }
-            if selector.is_some_and(overview_selector_starts_at_second) {
+            if selector.is_some_and(overview_selector_includes_second_and_third) {
+                return HDR_BYTES_2_PLUS_RESPONSE;
+            }
+            if selector.is_some_and(overview_selector_selects_second_only) {
                 return HDR_BYTES_2_RESPONSE;
             }
             return HDR_BYTES_RESPONSE;
@@ -3627,7 +3670,10 @@ fn hdr_response_for_args(args: &[u8]) -> &'static [u8] {
             if selector.is_some_and(overview_selector_selects_first_only) {
                 return HDR_LINES_1_RESPONSE;
             }
-            if selector.is_some_and(overview_selector_starts_at_second) {
+            if selector.is_some_and(overview_selector_includes_second_and_third) {
+                return HDR_LINES_2_PLUS_RESPONSE;
+            }
+            if selector.is_some_and(overview_selector_selects_second_only) {
                 return HDR_LINES_2_RESPONSE;
             }
             return HDR_LINES_RESPONSE;
@@ -3639,7 +3685,10 @@ fn hdr_response_for_args(args: &[u8]) -> &'static [u8] {
     if selector.is_some_and(overview_selector_selects_first_only) {
         return HDR_SUBJECT_1_RESPONSE;
     }
-    if selector.is_some_and(overview_selector_starts_at_second) {
+    if selector.is_some_and(overview_selector_includes_second_and_third) {
+        return HDR_SUBJECT_2_PLUS_RESPONSE;
+    }
+    if selector.is_some_and(overview_selector_selects_second_only) {
         return HDR_SUBJECT_2_RESPONSE;
     }
     HDR_RESPONSE
@@ -3655,7 +3704,10 @@ fn xhdr_response_for_args(args: &[u8]) -> &'static [u8] {
             if selector.is_some_and(overview_selector_selects_first_only) {
                 return XHDR_MESSAGE_ID_1_RESPONSE;
             }
-            if selector.is_some_and(overview_selector_starts_at_second) {
+            if selector.is_some_and(overview_selector_includes_second_and_third) {
+                return XHDR_MESSAGE_ID_2_PLUS_RESPONSE;
+            }
+            if selector.is_some_and(overview_selector_selects_second_only) {
                 return XHDR_MESSAGE_ID_2_RESPONSE;
             }
             return XHDR_MESSAGE_ID_RESPONSE;
@@ -3667,7 +3719,10 @@ fn xhdr_response_for_args(args: &[u8]) -> &'static [u8] {
             if selector.is_some_and(overview_selector_selects_first_only) {
                 return XHDR_BYTES_1_RESPONSE;
             }
-            if selector.is_some_and(overview_selector_starts_at_second) {
+            if selector.is_some_and(overview_selector_includes_second_and_third) {
+                return XHDR_BYTES_2_PLUS_RESPONSE;
+            }
+            if selector.is_some_and(overview_selector_selects_second_only) {
                 return XHDR_BYTES_2_RESPONSE;
             }
             return XHDR_BYTES_RESPONSE;
@@ -3679,7 +3734,10 @@ fn xhdr_response_for_args(args: &[u8]) -> &'static [u8] {
             if selector.is_some_and(overview_selector_selects_first_only) {
                 return XHDR_LINES_1_RESPONSE;
             }
-            if selector.is_some_and(overview_selector_starts_at_second) {
+            if selector.is_some_and(overview_selector_includes_second_and_third) {
+                return XHDR_LINES_2_PLUS_RESPONSE;
+            }
+            if selector.is_some_and(overview_selector_selects_second_only) {
                 return XHDR_LINES_2_RESPONSE;
             }
             return XHDR_LINES_RESPONSE;
@@ -3691,7 +3749,10 @@ fn xhdr_response_for_args(args: &[u8]) -> &'static [u8] {
     if selector.is_some_and(overview_selector_selects_first_only) {
         return XHDR_SUBJECT_1_RESPONSE;
     }
-    if selector.is_some_and(overview_selector_starts_at_second) {
+    if selector.is_some_and(overview_selector_includes_second_and_third) {
+        return XHDR_SUBJECT_2_PLUS_RESPONSE;
+    }
+    if selector.is_some_and(overview_selector_selects_second_only) {
         return XHDR_SUBJECT_2_RESPONSE;
     }
     XHDR_RESPONSE
@@ -5950,10 +6011,10 @@ mod tests {
                     expected: HDR_BYTES_MESSAGE_ID_RESPONSE,
                 },
                 ServerResponseCase {
-                    name: "HDR :lines range selector",
+                    name: "HDR :lines open range selector",
                     reference: "RFC 3977 section 8.5.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.2",
                     input: b"GROUP alt.test\r\nHDR :lines 2-\r\n",
-                    expected: HDR_LINES_2_RESPONSE,
+                    expected: HDR_LINES_2_PLUS_RESPONSE,
                 },
                 ServerResponseCase {
                     name: "XHDR :bytes numeric selector",
@@ -6064,7 +6125,8 @@ mod tests {
             // RFC 3977 sections 8.3.2 and 8.5.2 apply article-range selectors
             // to overview and header metadata. Ranges must include every
             // matching article row, and a lower bound of 2 must not return
-            // article 1 rows:
+            // article 1 rows, while open ranges must include all following
+            // articles:
             // https://www.rfc-editor.org/rfc/rfc3977#section-8.3.2
             assert_red_server_response_tail_cases(&[
                 ServerResponseCase {
@@ -6074,10 +6136,16 @@ mod tests {
                     expected: OVER_RANGE_RESPONSE,
                 },
                 ServerResponseCase {
-                    name: "OVER open range selector 1- returns both article rows",
+                    name: "OVER open range selector 1- returns all article rows",
                     reference: "RFC 3977 section 8.3.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.3.2",
                     input: b"GROUP alt.test\r\nOVER 1-\r\n",
-                    expected: OVER_RANGE_RESPONSE,
+                    expected: OVER_ALL_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "XOVER open range selector 1- returns all article rows",
+                    reference: "RFC 2980 section 2.8 https://www.rfc-editor.org/rfc/rfc2980#section-2.8",
+                    input: b"GROUP alt.test\r\nXOVER 1-\r\n",
+                    expected: OVER_ALL_RESPONSE,
                 },
                 ServerResponseCase {
                     name: "XOVER range selector 1-2 returns both article rows",
@@ -6086,40 +6154,40 @@ mod tests {
                     expected: OVER_RANGE_RESPONSE,
                 },
                 ServerResponseCase {
-                    name: "OVER range selector 2-",
+                    name: "OVER open range selector 2- returns article suffix",
                     reference: "RFC 3977 section 8.3.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.3.2",
                     input: b"GROUP alt.test\r\nOVER 2-\r\n",
-                    expected: OVER_2_RESPONSE,
+                    expected: OVER_2_PLUS_RESPONSE,
                 },
                 ServerResponseCase {
-                    name: "XOVER range selector 2-",
+                    name: "XOVER open range selector 2- returns article suffix",
                     reference: "RFC 2980 section 2.8 https://www.rfc-editor.org/rfc/rfc2980#section-2.8",
                     input: b"GROUP alt.test\r\nXOVER 2-\r\n",
-                    expected: OVER_2_RESPONSE,
+                    expected: OVER_2_PLUS_RESPONSE,
                 },
                 ServerResponseCase {
-                    name: "HDR Subject range selector 2-",
+                    name: "HDR Subject open range selector 2-",
                     reference: "RFC 3977 section 8.5.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.2",
                     input: b"GROUP alt.test\r\nHDR Subject 2-\r\n",
-                    expected: HDR_SUBJECT_2_RESPONSE,
+                    expected: HDR_SUBJECT_2_PLUS_RESPONSE,
                 },
                 ServerResponseCase {
-                    name: "HDR Message-ID range selector 2-",
+                    name: "HDR Message-ID open range selector 2-",
                     reference: "RFC 3977 section 8.5.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.2",
                     input: b"GROUP alt.test\r\nHDR Message-ID 2-\r\n",
-                    expected: HDR_MESSAGE_ID_2_RESPONSE,
+                    expected: HDR_MESSAGE_ID_2_PLUS_RESPONSE,
                 },
                 ServerResponseCase {
-                    name: "XHDR Subject range selector 2-",
+                    name: "XHDR Subject open range selector 2-",
                     reference: "RFC 2980 section 2.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.6",
                     input: b"GROUP alt.test\r\nXHDR Subject 2-\r\n",
-                    expected: XHDR_SUBJECT_2_RESPONSE,
+                    expected: XHDR_SUBJECT_2_PLUS_RESPONSE,
                 },
                 ServerResponseCase {
-                    name: "XHDR Message-ID range selector 2-",
+                    name: "XHDR Message-ID open range selector 2-",
                     reference: "RFC 2980 section 2.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.6",
                     input: b"GROUP alt.test\r\nXHDR Message-ID 2-\r\n",
-                    expected: XHDR_MESSAGE_ID_2_RESPONSE,
+                    expected: XHDR_MESSAGE_ID_2_PLUS_RESPONSE,
                 },
                 ServerResponseCase {
                     name: "OVER empty range returns 423",
@@ -11153,9 +11221,9 @@ mod tests {
             [
                 GREETING,
                 GROUP_RESPONSE,
-                OVER_RANGE_RESPONSE,
+                OVER_ALL_RESPONSE,
                 OVER_MESSAGE_ID_RESPONSE,
-                XOVER_RESPONSE,
+                OVER_ALL_RESPONSE,
                 b"501 command syntax error\r\n",
             ]
             .concat()
@@ -11758,9 +11826,9 @@ mod tests {
         assert_eq!(
             output,
             [
-                OVER_RANGE_RESPONSE,
+                OVER_ALL_RESPONSE,
                 OVER_MESSAGE_ID_RESPONSE,
-                XOVER_RESPONSE,
+                OVER_ALL_RESPONSE,
                 HDR_SUBJECT_1_RESPONSE,
                 HDR_MESSAGE_ID_1_RESPONSE,
                 XHDR_SUBJECT_1_RESPONSE,
