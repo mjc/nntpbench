@@ -5922,6 +5922,18 @@ mod tests {
                     input: b"AUTHINFO SASL MADE-UP-MECHANISM Y\r\n",
                     expected: b"504 base64 encoding error\r\n",
                 },
+                ServerResponseCase {
+                    name: "SASL initial response extra argument",
+                    reference: "RFC 4643 section 2.4.1 permits only a mechanism and optional initial response https://www.rfc-editor.org/rfc/rfc4643#section-2.4.1",
+                    input: b"AUTHINFO SASL MADE-UP-MECHANISM YQ== extra\r\n",
+                    expected: b"501 command syntax error\r\n",
+                },
+                ServerResponseCase {
+                    name: "SASL zero-length marker extra argument",
+                    reference: "RFC 4643 section 2.4.1 permits only a mechanism and optional initial response https://www.rfc-editor.org/rfc/rfc4643#section-2.4.1",
+                    input: b"AUTHINFO SASL MADE-UP-MECHANISM = extra\r\n",
+                    expected: b"501 command syntax error\r\n",
+                },
             ])
             .await;
         }
