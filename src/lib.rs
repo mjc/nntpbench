@@ -6971,22 +6971,30 @@ mod tests {
                     RequestKind::AuthInfoUser,
                     "RFC 4643 section 3.1 and RFC 3977 section 9.8 https://www.rfc-editor.org/rfc/rfc4643#section-3.1",
                 ),
+                (
+                    "DATE accepts trailing EOL whitespace",
+                    b"DATE \t\r\n",
+                    RequestKind::Date,
+                    "RFC 3977 sections 9.2 and 9.8 define EOL as optional SP/TAB before CRLF https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
+                ),
+                (
+                    "GROUP accepts repeated SP separator and trailing EOL whitespace",
+                    b"GROUP  alt.test \r\n",
+                    RequestKind::Group,
+                    "RFC 3977 sections 9.2 and 9.8 define WS as one or more SP/TAB and EOL as optional SP/TAB before CRLF https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
+                ),
+                (
+                    "NEWNEWS accepts repeated WS before time",
+                    b"NEWNEWS * 20260101  000000 GMT\r\n",
+                    RequestKind::NewNews,
+                    "RFC 3977 sections 7.4.1 and 9.2 https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
+                ),
             ]);
         }
 
         #[test]
         fn rfc3977_red_request_line_rejects_invalid_command_shapes_matrix() {
             assert_red_request_line_unknown_cases(&[
-                (
-                    "DATE rejects dangling WS before EOL",
-                    b"DATE \t\r\n",
-                    "RFC 3977 section 9.2 command = keyword *(WS token) https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
-                ),
-                (
-                    "GROUP rejects dangling WS after argument",
-                    b"GROUP alt.test \r\n",
-                    "RFC 3977 section 9.2 command = keyword *(WS token) https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
-                ),
                 (
                     "LAST argument",
                     b"LAST 1\r\n",
@@ -8123,42 +8131,42 @@ mod tests {
                         RequestKind::Xhdr,
                         "RFC 2980 section 2.6 and RFC 3977 section 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
                     ),
+                    (
+                        "DATE accepts trailing EOL whitespace",
+                        b"DATE  \r\n",
+                        RequestKind::Date,
+                        "RFC 3977 sections 9.2 and 9.8 define EOL as optional SP/TAB before CRLF https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
+                    ),
+                    (
+                        "GROUP accepts repeated WS and trailing EOL whitespace",
+                        b"GROUP  alt.test \r\n",
+                        RequestKind::Group,
+                        "RFC 3977 sections 9.2 and 9.8 define WS as one or more SP/TAB and EOL as optional SP/TAB before CRLF https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
+                    ),
+                    (
+                        "HEAD accepts repeated WS before selector",
+                        b"HEAD  1\r\n",
+                        RequestKind::Head,
+                        "RFC 3977 sections 6.2.2 and 9.2 https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
+                    ),
+                    (
+                        "MODE accepts repeated WS before READER",
+                        b"MODE  READER\r\n",
+                        RequestKind::ModeReader,
+                        "RFC 3977 sections 5.3 and 9.2 https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
+                    ),
+                    (
+                        "NEWNEWS accepts repeated WS before time",
+                        b"NEWNEWS * 20260101  000000 GMT\r\n",
+                        RequestKind::NewNews,
+                        "RFC 3977 sections 7.4.1 and 9.2 https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
+                    ),
                 ]);
             }
 
             #[test]
             fn rfc3977_red_request_line_grammar_matrix() {
                 assert_red_request_line_unknown_cases(&[
-                    (
-                        "DATE dangling WS before EOL",
-                        b"DATE  \r\n",
-                        "RFC 3977 section 9.2 command = keyword *(WS token) https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
-                    ),
-                    (
-                        "GROUP dangling WS after argument",
-                        b"GROUP alt.test \r\n",
-                        "RFC 3977 section 9.2 command = keyword *(WS token) https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
-                    ),
-                    (
-                        "GROUP repeated WS creates empty token",
-                        b"GROUP  alt.test\r\n",
-                        "RFC 3977 section 9.2 command = keyword *(WS token) https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
-                    ),
-                    (
-                        "HEAD repeated WS before selector creates empty token",
-                        b"HEAD  1\r\n",
-                        "RFC 3977 section 9.2 command = keyword *(WS token) https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
-                    ),
-                    (
-                        "MODE repeated WS before READER creates empty token",
-                        b"MODE  READER\r\n",
-                        "RFC 3977 section 9.2 command = keyword *(WS token) https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
-                    ),
-                    (
-                        "NEWNEWS repeated WS before time creates empty token",
-                        b"NEWNEWS * 20260101  000000 GMT\r\n",
-                        "RFC 3977 section 9.2 command = keyword *(WS token) https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
-                    ),
                     (
                         "ARTICLE extra argument",
                         b"ARTICLE <a@b> extra\r\n",
@@ -8255,16 +8263,10 @@ mod tests {
             async fn rfc3977_red_server_syntax_response_matrix() {
                 assert_red_server_response_cases(&[
                     ServerResponseCase {
-                        name: "DATE dangling WS before EOL",
-                        reference: "RFC 3977 section 9.2 command = keyword *(WS token) https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
-                        input: b"DATE \t\r\n",
-                        expected: b"501 command syntax error\r\n",
-                    },
-                    ServerResponseCase {
-                        name: "GROUP dangling WS after argument",
-                        reference: "RFC 3977 section 9.2 command = keyword *(WS token) https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
-                        input: b"GROUP alt.test \r\n",
-                        expected: b"501 command syntax error\r\n",
+                        name: "QUIT accepts trailing EOL whitespace",
+                        reference: "RFC 3977 sections 5.4, 9.2, and 9.8 define EOL as optional SP/TAB before CRLF https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
+                        input: b"QUIT \t\r\n",
+                        expected: b"205 closing connection\r\n",
                     },
                     ServerResponseCase {
                         name: "LIST unknown keyword with trailing token",
