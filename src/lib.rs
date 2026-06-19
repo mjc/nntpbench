@@ -277,7 +277,7 @@ pub const STAT_RESPONSE: &[u8] = b"223 1 <article.1@nntpbench.local> article ret
 pub const HELP_RESPONSE: &[u8] =
     b"100 help text follows\r\nARTICLE\r\nAUTHINFO\r\nBODY\r\nCAPABILITIES\r\nCHECK\r\nDATE\r\nGROUP\r\nHDR\r\nHEAD\r\nHELP\r\nIHAVE\r\nLAST\r\nLIST\r\nLISTGROUP\r\nMODE READER\r\nNEWGROUPS\r\nNEWNEWS\r\nNEXT\r\nOVER\r\nPOST\r\nQUIT\r\nSTARTTLS\r\nSTAT\r\nTAKETHIS\r\nXHDR\r\nXOVER\r\n.\r\n";
 pub const CAPABILITIES_RESPONSE: &[u8] =
-    b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nLIST ACTIVE ACTIVE.TIMES DISTRIB.PATS NEWSGROUPS OVERVIEW.FMT HEADERS\r\nOVER MSGID\r\nHDR\r\nNEWNEWS\r\nAUTHINFO\r\n.\r\n";
+    b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nLIST ACTIVE ACTIVE.TIMES DISTRIB.PATS NEWSGROUPS OVERVIEW.FMT HEADERS\r\nOVER MSGID\r\nHDR\r\nNEWNEWS\r\n.\r\n";
 pub const QUIT_RESPONSE: &[u8] = b"205 closing connection\r\n";
 pub const ARTICLE_NOT_FOUND_RESPONSE: &[u8] = b"430 no article with that number\r\n";
 const BODY_RESPONSE_PREFIX: &[u8] = b"222 1 <article.1@nntpbench.local> body follows\r\n";
@@ -5563,9 +5563,12 @@ mod tests {
             // RFC 3977 section 3.3 requires CAPABILITIES to describe available
             // protocol extensions. RFC 4642 STARTTLS, RFC 4643 SASL, and RFC 4644
             // STREAMING must not be advertised when their commands are unavailable.
+            // RFC 4643 section 2.1 likewise only advertises AUTHINFO variants
+            // that are supported by the server.
             // Section 3.4.2 also reserves MODE-READER for mode-switching transit
             // mode; this server offers reader commands immediately:
             // https://www.rfc-editor.org/rfc/rfc3977#section-3.3
+            // https://www.rfc-editor.org/rfc/rfc4643#section-2.1
             // https://www.rfc-editor.org/rfc/rfc3977#section-3.4.2
             let (output, _) = run_session_with_input(test_config(), b"CAPABILITIES\r\n").await;
             let text = String::from_utf8_lossy(without_greeting(&output));
@@ -5574,11 +5577,7 @@ mod tests {
                 "missing required RFC 3977 base/reader capabilities, got {text:?}"
             );
             assert!(
-                text.contains("AUTHINFO\r\n"),
-                "missing RFC 4643 AUTHINFO capability marker, got {text:?}"
-            );
-            assert!(
-                !text.contains("AUTHINFO USER")
+                !text.contains("AUTHINFO")
                     && !text.contains("STARTTLS")
                     && !text.contains("SASL")
                     && !text.contains("STREAMING")
