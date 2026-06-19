@@ -9600,6 +9600,18 @@ mod tests {
                         frame: b"230 list of new articles follows\r\none@alt.test\r\n.\r\n",
                     },
                     ResponseFrameCase {
+                        name: "NEWNEWS rejects empty article line",
+                        reference: "RFC 3977 sections 7.4.2 and 9.8 require each NEWNEWS body line to be a message-id https://www.rfc-editor.org/rfc/rfc3977#section-7.4.2",
+                        kind: RequestKind::NewNews,
+                        frame: b"230 list of new articles follows\r\n\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "NEWNEWS rejects trailing text after message-id",
+                        reference: "RFC 3977 sections 7.4.2 and 9.8 require each NEWNEWS body line to be exactly one message-id https://www.rfc-editor.org/rfc/rfc3977#section-7.4.2",
+                        kind: RequestKind::NewNews,
+                        frame: b"230 list of new articles follows\r\n<one@test> extra\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "LIST ACTIVE rejects invalid group name line",
                         reference: "RFC 3977 section 7.6.3 https://www.rfc-editor.org/rfc/rfc3977#section-7.6.3",
                         kind: RequestKind::ListActive,
