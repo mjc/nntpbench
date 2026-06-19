@@ -9386,6 +9386,48 @@ mod tests {
                         frame: b"383 = continue exchange\r\n",
                     },
                     ResponseFrameCase {
+                        name: "AUTHINFO USER accepts password-required continuation",
+                        reference: "RFC 4643 sections 2.3 and 4 define 381 for AUTHINFO USER password continuation https://www.rfc-editor.org/rfc/rfc4643#section-4",
+                        kind: RequestKind::AuthInfoUser,
+                        frame: b"381 password required\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "AUTHINFO USER accepts authentication-accepted response",
+                        reference: "RFC 4643 section 4 defines 281 for AUTHINFO USER authentication accepted https://www.rfc-editor.org/rfc/rfc4643#section-4",
+                        kind: RequestKind::AuthInfoUser,
+                        frame: b"281 authentication accepted\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "AUTHINFO PASS accepts authentication-accepted response",
+                        reference: "RFC 4643 section 4 defines 281 for AUTHINFO PASS authentication accepted https://www.rfc-editor.org/rfc/rfc4643#section-4",
+                        kind: RequestKind::AuthInfoPass,
+                        frame: b"281 authentication accepted\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "AUTHINFO SASL accepts authentication-accepted response",
+                        reference: "RFC 4643 sections 2.4.1 and 4 define 281 for AUTHINFO SASL authentication accepted https://www.rfc-editor.org/rfc/rfc4643#section-4",
+                        kind: RequestKind::AuthInfo,
+                        frame: b"281 authentication accepted\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "AUTHINFO USER accepts authentication-failed response",
+                        reference: "RFC 4643 section 4 defines 481 for AUTHINFO USER authentication failed or rejected https://www.rfc-editor.org/rfc/rfc4643#section-4",
+                        kind: RequestKind::AuthInfoUser,
+                        frame: b"481 authentication failed\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "AUTHINFO PASS accepts out-of-sequence response",
+                        reference: "RFC 4643 section 4 defines 482 for AUTHINFO PASS authentication commands issued out of sequence https://www.rfc-editor.org/rfc/rfc4643#section-4",
+                        kind: RequestKind::AuthInfoPass,
+                        frame: b"482 authentication commands issued out of sequence\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "AUTHINFO SASL accepts protocol-error response",
+                        reference: "RFC 4643 sections 2.4.1 and 4 define 482 for AUTHINFO SASL protocol error https://www.rfc-editor.org/rfc/rfc4643#section-4",
+                        kind: RequestKind::AuthInfo,
+                        frame: b"482 SASL protocol error\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "ARTICLE accepts RFC article multiline content",
                         reference: "RFC 3977 sections 3.6 and 9.4.3 https://www.rfc-editor.org/rfc/rfc3977#section-9.4.3",
                         kind: RequestKind::Article,
