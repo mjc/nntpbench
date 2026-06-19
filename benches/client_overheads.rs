@@ -35,23 +35,25 @@ mod request_construction {
     };
 
     #[divan::bench(sample_count = 1000, sample_size = 100)]
-    fn numeric_article(bencher: Bencher) {
+    fn message_id_article(bencher: Bencher) {
         bencher.bench_local(|| {
             black_box(bench_client_request_for_command(
                 black_box(42),
                 black_box(42),
                 black_box(ClientCommandMix::Article),
+                false,
             ))
         });
     }
 
     #[divan::bench(sample_count = 1000, sample_size = 100)]
-    fn numeric_body(bencher: Bencher) {
+    fn message_id_body(bencher: Bencher) {
         bencher.bench_local(|| {
             black_box(bench_client_request_for_command(
                 black_box(42),
                 black_box(42),
                 black_box(ClientCommandMix::Body),
+                false,
             ))
         });
     }
@@ -63,6 +65,7 @@ mod request_construction {
                 black_box(0),
                 black_box(0),
                 black_box(ClientCommandMix::Article),
+                false,
             ))
         });
     }

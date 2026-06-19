@@ -491,7 +491,7 @@ mod proptests {
                 Just(ClientCommandMix::Alternate),
             ],
         ) {
-            let request = client_request_for_command(command_id, 0, mix, None, 0, 1).unwrap();
+            let request = client_request_for_command(command_id, 0, mix, true, None, 0, 1).unwrap();
             let expected_kind = client_command_kind(command_id, mix);
 
             match expected_kind {
@@ -522,11 +522,21 @@ mod proptests {
             total_clients in 1_usize..4,
             segments in segment_set_strategy(),
         ) {
-            let zero_request = client_request_for_command(0, request_index, mix, None, client_index, total_clients).unwrap();
+            let zero_request =
+                client_request_for_command(0, request_index, mix, false, None, client_index, total_clients).unwrap();
             prop_assert!(zero_request.message_id().is_some());
             prop_assert_eq!(zero_request.message_id().unwrap().as_str(), "<bench.0@nntpbench.local>");
 
-            let segmented = client_request_for_command(17, request_index, mix, Some(&segments), client_index, total_clients).unwrap();
+            let segmented = client_request_for_command(
+                17,
+                request_index,
+                mix,
+                false,
+                Some(&segments),
+                client_index,
+                total_clients,
+            )
+            .unwrap();
             let expected = segment_for_request(&segments, client_index, total_clients, request_index);
             prop_assert_eq!(segmented.message_id().unwrap().as_str(), expected.as_str());
         }
@@ -961,12 +971,16 @@ fn client_request_for_command(
     command_id: u64,
     request_index: u64,
     mix: ClientCommandMix,
+    selected_group: bool,
     segments: Option<&SegmentSet>,
     client_index: usize,
     total_clients: usize,
 ) -> io::Result<Request<'static>> {
     let kind = client_command_kind(command_id, mix);
-    if segments.is_none() && (1..=crate::protocol::MAX_ARTICLE_NUMBER).contains(&command_id) {
+    if selected_group
+        && segments.is_none()
+        && (1..=crate::protocol::MAX_ARTICLE_NUMBER).contains(&command_id)
+    {
         return match kind {
             ClientCommandMix::Article => Request::article_number(command_id)
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid article number")),
@@ -1004,8 +1018,9 @@ pub fn bench_client_request_for_command(
     command_id: u64,
     request_index: u64,
     mix: ClientCommandMix,
+    selected_group: bool,
 ) -> io::Result<Request<'static>> {
-    client_request_for_command(command_id, request_index, mix, None, 0, 1)
+    client_request_for_command(command_id, request_index, mix, selected_group, None, 0, 1)
 }
 
 #[doc(hidden)]
@@ -1470,6 +1485,7 @@ where
                     writer,
                     pending_write,
                     config,
+                    RequestKind::Article,
                     article_id,
                     message_id.as_ref(),
                     session_stats,
@@ -1538,12 +1554,45 @@ where
                 .unwrap_or(1);
             session_state.current_article = Some(article_id);
             if article_id == 1 {
+                if config.article_dir.is_some()
+                    && write_stored_article_response(
+                        writer,
+                        pending_write,
+                        config,
+                        RequestKind::Head,
+                        Some(article_id),
+                        None,
+                        session_stats,
+                        article_path,
+                    )
+                    .await?
+                {
+                    session_state.current_article = Some(article_id);
+                    return Ok(false);
+                }
                 write_response(writer, pending_write, config.head_response(), session_stats)
                     .await?;
             } else {
+                if config.article_dir.is_some()
+                    && write_stored_article_response(
+                        writer,
+                        pending_write,
+                        config,
+                        RequestKind::Head,
+                        Some(article_id),
+                        None,
+                        session_stats,
+                        article_path,
+                    )
+                    .await?
+                {
+                    session_state.current_article = Some(article_id);
+                    return Ok(false);
+                }
                 let response = build_selected_head_response(article_id);
                 write_response(writer, pending_write, &response, session_stats).await?;
             }
+            session_state.current_article = Some(article_id);
             Ok(false)
         }
         RequestKind::Stat => {
@@ -1567,12 +1616,45 @@ where
                 .unwrap_or(1);
             session_state.current_article = Some(article_id);
             if article_id == 1 {
+                if config.article_dir.is_some()
+                    && write_stored_article_response(
+                        writer,
+                        pending_write,
+                        config,
+                        RequestKind::Stat,
+                        Some(article_id),
+                        None,
+                        session_stats,
+                        article_path,
+                    )
+                    .await?
+                {
+                    session_state.current_article = Some(article_id);
+                    return Ok(false);
+                }
                 write_response(writer, pending_write, config.stat_response(), session_stats)
                     .await?;
             } else {
+                if config.article_dir.is_some()
+                    && write_stored_article_response(
+                        writer,
+                        pending_write,
+                        config,
+                        RequestKind::Stat,
+                        Some(article_id),
+                        None,
+                        session_stats,
+                        article_path,
+                    )
+                    .await?
+                {
+                    session_state.current_article = Some(article_id);
+                    return Ok(false);
+                }
                 let response = build_selected_stat_response(article_id);
                 write_response(writer, pending_write, &response, session_stats).await?;
             }
+            session_state.current_article = Some(article_id);
             Ok(false)
         }
         RequestKind::Body => {
@@ -1596,12 +1678,45 @@ where
                 .unwrap_or(1);
             session_state.current_article = Some(article_id);
             if article_id == 1 {
+                if config.article_dir.is_some()
+                    && write_stored_article_response(
+                        writer,
+                        pending_write,
+                        config,
+                        RequestKind::Body,
+                        Some(article_id),
+                        None,
+                        session_stats,
+                        article_path,
+                    )
+                    .await?
+                {
+                    session_state.current_article = Some(article_id);
+                    return Ok(false);
+                }
                 write_response(writer, pending_write, config.body_response(), session_stats)
                     .await?;
             } else {
+                if config.article_dir.is_some()
+                    && write_stored_article_response(
+                        writer,
+                        pending_write,
+                        config,
+                        RequestKind::Body,
+                        Some(article_id),
+                        None,
+                        session_stats,
+                        article_path,
+                    )
+                    .await?
+                {
+                    session_state.current_article = Some(article_id);
+                    return Ok(false);
+                }
                 let response = build_selected_body_response(article_id, config.body_bytes);
                 write_response(writer, pending_write, &response, session_stats).await?;
             }
+            session_state.current_article = Some(article_id);
             Ok(false)
         }
         RequestKind::List => {
@@ -2239,6 +2354,7 @@ where
                 if write_stored_article_response_to(
                     output,
                     config,
+                    RequestKind::Article,
                     parse_article_id_arg(request.args()),
                     request.message_id().as_ref(),
                     stats,
@@ -2297,7 +2413,21 @@ where
                 output.write_all(&response).expect("response write failed");
                 return false;
             }
-            if let Some(article_id) = parse_article_id_arg(request.args()).filter(|id| *id != 1) {
+            let article_id = parse_article_id_arg(request.args()).unwrap_or(1);
+            if config.article_dir.is_some()
+                && write_stored_article_response_to(
+                    output,
+                    config,
+                    RequestKind::Head,
+                    Some(article_id),
+                    None,
+                    stats,
+                )
+                .expect("response write failed")
+            {
+                return false;
+            }
+            if article_id != 1 {
                 let response = build_selected_head_response(article_id);
                 stats
                     .bytes_sent
@@ -2305,7 +2435,13 @@ where
                 output.write_all(&response).expect("response write failed");
                 return false;
             }
-            config.head_response()
+            stats
+                .bytes_sent
+                .fetch_add(config.head_response().len() as u64, Ordering::Relaxed);
+            output
+                .write_all(config.head_response())
+                .expect("response write failed");
+            return false;
         }
         RequestKind::Stat => {
             stats.article_requests.fetch_add(1, Ordering::Relaxed);
@@ -2317,7 +2453,21 @@ where
                 output.write_all(&response).expect("response write failed");
                 return false;
             }
-            if let Some(article_id) = parse_article_id_arg(request.args()).filter(|id| *id != 1) {
+            let article_id = parse_article_id_arg(request.args()).unwrap_or(1);
+            if config.article_dir.is_some()
+                && write_stored_article_response_to(
+                    output,
+                    config,
+                    RequestKind::Stat,
+                    Some(article_id),
+                    None,
+                    stats,
+                )
+                .expect("response write failed")
+            {
+                return false;
+            }
+            if article_id != 1 {
                 let response = build_selected_stat_response(article_id);
                 stats
                     .bytes_sent
@@ -2325,7 +2475,13 @@ where
                 output.write_all(&response).expect("response write failed");
                 return false;
             }
-            config.stat_response()
+            stats
+                .bytes_sent
+                .fetch_add(config.stat_response().len() as u64, Ordering::Relaxed);
+            output
+                .write_all(config.stat_response())
+                .expect("response write failed");
+            return false;
         }
         RequestKind::Body => {
             stats.body_requests.fetch_add(1, Ordering::Relaxed);
@@ -2337,7 +2493,21 @@ where
                 output.write_all(&response).expect("response write failed");
                 return false;
             }
-            if let Some(article_id) = parse_article_id_arg(request.args()).filter(|id| *id != 1) {
+            let article_id = parse_article_id_arg(request.args()).unwrap_or(1);
+            if config.article_dir.is_some()
+                && write_stored_article_response_to(
+                    output,
+                    config,
+                    RequestKind::Body,
+                    Some(article_id),
+                    None,
+                    stats,
+                )
+                .expect("response write failed")
+            {
+                return false;
+            }
+            if article_id != 1 {
                 let response = build_selected_body_response(article_id, config.body_bytes);
                 stats
                     .bytes_sent
@@ -2498,10 +2668,125 @@ fn article_not_found_response(
     }
 }
 
+fn build_stored_article_response(kind: RequestKind, article_bytes: &[u8]) -> io::Result<Box<[u8]>> {
+    if kind == RequestKind::Article {
+        return Ok(article_bytes.to_vec().into_boxed_slice());
+    }
+
+    let article = Article::parse(article_bytes)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    let article_number = article.article_number.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "stored article response is missing an article number",
+        )
+    })?;
+
+    let mut output = Vec::with_capacity(article_bytes.len());
+    match kind {
+        RequestKind::Head => {
+            write!(
+                &mut output,
+                "221 {} {} article retrieved\r\n",
+                article_number.as_u64(),
+                article.message_id.as_str()
+            )
+            .expect("write to Vec cannot fail");
+            let headers = article.headers.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "stored article response is missing headers",
+                )
+            })?;
+            output.extend_from_slice(headers.as_bytes());
+            append_dot_terminator(&mut output);
+        }
+        RequestKind::Body => {
+            write!(
+                &mut output,
+                "222 {} {} body follows\r\n",
+                article_number.as_u64(),
+                article.message_id.as_str()
+            )
+            .expect("write to Vec cannot fail");
+            let body = article.body.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "stored article response is missing a body",
+                )
+            })?;
+            append_dot_stuffed_body(&mut output, body.as_ref());
+            append_dot_terminator(&mut output);
+        }
+        RequestKind::Stat => {
+            write!(
+                &mut output,
+                "223 {} {} article retrieved\r\n",
+                article_number.as_u64(),
+                article.message_id.as_str()
+            )
+            .expect("write to Vec cannot fail");
+        }
+        RequestKind::Article
+        | RequestKind::List
+        | RequestKind::ListActive
+        | RequestKind::ListActiveTimes
+        | RequestKind::ListNewsgroups
+        | RequestKind::ListOverviewFmt
+        | RequestKind::ListHeaders
+        | RequestKind::ListDistribPats
+        | RequestKind::Group
+        | RequestKind::ListGroup
+        | RequestKind::Last
+        | RequestKind::Next
+        | RequestKind::NewGroups
+        | RequestKind::NewNews
+        | RequestKind::Post
+        | RequestKind::Ihave
+        | RequestKind::Check
+        | RequestKind::TakeThis
+        | RequestKind::Capabilities
+        | RequestKind::Help
+        | RequestKind::Date
+        | RequestKind::Over
+        | RequestKind::Xover
+        | RequestKind::Hdr
+        | RequestKind::Xhdr
+        | RequestKind::StartTls
+        | RequestKind::AuthInfoUser
+        | RequestKind::AuthInfoPass
+        | RequestKind::AuthInfo
+        | RequestKind::ModeReader
+        | RequestKind::Quit
+        | RequestKind::Unknown => unreachable!("stored article response requested for non-article kind"),
+    }
+
+    Ok(output.into_boxed_slice())
+}
+
+fn append_dot_stuffed_body(output: &mut Vec<u8>, body: &[u8]) {
+    let mut start = 0;
+    while start < body.len() {
+        let Some(line_end) = find_crlf_line_end(body, start) else {
+            output.extend_from_slice(&body[start..]);
+            return;
+        };
+
+        let line = &body[start..line_end - CRLF.len()];
+        if line.first() == Some(&b'.') {
+            output.push(b'.');
+        }
+        output.extend_from_slice(line);
+        output.extend_from_slice(CRLF);
+        start = line_end;
+    }
+}
+
 async fn write_stored_article_response<W>(
     writer: &mut W,
     pending_write: &mut PendingWrite,
     config: &ServerConfig,
+    kind: RequestKind,
     article_id: Option<u64>,
     message_id: Option<&MessageId<'_>>,
     session_stats: &mut SessionStats,
@@ -2514,6 +2799,16 @@ where
     else {
         return Ok(false);
     };
+
+    if kind != RequestKind::Article {
+        let mut bytes = Vec::new();
+        let mut file = file;
+        file.read_to_end(&mut bytes)?;
+        let response = build_stored_article_response(kind, &bytes)?;
+        pending_write.flush(writer).await?;
+        write_response(writer, pending_write, &response, session_stats).await?;
+        return Ok(true);
+    }
 
     pending_write.flush(writer).await?;
     write_file_response_to_async(writer, file, session_stats).await?;
@@ -2542,6 +2837,7 @@ where
 fn write_stored_article_response_to<W>(
     output: &mut W,
     config: &ServerConfig,
+    kind: RequestKind,
     article_id: Option<u64>,
     message_id: Option<&MessageId<'_>>,
     stats: &Stats,
@@ -2555,6 +2851,17 @@ where
     else {
         return Ok(false);
     };
+    if kind != RequestKind::Article {
+        let mut bytes = Vec::new();
+        let mut file = file;
+        file.read_to_end(&mut bytes)?;
+        let response = build_stored_article_response(kind, &bytes)?;
+        stats
+            .bytes_sent
+            .fetch_add(response.len() as u64, Ordering::Relaxed);
+        output.write_all(&response)?;
+        return Ok(true);
+    }
     write_file_response_to(output, file, stats)?;
     Ok(true)
 }
@@ -5631,7 +5938,7 @@ mod tests {
             );
             assert!(
                 without_greeting(&output)
-                    .ends_with(b"223 2 <article.2@nntpbench.local> article retrieved\r\n"),
+                    .ends_with(b"223 2 <article.2@test> article retrieved\r\n"),
                 "RFC 3977 stored numeric ARTICLE must set current article, while message-id ARTICLE must not change it, got {:?}",
                 String::from_utf8_lossy(without_greeting(&output))
             );
@@ -11567,14 +11874,75 @@ mod tests {
     }
 
     #[test]
-    fn client_request_for_command_prefers_numeric_refs_without_segments() {
+    fn client_request_for_command_uses_message_ids_without_selected_group() {
         let article =
-            client_request_for_command(42, 0, ClientCommandMix::Article, None, 0, 1).unwrap();
-        let body = client_request_for_command(7, 0, ClientCommandMix::Body, None, 0, 1).unwrap();
+            client_request_for_command(42, 0, ClientCommandMix::Article, false, None, 0, 1)
+                .unwrap();
+        let body =
+            client_request_for_command(7, 0, ClientCommandMix::Body, false, None, 0, 1).unwrap();
         let alternate_article =
-            client_request_for_command(1, 0, ClientCommandMix::Alternate, None, 0, 1).unwrap();
+            client_request_for_command(1, 0, ClientCommandMix::Alternate, false, None, 0, 1)
+                .unwrap();
         let alternate_body =
-            client_request_for_command(2, 0, ClientCommandMix::Alternate, None, 0, 1).unwrap();
+            client_request_for_command(2, 0, ClientCommandMix::Alternate, false, None, 0, 1)
+                .unwrap();
+
+        assert_eq!(article.kind(), RequestKind::Article);
+        assert_eq!(
+            article.message_id().map(MessageId::as_str),
+            Some("<bench.42@nntpbench.local>")
+        );
+        assert_eq!(
+            article
+                .article_ref()
+                .and_then(ArticleRef::message_id)
+                .map(MessageId::as_str),
+            Some("<bench.42@nntpbench.local>")
+        );
+        assert_eq!(body.kind(), RequestKind::Body);
+        assert_eq!(
+            body.message_id().map(MessageId::as_str),
+            Some("<bench.7@nntpbench.local>")
+        );
+        assert_eq!(
+            body.article_ref()
+                .and_then(ArticleRef::message_id)
+                .map(MessageId::as_str),
+            Some("<bench.7@nntpbench.local>")
+        );
+        assert_eq!(alternate_article.kind(), RequestKind::Article);
+        assert_eq!(
+            alternate_article.message_id().map(MessageId::as_str),
+            Some("<bench.1@nntpbench.local>")
+        );
+        assert_eq!(
+            alternate_article
+                .article_ref()
+                .and_then(ArticleRef::message_id)
+                .map(MessageId::as_str),
+            Some("<bench.1@nntpbench.local>")
+        );
+        assert_eq!(alternate_body.kind(), RequestKind::Body);
+        assert_eq!(
+            alternate_body.message_id().map(MessageId::as_str),
+            Some("<bench.2@nntpbench.local>")
+        );
+        assert_eq!(
+            alternate_body
+                .article_ref()
+                .and_then(ArticleRef::message_id)
+                .map(MessageId::as_str),
+            Some("<bench.2@nntpbench.local>")
+        );
+    }
+
+    #[test]
+    fn client_request_for_command_uses_numeric_refs_only_with_selected_group() {
+        let article =
+            client_request_for_command(42, 0, ClientCommandMix::Article, true, None, 0, 1)
+                .unwrap();
+        let body =
+            client_request_for_command(7, 0, ClientCommandMix::Body, true, None, 0, 1).unwrap();
 
         assert_eq!(article.kind(), RequestKind::Article);
         assert_eq!(article.article_ref(), Some(&ArticleRef::Number(42)));
@@ -11582,15 +11950,6 @@ mod tests {
         assert_eq!(body.kind(), RequestKind::Body);
         assert_eq!(body.article_ref(), Some(&ArticleRef::Number(7)));
         assert!(body.message_id().is_none());
-        assert_eq!(alternate_article.kind(), RequestKind::Article);
-        assert_eq!(
-            alternate_article.article_ref(),
-            Some(&ArticleRef::Number(1))
-        );
-        assert!(alternate_article.message_id().is_none());
-        assert_eq!(alternate_body.kind(), RequestKind::Body);
-        assert_eq!(alternate_body.article_ref(), Some(&ArticleRef::Number(2)));
-        assert!(alternate_body.message_id().is_none());
     }
 
     #[test]
@@ -11600,17 +11959,17 @@ mod tests {
         fs::remove_file(path).unwrap();
 
         let segmented =
-            client_request_for_command(11, 0, ClientCommandMix::Article, Some(&segments), 0, 1)
+            client_request_for_command(11, 0, ClientCommandMix::Article, false, Some(&segments), 0, 1)
                 .unwrap();
         let segmented_body =
-            client_request_for_command(12, 1, ClientCommandMix::Body, Some(&segments), 0, 1)
+            client_request_for_command(12, 1, ClientCommandMix::Body, false, Some(&segments), 0, 1)
                 .unwrap();
         let zero_article =
-            client_request_for_command(0, 0, ClientCommandMix::Article, None, 0, 1).unwrap();
+            client_request_for_command(0, 0, ClientCommandMix::Article, false, None, 0, 1).unwrap();
         let zero_body =
-            client_request_for_command(0, 0, ClientCommandMix::Body, None, 0, 1).unwrap();
+            client_request_for_command(0, 0, ClientCommandMix::Body, false, None, 0, 1).unwrap();
         let zero_alternate =
-            client_request_for_command(0, 0, ClientCommandMix::Alternate, None, 0, 1).unwrap();
+            client_request_for_command(0, 0, ClientCommandMix::Alternate, false, None, 0, 1).unwrap();
 
         assert_eq!(
             segmented.message_id().map(MessageId::as_str),
@@ -11819,6 +12178,7 @@ mod tests {
             protocol::MAX_ARTICLE_NUMBER + 1,
             0,
             ClientCommandMix::Article,
+            false,
             None,
             0,
             1,
@@ -11837,6 +12197,7 @@ mod tests {
             protocol::MAX_ARTICLE_NUMBER + 2,
             0,
             ClientCommandMix::Body,
+            false,
             None,
             0,
             1,
@@ -13361,6 +13722,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn serve_session_reads_article_family_responses_from_article_dir() {
+        let article_dir = unique_temp_dir("server-article-family");
+        let response = b"220 2 <article.2@test> article follows\r\nSubject: stored\r\nFrom: Bench User <bench@nntpbench.local>\r\n\r\n..dot line\r\nbody\r\n.\r\n";
+        let path = article_id_tree_path(&article_dir, 2);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, response).unwrap();
+
+        let mut args = test_args();
+        args.article_dir = Some(article_dir.clone());
+        let (output, stats) = run_session_with_input(
+            Arc::new(ServerConfig::from_args(args)),
+            b"GROUP alt.test\r\nARTICLE 2\r\nHEAD 2\r\nBODY 2\r\nSTAT 2\r\nQUIT\r\n",
+        )
+        .await;
+
+        let expected_head = b"221 2 <article.2@test> article retrieved\r\nSubject: stored\r\nFrom: Bench User <bench@nntpbench.local>\r\n.\r\n";
+        let expected_body = b"222 2 <article.2@test> body follows\r\n..dot line\r\nbody\r\n.\r\n";
+        let expected_stat = b"223 2 <article.2@test> article retrieved\r\n";
+        assert_eq!(
+            output,
+            [
+                GREETING,
+                GROUP_RESPONSE,
+                response,
+                expected_head,
+                expected_body,
+                expected_stat,
+                QUIT_RESPONSE,
+            ]
+            .concat()
+        );
+
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.commands, 6);
+        assert_eq!(snapshot.article_requests, 3);
+        assert_eq!(snapshot.bytes_sent, output.len() as u64);
+
+        fs::remove_dir_all(article_dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn serve_session_supports_backend_negotiation_commands() {
         let (output, stats) =
             run_session_with_input(test_config(), b"MODE READER\r\nDATE\r\nQUIT\r\n").await;
@@ -14204,6 +14606,67 @@ mod tests {
     }
 
     #[test]
+    fn process_request_to_buffer_uses_article_dir_for_article_family_responses() {
+        let article_dir = unique_temp_dir("process-article-family");
+        let response = b"220 2 <article.2@test> article follows\r\nSubject: stored\r\nFrom: Bench User <bench@nntpbench.local>\r\n\r\n..dot line\r\nbody\r\n.\r\n";
+        let path = article_id_tree_path(&article_dir, 2);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, response).unwrap();
+
+        let mut args = test_args();
+        args.article_dir = Some(article_dir.clone());
+        let config = ServerConfig::from_args(args);
+        let stats = Stats::new();
+        let mut output = Vec::new();
+
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"ARTICLE 2\r\n"),
+            &config,
+            &stats,
+            &mut output,
+        ));
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"HEAD 2\r\n"),
+            &config,
+            &stats,
+            &mut output,
+        ));
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"BODY 2\r\n"),
+            &config,
+            &stats,
+            &mut output,
+        ));
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"STAT 2\r\n"),
+            &config,
+            &stats,
+            &mut output,
+        ));
+
+        let expected_head = b"221 2 <article.2@test> article retrieved\r\nSubject: stored\r\nFrom: Bench User <bench@nntpbench.local>\r\n.\r\n";
+        let expected_body = b"222 2 <article.2@test> body follows\r\n..dot line\r\nbody\r\n.\r\n";
+        let expected_stat = b"223 2 <article.2@test> article retrieved\r\n";
+        assert_eq!(
+            output,
+            [
+                response,
+                expected_head.as_slice(),
+                expected_body.as_slice(),
+                expected_stat.as_slice(),
+            ]
+            .concat()
+        );
+
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.commands, 4);
+        assert_eq!(snapshot.article_requests, 3);
+        assert_eq!(snapshot.bytes_sent, output.len() as u64);
+
+        fs::remove_dir_all(article_dir).unwrap();
+    }
+
+    #[test]
     fn synchronous_hot_path_units_do_not_allocate() {
         let config = ServerConfig::from_args(test_args());
         let stats = Stats::new();
@@ -14239,6 +14702,7 @@ mod tests {
                     42,
                     0,
                     ClientCommandMix::Article,
+                    false,
                     Some(&segments),
                     0,
                     1,
