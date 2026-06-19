@@ -2803,7 +2803,7 @@ fn validate_active_times_response_line(line: &[u8]) -> bool {
         .ok()
         .is_some_and(|group| GroupName::from_borrowed(group).is_ok())
         && is_response_decimal_token(timestamp)
-        && (creator.is_empty() || validate_u_text(creator))
+        && validate_u_text(creator)
 }
 
 fn split_active_times_response_line(line: &[u8]) -> Option<(&[u8], &[u8], &[u8])> {
@@ -6176,10 +6176,6 @@ mod tests {
                     .as_slice(),
             ),
             (
-                RequestKind::ListActiveTimes,
-                b"215 information follows\r\nalt.test 1715907600 \r\n.\r\n".as_slice(),
-            ),
-            (
                 RequestKind::ListNewsgroups,
                 b"215 information follows\r\nalt.test Synthetic group\r\n.\r\n".as_slice(),
             ),
@@ -6326,6 +6322,10 @@ mod tests {
             (
                 RequestKind::ListActiveTimes,
                 b"215 information follows\r\nalt.test 1715907600 \tadmin@test\r\n.\r\n".as_slice(),
+            ),
+            (
+                RequestKind::ListActiveTimes,
+                b"215 information follows\r\nalt.test 1715907600 \r\n.\r\n".as_slice(),
             ),
             (
                 RequestKind::ListNewsgroups,
