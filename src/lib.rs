@@ -4748,14 +4748,14 @@ mod tests {
                 ),
                 (
                     "BODY later line",
-                    b"222 1 <dot@test>\r\nplain\r\n..middle-dot\r\n.more\r\n.\r\n".as_slice(),
-                    b"plain\r\n.middle-dot\r\nmore\r\n".as_slice(),
+                    b"222 1 <dot@test>\r\nplain\r\n..middle-dot\r\n..more\r\n.\r\n".as_slice(),
+                    b"plain\r\n.middle-dot\r\n.more\r\n".as_slice(),
                 ),
                 (
                     "ARTICLE body lines",
-                    b"220 1 <dot@test>\r\nSubject: dots\r\n\r\n..article-dot\r\nplain\r\n.more\r\n.\r\n"
+                    b"220 1 <dot@test>\r\nSubject: dots\r\n\r\n..article-dot\r\nplain\r\n..more\r\n.\r\n"
                         .as_slice(),
-                    b".article-dot\r\nplain\r\nmore\r\n".as_slice(),
+                    b".article-dot\r\nplain\r\n.more\r\n".as_slice(),
                 ),
             ] {
                 let article = Article::parse(input).unwrap();
@@ -4763,6 +4763,33 @@ mod tests {
                     article.body.as_deref(),
                     Some(expected),
                     "{name}: RFC 3977 body lines should be dot-unstuffed"
+                );
+            }
+        }
+
+        #[test]
+        fn rfc3977_red_article_parser_rejects_unstuffed_dot_prefixed_body_lines() {
+            // RFC 3977 section 3.1.1 requires any data line beginning with "."
+            // inside a multi-line data block to be dot-stuffed; a line containing
+            // only "." is the terminator, not content:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1
+            for (name, input) in [
+                (
+                    "BODY first content line",
+                    b"222 1 <dot@test>\r\n.starts-with-dot\r\n.\r\n".as_slice(),
+                ),
+                (
+                    "BODY later content line",
+                    b"222 1 <dot@test>\r\nplain\r\n.more\r\n.\r\n".as_slice(),
+                ),
+                (
+                    "ARTICLE body content line",
+                    b"220 1 <dot@test>\r\nSubject: dots\r\n\r\n.more\r\n.\r\n".as_slice(),
+                ),
+            ] {
+                assert!(
+                    matches!(Article::parse(input), Err(ArticleParseError::InvalidBody)),
+                    "{name}: RFC 3977 article data must reject unstuffed dot-prefixed body lines"
                 );
             }
         }

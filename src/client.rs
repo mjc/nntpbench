@@ -2917,7 +2917,7 @@ mod tests {
     }
 
     fn body_content_bytes() -> impl Strategy<Value = u8> {
-        prop_oneof![Just(b'.'), Just(b' '), b'0'..=b'9', b'a'..=b'z']
+        prop_oneof![Just(b' '), b'0'..=b'9', b'a'..=b'z']
     }
 
     fn terminator_end_oracle(buffer: &[u8]) -> Option<usize> {
@@ -3558,8 +3558,8 @@ mod tests {
             mut prefix in vec(body_content_bytes(), 0..24),
             mut suffix in vec(body_content_bytes(), 0..24),
             near_miss in prop::sample::select(vec![
-                b".foo\r\n".to_vec(),
                 b"..\r\n".to_vec(),
+                b"x.foo\r\n".to_vec(),
                 b"body.\r\n".to_vec(),
             ]),
             trailer in vec(dangerous_wire_bytes(), 0..16),

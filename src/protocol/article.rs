@@ -1383,6 +1383,10 @@ fn validate_body_content(buf: &[u8]) -> Result<(), ArticleParseError> {
     while pos < buf.len() {
         let line_end =
             strict_crlf_line_content_end_from(buf, pos).ok_or(ArticleParseError::InvalidBody)?;
+        let line = &buf[pos..line_end];
+        if line.starts_with(b".") && !line.starts_with(b"..") {
+            return Err(ArticleParseError::InvalidBody);
+        }
         pos = line_end + crate::CRLF.len();
     }
 
