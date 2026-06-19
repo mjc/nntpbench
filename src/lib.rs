@@ -169,20 +169,29 @@ const HDR_SUBJECT_2_PLUS_RESPONSE: &[u8] =
     b"225 headers follow\r\n2 example two\r\n3 example three\r\n.\r\n";
 const HDR_FROM_RESPONSE: &[u8] =
     b"225 headers follow\r\n1 one@example.com\r\n2 two@example.com\r\n.\r\n";
+const HDR_FROM_MESSAGE_ID_RESPONSE: &[u8] = b"225 headers follow\r\n0 one@example.com\r\n.\r\n";
 const HDR_FROM_1_RESPONSE: &[u8] = b"225 headers follow\r\n1 one@example.com\r\n.\r\n";
 const HDR_FROM_2_RESPONSE: &[u8] = b"225 headers follow\r\n2 two@example.com\r\n.\r\n";
 const HDR_FROM_3_RESPONSE: &[u8] = b"225 headers follow\r\n3 three@example.com\r\n.\r\n";
+const HDR_FROM_2_PLUS_RESPONSE: &[u8] =
+    b"225 headers follow\r\n2 two@example.com\r\n3 three@example.com\r\n.\r\n";
 const HDR_DATE_RESPONSE: &[u8] = b"225 headers follow\r\n1 Fri, 16 May 2026 12:00:00 +0000\r\n2 Fri, 16 May 2026 12:00:01 +0000\r\n.\r\n";
+const HDR_DATE_MESSAGE_ID_RESPONSE: &[u8] =
+    b"225 headers follow\r\n0 Fri, 16 May 2026 12:00:00 +0000\r\n.\r\n";
 const HDR_DATE_1_RESPONSE: &[u8] =
     b"225 headers follow\r\n1 Fri, 16 May 2026 12:00:00 +0000\r\n.\r\n";
 const HDR_DATE_2_RESPONSE: &[u8] =
     b"225 headers follow\r\n2 Fri, 16 May 2026 12:00:01 +0000\r\n.\r\n";
 const HDR_DATE_3_RESPONSE: &[u8] =
     b"225 headers follow\r\n3 Fri, 16 May 2026 12:00:02 +0000\r\n.\r\n";
+const HDR_DATE_2_PLUS_RESPONSE: &[u8] = b"225 headers follow\r\n2 Fri, 16 May 2026 12:00:01 +0000\r\n3 Fri, 16 May 2026 12:00:02 +0000\r\n.\r\n";
 const HDR_REFERENCES_RESPONSE: &[u8] = b"225 headers follow\r\n1 \r\n2 <ref@example.com>\r\n.\r\n";
+const HDR_REFERENCES_MESSAGE_ID_RESPONSE: &[u8] = b"225 headers follow\r\n0 \r\n.\r\n";
 const HDR_REFERENCES_1_RESPONSE: &[u8] = b"225 headers follow\r\n1 \r\n.\r\n";
 const HDR_REFERENCES_2_RESPONSE: &[u8] = b"225 headers follow\r\n2 <ref@example.com>\r\n.\r\n";
 const HDR_REFERENCES_3_RESPONSE: &[u8] = b"225 headers follow\r\n3 <two@example.com>\r\n.\r\n";
+const HDR_REFERENCES_2_PLUS_RESPONSE: &[u8] =
+    b"225 headers follow\r\n2 <ref@example.com>\r\n3 <two@example.com>\r\n.\r\n";
 pub const XHDR_RESPONSE: &[u8] = b"221 headers follow\r\n1 example one\r\n2 example two\r\n.\r\n";
 const XHDR_SUBJECT_MESSAGE_ID_RESPONSE: &[u8] =
     b"221 headers follow\r\n<one@example.com> example one\r\n.\r\n";
@@ -193,20 +202,31 @@ const XHDR_SUBJECT_2_PLUS_RESPONSE: &[u8] =
     b"221 headers follow\r\n2 example two\r\n3 example three\r\n.\r\n";
 const XHDR_FROM_RESPONSE: &[u8] =
     b"221 headers follow\r\n1 one@example.com\r\n2 two@example.com\r\n.\r\n";
+const XHDR_FROM_MESSAGE_ID_RESPONSE: &[u8] =
+    b"221 headers follow\r\n<one@example.com> one@example.com\r\n.\r\n";
 const XHDR_FROM_1_RESPONSE: &[u8] = b"221 headers follow\r\n1 one@example.com\r\n.\r\n";
 const XHDR_FROM_2_RESPONSE: &[u8] = b"221 headers follow\r\n2 two@example.com\r\n.\r\n";
 const XHDR_FROM_3_RESPONSE: &[u8] = b"221 headers follow\r\n3 three@example.com\r\n.\r\n";
+const XHDR_FROM_2_PLUS_RESPONSE: &[u8] =
+    b"221 headers follow\r\n2 two@example.com\r\n3 three@example.com\r\n.\r\n";
 const XHDR_DATE_RESPONSE: &[u8] = b"221 headers follow\r\n1 Fri, 16 May 2026 12:00:00 +0000\r\n2 Fri, 16 May 2026 12:00:01 +0000\r\n.\r\n";
+const XHDR_DATE_MESSAGE_ID_RESPONSE: &[u8] =
+    b"221 headers follow\r\n<one@example.com> Fri, 16 May 2026 12:00:00 +0000\r\n.\r\n";
 const XHDR_DATE_1_RESPONSE: &[u8] =
     b"221 headers follow\r\n1 Fri, 16 May 2026 12:00:00 +0000\r\n.\r\n";
 const XHDR_DATE_2_RESPONSE: &[u8] =
     b"221 headers follow\r\n2 Fri, 16 May 2026 12:00:01 +0000\r\n.\r\n";
 const XHDR_DATE_3_RESPONSE: &[u8] =
     b"221 headers follow\r\n3 Fri, 16 May 2026 12:00:02 +0000\r\n.\r\n";
+const XHDR_DATE_2_PLUS_RESPONSE: &[u8] = b"221 headers follow\r\n2 Fri, 16 May 2026 12:00:01 +0000\r\n3 Fri, 16 May 2026 12:00:02 +0000\r\n.\r\n";
 const XHDR_REFERENCES_RESPONSE: &[u8] = b"221 headers follow\r\n1 \r\n2 <ref@example.com>\r\n.\r\n";
+const XHDR_REFERENCES_MESSAGE_ID_RESPONSE: &[u8] =
+    b"221 headers follow\r\n<one@example.com> \r\n.\r\n";
 const XHDR_REFERENCES_1_RESPONSE: &[u8] = b"221 headers follow\r\n1 \r\n.\r\n";
 const XHDR_REFERENCES_2_RESPONSE: &[u8] = b"221 headers follow\r\n2 <ref@example.com>\r\n.\r\n";
 const XHDR_REFERENCES_3_RESPONSE: &[u8] = b"221 headers follow\r\n3 <two@example.com>\r\n.\r\n";
+const XHDR_REFERENCES_2_PLUS_RESPONSE: &[u8] =
+    b"221 headers follow\r\n2 <ref@example.com>\r\n3 <two@example.com>\r\n.\r\n";
 const HDR_MESSAGE_ID_RESPONSE: &[u8] =
     b"225 headers follow\r\n1 <one@example.com>\r\n2 <two@example.com>\r\n.\r\n";
 const HDR_MESSAGE_ID_MESSAGE_ID_RESPONSE: &[u8] =
@@ -3768,8 +3788,14 @@ fn hdr_response_for_args(args: &[u8]) -> &'static [u8] {
 }
 
 fn hdr_from_response_for_selector(selector: Option<&[u8]>) -> &'static [u8] {
+    if selector.is_some_and(overview_selector_is_message_id) {
+        return HDR_FROM_MESSAGE_ID_RESPONSE;
+    }
     if selector.is_some_and(overview_selector_selects_first_only) {
         return HDR_FROM_1_RESPONSE;
+    }
+    if selector.is_some_and(overview_selector_includes_second_and_third) {
+        return HDR_FROM_2_PLUS_RESPONSE;
     }
     if selector.is_some_and(overview_selector_selects_second_only) {
         return HDR_FROM_2_RESPONSE;
@@ -3781,8 +3807,14 @@ fn hdr_from_response_for_selector(selector: Option<&[u8]>) -> &'static [u8] {
 }
 
 fn hdr_date_response_for_selector(selector: Option<&[u8]>) -> &'static [u8] {
+    if selector.is_some_and(overview_selector_is_message_id) {
+        return HDR_DATE_MESSAGE_ID_RESPONSE;
+    }
     if selector.is_some_and(overview_selector_selects_first_only) {
         return HDR_DATE_1_RESPONSE;
+    }
+    if selector.is_some_and(overview_selector_includes_second_and_third) {
+        return HDR_DATE_2_PLUS_RESPONSE;
     }
     if selector.is_some_and(overview_selector_selects_second_only) {
         return HDR_DATE_2_RESPONSE;
@@ -3794,8 +3826,14 @@ fn hdr_date_response_for_selector(selector: Option<&[u8]>) -> &'static [u8] {
 }
 
 fn hdr_references_response_for_selector(selector: Option<&[u8]>) -> &'static [u8] {
+    if selector.is_some_and(overview_selector_is_message_id) {
+        return HDR_REFERENCES_MESSAGE_ID_RESPONSE;
+    }
     if selector.is_some_and(overview_selector_selects_first_only) {
         return HDR_REFERENCES_1_RESPONSE;
+    }
+    if selector.is_some_and(overview_selector_includes_second_and_third) {
+        return HDR_REFERENCES_2_PLUS_RESPONSE;
     }
     if selector.is_some_and(overview_selector_selects_second_only) {
         return HDR_REFERENCES_2_RESPONSE;
@@ -3892,8 +3930,14 @@ fn xhdr_response_for_args(args: &[u8]) -> &'static [u8] {
 }
 
 fn xhdr_from_response_for_selector(selector: Option<&[u8]>) -> &'static [u8] {
+    if selector.is_some_and(overview_selector_is_message_id) {
+        return XHDR_FROM_MESSAGE_ID_RESPONSE;
+    }
     if selector.is_some_and(overview_selector_selects_first_only) {
         return XHDR_FROM_1_RESPONSE;
+    }
+    if selector.is_some_and(overview_selector_includes_second_and_third) {
+        return XHDR_FROM_2_PLUS_RESPONSE;
     }
     if selector.is_some_and(overview_selector_selects_second_only) {
         return XHDR_FROM_2_RESPONSE;
@@ -3905,8 +3949,14 @@ fn xhdr_from_response_for_selector(selector: Option<&[u8]>) -> &'static [u8] {
 }
 
 fn xhdr_date_response_for_selector(selector: Option<&[u8]>) -> &'static [u8] {
+    if selector.is_some_and(overview_selector_is_message_id) {
+        return XHDR_DATE_MESSAGE_ID_RESPONSE;
+    }
     if selector.is_some_and(overview_selector_selects_first_only) {
         return XHDR_DATE_1_RESPONSE;
+    }
+    if selector.is_some_and(overview_selector_includes_second_and_third) {
+        return XHDR_DATE_2_PLUS_RESPONSE;
     }
     if selector.is_some_and(overview_selector_selects_second_only) {
         return XHDR_DATE_2_RESPONSE;
@@ -3918,8 +3968,14 @@ fn xhdr_date_response_for_selector(selector: Option<&[u8]>) -> &'static [u8] {
 }
 
 fn xhdr_references_response_for_selector(selector: Option<&[u8]>) -> &'static [u8] {
+    if selector.is_some_and(overview_selector_is_message_id) {
+        return XHDR_REFERENCES_MESSAGE_ID_RESPONSE;
+    }
     if selector.is_some_and(overview_selector_selects_first_only) {
         return XHDR_REFERENCES_1_RESPONSE;
+    }
+    if selector.is_some_and(overview_selector_includes_second_and_third) {
+        return XHDR_REFERENCES_2_PLUS_RESPONSE;
     }
     if selector.is_some_and(overview_selector_selects_second_only) {
         return XHDR_REFERENCES_2_RESPONSE;
@@ -6373,6 +6429,24 @@ mod tests {
                     expected: HDR_MESSAGE_ID_2_PLUS_RESPONSE,
                 },
                 ServerResponseCase {
+                    name: "HDR From open range selector 2-",
+                    reference: "RFC 3977 section 8.5.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.2",
+                    input: b"GROUP alt.test\r\nHDR From 2-\r\n",
+                    expected: HDR_FROM_2_PLUS_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "HDR Date open range selector 2-",
+                    reference: "RFC 3977 section 8.5.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.2",
+                    input: b"GROUP alt.test\r\nHDR Date 2-\r\n",
+                    expected: HDR_DATE_2_PLUS_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "HDR References open range selector 2-",
+                    reference: "RFC 3977 section 8.5.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.2",
+                    input: b"GROUP alt.test\r\nHDR References 2-\r\n",
+                    expected: HDR_REFERENCES_2_PLUS_RESPONSE,
+                },
+                ServerResponseCase {
                     name: "XHDR Subject open range selector 2-",
                     reference: "RFC 2980 section 2.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.6",
                     input: b"GROUP alt.test\r\nXHDR Subject 2-\r\n",
@@ -6383,6 +6457,24 @@ mod tests {
                     reference: "RFC 2980 section 2.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.6",
                     input: b"GROUP alt.test\r\nXHDR Message-ID 2-\r\n",
                     expected: XHDR_MESSAGE_ID_2_PLUS_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "XHDR From open range selector 2-",
+                    reference: "RFC 2980 section 2.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.6",
+                    input: b"GROUP alt.test\r\nXHDR From 2-\r\n",
+                    expected: XHDR_FROM_2_PLUS_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "XHDR Date open range selector 2-",
+                    reference: "RFC 2980 section 2.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.6",
+                    input: b"GROUP alt.test\r\nXHDR Date 2-\r\n",
+                    expected: XHDR_DATE_2_PLUS_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "XHDR References open range selector 2-",
+                    reference: "RFC 2980 section 2.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.6",
+                    input: b"GROUP alt.test\r\nXHDR References 2-\r\n",
+                    expected: XHDR_REFERENCES_2_PLUS_RESPONSE,
                 },
                 ServerResponseCase {
                     name: "OVER empty range returns 423",
@@ -6481,6 +6573,24 @@ mod tests {
                     expected: HDR_MESSAGE_ID_MESSAGE_ID_RESPONSE,
                 },
                 ServerResponseCase {
+                    name: "HDR From message-id selector uses article number 0",
+                    reference: "RFC 3977 section 8.5.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.2",
+                    input: b"HDR From <one@example.com>\r\n",
+                    expected: HDR_FROM_MESSAGE_ID_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "HDR Date message-id selector uses article number 0",
+                    reference: "RFC 3977 section 8.5.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.2",
+                    input: b"HDR Date <one@example.com>\r\n",
+                    expected: HDR_DATE_MESSAGE_ID_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "HDR References message-id selector uses article number 0",
+                    reference: "RFC 3977 section 8.5.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.2",
+                    input: b"HDR References <one@example.com>\r\n",
+                    expected: HDR_REFERENCES_MESSAGE_ID_RESPONSE,
+                },
+                ServerResponseCase {
                     name: "XHDR Subject message-id selector uses message-id row key",
                     reference: "RFC 2980 section 2.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.6",
                     input: b"XHDR Subject <one@example.com>\r\n",
@@ -6491,6 +6601,24 @@ mod tests {
                     reference: "RFC 2980 section 2.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.6",
                     input: b"XHDR Message-ID <one@example.com>\r\n",
                     expected: XHDR_MESSAGE_ID_MESSAGE_ID_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "XHDR From message-id selector uses message-id row key",
+                    reference: "RFC 2980 section 2.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.6",
+                    input: b"XHDR From <one@example.com>\r\n",
+                    expected: XHDR_FROM_MESSAGE_ID_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "XHDR Date message-id selector uses message-id row key",
+                    reference: "RFC 2980 section 2.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.6",
+                    input: b"XHDR Date <one@example.com>\r\n",
+                    expected: XHDR_DATE_MESSAGE_ID_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "XHDR References message-id selector uses message-id row key",
+                    reference: "RFC 2980 section 2.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.6",
+                    input: b"XHDR References <one@example.com>\r\n",
+                    expected: XHDR_REFERENCES_MESSAGE_ID_RESPONSE,
                 },
             ])
             .await;
