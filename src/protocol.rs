@@ -5887,6 +5887,108 @@ mod tests {
     }
 
     #[test]
+    fn rfc3977_red_response_framing_error_status_matrix() {
+        // RFC 3977 section 3.2.1 defines generic errors as single-line
+        // responses, but command-specific errors are valid only for commands
+        // that list them. RFC 3977 section 5.2.2 also restricts CAPABILITIES
+        // to 101 or 501, and section 5.4.2 restricts QUIT to 205 or 501:
+        // https://www.rfc-editor.org/rfc/rfc3977#section-3.2.1
+        // https://www.rfc-editor.org/rfc/rfc3977#section-5.2.2
+        for (name, kind, status, expected) in [
+            (
+                "ARTICLE generic syntax error is single-line",
+                RequestKind::Article,
+                StatusCode(501),
+                ResponseFraming::SingleLine,
+            ),
+            (
+                "ARTICLE missing message-id error is single-line",
+                RequestKind::Article,
+                StatusCode(430),
+                ResponseFraming::SingleLine,
+            ),
+            (
+                "ARTICLE rejects unrelated no-such-group error",
+                RequestKind::Article,
+                StatusCode(411),
+                ResponseFraming::Unexpected,
+            ),
+            (
+                "GROUP no-such-group error is single-line",
+                RequestKind::Group,
+                StatusCode(411),
+                ResponseFraming::SingleLine,
+            ),
+            (
+                "GROUP rejects no-current-group error",
+                RequestKind::Group,
+                StatusCode(412),
+                ResponseFraming::Unexpected,
+            ),
+            (
+                "LISTGROUP accepts no-such-group error",
+                RequestKind::ListGroup,
+                StatusCode(411),
+                ResponseFraming::SingleLine,
+            ),
+            (
+                "LISTGROUP accepts no-current-group error",
+                RequestKind::ListGroup,
+                StatusCode(412),
+                ResponseFraming::SingleLine,
+            ),
+            (
+                "CAPABILITIES syntax error is single-line",
+                RequestKind::Capabilities,
+                StatusCode(501),
+                ResponseFraming::SingleLine,
+            ),
+            (
+                "CAPABILITIES rejects generic unavailable error",
+                RequestKind::Capabilities,
+                StatusCode(503),
+                ResponseFraming::Unexpected,
+            ),
+            (
+                "QUIT syntax error is single-line",
+                RequestKind::Quit,
+                StatusCode(501),
+                ResponseFraming::SingleLine,
+            ),
+            (
+                "QUIT rejects unknown-command error",
+                RequestKind::Quit,
+                StatusCode(500),
+                ResponseFraming::Unexpected,
+            ),
+            (
+                "STARTTLS accepts unable-to-initiate-TLS error",
+                RequestKind::StartTls,
+                StatusCode(580),
+                ResponseFraming::SingleLine,
+            ),
+            (
+                "STARTTLS rejects authentication-required error",
+                RequestKind::StartTls,
+                StatusCode(480),
+                ResponseFraming::Unexpected,
+            ),
+            (
+                "AUTHINFO rejects authentication-required error",
+                RequestKind::AuthInfo,
+                StatusCode(480),
+                ResponseFraming::Unexpected,
+            ),
+        ] {
+            assert_eq!(
+                ResponseFraming::for_request_status(kind, status),
+                expected,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
     fn response_frame_parse_returns_borrowed_whole_response_parts() {
         // RFC 3977 section 9.4 defines multi-line responses as the initial
         // response line followed by the section 3.1.1 dot-terminated block.
