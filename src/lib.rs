@@ -9536,6 +9536,48 @@ mod tests {
                         frame: b"205 closing connection\r\n",
                     },
                     ResponseFrameCase {
+                        name: "HELP rejects DATE success response",
+                        reference: "RFC 3977 sections 7.1.2 and 7.2.2 bind DATE to 111 and HELP to 100 https://www.rfc-editor.org/rfc/rfc3977#section-7.2.2",
+                        kind: RequestKind::Help,
+                        frame: b"111 20260602120000\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "DATE rejects HELP success response",
+                        reference: "RFC 3977 sections 7.1.2 and 7.2.2 bind DATE to 111 and HELP to 100 https://www.rfc-editor.org/rfc/rfc3977#section-7.1.2",
+                        kind: RequestKind::Date,
+                        frame: b"100 help follows\r\nDATE\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "NEWGROUPS rejects LIST success response",
+                        reference: "RFC 3977 sections 7.3.2 and 7.6.2 bind NEWGROUPS to 231 and LIST to 215 https://www.rfc-editor.org/rfc/rfc3977#section-7.3.2",
+                        kind: RequestKind::NewGroups,
+                        frame: b"215 list of newsgroups follows\r\nalt.test 3 1 y\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "NEWNEWS rejects NEWGROUPS success response",
+                        reference: "RFC 3977 sections 7.3.2 and 7.4.2 bind NEWGROUPS to 231 and NEWNEWS to 230 https://www.rfc-editor.org/rfc/rfc3977#section-7.4.2",
+                        kind: RequestKind::NewNews,
+                        frame: b"231 list of new newsgroups follows\r\nalt.test 3 1 y\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "LIST ACTIVE rejects NEWGROUPS success response",
+                        reference: "RFC 3977 sections 7.3.2 and 7.6.3 bind NEWGROUPS to 231 and LIST ACTIVE to 215 https://www.rfc-editor.org/rfc/rfc3977#section-7.6.3",
+                        kind: RequestKind::ListActive,
+                        frame: b"231 list of new newsgroups follows\r\nalt.test 3 1 y\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "LIST OVERVIEW.FMT rejects OVER success response",
+                        reference: "RFC 3977 sections 8.3.2 and 8.4 bind OVER to 224 and LIST OVERVIEW.FMT to 215 https://www.rfc-editor.org/rfc/rfc3977#section-8.4",
+                        kind: RequestKind::ListOverviewFmt,
+                        frame: b"224 overview information follows\r\n1\tSubject\tfrom@test\tdate\t<one@test>\t\t1\t1\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "LIST HEADERS rejects HDR success response",
+                        reference: "RFC 3977 sections 8.5.2 and 8.6.2 bind HDR to 225 and LIST HEADERS to 215 https://www.rfc-editor.org/rfc/rfc3977#section-8.6.2",
+                        kind: RequestKind::ListHeaders,
+                        frame: b"225 headers follow\r\n1 Subject\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "HEAD rejects unknown mandatory command response",
                         reference: "RFC 3977 section 3.2.1 and Appendix B say servers MUST NOT generate 500 for mandatory commands https://www.rfc-editor.org/rfc/rfc3977#section-3.2.1",
                         kind: RequestKind::Head,
