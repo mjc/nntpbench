@@ -9215,6 +9215,12 @@ mod tests {
                         frame: b"215 information follows\r\nalt.test 1715907600 admin\xef\xbb\xbftest\r\n.\r\n",
                     },
                     ResponseFrameCase {
+                        name: "LIST ACTIVE.TIMES rejects DEL in U-TEXT creator",
+                        reference: "RFC 3977 sections 7.6.4, 9.6, and 9.8 define U-TEXT from U-CHAR, excluding DEL https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
+                        kind: RequestKind::ListActiveTimes,
+                        frame: b"215 information follows\r\nalt.test 1715907600 admin\x7ftest\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "LIST NEWSGROUPS rejects invalid group name line",
                         reference: "RFC 3977 section 7.6.6 https://www.rfc-editor.org/rfc/rfc3977#section-7.6.6",
                         kind: RequestKind::ListNewsgroups,
@@ -9411,6 +9417,24 @@ mod tests {
                         reference: "RFC 3977 sections 3.1, 7.2, and 9.4.3 https://www.rfc-editor.org/rfc/rfc3977#section-3.1",
                         kind: RequestKind::Help,
                         frame: b"100 help follows\r\nCommands\xef\xbb\xbf include CAPABILITIES\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "HELP rejects DEL in U-CHAR text",
+                        reference: "RFC 3977 sections 7.2, 9.4.3, and 9.8 define U-CHAR without DEL https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
+                        kind: RequestKind::Help,
+                        frame: b"100 help follows\r\nCommands\x7f include CAPABILITIES\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "DATE rejects DEL in trailing U-CHAR comment",
+                        reference: "RFC 3977 sections 7.1, 9.4.1, and 9.8 define response text from U-CHAR without DEL https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
+                        kind: RequestKind::Date,
+                        frame: b"111 20260602120000 clock\x7fcomment\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "QUIT rejects DEL in generic response text",
+                        reference: "RFC 3977 sections 5.4, 9.4.1, and 9.8 define response text from U-CHAR without DEL https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
+                        kind: RequestKind::Quit,
+                        frame: b"205 closing\x7fconnection\r\n",
                     },
                     ResponseFrameCase {
                         name: "OVER rejects body row without tab-separated overview fields",
