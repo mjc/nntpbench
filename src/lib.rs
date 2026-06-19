@@ -8843,6 +8843,24 @@ mod tests {
                         frame: b"215 information follows\r\nalt.test \x01control-prefixed\r\n.\r\n",
                     },
                     ResponseFrameCase {
+                        name: "LIST OVERVIEW.FMT accepts legacy Bytes and Lines fields",
+                        reference: "RFC 3977 section 8.4 and RFC 2980 section 2.1.7 define overview field order compatibility https://www.rfc-editor.org/rfc/rfc3977#section-8.4",
+                        kind: RequestKind::ListOverviewFmt,
+                        frame: b"215 overview format follows\r\nSubject:\r\nFrom:\r\nDate:\r\nMessage-ID:\r\nReferences:\r\nBytes:\r\nLines:\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "LIST OVERVIEW.FMT accepts full optional header marker",
+                        reference: "RFC 3977 section 8.4 says LIST OVERVIEW.FMT optional fields may use the :full suffix https://www.rfc-editor.org/rfc/rfc3977#section-8.4",
+                        kind: RequestKind::ListOverviewFmt,
+                        frame: b"215 overview format follows\r\nSubject:\r\nFrom:\r\nDate:\r\nMessage-ID:\r\nReferences:\r\n:bytes\r\n:lines\r\nXref:full\r\n:x-article-number\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "LIST HEADERS accepts all-headers marker with metadata names",
+                        reference: "RFC 3977 section 8.6.2 permits LIST HEADERS to advertise all headers with ':' and metadata names https://www.rfc-editor.org/rfc/rfc3977#section-8.6.2",
+                        kind: RequestKind::ListHeaders,
+                        frame: b"215 headers supported\r\n:\r\n:bytes\r\n:lines\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "CAPABILITIES accepts TAB-separated WS tokens",
                         reference: "RFC 3977 sections 5.2 and 9.5 https://www.rfc-editor.org/rfc/rfc3977#section-9.5",
                         kind: RequestKind::Capabilities,
