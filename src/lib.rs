@@ -8502,6 +8502,56 @@ mod tests {
                         b"NEWNEWS alt.* 20260101 000000 GMT extra\r\n",
                         "RFC 3977 section 7.4.1 https://www.rfc-editor.org/rfc/rfc3977#section-7.4.1",
                     ),
+                    (
+                        "LIST ACTIVE.TIMES extra argument",
+                        b"LIST ACTIVE.TIMES comp.* extra\r\n",
+                        "RFC 3977 section 7.6.4 https://www.rfc-editor.org/rfc/rfc3977#section-7.6.4",
+                    ),
+                    (
+                        "LIST NEWSGROUPS extra argument",
+                        b"LIST NEWSGROUPS comp.* extra\r\n",
+                        "RFC 3977 section 7.6.6 https://www.rfc-editor.org/rfc/rfc3977#section-7.6.6",
+                    ),
+                    (
+                        "LIST OVERVIEW.FMT rejects arguments",
+                        b"LIST OVERVIEW.FMT MSGID\r\n",
+                        "RFC 3977 section 8.4 https://www.rfc-editor.org/rfc/rfc3977#section-8.4",
+                    ),
+                    (
+                        "LIST HEADERS rejects unknown selector",
+                        b"LIST HEADERS ALL\r\n",
+                        "RFC 3977 section 8.6.1 defines only MSGID and RANGE arguments https://www.rfc-editor.org/rfc/rfc3977#section-8.6.1",
+                    ),
+                    (
+                        "LIST DISTRIB.PATS rejects arguments",
+                        b"LIST DISTRIB.PATS world\r\n",
+                        "RFC 3977 section 7.6.5 https://www.rfc-editor.org/rfc/rfc3977#section-7.6.5",
+                    ),
+                    (
+                        "OVER extra argument",
+                        b"OVER 1-2 extra\r\n",
+                        "RFC 3977 section 8.3.1 https://www.rfc-editor.org/rfc/rfc3977#section-8.3.1",
+                    ),
+                    (
+                        "XOVER message-id selector",
+                        b"XOVER <one@example.com>\r\n",
+                        "RFC 2980 section 2.8 defines XOVER arguments as a range, not a message-id https://www.rfc-editor.org/rfc/rfc2980#section-2.8",
+                    ),
+                    (
+                        "HDR extra argument",
+                        b"HDR Subject 1 extra\r\n",
+                        "RFC 3977 section 8.5.1 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.1",
+                    ),
+                    (
+                        "XHDR extra argument",
+                        b"XHDR Subject 1 extra\r\n",
+                        "RFC 2980 section 2.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.6",
+                    ),
+                    (
+                        "AUTHINFO SASL extra argument",
+                        b"AUTHINFO SASL PLAIN = extra\r\n",
+                        "RFC 4643 section 2.2 defines at most mechanism and initial-response arguments https://www.rfc-editor.org/rfc/rfc4643#section-2.2",
+                    ),
                 ]);
             }
         }
