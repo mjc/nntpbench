@@ -4,12 +4,13 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 #[cfg(test)]
 use std::cell::Cell;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::future::poll_fn;
 use std::io::{self, IoSlice, Read, Write};
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -1374,18 +1375,117 @@ enum FixtureGroup {
     EmptyTest,
 }
 
+#[derive(Debug, Clone)]
+enum SelectedGroup {
+    Fixture(FixtureGroup),
+    Indexed(Arc<str>),
+}
+
+#[derive(Debug)]
+struct ArticleStoreIndex {
+    groups: BTreeMap<Arc<str>, ArticleStoreGroup>,
+    articles_by_number: BTreeMap<u64, ArticleStoreEntry>,
+    articles_by_message_id: HashMap<Arc<str>, u64>,
+}
+
+#[derive(Debug)]
+struct ArticleStoreGroup {
+    article_numbers: Box<[u64]>,
+    active_time: u64,
+}
+
+#[derive(Debug)]
+struct ArticleStoreEntry {
+    message_id: Arc<str>,
+    newsgroups: Box<[Arc<str>]>,
+    date_key: Option<u64>,
+    subject: Box<[u8]>,
+    from: Box<[u8]>,
+    date: Box<[u8]>,
+    references: Box<[u8]>,
+    overview_bytes: u64,
+    overview_lines: u64,
+}
+
 #[derive(Debug, Default)]
 struct SessionState {
     group_selected: bool,
-    selected_group: Option<FixtureGroup>,
+    selected_group: Option<SelectedGroup>,
     current_article: Option<u64>,
 }
 
 impl SessionState {
-    fn article_count(&self) -> u64 {
+    fn article_count(&self, index: Option<&ArticleStoreIndex>) -> u64 {
         self.selected_group
-            .map(FixtureGroup::article_count)
+            .as_ref()
+            .map(|group| group.article_count(index))
             .unwrap_or(FixtureGroup::AltTest.article_count())
+    }
+
+    fn current_group_articles<'a>(
+        &'a self,
+        index: Option<&'a ArticleStoreIndex>,
+    ) -> Option<&'a [u64]> {
+        self.selected_group
+            .as_ref()
+            .and_then(|group| group.article_numbers(index))
+    }
+
+    fn selected_group_name<'a>(&'a self, index: Option<&'a ArticleStoreIndex>) -> Option<&'a str> {
+        self.selected_group
+            .as_ref()
+            .and_then(|group| group.group_name(index))
+    }
+
+    fn current_group_contains(&self, article_id: u64, index: Option<&ArticleStoreIndex>) -> bool {
+        self.current_group_articles(index)
+            .is_some_and(|articles| articles.binary_search(&article_id).is_ok())
+    }
+
+    fn current_group_previous_article(
+        &self,
+        article_id: u64,
+        index: Option<&ArticleStoreIndex>,
+    ) -> Option<u64> {
+        let articles = self.current_group_articles(index)?;
+        let position = articles.binary_search(&article_id).ok()?;
+        position
+            .checked_sub(1)
+            .and_then(|idx| articles.get(idx).copied())
+    }
+
+    fn current_group_next_article(
+        &self,
+        article_id: u64,
+        index: Option<&ArticleStoreIndex>,
+    ) -> Option<u64> {
+        let articles = self.current_group_articles(index)?;
+        let position = articles.binary_search(&article_id).ok()?;
+        articles.get(position + 1).copied()
+    }
+}
+
+impl SelectedGroup {
+    fn article_count(&self, index: Option<&ArticleStoreIndex>) -> u64 {
+        self.article_numbers(index)
+            .map_or(0, |articles| articles.len() as u64)
+    }
+
+    fn article_numbers<'a>(&'a self, index: Option<&'a ArticleStoreIndex>) -> Option<&'a [u64]> {
+        match self {
+            Self::Fixture(group) => Some(group.article_numbers()),
+            Self::Indexed(group_name) => index?
+                .groups
+                .get(group_name)
+                .map(|group| group.article_numbers.as_ref()),
+        }
+    }
+
+    fn group_name<'a>(&'a self, index: Option<&'a ArticleStoreIndex>) -> Option<&'a str> {
+        match self {
+            Self::Fixture(group) => Some(group.name()),
+            Self::Indexed(group_name) => index?.groups.get(group_name).map(|_| group_name.as_ref()),
+        }
     }
 }
 
@@ -1469,7 +1569,7 @@ where
         RequestKind::Article => {
             session_stats.article_requests += 1;
             if let Some(response) =
-                article_selector_error(command, command_lines, session_state, true)
+                article_selector_error(command, command_lines, session_state, config, true)
             {
                 write_response(writer, pending_write, response, session_stats).await?;
                 return Ok(false);
@@ -1536,7 +1636,7 @@ where
         RequestKind::Head => {
             session_stats.article_requests += 1;
             if let Some(response) =
-                article_selector_error(command, command_lines, session_state, true)
+                article_selector_error(command, command_lines, session_state, config, true)
             {
                 write_response(writer, pending_write, response, session_stats).await?;
                 return Ok(false);
@@ -1544,6 +1644,41 @@ where
             if let Some(message_id) =
                 command_lines.and_then(|lines| command_message_id(command, lines))
             {
+                if config.article_dir.is_some()
+                    && write_stored_article_response(
+                        writer,
+                        pending_write,
+                        config,
+                        RequestKind::Head,
+                        None,
+                        Some(&message_id),
+                        session_stats,
+                        article_path,
+                    )
+                    .await?
+                {
+                    return Ok(false);
+                }
+                if config.article_dir.is_some() {
+                    write_response(
+                        writer,
+                        pending_write,
+                        article_not_found_response(None, Some(&message_id)),
+                        session_stats,
+                    )
+                    .await?;
+                    return Ok(false);
+                }
+                if contains_subslice(message_id.as_str().as_bytes(), b"missing") {
+                    write_response(
+                        writer,
+                        pending_write,
+                        b"430 no article with that message-id\r\n",
+                        session_stats,
+                    )
+                    .await?;
+                    return Ok(false);
+                }
                 let response = build_message_id_head_response(&message_id);
                 write_response(writer, pending_write, &response, session_stats).await?;
                 return Ok(false);
@@ -1598,7 +1733,7 @@ where
         RequestKind::Stat => {
             session_stats.article_requests += 1;
             if let Some(response) =
-                article_selector_error(command, command_lines, session_state, true)
+                article_selector_error(command, command_lines, session_state, config, true)
             {
                 write_response(writer, pending_write, response, session_stats).await?;
                 return Ok(false);
@@ -1606,6 +1741,41 @@ where
             if let Some(message_id) =
                 command_lines.and_then(|lines| command_message_id(command, lines))
             {
+                if config.article_dir.is_some()
+                    && write_stored_article_response(
+                        writer,
+                        pending_write,
+                        config,
+                        RequestKind::Stat,
+                        None,
+                        Some(&message_id),
+                        session_stats,
+                        article_path,
+                    )
+                    .await?
+                {
+                    return Ok(false);
+                }
+                if config.article_dir.is_some() {
+                    write_response(
+                        writer,
+                        pending_write,
+                        article_not_found_response(None, Some(&message_id)),
+                        session_stats,
+                    )
+                    .await?;
+                    return Ok(false);
+                }
+                if contains_subslice(message_id.as_str().as_bytes(), b"missing") {
+                    write_response(
+                        writer,
+                        pending_write,
+                        b"430 no article with that message-id\r\n",
+                        session_stats,
+                    )
+                    .await?;
+                    return Ok(false);
+                }
                 let response = build_message_id_stat_response(&message_id);
                 write_response(writer, pending_write, &response, session_stats).await?;
                 return Ok(false);
@@ -1660,7 +1830,7 @@ where
         RequestKind::Body => {
             session_stats.body_requests += 1;
             if let Some(response) =
-                article_selector_error(command, command_lines, session_state, true)
+                article_selector_error(command, command_lines, session_state, config, true)
             {
                 write_response(writer, pending_write, response, session_stats).await?;
                 return Ok(false);
@@ -1668,6 +1838,41 @@ where
             if let Some(message_id) =
                 command_lines.and_then(|lines| command_message_id(command, lines))
             {
+                if config.article_dir.is_some()
+                    && write_stored_article_response(
+                        writer,
+                        pending_write,
+                        config,
+                        RequestKind::Body,
+                        None,
+                        Some(&message_id),
+                        session_stats,
+                        article_path,
+                    )
+                    .await?
+                {
+                    return Ok(false);
+                }
+                if config.article_dir.is_some() {
+                    write_response(
+                        writer,
+                        pending_write,
+                        article_not_found_response(None, Some(&message_id)),
+                        session_stats,
+                    )
+                    .await?;
+                    return Ok(false);
+                }
+                if contains_subslice(message_id.as_str().as_bytes(), b"missing") {
+                    write_response(
+                        writer,
+                        pending_write,
+                        b"430 no article with that message-id\r\n",
+                        session_stats,
+                    )
+                    .await?;
+                    return Ok(false);
+                }
                 let response = build_message_id_body_response(&message_id, config.body_bytes);
                 write_response(writer, pending_write, &response, session_stats).await?;
                 return Ok(false);
@@ -1724,27 +1929,60 @@ where
             Ok(false)
         }
         RequestKind::ListActive => {
-            let response = list_active_response(list_variant_wildmat_args(
+            let args = list_variant_wildmat_args(
                 RequestKind::ListActive,
                 command_args(command, command_lines).unwrap_or_default(),
-            ));
-            write_response(writer, pending_write, response, session_stats).await?;
+            );
+            if let Some(index) = config.article_index() {
+                let response = list_active_response_for_index(args, index);
+                write_response(writer, pending_write, &response, session_stats).await?;
+            } else {
+                write_response(
+                    writer,
+                    pending_write,
+                    list_active_response(args),
+                    session_stats,
+                )
+                .await?;
+            }
             Ok(false)
         }
         RequestKind::ListActiveTimes => {
-            let response = list_active_times_response(list_variant_wildmat_args(
+            let args = list_variant_wildmat_args(
                 RequestKind::ListActiveTimes,
                 command_args(command, command_lines).unwrap_or_default(),
-            ));
-            write_response(writer, pending_write, response, session_stats).await?;
+            );
+            if let Some(index) = config.article_index() {
+                let response = list_active_times_response_for_index(args, index);
+                write_response(writer, pending_write, &response, session_stats).await?;
+            } else {
+                write_response(
+                    writer,
+                    pending_write,
+                    list_active_times_response(args),
+                    session_stats,
+                )
+                .await?;
+            }
             Ok(false)
         }
         RequestKind::ListNewsgroups => {
-            let response = list_newsgroups_response(list_variant_wildmat_args(
+            let args = list_variant_wildmat_args(
                 RequestKind::ListNewsgroups,
                 command_args(command, command_lines).unwrap_or_default(),
-            ));
-            write_response(writer, pending_write, response, session_stats).await?;
+            );
+            if let Some(index) = config.article_index() {
+                let response = list_newsgroups_response_for_index(args, index);
+                write_response(writer, pending_write, &response, session_stats).await?;
+            } else {
+                write_response(
+                    writer,
+                    pending_write,
+                    list_newsgroups_response(args),
+                    session_stats,
+                )
+                .await?;
+            }
             Ok(false)
         }
         RequestKind::ListOverviewFmt => {
@@ -1773,26 +2011,45 @@ where
         }
         RequestKind::Group => {
             let args = command_args(command, command_lines).unwrap_or_default();
-            let Some(group) = fixture_group_from_name(args) else {
-                write_response(
-                    writer,
-                    pending_write,
-                    b"411 no such newsgroup\r\n",
-                    session_stats,
-                )
-                .await?;
-                return Ok(false);
+            let response = if let Some(index) = config.article_index() {
+                let Some(response) = group_response_for_args_with_index(args, index) else {
+                    write_response(
+                        writer,
+                        pending_write,
+                        b"411 no such newsgroup\r\n",
+                        session_stats,
+                    )
+                    .await?;
+                    return Ok(false);
+                };
+                let group_name = std::str::from_utf8(args).unwrap_or_default().trim();
+                session_state.group_selected = true;
+                if let Some(articles) = index.article_numbers_for_group(group_name) {
+                    session_state.selected_group =
+                        Some(SelectedGroup::Indexed(Arc::from(group_name.to_string())));
+                    session_state.current_article = articles.first().copied();
+                } else if let Some(group) = fixture_group_from_name(args) {
+                    session_state.selected_group = Some(SelectedGroup::Fixture(group));
+                    session_state.current_article = group.first_article();
+                }
+                response
+            } else {
+                let Some(group) = fixture_group_from_name(args) else {
+                    write_response(
+                        writer,
+                        pending_write,
+                        b"411 no such newsgroup\r\n",
+                        session_stats,
+                    )
+                    .await?;
+                    return Ok(false);
+                };
+                session_state.group_selected = true;
+                session_state.selected_group = Some(SelectedGroup::Fixture(group));
+                session_state.current_article = group.first_article();
+                group_response_for_group(group).to_vec().into_boxed_slice()
             };
-            session_state.group_selected = true;
-            session_state.selected_group = Some(group);
-            session_state.current_article = group.first_article();
-            write_response(
-                writer,
-                pending_write,
-                group_response_for_group(group),
-                session_stats,
-            )
-            .await?;
+            write_response(writer, pending_write, &response, session_stats).await?;
             Ok(false)
         }
         RequestKind::ListGroup => {
@@ -1801,18 +2058,57 @@ where
                 write_response(writer, pending_write, response, session_stats).await?;
                 return Ok(false);
             }
-            let group = listgroup_selected_group(args, session_state.selected_group)
-                .unwrap_or(FixtureGroup::AltTest);
-            session_state.group_selected = true;
-            session_state.selected_group = Some(group);
-            session_state.current_article = group.first_article();
-            write_response(
-                writer,
-                pending_write,
-                listgroup_response_for_args(args, Some(group)),
-                session_stats,
-            )
-            .await?;
+            if let Some(index) = config.article_index() {
+                let current_group = session_state
+                    .selected_group_name(Some(index))
+                    .map(str::to_string);
+                let current_group_ref = current_group.as_deref();
+                let Some(response) =
+                    listgroup_response_for_args_with_index(args, current_group_ref, index)
+                else {
+                    write_response(
+                        writer,
+                        pending_write,
+                        b"411 no such newsgroup\r\n",
+                        session_stats,
+                    )
+                    .await?;
+                    return Ok(false);
+                };
+                let group_name = listgroup_explicit_group_arg(args)
+                    .and_then(|group| std::str::from_utf8(group).ok())
+                    .map(str::trim)
+                    .filter(|group| !group.is_empty())
+                    .or(current_group_ref)
+                    .unwrap_or("alt.test");
+                session_state.group_selected = true;
+                if let Some(articles) = index.article_numbers_for_group(group_name) {
+                    session_state.selected_group =
+                        Some(SelectedGroup::Indexed(Arc::from(group_name.to_string())));
+                    session_state.current_article = articles.first().copied();
+                } else if let Some(group) = fixture_group_from_name(group_name.as_bytes()) {
+                    session_state.selected_group = Some(SelectedGroup::Fixture(group));
+                    session_state.current_article = group.first_article();
+                }
+                write_response(writer, pending_write, &response, session_stats).await?;
+            } else {
+                let current_group = match session_state.selected_group.as_ref() {
+                    Some(SelectedGroup::Fixture(group)) => Some(*group),
+                    _ => None,
+                };
+                let group =
+                    listgroup_selected_group(args, current_group).unwrap_or(FixtureGroup::AltTest);
+                session_state.group_selected = true;
+                session_state.selected_group = Some(SelectedGroup::Fixture(group));
+                session_state.current_article = group.first_article();
+                write_response(
+                    writer,
+                    pending_write,
+                    listgroup_response_for_args(args, Some(group)),
+                    session_stats,
+                )
+                .await?;
+            }
             Ok(false)
         }
         RequestKind::Last => {
@@ -1836,7 +2132,21 @@ where
                 .await?;
                 return Ok(false);
             };
-            if current_article <= 1 {
+            let previous_article = if let Some(index) = config.article_index() {
+                let Some(previous_article) =
+                    session_state.current_group_previous_article(current_article, Some(index))
+                else {
+                    write_response(
+                        writer,
+                        pending_write,
+                        b"422 no previous article in this group\r\n",
+                        session_stats,
+                    )
+                    .await?;
+                    return Ok(false);
+                };
+                previous_article
+            } else if current_article <= 1 {
                 write_response(
                     writer,
                     pending_write,
@@ -1845,16 +2155,20 @@ where
                 )
                 .await?;
                 return Ok(false);
-            }
-            let previous_article = current_article - 1;
+            } else {
+                session_state
+                    .current_group_previous_article(current_article, None)
+                    .unwrap_or(current_article - 1)
+            };
             session_state.current_article = Some(previous_article);
-            write_response(
-                writer,
-                pending_write,
-                last_response_for_article(previous_article),
-                session_stats,
-            )
-            .await?;
+            let response = if let Some(index) = config.article_index() {
+                build_navigation_article_response(index, previous_article)?
+            } else {
+                last_response_for_article(previous_article)
+                    .to_vec()
+                    .into_boxed_slice()
+            };
+            write_response(writer, pending_write, &response, session_stats).await?;
             Ok(false)
         }
         RequestKind::Next => {
@@ -1878,7 +2192,21 @@ where
                 .await?;
                 return Ok(false);
             };
-            if current_article >= session_state.article_count() {
+            let next_article = if let Some(index) = config.article_index() {
+                let Some(next_article) =
+                    session_state.current_group_next_article(current_article, Some(index))
+                else {
+                    write_response(
+                        writer,
+                        pending_write,
+                        b"421 no next article in this group\r\n",
+                        session_stats,
+                    )
+                    .await?;
+                    return Ok(false);
+                };
+                next_article
+            } else if current_article >= session_state.article_count(None) {
                 write_response(
                     writer,
                     pending_write,
@@ -1887,34 +2215,51 @@ where
                 )
                 .await?;
                 return Ok(false);
-            }
-            let next_article = current_article + 1;
+            } else {
+                session_state
+                    .current_group_next_article(current_article, None)
+                    .unwrap_or(current_article + 1)
+            };
             session_state.current_article = Some(next_article);
-            write_response(
-                writer,
-                pending_write,
-                next_response_for_article(next_article),
-                session_stats,
-            )
-            .await?;
+            let response = if let Some(index) = config.article_index() {
+                build_navigation_article_response(index, next_article)?
+            } else {
+                next_response_for_article(next_article)
+                    .to_vec()
+                    .into_boxed_slice()
+            };
+            write_response(writer, pending_write, &response, session_stats).await?;
             Ok(false)
         }
         RequestKind::NewGroups => {
-            let response = if command_args(command, command_lines)
-                .and_then(newgroups_datetime_key)
+            let args = command_args(command, command_lines).unwrap_or_default();
+            if let Some(index) = config.article_index() {
+                let response = newgroups_response_for_index(args, index);
+                write_response(writer, pending_write, &response, session_stats).await?;
+            } else if newgroups_datetime_key(args)
                 .is_some_and(|datetime| datetime >= FAR_FUTURE_DATETIME_KEY)
             {
-                NEWGROUPS_EMPTY_RESPONSE
+                write_response(
+                    writer,
+                    pending_write,
+                    NEWGROUPS_EMPTY_RESPONSE,
+                    session_stats,
+                )
+                .await?;
             } else {
-                NEWGROUPS_RESPONSE
-            };
-            write_response(writer, pending_write, response, session_stats).await?;
+                write_response(writer, pending_write, NEWGROUPS_RESPONSE, session_stats).await?;
+            }
             Ok(false)
         }
         RequestKind::NewNews => {
-            let response =
-                newnews_response(command_args(command, command_lines).unwrap_or_default());
-            write_response(writer, pending_write, response, session_stats).await?;
+            let args = command_args(command, command_lines).unwrap_or_default();
+            if let Some(index) = config.article_index() {
+                let response = newnews_response_for_index(args, index);
+                write_response(writer, pending_write, &response, session_stats).await?;
+            } else {
+                write_response(writer, pending_write, newnews_response(args), session_stats)
+                    .await?;
+            }
             Ok(false)
         }
         RequestKind::Post => {
@@ -1998,59 +2343,107 @@ where
             Ok(false)
         }
         RequestKind::Over => {
-            if let Some(response) = overview_selector_error(command, command_lines, session_state) {
+            if let Some(response) = overview_selector_error(
+                command,
+                command_lines,
+                session_state,
+                config.article_index(),
+            ) {
                 write_response(writer, pending_write, response, session_stats).await?;
                 return Ok(false);
             }
-            write_response(
-                writer,
-                pending_write,
-                over_response(command, command_lines, session_state),
-                session_stats,
-            )
-            .await?;
+            if let Some(index) = config.article_index()
+                && let Some(response) =
+                    over_response_for_args_with_index(command, command_lines, session_state, index)
+            {
+                write_response(writer, pending_write, &response, session_stats).await?;
+            } else {
+                write_response(
+                    writer,
+                    pending_write,
+                    over_response(command, command_lines, session_state),
+                    session_stats,
+                )
+                .await?;
+            }
             Ok(false)
         }
         RequestKind::Xover => {
-            if let Some(response) = overview_selector_error(command, command_lines, session_state) {
+            if let Some(response) = overview_selector_error(
+                command,
+                command_lines,
+                session_state,
+                config.article_index(),
+            ) {
                 write_response(writer, pending_write, response, session_stats).await?;
                 return Ok(false);
             }
-            write_response(
-                writer,
-                pending_write,
-                xover_response(command, command_lines, session_state),
-                session_stats,
-            )
-            .await?;
+            if let Some(index) = config.article_index()
+                && let Some(response) =
+                    xover_response_for_args_with_index(command, command_lines, session_state, index)
+            {
+                write_response(writer, pending_write, &response, session_stats).await?;
+            } else {
+                write_response(
+                    writer,
+                    pending_write,
+                    xover_response(command, command_lines, session_state),
+                    session_stats,
+                )
+                .await?;
+            }
             Ok(false)
         }
         RequestKind::Hdr => {
-            if let Some(response) = overview_selector_error(command, command_lines, session_state) {
+            if let Some(response) = overview_selector_error(
+                command,
+                command_lines,
+                session_state,
+                config.article_index(),
+            ) {
                 write_response(writer, pending_write, response, session_stats).await?;
                 return Ok(false);
             }
-            write_response(
-                writer,
-                pending_write,
-                hdr_response(command, command_lines, session_state),
-                session_stats,
-            )
-            .await?;
+            if let Some(index) = config.article_index()
+                && let Some(response) =
+                    hdr_response_for_args_with_index(command, command_lines, session_state, index)
+            {
+                write_response(writer, pending_write, &response, session_stats).await?;
+            } else {
+                write_response(
+                    writer,
+                    pending_write,
+                    hdr_response(command, command_lines, session_state),
+                    session_stats,
+                )
+                .await?;
+            }
             Ok(false)
         }
         RequestKind::Xhdr => {
-            if let Some(response) = overview_selector_error(command, command_lines, session_state) {
+            if let Some(response) = overview_selector_error(
+                command,
+                command_lines,
+                session_state,
+                config.article_index(),
+            ) {
                 write_response(writer, pending_write, response, session_stats).await?;
                 return Ok(false);
             }
-            write_response(
-                writer,
-                pending_write,
-                xhdr_response(command, command_lines, session_state),
-                session_stats,
-            )
-            .await?;
+            if let Some(index) = config.article_index()
+                && let Some(response) =
+                    xhdr_response_for_args_with_index(command, command_lines, session_state, index)
+            {
+                write_response(writer, pending_write, &response, session_stats).await?;
+            } else {
+                write_response(
+                    writer,
+                    pending_write,
+                    xhdr_response(command, command_lines, session_state),
+                    session_stats,
+                )
+                .await?;
+            }
             Ok(false)
         }
         RequestKind::Capabilities => {
@@ -2525,13 +2918,43 @@ where
         }
         RequestKind::List => LIST_RESPONSE,
         RequestKind::ListActive => {
-            list_active_response(list_variant_wildmat_args(request.kind(), request.args()))
+            let args = list_variant_wildmat_args(request.kind(), request.args());
+            if let Some(index) = config.article_index() {
+                let response = list_active_response_for_index(args, index);
+                stats
+                    .bytes_sent
+                    .fetch_add(response.len() as u64, Ordering::Relaxed);
+                output.write_all(&response).expect("response write failed");
+                return false;
+            } else {
+                list_active_response(args)
+            }
         }
         RequestKind::ListActiveTimes => {
-            list_active_times_response(list_variant_wildmat_args(request.kind(), request.args()))
+            let args = list_variant_wildmat_args(request.kind(), request.args());
+            if let Some(index) = config.article_index() {
+                let response = list_active_times_response_for_index(args, index);
+                stats
+                    .bytes_sent
+                    .fetch_add(response.len() as u64, Ordering::Relaxed);
+                output.write_all(&response).expect("response write failed");
+                return false;
+            } else {
+                list_active_times_response(args)
+            }
         }
         RequestKind::ListNewsgroups => {
-            list_newsgroups_response(list_variant_wildmat_args(request.kind(), request.args()))
+            let args = list_variant_wildmat_args(request.kind(), request.args());
+            if let Some(index) = config.article_index() {
+                let response = list_newsgroups_response_for_index(args, index);
+                stats
+                    .bytes_sent
+                    .fetch_add(response.len() as u64, Ordering::Relaxed);
+                output.write_all(&response).expect("response write failed");
+                return false;
+            } else {
+                list_newsgroups_response(args)
+            }
         }
         RequestKind::ListOverviewFmt => LIST_OVERVIEW_FMT_RESPONSE,
         RequestKind::ListHeaders => LIST_HEADERS_RESPONSE,
@@ -2540,8 +2963,30 @@ where
         RequestKind::ListGroup => listgroup_response_for_args(request.args(), None),
         RequestKind::Last => LAST_RESPONSE,
         RequestKind::Next => NEXT_RESPONSE,
-        RequestKind::NewGroups => NEWGROUPS_RESPONSE,
-        RequestKind::NewNews => newnews_response(request.args()),
+        RequestKind::NewGroups => {
+            if let Some(index) = config.article_index() {
+                let response = newgroups_response_for_index(request.args(), index);
+                stats
+                    .bytes_sent
+                    .fetch_add(response.len() as u64, Ordering::Relaxed);
+                output.write_all(&response).expect("response write failed");
+                return false;
+            } else {
+                NEWGROUPS_RESPONSE
+            }
+        }
+        RequestKind::NewNews => {
+            if let Some(index) = config.article_index() {
+                let response = newnews_response_for_index(request.args(), index);
+                stats
+                    .bytes_sent
+                    .fetch_add(response.len() as u64, Ordering::Relaxed);
+                output.write_all(&response).expect("response write failed");
+                return false;
+            } else {
+                newnews_response(request.args())
+            }
+        }
         RequestKind::Post => b"440 posting not permitted\r\n",
         RequestKind::Ihave => b"435 article not wanted\r\n",
         RequestKind::Check | RequestKind::TakeThis | RequestKind::StartTls => {
@@ -2655,6 +3100,268 @@ fn open_stored_article_response(
     Ok(None)
 }
 
+fn stored_article_message_id_exists(config: &ServerConfig, message_id: &MessageId<'_>) -> bool {
+    if config.article_dir.is_none() {
+        return false;
+    }
+
+    let mut article_path = PathBuf::with_capacity(1024);
+    matches!(
+        open_stored_article_response(config, None, Some(message_id), &mut article_path),
+        Ok(Some(_))
+    )
+}
+
+impl ArticleStoreIndex {
+    fn build(root: &Path) -> io::Result<Self> {
+        let mut entries = Vec::new();
+        collect_article_paths(root, &mut entries)?;
+
+        let mut groups: BTreeMap<Arc<str>, ArticleStoreGroupBuilder> = BTreeMap::new();
+        let mut articles_by_number = BTreeMap::new();
+        let mut articles_by_message_id = HashMap::new();
+
+        for path in entries {
+            let bytes = fs::read(&path)?;
+            let article = match Article::parse(&bytes) {
+                Ok(article) => article,
+                Err(_) => continue,
+            };
+            let Some(article_number) = article.article_number.map(ArticleNumber::as_u64) else {
+                continue;
+            };
+            let message_id = Arc::<str>::from(article.message_id.as_str());
+            let newsgroups = article
+                .headers
+                .as_ref()
+                .and_then(|headers| headers.get("Newsgroups"))
+                .map(parse_newsgroups)
+                .unwrap_or_default();
+            let date_key = article
+                .headers
+                .as_ref()
+                .and_then(|headers| headers.get("Date"))
+                .and_then(parse_rfc2822_date_key);
+            let headers = article.headers.as_ref();
+            let body = article.body.as_deref().unwrap_or(&[]);
+
+            let entry = ArticleStoreEntry {
+                message_id: message_id.clone(),
+                newsgroups: newsgroups.clone().into_boxed_slice(),
+                date_key,
+                subject: headers
+                    .and_then(|headers| headers.get("Subject"))
+                    .unwrap_or(&[])
+                    .into(),
+                from: headers
+                    .and_then(|headers| headers.get("From"))
+                    .unwrap_or(&[])
+                    .into(),
+                date: headers
+                    .and_then(|headers| headers.get("Date"))
+                    .unwrap_or(&[])
+                    .into(),
+                references: headers
+                    .and_then(|headers| headers.get("References"))
+                    .unwrap_or(&[])
+                    .into(),
+                overview_bytes: headers
+                    .map(|headers| article_size_for_overview(headers, body))
+                    .unwrap_or(body.len() as u64),
+                overview_lines: body_line_count(body),
+            };
+            articles_by_message_id.insert(message_id.clone(), article_number);
+            articles_by_number.insert(article_number, entry);
+
+            for group_name in newsgroups {
+                let builder = groups.entry(group_name).or_default();
+                builder.article_numbers.push(article_number);
+                builder.active_time = builder.active_time.max(date_key.unwrap_or(0));
+            }
+        }
+
+        let groups = groups
+            .into_iter()
+            .map(|(name, builder)| {
+                let mut article_numbers = builder.article_numbers;
+                article_numbers.sort_unstable();
+                article_numbers.dedup();
+                (
+                    name,
+                    ArticleStoreGroup {
+                        article_numbers: article_numbers.into_boxed_slice(),
+                        active_time: builder.active_time,
+                    },
+                )
+            })
+            .collect();
+
+        Ok(Self {
+            groups,
+            articles_by_number,
+            articles_by_message_id,
+        })
+    }
+
+    fn group(&self, name: &str) -> Option<&ArticleStoreGroup> {
+        self.groups.get(name)
+    }
+
+    fn article_numbers_for_group(&self, name: &str) -> Option<&[u64]> {
+        self.group(name).map(|group| group.article_numbers.as_ref())
+    }
+
+    fn article_number_for_message_id(&self, message_id: &MessageId<'_>) -> Option<u64> {
+        self.articles_by_message_id
+            .get(message_id.as_str())
+            .copied()
+    }
+
+    fn article_entry(&self, article_id: u64) -> Option<&ArticleStoreEntry> {
+        self.articles_by_number.get(&article_id)
+    }
+
+    fn article_entry_for_message_id(
+        &self,
+        message_id: &MessageId<'_>,
+    ) -> Option<&ArticleStoreEntry> {
+        self.article_number_for_message_id(message_id)
+            .and_then(|article_id| self.article_entry(article_id))
+    }
+}
+
+#[derive(Debug, Default)]
+struct ArticleStoreGroupBuilder {
+    article_numbers: Vec<u64>,
+    active_time: u64,
+}
+
+fn collect_article_paths(root: &Path, output: &mut Vec<PathBuf>) -> io::Result<()> {
+    fn recurse(path: &Path, output: &mut Vec<PathBuf>) -> io::Result<()> {
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            let entry_path = entry.path();
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                if entry.file_name() == "msgid" {
+                    continue;
+                }
+                recurse(&entry_path, output)?;
+            } else if file_type.is_file() {
+                if entry_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.chars().all(|ch| ch.is_ascii_digit()))
+                {
+                    output.push(entry_path);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    recurse(root, output)
+}
+
+fn parse_newsgroups(value: &[u8]) -> Vec<Arc<str>> {
+    std::str::from_utf8(value)
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .filter_map(|group| {
+                    let group = group.trim();
+                    (!group.is_empty()).then(|| Arc::<str>::from(group))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn parse_rfc2822_date_key(value: &[u8]) -> Option<u64> {
+    let value = std::str::from_utf8(value).ok()?.trim();
+    let value = value.strip_suffix(" GMT").map_or(value, |trimmed| trimmed);
+    let value = value.strip_suffix(" UTC").map_or(value, |trimmed| trimmed);
+    let mut parts = value.split_whitespace();
+    let first = parts.next()?;
+    let day = if first.ends_with(',') {
+        parts.next()?
+    } else {
+        first
+    };
+    let month = parts.next()?;
+    let year = parts.next()?;
+    let time = parts.next()?;
+    let tz = parts.next().unwrap_or("+0000");
+    if parts.next().is_some() {
+        return None;
+    }
+
+    let day = day.parse::<u32>().ok()?;
+    let month = match month {
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
+        _ => return None,
+    };
+    let year = year.parse::<i32>().ok()?;
+    let mut time_parts = time.split(':');
+    let hour = time_parts.next()?.parse::<u32>().ok()?;
+    let minute = time_parts.next()?.parse::<u32>().ok()?;
+    let second = time_parts.next()?.parse::<u32>().ok()?;
+    if time_parts.next().is_some() {
+        return None;
+    }
+
+    let offset_seconds = if tz.eq_ignore_ascii_case("GMT") || tz == "+0000" {
+        0
+    } else {
+        let sign = match tz.as_bytes().first().copied()? {
+            b'+' => 1,
+            b'-' => -1,
+            _ => return None,
+        };
+        if tz.len() != 5 || !tz[1..].bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        let hours = tz[1..3].parse::<i32>().ok()?;
+        let minutes = tz[3..5].parse::<i32>().ok()?;
+        sign * (hours * 3600 + minutes * 60)
+    };
+
+    let days = days_from_civil(year, month, day as i32)?;
+    let mut seconds = days
+        .checked_mul(86_400)?
+        .checked_add(i64::from(hour * 3600 + minute * 60 + second))?;
+    seconds -= i64::from(offset_seconds);
+    (seconds >= 0).then_some(seconds as u64)
+}
+
+fn days_from_civil(year: i32, month: u32, day: i32) -> Option<i64> {
+    if !(1..=12).contains(&month) || !(1..=31).contains(&(day as u32)) {
+        return None;
+    }
+    let mut y = year as i64;
+    let m = month as i64;
+    let d = day as i64;
+    y -= (m <= 2) as i64;
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = m + if m > 2 { -3 } else { 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some(era * 146_097 + doe - 719_468)
+}
+
 fn article_not_found_response(
     article_id: Option<u64>,
     message_id: Option<&MessageId<'_>>,
@@ -2758,7 +3465,9 @@ fn build_stored_article_response(kind: RequestKind, article_bytes: &[u8]) -> io:
         | RequestKind::AuthInfo
         | RequestKind::ModeReader
         | RequestKind::Quit
-        | RequestKind::Unknown => unreachable!("stored article response requested for non-article kind"),
+        | RequestKind::Unknown => {
+            unreachable!("stored article response requested for non-article kind")
+        }
     }
 
     Ok(output.into_boxed_slice())
@@ -2923,6 +3632,8 @@ pub struct ServerConfig {
     body_response: Box<[u8]>,
     article_response: Box<[u8]>,
     pub article_dir: Option<Arc<PathBuf>>,
+    article_index: Option<Arc<ArticleStoreIndex>>,
+    pub article_index_error: Option<Arc<str>>,
     pub max_connections: usize,
     pub max_pipeline_depth: usize,
     pub stats_interval: Duration,
@@ -2938,12 +3649,21 @@ impl ServerConfig {
         let body_response = build_generated_response(BODY_RESPONSE_PREFIX, args.body_bytes);
         let article_response =
             build_generated_response(ARTICLE_RESPONSE_PREFIX, args.article_bytes);
+        let (article_index, article_index_error) = match args.article_dir.as_deref() {
+            Some(root) => match ArticleStoreIndex::build(root) {
+                Ok(index) => (Some(Arc::new(index)), None),
+                Err(error) => (None, Some(Arc::<str>::from(error.to_string()))),
+            },
+            None => (None, None),
+        };
         Self {
             body_bytes: args.body_bytes,
             article_bytes: args.article_bytes,
             body_response,
             article_response,
             article_dir: args.article_dir.map(Arc::new),
+            article_index,
+            article_index_error,
             max_connections: args.max_connections,
             max_pipeline_depth: args.max_pipeline_depth.clamp(1, 1024),
             stats_interval: Duration::from_secs(args.stats_interval_secs),
@@ -2969,6 +3689,10 @@ impl ServerConfig {
 
     pub fn article_response(&self) -> &[u8] {
         &self.article_response
+    }
+
+    fn article_index(&self) -> Option<&ArticleStoreIndex> {
+        self.article_index.as_deref()
     }
 }
 
@@ -3542,6 +4266,104 @@ fn list_active_response(args: &[u8]) -> &'static [u8] {
     }
 }
 
+fn list_active_response_for_index(args: &[u8], index: &ArticleStoreIndex) -> Box<[u8]> {
+    format_active_group_response(
+        b"215 list of newsgroups follows\r\n",
+        args,
+        index,
+        |group_name, group| {
+            let low = group.article_numbers.first().copied().unwrap_or(0);
+            let high = group.article_numbers.last().copied().unwrap_or(0);
+            format!("{group_name} {high} {low} y\r\n")
+        },
+    )
+}
+
+fn list_active_times_response_for_index(args: &[u8], index: &ArticleStoreIndex) -> Box<[u8]> {
+    format_active_group_response(
+        b"215 information follows\r\n",
+        args,
+        index,
+        |group_name, group| {
+            format!(
+                "{} {} {}\r\n",
+                group_name, group.active_time, "bench@nntpbench.local"
+            )
+        },
+    )
+}
+
+fn list_newsgroups_response_for_index(args: &[u8], index: &ArticleStoreIndex) -> Box<[u8]> {
+    format_active_group_response(
+        b"215 information follows\r\n",
+        args,
+        index,
+        |group_name, _group| format!("{group_name} article_dir-backed group\r\n"),
+    )
+}
+
+fn newgroups_response_for_index(args: &[u8], index: &ArticleStoreIndex) -> Box<[u8]> {
+    let cutoff = newgroups_datetime_timestamp(args);
+    let mut response = Vec::from(b"231 list of new newsgroups follows\r\n".as_slice());
+    for (group_name, group) in &index.groups {
+        if cutoff.is_some_and(|cutoff| group.active_time < cutoff) {
+            continue;
+        }
+        let low = group.article_numbers.first().copied().unwrap_or(0);
+        let high = group.article_numbers.last().copied().unwrap_or(0);
+        let line = format!("{group_name} {high} {low} y\r\n");
+        response.extend_from_slice(line.as_bytes());
+    }
+    response.extend_from_slice(b".\r\n");
+    response.into_boxed_slice()
+}
+
+fn newnews_response_for_index(args: &[u8], index: &ArticleStoreIndex) -> Box<[u8]> {
+    let cutoff = newnews_datetime_timestamp(args);
+    let wildmat = first_command_arg(args).unwrap_or_default();
+    let mut response = Vec::from(b"230 list of new articles follows\r\n".as_slice());
+    let mut seen = BTreeMap::<u64, Arc<str>>::new();
+    for (article_id, entry) in &index.articles_by_number {
+        if cutoff.is_some_and(|cutoff| entry.date_key.unwrap_or(0) < cutoff) {
+            continue;
+        }
+        if !wildmat.is_empty()
+            && !entry
+                .newsgroups
+                .iter()
+                .any(|group| wildmat_matches(wildmat, group.as_bytes()))
+        {
+            continue;
+        }
+        seen.insert(*article_id, entry.message_id.clone());
+    }
+    for message_id in seen.values() {
+        write!(&mut response, "{message_id}\r\n").expect("write to Vec cannot fail");
+    }
+    response.extend_from_slice(b".\r\n");
+    response.into_boxed_slice()
+}
+
+fn format_active_group_response<F>(
+    prefix: &[u8],
+    args: &[u8],
+    index: &ArticleStoreIndex,
+    mut format_line: F,
+) -> Box<[u8]>
+where
+    F: FnMut(&str, &ArticleStoreGroup) -> String,
+{
+    let mut response = Vec::from(prefix);
+    for (group_name, group) in &index.groups {
+        if !args.is_empty() && !wildmat_matches(args, group_name.as_bytes()) {
+            continue;
+        }
+        response.extend_from_slice(format_line(group_name.as_ref(), group).as_bytes());
+    }
+    response.extend_from_slice(b".\r\n");
+    response.into_boxed_slice()
+}
+
 fn list_variant_wildmat_args(kind: RequestKind, args: &[u8]) -> &[u8] {
     match kind {
         RequestKind::ListActive => strip_list_variant_args(args, b"ACTIVE"),
@@ -3688,6 +4510,18 @@ fn newnews_datetime_key(args: &[u8]) -> Option<u64> {
     normalized_nntp_datetime_key(date, time, current_utc_year())
 }
 
+fn newgroups_datetime_timestamp(args: &[u8]) -> Option<u64> {
+    let date = first_command_arg(args)?;
+    let time = nth_command_arg(args, 1)?;
+    nntp_datetime_timestamp(date, time, current_utc_year())
+}
+
+fn newnews_datetime_timestamp(args: &[u8]) -> Option<u64> {
+    let date = nth_command_arg(args, 1)?;
+    let time = nth_command_arg(args, 2)?;
+    nntp_datetime_timestamp(date, time, current_utc_year())
+}
+
 fn normalized_nntp_datetime_key(date: &[u8], time: &[u8], current_year: u16) -> Option<u64> {
     let date = u64::from(normalized_nntp_date_key(date, current_year)?);
     if time.len() != 6 || !time.iter().all(u8::is_ascii_digit) {
@@ -3695,6 +4529,23 @@ fn normalized_nntp_datetime_key(date: &[u8], time: &[u8], current_year: u16) -> 
     }
     let time = u64::from(parse_ascii_decimal_u32(time)?);
     Some(date * 1_000_000 + time)
+}
+
+fn nntp_datetime_timestamp(date: &[u8], time: &[u8], current_year: u16) -> Option<u64> {
+    let date_key = normalized_nntp_date_key(date, current_year)?;
+    if time.len() != 6 || !time.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let year = i32::try_from(date_key / 10_000).ok()?;
+    let month = ((date_key / 100) % 100) as u32;
+    let day = (date_key % 100) as i32;
+    let hour = u32::from(parse_ascii_decimal_u32(&time[..2])?);
+    let minute = u32::from(parse_ascii_decimal_u32(&time[2..4])?);
+    let second = u32::from(parse_ascii_decimal_u32(&time[4..6])?);
+    let days = days_from_civil(year, month, day)?;
+    days.checked_mul(86_400)?
+        .checked_add(i64::from(hour * 3600 + minute * 60 + second))
+        .and_then(|seconds| (seconds >= 0).then_some(seconds as u64))
 }
 
 fn normalized_nntp_date_key(date: &[u8], current_year: u16) -> Option<u32> {
@@ -3743,8 +4594,10 @@ fn article_selector_error(
     command: &ParsedCommand,
     command_lines: Option<&CommandLineBatch>,
     session_state: &SessionState,
+    config: &ServerConfig,
     current_selector_allowed: bool,
 ) -> Option<&'static [u8]> {
+    let index = config.article_index();
     let args = command_args(command, command_lines).unwrap_or_default();
     if args.is_empty() && current_selector_allowed {
         if !session_state.group_selected {
@@ -3760,11 +4613,18 @@ fn article_selector_error(
     }
     if command
         .article_id
-        .is_some_and(|article_id| article_id > session_state.article_count())
+        .is_some_and(|article_id| !session_state.current_group_contains(article_id, index))
     {
         return Some(b"423 no article with that number\r\n");
     }
-    if command.message_id.is_some() && contains_subslice(args, b"missing") {
+    if let Some(message_id) = command_lines.and_then(|lines| command_message_id(command, lines)) {
+        if let Some(index) = index
+            && index.article_entry_for_message_id(&message_id).is_none()
+            && !stored_article_message_id_exists(config, &message_id)
+        {
+            return Some(b"430 no article with that message-id\r\n");
+        }
+    } else if command.message_id.is_some() && contains_subslice(args, b"missing") {
         return Some(b"430 no article with that message-id\r\n");
     }
     None
@@ -3774,6 +4634,7 @@ fn overview_selector_error(
     command: &ParsedCommand,
     command_lines: Option<&CommandLineBatch>,
     session_state: &SessionState,
+    index: Option<&ArticleStoreIndex>,
 ) -> Option<&'static [u8]> {
     let args = command_args(command, command_lines).unwrap_or_default();
     if matches!(command.kind, RequestKind::Hdr | RequestKind::Xhdr)
@@ -3801,7 +4662,10 @@ fn overview_selector_error(
     }
     if selector.is_some_and(|selector| {
         overview_selector_is_range(selector)
-            && !overview_selector_range_selects_articles(selector, session_state.article_count())
+            && !overview_selector_range_selects_articles(
+                selector,
+                session_state.current_group_articles(index).unwrap_or(&[]),
+            )
     }) {
         if legacy_overview_uses_420_for_missing_range(command.kind) {
             return Some(b"420 no article(s) selected\r\n");
@@ -3813,10 +4677,10 @@ fn overview_selector_error(
             && std::str::from_utf8(selector)
                 .ok()
                 .and_then(|value| value.parse::<u64>().ok())
-                .is_some_and(|article_id| article_id > session_state.article_count())
+                .is_some_and(|article_id| !session_state.current_group_contains(article_id, index))
     }) || command
         .article_id
-        .is_some_and(|article_id| article_id > session_state.article_count())
+        .is_some_and(|article_id| !session_state.current_group_contains(article_id, index))
     {
         if legacy_overview_uses_420_for_missing_range(command.kind) {
             return Some(b"420 no article(s) selected\r\n");
@@ -3940,12 +4804,14 @@ fn overview_selector_is_range(selector: &[u8]) -> bool {
     selector.contains(&b'-')
 }
 
-fn overview_selector_range_selects_articles(selector: &[u8], article_count: u64) -> bool {
+fn overview_selector_range_selects_articles(selector: &[u8], articles: &[u64]) -> bool {
     let Some((start, end)) = listgroup_range_bounds(selector) else {
         return false;
     };
-    let end = end.unwrap_or(article_count).min(article_count);
-    start <= end && start <= article_count
+    let end = end.unwrap_or(u64::MAX);
+    articles
+        .iter()
+        .any(|article| (*article >= start) && (*article <= end))
 }
 
 fn overview_selector_is_message_id(selector: &[u8]) -> bool {
@@ -3989,10 +4855,26 @@ impl FixtureGroup {
         }
     }
 
+    const fn article_numbers(self) -> &'static [u64] {
+        match self {
+            Self::AltTest => &[1, 2, 3],
+            Self::CompLangRust => &[1],
+            Self::EmptyTest => &[],
+        }
+    }
+
     const fn first_article(self) -> Option<u64> {
         match self {
             Self::AltTest | Self::CompLangRust => Some(1),
             Self::EmptyTest => None,
+        }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::AltTest => "alt.test",
+            Self::CompLangRust => "comp.lang.rust",
+            Self::EmptyTest => "empty.test",
         }
     }
 }
@@ -4014,10 +4896,35 @@ fn group_response_for_group(group: FixtureGroup) -> &'static [u8] {
     }
 }
 
+fn group_response_for_index(group_name: &str, articles: &[u64]) -> Box<[u8]> {
+    let low = articles.first().copied().unwrap_or(0);
+    let high = articles.last().copied().unwrap_or(0);
+    let mut response = Vec::new();
+    write!(
+        &mut response,
+        "211 {} {} {} {}\r\n",
+        articles.len(),
+        low,
+        high,
+        group_name
+    )
+    .expect("write to Vec cannot fail");
+    response.into_boxed_slice()
+}
+
 fn group_response_for_args(args: &[u8]) -> &'static [u8] {
     fixture_group_from_name(args)
         .map(group_response_for_group)
         .unwrap_or(b"411 no such newsgroup\r\n")
+}
+
+fn group_response_for_args_with_index(args: &[u8], index: &ArticleStoreIndex) -> Option<Box<[u8]>> {
+    let group_name = std::str::from_utf8(args).ok()?.trim();
+    if let Some(articles) = index.article_numbers_for_group(group_name) {
+        return Some(group_response_for_index(group_name, articles));
+    }
+    fixture_group_from_name(args)
+        .map(|group| group_response_for_group(group).to_vec().into_boxed_slice())
 }
 
 fn last_response_for_article(article_id: u64) -> &'static [u8] {
@@ -4062,6 +4969,79 @@ fn listgroup_response_for_args(args: &[u8], current_group: Option<FixtureGroup>)
         }
     }
     LISTGROUP_RESPONSE
+}
+
+fn build_navigation_article_response(
+    index: &ArticleStoreIndex,
+    article_id: u64,
+) -> io::Result<Box<[u8]>> {
+    let entry = index.article_entry(article_id).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "navigation article not found in article store index",
+        )
+    })?;
+    let mut response = Vec::new();
+    write!(
+        &mut response,
+        "223 {} {} article retrieved - request text separately\r\n",
+        article_id, entry.message_id
+    )
+    .expect("write to Vec cannot fail");
+    Ok(response.into_boxed_slice())
+}
+
+fn listgroup_response_for_args_with_index(
+    args: &[u8],
+    current_group: Option<&str>,
+    index: &ArticleStoreIndex,
+) -> Option<Box<[u8]>> {
+    let group_name = listgroup_explicit_group_arg(args)
+        .and_then(|group| std::str::from_utf8(group).ok())
+        .map(str::trim)
+        .filter(|group| !group.is_empty())
+        .or(current_group)
+        .unwrap_or("alt.test");
+    if let Some(articles) = index.article_numbers_for_group(group_name) {
+        let range = listgroup_range_arg(args).and_then(listgroup_range_bounds);
+        let filtered: Vec<u64> = match range {
+            Some((start, end)) => articles
+                .iter()
+                .copied()
+                .filter(|article| {
+                    let end = end.unwrap_or(u64::MAX);
+                    *article >= start && *article <= end
+                })
+                .collect(),
+            None => articles.to_vec(),
+        };
+        return Some(format_listgroup_response(group_name, articles, &filtered));
+    }
+    fixture_group_from_name(group_name.as_bytes()).map(|group| {
+        listgroup_response_for_args(args, Some(group))
+            .to_vec()
+            .into_boxed_slice()
+    })
+}
+
+fn format_listgroup_response(group_name: &str, articles: &[u64], filtered: &[u64]) -> Box<[u8]> {
+    let low = articles.first().copied().unwrap_or(0);
+    let high = articles.last().copied().unwrap_or(0);
+    let mut response = Vec::new();
+    write!(
+        &mut response,
+        "211 {} {} {} {}\r\n",
+        articles.len(),
+        low,
+        high,
+        group_name
+    )
+    .expect("write to Vec cannot fail");
+    for article in filtered {
+        write!(&mut response, "{article}\r\n").expect("write to Vec cannot fail");
+    }
+    response.extend_from_slice(b".\r\n");
+    response.into_boxed_slice()
 }
 
 fn listgroup_range_arg(args: &[u8]) -> Option<&[u8]> {
@@ -4396,6 +5376,263 @@ fn xhdr_references_response_for_selector(selector: Option<&[u8]>) -> &'static [u
         return XHDR_REFERENCES_3_RESPONSE;
     }
     XHDR_REFERENCES_RESPONSE
+}
+
+fn over_response_for_args_with_index(
+    command: &ParsedCommand,
+    command_lines: Option<&CommandLineBatch>,
+    session_state: &SessionState,
+    index: &ArticleStoreIndex,
+) -> Option<Box<[u8]>> {
+    let args = command_args(command, command_lines).unwrap_or_default();
+    overview_response_for_index(
+        b"224 Overview information follows\r\n",
+        args,
+        session_state,
+        index,
+    )
+}
+
+fn xover_response_for_args_with_index(
+    command: &ParsedCommand,
+    command_lines: Option<&CommandLineBatch>,
+    session_state: &SessionState,
+    index: &ArticleStoreIndex,
+) -> Option<Box<[u8]>> {
+    let args = command_args(command, command_lines).unwrap_or_default();
+    overview_response_for_index(
+        b"224 Overview information follows\r\n",
+        args,
+        session_state,
+        index,
+    )
+}
+
+fn hdr_response_for_args_with_index(
+    command: &ParsedCommand,
+    command_lines: Option<&CommandLineBatch>,
+    session_state: &SessionState,
+    index: &ArticleStoreIndex,
+) -> Option<Box<[u8]>> {
+    let args = command_args(command, command_lines).unwrap_or_default();
+    header_response_for_index(
+        b"225 headers follow\r\n",
+        args,
+        session_state,
+        index,
+        HeaderMessageIdRowKey::Zero,
+    )
+}
+
+fn xhdr_response_for_args_with_index(
+    command: &ParsedCommand,
+    command_lines: Option<&CommandLineBatch>,
+    session_state: &SessionState,
+    index: &ArticleStoreIndex,
+) -> Option<Box<[u8]>> {
+    let args = command_args(command, command_lines).unwrap_or_default();
+    header_response_for_index(
+        b"221 headers follow\r\n",
+        args,
+        session_state,
+        index,
+        HeaderMessageIdRowKey::MessageId,
+    )
+}
+
+fn overview_response_for_index(
+    prefix: &[u8],
+    args: &[u8],
+    session_state: &SessionState,
+    index: &ArticleStoreIndex,
+) -> Option<Box<[u8]>> {
+    let articles = overview_articles_for_index(args, session_state, index)?;
+    let mut response = Vec::from(prefix);
+    for article in articles {
+        let article_number = article.article_number();
+        let entry = index.article_entry(article_number)?;
+        append_overview_row_for_entry(&mut response, article, entry);
+    }
+    response.extend_from_slice(b".\r\n");
+    Some(response.into_boxed_slice())
+}
+
+fn header_response_for_index(
+    prefix: &[u8],
+    args: &[u8],
+    session_state: &SessionState,
+    index: &ArticleStoreIndex,
+    message_id_row_key: HeaderMessageIdRowKey,
+) -> Option<Box<[u8]>> {
+    let header_name = header_query_name_from_args(args)?;
+    let articles = header_articles_for_index(args, session_state, index)?;
+    let mut response = Vec::from(prefix);
+    for article in articles {
+        let article_number = article.article_number();
+        let entry = index.article_entry(article_number)?;
+        append_header_row_for_entry(
+            &mut response,
+            article,
+            entry,
+            header_name,
+            message_id_row_key,
+        );
+    }
+    response.extend_from_slice(b".\r\n");
+    Some(response.into_boxed_slice())
+}
+
+#[derive(Clone, Copy)]
+enum IndexedArticleSelector {
+    Number(u64),
+    MessageId(u64),
+}
+
+#[derive(Clone, Copy)]
+enum HeaderMessageIdRowKey {
+    Zero,
+    MessageId,
+}
+
+impl IndexedArticleSelector {
+    fn article_number(self) -> u64 {
+        match self {
+            Self::Number(article_number) | Self::MessageId(article_number) => article_number,
+        }
+    }
+}
+
+fn overview_articles_for_index(
+    args: &[u8],
+    session_state: &SessionState,
+    index: &ArticleStoreIndex,
+) -> Option<Vec<IndexedArticleSelector>> {
+    if args.is_empty() {
+        return session_state
+            .current_article
+            .map(|article| vec![IndexedArticleSelector::Number(article)]);
+    }
+
+    if overview_selector_is_message_id(args) {
+        let message_id = message_id_from_selector(args)?;
+        return index
+            .article_number_for_message_id(&message_id)
+            .map(|article| vec![IndexedArticleSelector::MessageId(article)]);
+    }
+
+    if let Some((start, end)) = listgroup_range_bounds(args) {
+        let articles = session_state.current_group_articles(Some(index))?;
+        let upper = end.unwrap_or(u64::MAX);
+        return Some(
+            articles
+                .iter()
+                .copied()
+                .filter(|article| (*article >= start) && (*article <= upper))
+                .map(IndexedArticleSelector::Number)
+                .collect(),
+        );
+    }
+
+    let article_number = parse_article_id_arg(args)?;
+    if session_state.current_group_contains(article_number, Some(index)) {
+        Some(vec![IndexedArticleSelector::Number(article_number)])
+    } else {
+        Some(Vec::new())
+    }
+}
+
+fn header_articles_for_index(
+    args: &[u8],
+    session_state: &SessionState,
+    index: &ArticleStoreIndex,
+) -> Option<Vec<IndexedArticleSelector>> {
+    if command_arg_count(args) == 1 {
+        return session_state
+            .current_article
+            .map(|article| vec![IndexedArticleSelector::Number(article)]);
+    }
+
+    let selector = overview_selector_arg(RequestKind::Hdr, args)?;
+    overview_articles_for_index(selector, session_state, index)
+}
+
+fn message_id_from_selector(selector: &[u8]) -> Option<MessageId<'static>> {
+    let selector = std::str::from_utf8(selector).ok()?.trim();
+    MessageId::from_str_or_wrap(selector).ok()
+}
+
+fn append_overview_row_for_entry(
+    output: &mut Vec<u8>,
+    selector: IndexedArticleSelector,
+    entry: &ArticleStoreEntry,
+) {
+    match selector {
+        IndexedArticleSelector::Number(article_number) => {
+            write!(output, "{article_number}\t").expect("write to Vec cannot fail");
+        }
+        IndexedArticleSelector::MessageId(_) => output.extend_from_slice(b"0\t"),
+    }
+    output.extend_from_slice(&entry.subject);
+    output.push(b'\t');
+    output.extend_from_slice(&entry.from);
+    output.push(b'\t');
+    output.extend_from_slice(&entry.date);
+    output.push(b'\t');
+    output.extend_from_slice(entry.message_id.as_ref().as_bytes());
+    output.push(b'\t');
+    output.extend_from_slice(&entry.references);
+    output.push(b'\t');
+    write!(
+        output,
+        "{}\t{}\r\n",
+        entry.overview_bytes, entry.overview_lines
+    )
+    .expect("write to Vec cannot fail");
+}
+
+fn append_header_row_for_entry(
+    output: &mut Vec<u8>,
+    selector: IndexedArticleSelector,
+    entry: &ArticleStoreEntry,
+    header_name: &[u8],
+    message_id_row_key: HeaderMessageIdRowKey,
+) {
+    match selector {
+        IndexedArticleSelector::Number(article_number) => {
+            write!(output, "{article_number} ").expect("write to Vec cannot fail");
+        }
+        IndexedArticleSelector::MessageId(_) => match message_id_row_key {
+            HeaderMessageIdRowKey::Zero => output.extend_from_slice(b"0 "),
+            HeaderMessageIdRowKey::MessageId => {
+                output.extend_from_slice(entry.message_id.as_ref().as_bytes());
+                output.push(b' ');
+            }
+        },
+    }
+    if header_name.eq_ignore_ascii_case(b"Message-ID") {
+        output.extend_from_slice(entry.message_id.as_ref().as_bytes());
+    } else if header_name.eq_ignore_ascii_case(b":bytes") {
+        write!(output, "{}", entry.overview_bytes).expect("write to Vec cannot fail");
+    } else if header_name.eq_ignore_ascii_case(b":lines") {
+        write!(output, "{}", entry.overview_lines).expect("write to Vec cannot fail");
+    } else if header_name.eq_ignore_ascii_case(b"Subject") {
+        output.extend_from_slice(&entry.subject);
+    } else if header_name.eq_ignore_ascii_case(b"From") {
+        output.extend_from_slice(&entry.from);
+    } else if header_name.eq_ignore_ascii_case(b"Date") {
+        output.extend_from_slice(&entry.date);
+    } else if header_name.eq_ignore_ascii_case(b"References") {
+        output.extend_from_slice(&entry.references);
+    }
+    output.extend_from_slice(b"\r\n");
+}
+
+fn article_size_for_overview(headers: &Headers<'_>, body: &[u8]) -> u64 {
+    headers.as_bytes().len() as u64 + body.len() as u64 + 2
+}
+
+fn body_line_count(body: &[u8]) -> u64 {
+    memchr::memchr_iter(b'\n', body).count() as u64
 }
 
 fn over_response(
@@ -4869,6 +6106,26 @@ mod tests {
             socket_recv_buffer: HIGH_THROUGHPUT_SOCKET_BUFFER,
             socket_send_buffer: HIGH_THROUGHPUT_SOCKET_BUFFER,
         }
+    }
+
+    async fn assert_read_request(stream: &mut TcpStream, expected: &[u8]) {
+        let mut request = vec![0_u8; expected.len()];
+        stream.read_exact(&mut request).await.unwrap();
+        assert_eq!(request, expected);
+    }
+
+    async fn expect_negotiated_request(
+        stream: &mut TcpStream,
+        expected_request: &[u8],
+        response: &[u8],
+    ) {
+        assert_read_request(stream, b"CAPABILITIES\r\n").await;
+        stream
+            .write_all(b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nOVER\r\nSTARTTLS\r\n.\r\n")
+            .await
+            .unwrap();
+        assert_read_request(stream, expected_request).await;
+        stream.write_all(response).await.unwrap();
     }
 
     fn write_temp_segments(name: &str, contents: &str) -> PathBuf {
@@ -11513,7 +12770,7 @@ mod tests {
         let mut article_path = PathBuf::new();
         let mut session_state = SessionState {
             group_selected: true,
-            selected_group: Some(FixtureGroup::AltTest),
+            selected_group: Some(SelectedGroup::Fixture(FixtureGroup::AltTest)),
             current_article: Some(1),
         };
         let mut writer = FailingWriter;
@@ -11939,8 +13196,7 @@ mod tests {
     #[test]
     fn client_request_for_command_uses_numeric_refs_only_with_selected_group() {
         let article =
-            client_request_for_command(42, 0, ClientCommandMix::Article, true, None, 0, 1)
-                .unwrap();
+            client_request_for_command(42, 0, ClientCommandMix::Article, true, None, 0, 1).unwrap();
         let body =
             client_request_for_command(7, 0, ClientCommandMix::Body, true, None, 0, 1).unwrap();
 
@@ -11958,9 +13214,16 @@ mod tests {
         let segments = read_segments(&path).unwrap();
         fs::remove_file(path).unwrap();
 
-        let segmented =
-            client_request_for_command(11, 0, ClientCommandMix::Article, false, Some(&segments), 0, 1)
-                .unwrap();
+        let segmented = client_request_for_command(
+            11,
+            0,
+            ClientCommandMix::Article,
+            false,
+            Some(&segments),
+            0,
+            1,
+        )
+        .unwrap();
         let segmented_body =
             client_request_for_command(12, 1, ClientCommandMix::Body, false, Some(&segments), 0, 1)
                 .unwrap();
@@ -11969,7 +13232,8 @@ mod tests {
         let zero_body =
             client_request_for_command(0, 0, ClientCommandMix::Body, false, None, 0, 1).unwrap();
         let zero_alternate =
-            client_request_for_command(0, 0, ClientCommandMix::Alternate, false, None, 0, 1).unwrap();
+            client_request_for_command(0, 0, ClientCommandMix::Alternate, false, None, 0, 1)
+                .unwrap();
 
         assert_eq!(
             segmented.message_id().map(MessageId::as_str),
@@ -12509,6 +13773,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rfc3977_compliance_fetch_response_requires_capabilities_before_extension_commands() {
+        let scenarios = vec![
+            (
+                "AUTHINFO USER",
+                {
+                    let mut args = test_fetch_args();
+                    args.request = FetchRequestKind::AuthinfoUser;
+                    args.auth_value = Some("bench-user".to_string());
+                    args.message_id = None;
+                    args
+                },
+                b"AUTHINFO USER bench-user\r\n".as_slice(),
+                b"101 Capability list:\r\nVERSION 2\r\nAUTHINFO USER\r\n.\r\n".as_slice(),
+                b"381 more authentication information required\r\n".as_slice(),
+            ),
+            (
+                "CHECK",
+                {
+                    let mut args = test_fetch_args();
+                    args.request = FetchRequestKind::Check;
+                    args.message_id = Some("check@test".to_string());
+                    args
+                },
+                b"CHECK <check@test>\r\n".as_slice(),
+                b"101 Capability list:\r\nVERSION 2\r\nSTREAMING\r\n.\r\n".as_slice(),
+                b"238 <check@test> send article to be transferred\r\n".as_slice(),
+            ),
+            (
+                "TAKETHIS",
+                {
+                    let mut args = test_fetch_args();
+                    args.request = FetchRequestKind::Takethis;
+                    args.message_id = Some("take@test".to_string());
+                    args.article_body = Some("Subject: Take\r\n\r\n.line\r\nbody".to_string());
+                    args
+                },
+                b"TAKETHIS <take@test>\r\nSubject: Take\r\n\r\n..line\r\nbody\r\n.\r\n".as_slice(),
+                b"101 Capability list:\r\nVERSION 2\r\nSTREAMING\r\n.\r\n".as_slice(),
+                b"239 <take@test> article transferred ok\r\n".as_slice(),
+            ),
+        ];
+
+        let mut failures = Vec::new();
+
+        for (name, mut args, expected_request, capabilities_response, request_response) in scenarios
+        {
+            let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                stream.write_all(b"201 fetch ready\r\n").await.unwrap();
+                assert_read_request(&mut stream, b"CAPABILITIES\r\n").await;
+                stream.write_all(capabilities_response).await.unwrap();
+                assert_read_request(&mut stream, expected_request).await;
+                stream.write_all(request_response).await.unwrap();
+            });
+
+            args.connect = addr;
+            let result = time::timeout(Duration::from_millis(250), fetch_response(&args)).await;
+            let server_result = server.await;
+
+            if result.is_ok() && server_result.is_ok() {
+                continue;
+            }
+
+            failures.push(format!(
+                "{name}: fetch_response did not complete the negotiated command path before the timeout"
+            ));
+        }
+
+        assert!(
+            failures.is_empty(),
+            "RFC 3977 capability negotiation is still missing for fetch-response extension commands:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    #[tokio::test]
     async fn fetch_response_supports_list_subcommand_request_kinds() {
         let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
         let addr = listener.local_addr().unwrap();
@@ -12645,47 +13987,41 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut first, _) = listener.accept().await.unwrap();
             first.write_all(b"201 fetch ready\r\n").await.unwrap();
-
-            let mut request = [0_u8; 128];
-            let read = first.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"HDR Subject 1-10\r\n");
-            first.write_all(HDR_RESPONSE).await.unwrap();
+            expect_negotiated_request(&mut first, b"HDR Subject 1-10\r\n", HDR_RESPONSE).await;
 
             let (mut second, _) = listener.accept().await.unwrap();
             second.write_all(b"201 fetch ready\r\n").await.unwrap();
-            let read = second.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"HDR Message-ID <headers@test>\r\n");
-            second.write_all(HDR_RESPONSE).await.unwrap();
+            expect_negotiated_request(
+                &mut second,
+                b"HDR Message-ID <headers@test>\r\n",
+                HDR_RESPONSE,
+            )
+            .await;
 
             let (mut third, _) = listener.accept().await.unwrap();
             third.write_all(b"201 fetch ready\r\n").await.unwrap();
-            let read = third.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"XHDR Subject 1-10\r\n");
-            third.write_all(XHDR_RESPONSE).await.unwrap();
+            expect_negotiated_request(&mut third, b"XHDR Subject 1-10\r\n", XHDR_RESPONSE).await;
 
             let (mut fourth, _) = listener.accept().await.unwrap();
             fourth.write_all(b"201 fetch ready\r\n").await.unwrap();
-            let read = fourth.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"XHDR Message-ID <headers@test>\r\n");
-            fourth.write_all(XHDR_RESPONSE).await.unwrap();
+            expect_negotiated_request(
+                &mut fourth,
+                b"XHDR Message-ID <headers@test>\r\n",
+                XHDR_RESPONSE,
+            )
+            .await;
 
             let (mut fifth, _) = listener.accept().await.unwrap();
             fifth.write_all(b"201 fetch ready\r\n").await.unwrap();
-            let read = fifth.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"HDR :bytes 1\r\n");
-            fifth.write_all(HDR_RESPONSE).await.unwrap();
+            expect_negotiated_request(&mut fifth, b"HDR :bytes 1\r\n", HDR_RESPONSE).await;
 
             let (mut sixth, _) = listener.accept().await.unwrap();
             sixth.write_all(b"201 fetch ready\r\n").await.unwrap();
-            let read = sixth.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"HDR Subject\r\n");
-            sixth.write_all(HDR_RESPONSE).await.unwrap();
+            expect_negotiated_request(&mut sixth, b"HDR Subject\r\n", HDR_RESPONSE).await;
 
             let (mut seventh, _) = listener.accept().await.unwrap();
             seventh.write_all(b"201 fetch ready\r\n").await.unwrap();
-            let read = seventh.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"XHDR Message-ID\r\n");
-            seventh.write_all(XHDR_RESPONSE).await.unwrap();
+            expect_negotiated_request(&mut seventh, b"XHDR Message-ID\r\n", XHDR_RESPONSE).await;
         });
 
         let mut hdr_range_args = test_fetch_args();
@@ -12768,35 +14104,24 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut first, _) = listener.accept().await.unwrap();
             first.write_all(b"201 fetch ready\r\n").await.unwrap();
-
-            let mut request = [0_u8; 128];
-            let read = first.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"OVER 1-10\r\n");
-            first.write_all(OVER_RESPONSE).await.unwrap();
+            expect_negotiated_request(&mut first, b"OVER 1-10\r\n", OVER_RESPONSE).await;
 
             let (mut second, _) = listener.accept().await.unwrap();
             second.write_all(b"201 fetch ready\r\n").await.unwrap();
-            let read = second.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"OVER <overview@test>\r\n");
-            second.write_all(OVER_RESPONSE).await.unwrap();
+            expect_negotiated_request(&mut second, b"OVER <overview@test>\r\n", OVER_RESPONSE)
+                .await;
 
             let (mut third, _) = listener.accept().await.unwrap();
             third.write_all(b"201 fetch ready\r\n").await.unwrap();
-            let read = third.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"XOVER 1-10\r\n");
-            third.write_all(XOVER_RESPONSE).await.unwrap();
+            expect_negotiated_request(&mut third, b"XOVER 1-10\r\n", XOVER_RESPONSE).await;
 
             let (mut fourth, _) = listener.accept().await.unwrap();
             fourth.write_all(b"201 fetch ready\r\n").await.unwrap();
-            let read = fourth.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"OVER\r\n");
-            fourth.write_all(OVER_RESPONSE).await.unwrap();
+            expect_negotiated_request(&mut fourth, b"OVER\r\n", OVER_RESPONSE).await;
 
             let (mut fifth, _) = listener.accept().await.unwrap();
             fifth.write_all(b"201 fetch ready\r\n").await.unwrap();
-            let read = fifth.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"XOVER\r\n");
-            fifth.write_all(XOVER_RESPONSE).await.unwrap();
+            expect_negotiated_request(&mut fifth, b"XOVER\r\n", XOVER_RESPONSE).await;
         });
 
         let mut over_range_args = test_fetch_args();
@@ -12892,18 +14217,21 @@ mod tests {
 
             let (mut seventh, _) = listener.accept().await.unwrap();
             seventh.write_all(b"201 fetch ready\r\n").await.unwrap();
-            let read = seventh.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"NEWGROUPS 20260101 000000 GMT\r\n");
-            seventh.write_all(NEWGROUPS_RESPONSE).await.unwrap();
+            expect_negotiated_request(
+                &mut seventh,
+                b"NEWGROUPS 20260101 000000 GMT\r\n",
+                NEWGROUPS_RESPONSE,
+            )
+            .await;
 
             let (mut eighth, _) = listener.accept().await.unwrap();
             eighth.write_all(b"201 fetch ready\r\n").await.unwrap();
-            let read = eighth.read(&mut request).await.unwrap();
-            assert_eq!(
-                &request[..read],
-                b"NEWNEWS comp.lang.*,alt.test 20260101 000000\r\n"
-            );
-            eighth.write_all(NEWNEWS_RESPONSE).await.unwrap();
+            expect_negotiated_request(
+                &mut eighth,
+                b"NEWNEWS comp.lang.*,alt.test 20260101 000000\r\n",
+                NEWNEWS_RESPONSE,
+            )
+            .await;
         });
 
         let mut group_args = test_fetch_args();
@@ -12989,52 +14317,65 @@ mod tests {
     async fn fetch_response_supports_remaining_rfc_request_kinds() {
         let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
         let addr = listener.local_addr().unwrap();
+        async fn expect_negotiated_request(
+            stream: &mut TcpStream,
+            expected_request: &[u8],
+            response: &[u8],
+        ) {
+            assert_read_request(stream, b"CAPABILITIES\r\n").await;
+            stream
+                .write_all(b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nSTARTTLS\r\n.\r\n")
+                .await
+                .unwrap();
+            let mut request = [0_u8; 256];
+            let read = stream.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], expected_request);
+            stream.write_all(response).await.unwrap();
+        }
+
         let server = tokio::spawn(async move {
             let (mut first, _) = listener.accept().await.unwrap();
             first.write_all(b"201 fetch ready\r\n").await.unwrap();
-            let mut request = [0_u8; 256];
-            let read = first.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"POST\r\n");
-            first.write_all(POST_RESPONSE).await.unwrap();
+            expect_negotiated_request(&mut first, b"POST\r\n", POST_RESPONSE).await;
 
             let (mut second, _) = listener.accept().await.unwrap();
             second.write_all(b"201 fetch ready\r\n").await.unwrap();
-            let read = second.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"IHAVE <ihave@test>\r\n");
-            second.write_all(IHAVE_RESPONSE).await.unwrap();
+            expect_negotiated_request(&mut second, b"IHAVE <ihave@test>\r\n", IHAVE_RESPONSE).await;
 
             let (mut third, _) = listener.accept().await.unwrap();
             third.write_all(b"201 fetch ready\r\n").await.unwrap();
-            let read = third.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"CHECK <check@test>\r\n");
-            third.write_all(CHECK_RESPONSE).await.unwrap();
+            expect_negotiated_request(&mut third, b"CHECK <check@test>\r\n", CHECK_RESPONSE).await;
 
             let (mut fourth, _) = listener.accept().await.unwrap();
             fourth.write_all(b"201 fetch ready\r\n").await.unwrap();
-            let read = fourth.read(&mut request).await.unwrap();
-            assert_eq!(
-                &request[..read],
-                b"TAKETHIS <take@test>\r\nSubject: Taken\r\n\r\n..dot line\r\npayload\r\n.\r\n"
-            );
-            fourth.write_all(TAKETHIS_RESPONSE).await.unwrap();
+            expect_negotiated_request(
+                &mut fourth,
+                b"TAKETHIS <take@test>\r\nSubject: Taken\r\n\r\n..dot line\r\npayload\r\n.\r\n",
+                TAKETHIS_RESPONSE,
+            )
+            .await;
 
             let (mut fifth, _) = listener.accept().await.unwrap();
             fifth.write_all(b"201 fetch ready\r\n").await.unwrap();
-            let read = fifth.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"AUTHINFO USER bench-user\r\n");
-            fifth.write_all(AUTHINFO_RESPONSE).await.unwrap();
+            expect_negotiated_request(
+                &mut fifth,
+                b"AUTHINFO USER bench-user\r\n",
+                AUTHINFO_RESPONSE,
+            )
+            .await;
 
             let (mut sixth, _) = listener.accept().await.unwrap();
             sixth.write_all(b"201 fetch ready\r\n").await.unwrap();
-            let read = sixth.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"AUTHINFO PASS bench-pass\r\n");
-            sixth.write_all(AUTHINFO_RESPONSE).await.unwrap();
+            expect_negotiated_request(
+                &mut sixth,
+                b"AUTHINFO PASS bench-pass\r\n",
+                AUTHINFO_RESPONSE,
+            )
+            .await;
 
             let (mut seventh, _) = listener.accept().await.unwrap();
             seventh.write_all(b"201 fetch ready\r\n").await.unwrap();
-            let read = seventh.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], b"STARTTLS\r\n");
-            seventh.write_all(STARTTLS_RESPONSE).await.unwrap();
+            expect_negotiated_request(&mut seventh, b"STARTTLS\r\n", STARTTLS_RESPONSE).await;
         });
 
         let mut post_args = test_fetch_args();
@@ -13724,7 +15065,7 @@ mod tests {
     #[tokio::test]
     async fn serve_session_reads_article_family_responses_from_article_dir() {
         let article_dir = unique_temp_dir("server-article-family");
-        let response = b"220 2 <article.2@test> article follows\r\nSubject: stored\r\nFrom: Bench User <bench@nntpbench.local>\r\n\r\n..dot line\r\nbody\r\n.\r\n";
+        let response = b"220 2 <article.2@test> article follows\r\nSubject: stored\r\nFrom: Bench User <bench@nntpbench.local>\r\nNewsgroups: alt.test\r\nDate: Fri, 16 May 2026 12:00:00 +0000\r\n\r\n..dot line\r\nbody\r\n.\r\n";
         let path = article_id_tree_path(&article_dir, 2);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, response).unwrap();
@@ -13737,14 +15078,15 @@ mod tests {
         )
         .await;
 
-        let expected_head = b"221 2 <article.2@test> article retrieved\r\nSubject: stored\r\nFrom: Bench User <bench@nntpbench.local>\r\n.\r\n";
+        let expected_group = b"211 1 2 2 alt.test\r\n";
+        let expected_head = b"221 2 <article.2@test> article retrieved\r\nSubject: stored\r\nFrom: Bench User <bench@nntpbench.local>\r\nNewsgroups: alt.test\r\nDate: Fri, 16 May 2026 12:00:00 +0000\r\n.\r\n";
         let expected_body = b"222 2 <article.2@test> body follows\r\n..dot line\r\nbody\r\n.\r\n";
         let expected_stat = b"223 2 <article.2@test> article retrieved\r\n";
         assert_eq!(
             output,
             [
                 GREETING,
-                GROUP_RESPONSE,
+                expected_group,
                 response,
                 expected_head,
                 expected_body,
@@ -13757,6 +15099,168 @@ mod tests {
         let snapshot = stats.snapshot();
         assert_eq!(snapshot.commands, 6);
         assert_eq!(snapshot.article_requests, 3);
+        assert_eq!(snapshot.bytes_sent, output.len() as u64);
+
+        fs::remove_dir_all(article_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn rfc3977_compliance_article_dir_group_state_uses_indexed_articles() {
+        let article_dir = unique_temp_dir("server-article-index");
+        let response = b"220 2 <article.2@test> article follows\r\nSubject: stored\r\nFrom: Bench User <bench@nntpbench.local>\r\nNewsgroups: alt.test\r\nDate: Fri, 16 May 2026 12:00:00 +0000\r\n\r\nbody\r\n.\r\n";
+        let path = article_id_tree_path(&article_dir, 2);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, response).unwrap();
+
+        let mut args = test_args();
+        args.article_dir = Some(article_dir.clone());
+        let (output, stats) = run_session_with_input(
+            Arc::new(ServerConfig::from_args(args)),
+            b"GROUP alt.test\r\nLISTGROUP\r\nARTICLE 1\r\nARTICLE 2\r\nLAST\r\nNEXT\r\nQUIT\r\n",
+        )
+        .await;
+
+        assert_eq!(
+            output,
+            [
+                GREETING,
+                b"211 1 2 2 alt.test\r\n".as_slice(),
+                b"211 1 2 2 alt.test\r\n2\r\n.\r\n".as_slice(),
+                b"423 no article with that number\r\n".as_slice(),
+                response,
+                b"422 no previous article in this group\r\n".as_slice(),
+                b"421 no next article in this group\r\n".as_slice(),
+                QUIT_RESPONSE,
+            ]
+            .concat()
+        );
+
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.commands, 7);
+        assert_eq!(snapshot.article_requests, 2);
+        assert_eq!(snapshot.bytes_sent, output.len() as u64);
+
+        fs::remove_dir_all(article_dir).unwrap();
+    }
+
+    #[test]
+    fn server_config_tracks_article_index_build_errors() {
+        let article_dir = write_temp_segments("article-index-error", "not a directory");
+
+        let mut args = test_args();
+        args.article_dir = Some(article_dir.clone());
+        let config = ServerConfig::from_args(args);
+
+        assert!(
+            config.article_index_error.is_some(),
+            "article_dir index build errors should be visible to callers"
+        );
+
+        fs::remove_file(article_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn rfc3977_compliance_article_dir_discovery_views_track_store() {
+        let article_dir = unique_temp_dir("server-article-discovery");
+        let response = b"220 2 <article.2@test> article follows\r\nSubject: stored\r\nFrom: Bench User <bench@nntpbench.local>\r\nNewsgroups: alt.test\r\nDate: Fri, 16 May 2026 12:00:00 +0000\r\n\r\nbody\r\n.\r\n";
+        let path = article_id_tree_path(&article_dir, 2);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, response).unwrap();
+
+        let mut args = test_args();
+        args.article_dir = Some(article_dir.clone());
+        let (output, stats) = run_session_with_input(
+            Arc::new(ServerConfig::from_args(args)),
+            b"LIST ACTIVE\r\nNEWGROUPS 20260515 000000 GMT\r\nNEWNEWS alt.* 20260515 000000 GMT\r\nQUIT\r\n",
+        )
+        .await;
+
+        assert_eq!(
+            output,
+            [
+                GREETING,
+                b"215 list of newsgroups follows\r\nalt.test 2 2 y\r\n.\r\n".as_slice(),
+                b"231 list of new newsgroups follows\r\nalt.test 2 2 y\r\n.\r\n".as_slice(),
+                b"230 list of new articles follows\r\n<article.2@test>\r\n.\r\n".as_slice(),
+                QUIT_RESPONSE,
+            ]
+            .concat()
+        );
+
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.commands, 4);
+        assert_eq!(snapshot.bytes_sent, output.len() as u64);
+
+        fs::remove_dir_all(article_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn rfc3977_compliance_article_dir_overview_and_header_views_track_store() {
+        let article_dir = unique_temp_dir("server-article-header");
+        let response = b"220 2 <article.2@test> article follows\r\nSubject: stored\r\nFrom: Bench User <bench@nntpbench.local>\r\nNewsgroups: alt.test\r\nDate: Fri, 16 May 2026 12:00:00 +0000\r\n\r\nbody\r\n.\r\n";
+        let path = article_id_tree_path(&article_dir, 2);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, response).unwrap();
+
+        let article = Article::parse(response).unwrap();
+        let headers = article.headers.unwrap();
+        let body = article.body.unwrap();
+        let overview_bytes = headers.as_bytes().len() as u64 + body.len() as u64 + 2;
+        let lines = memchr::memchr_iter(b'\n', &body).count() as u64;
+        let subject = headers.get("Subject").unwrap();
+        let from = headers.get("From").unwrap();
+        let date = headers.get("Date").unwrap();
+        let message_id = article.message_id.as_str();
+        let references = headers.get("References").unwrap_or(&[]);
+
+        let expected_overview_row = |row_key: &str| {
+            format!(
+                "224 Overview information follows\r\n{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\r\n.\r\n",
+                row_key,
+                std::str::from_utf8(subject).unwrap(),
+                std::str::from_utf8(from).unwrap(),
+                std::str::from_utf8(date).unwrap(),
+                message_id,
+                std::str::from_utf8(references).unwrap_or_default(),
+                overview_bytes,
+                lines
+            )
+        };
+        let expected_numeric_overview_row = expected_overview_row("2");
+        let expected_message_id_overview_row = expected_overview_row("0");
+        let expected_header_row = "225 headers follow\r\n2 stored\r\n.\r\n";
+        let expected_xheader_row = "221 headers follow\r\n2 stored\r\n.\r\n";
+        let expected_message_id_header_row = "225 headers follow\r\n0 stored\r\n.\r\n";
+        let expected_message_id_xheader_row =
+            "221 headers follow\r\n<article.2@test> stored\r\n.\r\n";
+
+        let mut args = test_args();
+        args.article_dir = Some(article_dir.clone());
+        let (output, stats) = run_session_with_input(
+            Arc::new(ServerConfig::from_args(args)),
+            b"GROUP alt.test\r\nOVER 2\r\nXOVER 2\r\nHDR Subject 2\r\nXHDR Subject 2\r\nOVER <article.2@test>\r\nHDR Subject <article.2@test>\r\nXHDR Subject <article.2@test>\r\nQUIT\r\n",
+        )
+        .await;
+
+        assert_eq!(
+            output,
+            [
+                GREETING,
+                b"211 1 2 2 alt.test\r\n".as_slice(),
+                expected_numeric_overview_row.as_bytes(),
+                expected_numeric_overview_row.as_bytes(),
+                expected_header_row.as_bytes(),
+                expected_xheader_row.as_bytes(),
+                expected_message_id_overview_row.as_bytes(),
+                expected_message_id_header_row.as_bytes(),
+                expected_message_id_xheader_row.as_bytes(),
+                QUIT_RESPONSE,
+            ]
+            .concat()
+        );
+
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.commands, 9);
         assert_eq!(snapshot.bytes_sent, output.len() as u64);
 
         fs::remove_dir_all(article_dir).unwrap();
@@ -14608,7 +16112,7 @@ mod tests {
     #[test]
     fn process_request_to_buffer_uses_article_dir_for_article_family_responses() {
         let article_dir = unique_temp_dir("process-article-family");
-        let response = b"220 2 <article.2@test> article follows\r\nSubject: stored\r\nFrom: Bench User <bench@nntpbench.local>\r\n\r\n..dot line\r\nbody\r\n.\r\n";
+        let response = b"220 2 <article.2@test> article follows\r\nSubject: stored\r\nFrom: Bench User <bench@nntpbench.local>\r\nNewsgroups: alt.test\r\nDate: Fri, 16 May 2026 12:00:00 +0000\r\n\r\n..dot line\r\nbody\r\n.\r\n";
         let path = article_id_tree_path(&article_dir, 2);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, response).unwrap();
@@ -14644,7 +16148,7 @@ mod tests {
             &mut output,
         ));
 
-        let expected_head = b"221 2 <article.2@test> article retrieved\r\nSubject: stored\r\nFrom: Bench User <bench@nntpbench.local>\r\n.\r\n";
+        let expected_head = b"221 2 <article.2@test> article retrieved\r\nSubject: stored\r\nFrom: Bench User <bench@nntpbench.local>\r\nNewsgroups: alt.test\r\nDate: Fri, 16 May 2026 12:00:00 +0000\r\n.\r\n";
         let expected_body = b"222 2 <article.2@test> body follows\r\n..dot line\r\nbody\r\n.\r\n";
         let expected_stat = b"223 2 <article.2@test> article retrieved\r\n";
         assert_eq!(
