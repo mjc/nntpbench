@@ -7911,6 +7911,12 @@ mod tests {
                         frame: b"215 information follows\r\nalt.test  1715907600   admin test creator\r\n.\r\n",
                     },
                     ResponseFrameCase {
+                        name: "LIST ACTIVE.TIMES accepts RFC example empty creator field",
+                        reference: "RFC 3977 sections 7.6.4 and 9.6 https://www.rfc-editor.org/rfc/rfc3977#section-7.6.4",
+                        kind: RequestKind::ListActiveTimes,
+                        frame: b"215 information follows\r\nalt.test 1715907600 \r\n.\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "LIST NEWSGROUPS accepts byte-oriented S-TEXT description",
                         reference: "RFC 3977 sections 7.6.6 and 9.6 https://www.rfc-editor.org/rfc/rfc3977#section-9.6",
                         kind: RequestKind::ListNewsgroups,
@@ -8612,12 +8618,6 @@ mod tests {
                         reference: "RFC 3977 section 7.6.4 https://www.rfc-editor.org/rfc/rfc3977#section-7.6.4",
                         kind: RequestKind::ListActiveTimes,
                         frame: b"215 information follows\r\nalt.test yesterday admin@test\r\n.\r\n",
-                    },
-                    ResponseFrameCase {
-                        name: "LIST ACTIVE.TIMES rejects empty creator text",
-                        reference: "RFC 3977 sections 7.6.4 and 9.6 https://www.rfc-editor.org/rfc/rfc3977#section-9.6",
-                        kind: RequestKind::ListActiveTimes,
-                        frame: b"215 information follows\r\nalt.test 1715907600 \r\n.\r\n",
                     },
                     ResponseFrameCase {
                         name: "LIST ACTIVE.TIMES rejects creator text without leading P-CHAR",
