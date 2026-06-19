@@ -8071,6 +8071,24 @@ mod tests {
                     expected: NEWNEWS_EMPTY_RESPONSE,
                 },
                 ServerResponseCase {
+                    name: "NEWNEWS accepts omitted GMT flag",
+                    reference: "RFC 3977 section 7.4.1 defines GMT as optional https://www.rfc-editor.org/rfc/rfc3977#section-7.4.1",
+                    input: b"NEWNEWS alt.* 700101 000000\r\n",
+                    expected: NEWNEWS_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "NEWNEWS accepts lowercase GMT token",
+                    reference: "RFC 3977 sections 7.4.1 and 9.8 define GMT as a keyword token https://www.rfc-editor.org/rfc/rfc3977#section-7.4.1",
+                    input: b"NEWNEWS alt.* 700101 000000 gmt\r\n",
+                    expected: NEWNEWS_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "NEWNEWS rejects unsupported distribution argument",
+                    reference: "RFC 3977 section 7.4.1 does not define a distribution argument https://www.rfc-editor.org/rfc/rfc3977#section-7.4.1",
+                    input: b"NEWNEWS alt.* 700101 000000 GMT local\r\n",
+                    expected: b"501 command syntax error\r\n",
+                },
+                ServerResponseCase {
                     name: "NEWNEWS invalid date",
                     reference: "RFC 3977 sections 7.4.1 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-7.4.1",
                     input: b"NEWNEWS comp.lang.* 20260132 000000 GMT\r\n",
@@ -8080,6 +8098,30 @@ mod tests {
                     name: "NEWNEWS invalid time",
                     reference: "RFC 3977 sections 7.4.1 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-7.4.1",
                     input: b"NEWNEWS comp.lang.* 20260101 246060 GMT\r\n",
+                    expected: b"501 command syntax error\r\n",
+                },
+                ServerResponseCase {
+                    name: "NEWNEWS rejects zero month",
+                    reference: "RFC 3977 sections 7.3.2 and 7.4.1 define months 01-12 https://www.rfc-editor.org/rfc/rfc3977#section-7.4.1",
+                    input: b"NEWNEWS comp.lang.* 20260001 000000 GMT\r\n",
+                    expected: b"501 command syntax error\r\n",
+                },
+                ServerResponseCase {
+                    name: "NEWNEWS rejects zero day",
+                    reference: "RFC 3977 sections 7.3.2 and 7.4.1 define days 01-31 https://www.rfc-editor.org/rfc/rfc3977#section-7.4.1",
+                    input: b"NEWNEWS comp.lang.* 20260100 000000 GMT\r\n",
+                    expected: b"501 command syntax error\r\n",
+                },
+                ServerResponseCase {
+                    name: "NEWNEWS rejects minute 60",
+                    reference: "RFC 3977 sections 7.3.2 and 7.4.1 define minutes 00-59 https://www.rfc-editor.org/rfc/rfc3977#section-7.4.1",
+                    input: b"NEWNEWS comp.lang.* 20260101 006000 GMT\r\n",
+                    expected: b"501 command syntax error\r\n",
+                },
+                ServerResponseCase {
+                    name: "NEWNEWS rejects second 61",
+                    reference: "RFC 3977 sections 7.3.2 and 7.4.1 define seconds 00-60 https://www.rfc-editor.org/rfc/rfc3977#section-7.4.1",
+                    input: b"NEWNEWS comp.lang.* 20260101 000061 GMT\r\n",
                     expected: b"501 command syntax error\r\n",
                 },
                 ServerResponseCase {
