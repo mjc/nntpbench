@@ -4649,6 +4649,34 @@ fn command_tokens(args: &[u8]) -> impl Iterator<Item = &[u8]> {
         .filter(|token| !token.is_empty())
 }
 
+pub(crate) fn request_line_has_valid_generic_command_syntax(request: RequestLine<'_>) -> bool {
+    validate_ascii_token(request.verb(), validate_keyword)
+        && command_tokens(request.args()).all(validate_p_char_token)
+}
+
+pub(crate) fn command_line_has_valid_generic_syntax(line: &[u8]) -> bool {
+    let Some(line) = strip_complete_crlf_line(line) else {
+        return false;
+    };
+    let line = strip_command_eol_ws(line);
+    if command_spacing_is_invalid(line) {
+        return false;
+    }
+
+    let split = line
+        .iter()
+        .position(|byte| is_command_ws(*byte))
+        .unwrap_or(line.len());
+    let verb = &line[..split];
+    let args = if split < line.len() {
+        skip_command_ws(&line[split..])
+    } else {
+        &[]
+    };
+
+    validate_ascii_token(verb, validate_keyword) && command_tokens(args).all(validate_p_char_token)
+}
+
 fn classify_direct_command(kind: RequestKind, args: &[u8]) -> RequestKind {
     match kind {
         RequestKind::Article | RequestKind::Body | RequestKind::Head | RequestKind::Stat => {

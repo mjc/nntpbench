@@ -2973,7 +2973,9 @@ fn parse_command_line(line: &[u8], line_slot: usize) -> ParsedCommand {
         article_id: parse_article_id_arg(request.args()),
         line_slot: line_slot.try_into().unwrap_or(u16::MAX),
         message_id: parsed_message_id_range(line, request.message_id()),
-        syntax_error: matches!(request.kind(), RequestKind::Unknown) && is_known_command_line(line),
+        syntax_error: matches!(request.kind(), RequestKind::Unknown)
+            && (is_known_command_line(line)
+                || !protocol::command_line_has_valid_generic_syntax(line)),
         authinfo_sasl_base64_error: authinfo_sasl_initial_response_base64_error(
             request.verb(),
             request.args(),
@@ -3065,7 +3067,9 @@ fn is_known_command_line(line: &[u8]) -> bool {
 }
 
 fn is_known_request_syntax_error(request: RequestLine<'_>) -> bool {
-    matches!(request.kind(), RequestKind::Unknown) && is_known_command_line(request.verb())
+    matches!(request.kind(), RequestKind::Unknown)
+        && (is_known_command_line(request.verb())
+            || !protocol::request_line_has_valid_generic_command_syntax(request))
 }
 
 fn parsed_message_id_range(
@@ -8269,6 +8273,30 @@ mod tests {
                         expected: b"205 closing connection\r\n",
                     },
                     ServerResponseCase {
+                        name: "unknown command rejects too-short keyword syntax",
+                        reference: "RFC 3977 sections 3.2.1 and 9.2 define unknown-command 500 only for syntactically valid commands https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
+                        input: b"XY\r\n",
+                        expected: b"501 command syntax error\r\n",
+                    },
+                    ServerResponseCase {
+                        name: "unknown command rejects non-alpha keyword syntax",
+                        reference: "RFC 3977 sections 3.2.1 and 9.2 require command keywords to start with ALPHA https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
+                        input: b"1BAD\r\n",
+                        expected: b"501 command syntax error\r\n",
+                    },
+                    ServerResponseCase {
+                        name: "unknown command rejects invalid token syntax",
+                        reference: "RFC 3977 sections 9.2 and 9.8 define extension command arguments as P-CHAR tokens https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
+                        input: b"XYZZY bad\0token\r\n",
+                        expected: b"501 command syntax error\r\n",
+                    },
+                    ServerResponseCase {
+                        name: "unknown command with valid keyword returns 500",
+                        reference: "RFC 3977 section 3.2.1 defines 500 for unknown but syntactically valid commands https://www.rfc-editor.org/rfc/rfc3977#section-3.2.1",
+                        input: b"XYZZY valid-token\r\n",
+                        expected: b"500 unknown command\r\n",
+                    },
+                    ServerResponseCase {
                         name: "LIST unknown keyword with trailing token",
                         reference: "RFC 3977 section 7.6 https://www.rfc-editor.org/rfc/rfc3977#section-7.6",
                         input: b"LIST FROBNICATE extra\r\n",
@@ -12746,9 +12774,21 @@ mod tests {
             &stats,
             &mut output,
         ));
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"XY\r\n"),
+            &config,
+            &stats,
+            &mut output,
+        ));
+        assert!(!process_request_to_buffer(
+            RequestLine::parse(b"XYZZY bad\0token\r\n"),
+            &config,
+            &stats,
+            &mut output,
+        ));
 
         let snapshot = stats.snapshot();
-        assert_eq!(snapshot.commands, 5);
+        assert_eq!(snapshot.commands, 7);
         assert_eq!(snapshot.article_requests, 2);
         assert_eq!(snapshot.body_requests, 1);
         assert!(output.starts_with(b"222 "));
@@ -12762,7 +12802,12 @@ mod tests {
                 .windows(STAT_RESPONSE.len())
                 .any(|window| window == STAT_RESPONSE)
         );
-        assert!(output.ends_with(b"500 unknown command\r\n"));
+        assert!(
+            output
+                .windows(b"500 unknown command\r\n".len())
+                .any(|window| window == b"500 unknown command\r\n")
+        );
+        assert!(output.ends_with(b"501 command syntax error\r\n501 command syntax error\r\n"));
     }
 
     #[test]
