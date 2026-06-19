@@ -10867,11 +10867,16 @@ mod tests {
         // RFC 3977 section 5.1 allows only 200, 201, 400, and 502 as initial
         // connection greeting codes. 200 and 201 are service-ready states;
         // 400 and 502 require the server to close and must not be treated as
-        // a usable client connection:
+        // a usable client connection. Sections 9.4.1 and 9.8 define greeting
+        // response text as optional U-CHAR text after the status code:
         // https://www.rfc-editor.org/rfc/rfc3977#section-5.1
+        // https://www.rfc-editor.org/rfc/rfc3977#section-9.4.1
         for greeting in [
+            b"200\r\n".as_slice(),
             b"200 service ready, posting allowed\r\n".as_slice(),
+            b"200 service ready\twith tab\r\n".as_slice(),
             b"201 service ready, posting prohibited\r\n".as_slice(),
+            b"201 service ready caf\xc3\xa9\r\n".as_slice(),
         ] {
             read_greeting_result_for(greeting).await.unwrap();
         }
@@ -10891,6 +10896,8 @@ mod tests {
             b"999 invalid response class\r\n".as_slice(),
             b"ready\r\n".as_slice(),
             b"201 ready caf\xe9\r\n".as_slice(),
+            b"201 ready\x7fwith DEL\r\n".as_slice(),
+            b"201 ready\xef\xbb\xbfwith BOM\r\n".as_slice(),
         ] {
             let err = read_greeting_result_for(greeting).await.unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{greeting:?}");
