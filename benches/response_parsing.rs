@@ -165,7 +165,7 @@ mod response_frame_parsing {
 This is the benchmark body.\r\n\
 It has multiple lines.\r\n\
 .\r\n";
-    const EMPTY_CAPABILITIES_RESPONSE: &[u8] = b"101 capability list follows\r\n.\r\n";
+    const EMPTY_CAPABILITIES_RESPONSE: &[u8] = b"101 capability list follows\r\nVERSION 2\r\n.\r\n";
 
     #[divan::bench(sample_count = 1000, sample_size = 100)]
     fn single_line_stat(bencher: Bencher) {

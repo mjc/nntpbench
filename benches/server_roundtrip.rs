@@ -274,7 +274,7 @@ mod command_roundtrip {
 
     #[divan::bench(sample_count = 100, sample_size = 100)]
     fn unknown(bencher: Bencher) {
-        bench_persistent_roundtrip(bencher, b"HEAD 1\r\n", false, BODY_64K, ARTICLE_64K, 64);
+        bench_persistent_roundtrip(bencher, b"XYZZY 1\r\n", false, BODY_64K, ARTICLE_64K, 64);
     }
 
     #[divan::bench(sample_count = 100, sample_size = 100)]
