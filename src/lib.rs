@@ -8897,6 +8897,18 @@ mod tests {
                         frame: b"215 headers supported\r\n:\r\n:bytes\r\n:lines\r\n.\r\n",
                     },
                     ResponseFrameCase {
+                        name: "LIST DISTRIB.PATS accepts priority wildmat distribution triples",
+                        reference: "RFC 3977 sections 7.6.5 and 9.6 define LIST DISTRIB.PATS rows as priority:wildmat:distribution https://www.rfc-editor.org/rfc/rfc3977#section-7.6.5",
+                        kind: RequestKind::ListDistribPats,
+                        frame: b"215 distribution patterns\r\n1:*:world\r\n10:comp.lang.?:local\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "LIST DISTRIB.PATS accepts punctuation distribution token",
+                        reference: "RFC 3977 sections 7.6.5 and 9.8 define distribution as a P-CHAR token https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
+                        kind: RequestKind::ListDistribPats,
+                        frame: b"215 distribution patterns\r\n1:*.local:local.test!edge\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "CAPABILITIES accepts TAB-separated WS tokens",
                         reference: "RFC 3977 sections 5.2 and 9.5 https://www.rfc-editor.org/rfc/rfc3977#section-9.5",
                         kind: RequestKind::Capabilities,
