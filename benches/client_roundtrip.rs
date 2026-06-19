@@ -169,12 +169,10 @@ fn bench_pipelined_rfc_grammar_requests(bencher: Bencher) {
         .bench_local(|| {
             black_box(harness.rt.block_on(async {
                 let (body, article, over, listgroup) = tokio::try_join!(
-                    harness.client.body_selector("42"),
-                    harness.client.article_current(),
+                    harness.client.body("bench.body@nntpbench.local"),
+                    harness.client.article("bench.article@nntpbench.local"),
                     harness.client.over("<overview@nntpbench.local>"),
-                    harness
-                        .client
-                        .listgroup_group_range("alt.binaries.bench", "1-10"),
+                    harness.client.listgroup_group_range("alt.test", "1-3"),
                 )
                 .unwrap();
 

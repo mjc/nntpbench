@@ -176,8 +176,8 @@ fn bench_connecting_command(
 fn bench_pipeline_mixed(bencher: Bencher) {
     let rt = Builder::new_current_thread().enable_all().build().unwrap();
     let addr = rt.block_on(spawn_server(BODY_64K, ARTICLE_64K));
-    let request = b"BODY 42\r\n\
-ARTICLE\r\n\
+    let request = b"BODY <body@nntpbench.local>\r\n\
+ARTICLE <article@nntpbench.local>\r\n\
 CAPABILITIES\r\n\
 DATE\r\n\
 MODE READER\r\n\

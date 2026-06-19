@@ -89,7 +89,7 @@ Article body line 5\r\n\
 mod article_parsing {
     use super::{Article, Bencher, black_box};
 
-    const ARTICLE_RESPONSE: &[u8] = b"220 42 <bench@example.com>\r\n\
+    const ARTICLE_RESPONSE: &[u8] = b"220 42 <bench@example.com> article follows\r\n\
 Subject: Benchmark\r\n\
 From: bench@example.com\r\n\
 Message-ID: <bench@example.com>\r\n\
@@ -98,22 +98,24 @@ This is the benchmark body.\r\n\
 It has multiple lines.\r\n\
 .\r\n";
 
-    const HEAD_RESPONSE: &[u8] = b"221 42 <bench@example.com>\r\n\
+    const HEAD_RESPONSE: &[u8] = b"221 42 <bench@example.com> article retrieved\r\n\
 Subject: Benchmark\r\n\
 From: bench@example.com\r\n\
 Message-ID: <bench@example.com>\r\n\
 .\r\n";
 
-    const BODY_RESPONSE: &[u8] = b"222 42 <bench@example.com>\r\n\
+    const BODY_RESPONSE: &[u8] = b"222 42 <bench@example.com> body follows\r\n\
 This is the benchmark body.\r\n\
 It has multiple lines.\r\n\
 .\r\n";
 
-    const STAT_RESPONSE: &[u8] = b"223 42 <bench@example.com>\r\n.\r\n";
-    const LONG_ARTICLE_RESPONSE: &[u8] = b"220 42 <aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa@example.com>\r\nSubject: Benchmark\r\nFrom: bench@example.com\r\nMessage-ID: <bench@example.com>\r\n\r\nBody\r\n.\r\n";
-    const EMPTY_ARTICLE_RESPONSE: &[u8] = b"220 42 <bench@example.com>\r\n\r\n\r\n.\r\n";
-    const EMPTY_HEAD_RESPONSE: &[u8] = b"221 42 <bench@example.com>\r\n.\r\n";
-    const EMPTY_BODY_RESPONSE: &[u8] = b"222 42 <bench@example.com>\r\n.\r\n";
+    const STAT_RESPONSE: &[u8] = b"223 42 <bench@example.com> article retrieved\r\n";
+    const LONG_ARTICLE_RESPONSE: &[u8] = b"220 42 <aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa@example.com> article follows\r\nSubject: Benchmark\r\nFrom: bench@example.com\r\nMessage-ID: <bench@example.com>\r\n\r\nBody\r\n.\r\n";
+    const EMPTY_ARTICLE_RESPONSE: &[u8] =
+        b"220 42 <bench@example.com> article follows\r\nSubject: Empty\r\n\r\n.\r\n";
+    const EMPTY_HEAD_RESPONSE: &[u8] =
+        b"221 42 <bench@example.com> article retrieved\r\nSubject: Empty\r\n.\r\n";
+    const EMPTY_BODY_RESPONSE: &[u8] = b"222 42 <bench@example.com> body follows\r\n.\r\n";
 
     #[divan::bench(sample_count = 1000, sample_size = 100)]
     fn article_220(bencher: Bencher) {
