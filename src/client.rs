@@ -10,7 +10,7 @@ use std::sync::Arc;
 use bytes::{BufMut, Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, OnceCell, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::protocol::{
@@ -928,6 +928,7 @@ impl ClientConnection {
             inner: Arc::new(ConnectionHandle {
                 request_tx,
                 poisoned,
+                capabilities_negotiated: Arc::new(OnceCell::new()),
                 writer_task,
                 reader_task,
             }),
@@ -1767,6 +1768,20 @@ impl ClientConnection {
         &self,
         request: Request<'static>,
     ) -> Result<PendingResponse, ClientError> {
+        let kind = request.kind();
+        if kind != RequestKind::Capabilities {
+            self.ensure_capabilities_negotiated(kind).await?;
+        }
+
+        self.queue_request_unchecked(request, kind == RequestKind::Capabilities)
+            .await
+    }
+
+    async fn queue_request_unchecked(
+        &self,
+        request: Request<'static>,
+        mark_capabilities_on_success: bool,
+    ) -> Result<PendingResponse, ClientError> {
         let (response_tx, response_rx) = oneshot::channel();
         self.inner
             .request_tx
@@ -1780,12 +1795,27 @@ impl ClientConnection {
         Ok(PendingResponse {
             inner: self.inner.clone(),
             response_rx,
+            mark_capabilities_on_success,
         })
     }
 
     pub(crate) async fn queue_request_exchange(
         &self,
         request: Request<'static>,
+    ) -> Result<PendingExchange, ClientError> {
+        let kind = request.kind();
+        if kind != RequestKind::Capabilities {
+            self.ensure_capabilities_negotiated(kind).await?;
+        }
+
+        self.queue_request_exchange_unchecked(request, kind == RequestKind::Capabilities)
+            .await
+    }
+
+    async fn queue_request_exchange_unchecked(
+        &self,
+        request: Request<'static>,
+        mark_capabilities_on_success: bool,
     ) -> Result<PendingExchange, ClientError> {
         let (response_tx, response_rx) = oneshot::channel();
         self.inner
@@ -1800,6 +1830,7 @@ impl ClientConnection {
         Ok(PendingExchange {
             inner: self.inner.clone(),
             response_rx,
+            mark_capabilities_on_success,
         })
     }
 
@@ -1810,6 +1841,50 @@ impl ClientConnection {
     ) -> Result<OwnedExchange, ClientError> {
         self.queue_request_exchange(request).await?.receive().await
     }
+
+    async fn ensure_capabilities_negotiated(
+        &self,
+        request_kind: RequestKind,
+    ) -> Result<(), ClientError> {
+        if !request_kind_requires_capabilities(request_kind) {
+            return Ok(());
+        }
+
+        let response = self
+            .inner
+            .capabilities_negotiated
+            .get_or_try_init(|| async {
+                let pending = self
+                    .queue_request_unchecked(Request::Capabilities, false)
+                    .await?;
+                let response = pending.receive().await?;
+                if response.status().as_u16() != 101 {
+                    return Err(ClientError::CapabilitiesUnavailable);
+                }
+                Ok::<(), ClientError>(())
+            })
+            .await;
+        response.map(|_| ())
+    }
+}
+
+fn request_kind_requires_capabilities(kind: RequestKind) -> bool {
+    matches!(
+        kind,
+        RequestKind::Post
+            | RequestKind::Ihave
+            | RequestKind::Check
+            | RequestKind::TakeThis
+            | RequestKind::AuthInfoUser
+            | RequestKind::AuthInfoPass
+            | RequestKind::StartTls
+            | RequestKind::Over
+            | RequestKind::Xover
+            | RequestKind::Hdr
+            | RequestKind::Xhdr
+            | RequestKind::NewGroups
+            | RequestKind::NewNews
+    )
 }
 
 impl Drop for ConnectionHandle {
@@ -1823,6 +1898,7 @@ impl Drop for ConnectionHandle {
 struct ConnectionHandle {
     request_tx: mpsc::Sender<QueuedRequest>,
     poisoned: Arc<Mutex<Option<SharedEngineError>>>,
+    capabilities_negotiated: Arc<OnceCell<()>>,
     writer_task: JoinHandle<()>,
     reader_task: JoinHandle<()>,
 }
@@ -2013,6 +2089,7 @@ pub enum ClientError {
     InvalidArticleSelector,
     MissingArticleSelector,
     InvalidListGroupRange,
+    CapabilitiesUnavailable,
     ConnectionClosed,
     UnexpectedArticleResponse {
         response: OwnedResponse,
@@ -2046,6 +2123,9 @@ impl fmt::Display for ClientError {
                 write!(f, "article selector is required for this request")
             }
             Self::InvalidListGroupRange => write!(f, "invalid LISTGROUP range"),
+            Self::CapabilitiesUnavailable => {
+                write!(f, "CAPABILITIES did not return a capability list")
+            }
             Self::ConnectionClosed => write!(f, "connection engine closed"),
             Self::UnexpectedArticleResponse { response, source } => write!(
                 f,
@@ -2329,6 +2409,7 @@ struct QueuedRequest {
 pub(crate) struct PendingResponse {
     inner: Arc<ConnectionHandle>,
     response_rx: oneshot::Receiver<Result<CompletedRequest, SharedEngineError>>,
+    mark_capabilities_on_success: bool,
 }
 
 impl PendingResponse {
@@ -2348,7 +2429,14 @@ impl PendingResponse {
         };
 
         match response.map_err(ClientError::from)?.response {
-            CompletedResponse::Owned(response) => Ok(response),
+            CompletedResponse::Owned(response) => {
+                if self.mark_capabilities_on_success && response.status().as_u16() == 101 {
+                    let _ = self.inner.capabilities_negotiated.set(());
+                } else if self.mark_capabilities_on_success {
+                    return Err(ClientError::CapabilitiesUnavailable);
+                }
+                Ok(response)
+            }
         }
     }
 }
@@ -2357,6 +2445,7 @@ impl PendingResponse {
 pub(crate) struct PendingExchange {
     inner: Arc<ConnectionHandle>,
     response_rx: oneshot::Receiver<Result<CompletedRequest, SharedEngineError>>,
+    mark_capabilities_on_success: bool,
 }
 
 impl PendingExchange {
@@ -2377,10 +2466,17 @@ impl PendingExchange {
 
         let completed = response.map_err(ClientError::from)?;
         match completed.response {
-            CompletedResponse::Owned(response) => Ok(OwnedExchange {
-                request: completed.request,
-                response,
-            }),
+            CompletedResponse::Owned(response) => {
+                if self.mark_capabilities_on_success && response.status().as_u16() == 101 {
+                    let _ = self.inner.capabilities_negotiated.set(());
+                } else if self.mark_capabilities_on_success {
+                    return Err(ClientError::CapabilitiesUnavailable);
+                }
+                Ok(OwnedExchange {
+                    request: completed.request,
+                    response,
+                })
+            }
         }
     }
 }
@@ -3079,6 +3175,7 @@ fn shared_engine_error_from_client(err: ClientError) -> SharedEngineError {
         | ClientError::InvalidArticleSelector
         | ClientError::MissingArticleSelector
         | ClientError::InvalidListGroupRange
+        | ClientError::CapabilitiesUnavailable
         | ClientError::UnexpectedArticleResponse { .. } => SharedEngineError::ConnectionClosed,
     }
 }
@@ -4515,6 +4612,11 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             stream.write_all(b"201 client ready\r\n").await.unwrap();
+            assert_read_request(&mut stream, b"CAPABILITIES\r\n").await;
+            stream
+                .write_all(b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n")
+                .await
+                .unwrap();
             assert_read_request(&mut stream, b"NEWGROUPS 20260101 000000 GMT\r\n").await;
             stream.write_all(crate::NEWGROUPS_RESPONSE).await.unwrap();
             assert_read_request(
@@ -4561,6 +4663,11 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             stream.write_all(b"201 client ready\r\n").await.unwrap();
+            assert_read_request(&mut stream, b"CAPABILITIES\r\n").await;
+            stream
+                .write_all(b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nSTARTTLS\r\n.\r\n")
+                .await
+                .unwrap();
             assert_read_request(&mut stream, b"POST\r\n").await;
             stream.write_all(crate::POST_RESPONSE).await.unwrap();
             assert_read_request(&mut stream, b"IHAVE <ihave@test>\r\n").await;
@@ -4627,12 +4734,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rfc3977_compliance_client_connection_negotiates_capabilities_before_starttls() {
+        // RFC 3977 section 3.3 requires clients to discover CAPABILITIES
+        // before treating extension commands as negotiated behavior, and RFC
+        // 4642 section 2.2 places STARTTLS behind capability advertisement.
+        // This benchmark client still jumps straight to STARTTLS.
+        use std::time::Duration;
+
+        let listener = crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"201 client ready\r\n").await.unwrap();
+            assert_read_request(&mut stream, b"CAPABILITIES\r\n").await;
+            stream
+                .write_all(b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nSTARTTLS\r\n.\r\n")
+                .await
+                .unwrap();
+            assert_read_request(&mut stream, b"STARTTLS\r\n").await;
+            stream.write_all(crate::STARTTLS_RESPONSE).await.unwrap();
+        });
+
+        let connection = ClientConnection::connect(addr).await.unwrap();
+        let result = tokio::time::timeout(Duration::from_millis(250), connection.starttls()).await;
+        server.abort();
+        let _ = server.await;
+
+        assert!(
+            result.is_ok(),
+            "RFC 3977 and RFC 4642 require capability negotiation before STARTTLS, but the client did not complete the negotiated path"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_connection_retries_capability_preflight_after_non_list_response() {
+        let listener = crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"201 client ready\r\n").await.unwrap();
+
+            assert_read_request(&mut stream, b"CAPABILITIES\r\n").await;
+            stream
+                .write_all(b"501 capability keyword not understood\r\n")
+                .await
+                .unwrap();
+
+            assert_read_request(&mut stream, b"CAPABILITIES\r\n").await;
+            stream
+                .write_all(b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nSTARTTLS\r\n.\r\n")
+                .await
+                .unwrap();
+            assert_read_request(&mut stream, b"STARTTLS\r\n").await;
+            stream.write_all(crate::STARTTLS_RESPONSE).await.unwrap();
+        });
+
+        let connection = ClientConnection::connect(addr).await.unwrap();
+        assert!(matches!(
+            connection.capabilities().await,
+            Err(ClientError::CapabilitiesUnavailable)
+        ));
+        let starttls = connection.starttls().await.unwrap();
+        assert_eq!(starttls.kind(), RequestKind::StartTls);
+        assert_eq!(starttls.status().as_u16(), 382);
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn client_connection_fetches_hdr_and_xhdr_frames() {
         let listener = crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             stream.write_all(b"201 client ready\r\n").await.unwrap();
+            assert_read_request(&mut stream, b"CAPABILITIES\r\n").await;
+            stream
+                .write_all(b"101 Capability list:\r\nVERSION 2\r\nOVER\r\n.\r\n")
+                .await
+                .unwrap();
             assert_read_request(&mut stream, b"HDR Subject 1-10\r\n").await;
             stream.write_all(crate::HDR_RESPONSE).await.unwrap();
             assert_read_request(&mut stream, b"HDR Message-ID <headers@test>\r\n").await;
@@ -4696,6 +4876,11 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             stream.write_all(b"201 client ready\r\n").await.unwrap();
+            assert_read_request(&mut stream, b"CAPABILITIES\r\n").await;
+            stream
+                .write_all(b"101 Capability list:\r\nVERSION 2\r\nOVER\r\n.\r\n")
+                .await
+                .unwrap();
             assert_read_request(&mut stream, b"OVER 1-10\r\n").await;
             stream.write_all(crate::OVER_RESPONSE).await.unwrap();
             assert_read_request(&mut stream, b"OVER <overview@test>\r\n").await;
@@ -5045,6 +5230,11 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             stream.write_all(b"201 client ready\r\n").await.unwrap();
+            assert_read_request(&mut stream, b"CAPABILITIES\r\n").await;
+            stream
+                .write_all(b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n")
+                .await
+                .unwrap();
             assert_read_request(&mut stream, b"NEWGROUPS 20260101 000000 GMT\r\n").await;
             stream.write_all(crate::NEWGROUPS_RESPONSE).await.unwrap();
             assert_read_request(
@@ -5088,6 +5278,11 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             stream.write_all(b"201 client ready\r\n").await.unwrap();
+            assert_read_request(&mut stream, b"CAPABILITIES\r\n").await;
+            stream
+                .write_all(b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nSTARTTLS\r\n.\r\n")
+                .await
+                .unwrap();
             assert_read_request(&mut stream, b"POST\r\n").await;
             stream.write_all(crate::POST_RESPONSE).await.unwrap();
             assert_read_request(&mut stream, b"IHAVE <ihave-surface@test>\r\n").await;
@@ -5149,6 +5344,11 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             stream.write_all(b"201 client ready\r\n").await.unwrap();
+            assert_read_request(&mut stream, b"CAPABILITIES\r\n").await;
+            stream
+                .write_all(b"101 Capability list:\r\nVERSION 2\r\nOVER\r\n.\r\n")
+                .await
+                .unwrap();
             assert_read_request(&mut stream, b"HDR Subject 1-10\r\n").await;
             stream.write_all(crate::HDR_RESPONSE).await.unwrap();
             assert_read_request(&mut stream, b"HDR Message-ID <headers@test>\r\n").await;
@@ -5204,6 +5404,11 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             stream.write_all(b"201 client ready\r\n").await.unwrap();
+            assert_read_request(&mut stream, b"CAPABILITIES\r\n").await;
+            stream
+                .write_all(b"101 Capability list:\r\nVERSION 2\r\nOVER\r\n.\r\n")
+                .await
+                .unwrap();
             assert_read_request(&mut stream, b"OVER 1-10\r\n").await;
             stream.write_all(crate::OVER_RESPONSE).await.unwrap();
             assert_read_request(&mut stream, b"OVER <overview@test>\r\n").await;
