@@ -3221,7 +3221,11 @@ fn validate_capability_response_line(line: &[u8]) -> bool {
         return false;
     };
     if !validate_ascii_token(label, validate_keyword) {
-        return false;
+        return validate_capability_argument_token(label)
+            && label
+                .first()
+                .is_some_and(|byte| !byte.is_ascii_alphabetic())
+            && validate_capability_argument_tokens(rest);
     }
 
     if let Some(valid) = validate_known_capability_response_line(label, rest) {

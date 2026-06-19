@@ -8596,6 +8596,12 @@ mod tests {
                         frame: b"101 capability list follows\r\nVERSION 2\r\nSTARTTLS\r\nSTREAMING\r\nAUTHINFO USER SASL\r\nSASL CRAM-MD5 DIGEST-MD5 GSSAPI PLAIN EXTERNAL\r\n.\r\n",
                     },
                     ResponseFrameCase {
+                        name: "CAPABILITIES accepts reserved future line",
+                        reference: "RFC 3977 section 3.3.1 says clients must ignore capability lines beginning with non-letters https://www.rfc-editor.org/rfc/rfc3977#section-3.3.1",
+                        kind: RequestKind::Capabilities,
+                        frame: b"101 capability list follows\r\nVERSION 2\r\n1RESERVED future-token\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "CAPABILITIES accepts future AUTHINFO arguments",
                         reference: "RFC 4643 section 2.1 https://www.rfc-editor.org/rfc/rfc4643#section-2.1",
                         kind: RequestKind::Capabilities,
@@ -9507,12 +9513,6 @@ mod tests {
                         reference: "RFC 3977 section 9.5 https://www.rfc-editor.org/rfc/rfc3977#section-9.5",
                         kind: RequestKind::Capabilities,
                         frame: b"101 Capability list:\r\nVERSION 2\r\nOVER RANGE\r\n.\r\n",
-                    },
-                    ResponseFrameCase {
-                        name: "CAPABILITIES rejects non-keyword capability label",
-                        reference: "RFC 3977 sections 3.3.1 and 9.5 define capability-label as keyword https://www.rfc-editor.org/rfc/rfc3977#section-9.5",
-                        kind: RequestKind::Capabilities,
-                        frame: b"101 Capability list:\r\nVERSION 2\r\n1RESERVED future-token\r\n.\r\n",
                     },
                     ResponseFrameCase {
                         name: "CAPABILITIES rejects STARTTLS capability argument",
