@@ -9915,6 +9915,12 @@ mod tests {
                         frame: b"100 help follows\r\n.dot-prefixed help text\r\n.\r\n",
                     },
                     ResponseFrameCase {
+                        name: "CAPABILITIES rejects unstuffed dot-prefixed reserved line",
+                        reference: "RFC 3977 sections 3.1.1, 3.3.1, and 5.2 require dot-prefixed multiline data lines to be dot-stuffed https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1",
+                        kind: RequestKind::Capabilities,
+                        frame: b"101 Capability list:\r\nVERSION 2\r\n.dot-prefixed-reserved\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "LIST rejects CAPABILITIES success code",
                         reference: "RFC 3977 sections 5.2 and 7.6 https://www.rfc-editor.org/rfc/rfc3977#section-5.2",
                         kind: RequestKind::List,
@@ -10293,6 +10299,12 @@ mod tests {
                         frame: b"215 overview format follows\r\nSubject:\r\nFrom:\r\nDate:\r\nMessage-ID:\r\nReferences:\r\n:bytes\r\n:lines\r\nXref:\r\n.\r\n",
                     },
                     ResponseFrameCase {
+                        name: "LIST OVERVIEW.FMT rejects unstuffed dot-prefixed extension metadata",
+                        reference: "RFC 3977 sections 3.1.1, 8.4, and 9.6 require dot-prefixed multiline data lines to be dot-stuffed https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1",
+                        kind: RequestKind::ListOverviewFmt,
+                        frame: b"215 overview format follows\r\nSubject:\r\nFrom:\r\nDate:\r\nMessage-ID:\r\nReferences:\r\n:bytes\r\n:lines\r\n.Xref:full\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "LIST HEADERS rejects overview field colon suffix",
                         reference: "RFC 3977 section 8.6.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.6.2",
                         kind: RequestKind::ListHeaders,
@@ -10303,6 +10315,12 @@ mod tests {
                         reference: "RFC 3977 sections 8.6.2 and 9.6 https://www.rfc-editor.org/rfc/rfc3977#section-9.6",
                         kind: RequestKind::ListHeaders,
                         frame: b"215 headers supported\r\n:\r\nSubject\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "LIST HEADERS rejects unstuffed dot-prefixed header name",
+                        reference: "RFC 3977 sections 3.1.1 and 8.6.2 require dot-prefixed multiline data lines to be dot-stuffed https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1",
+                        kind: RequestKind::ListHeaders,
+                        frame: b"215 headers supported\r\n.Subject\r\n.\r\n",
                     },
                     ResponseFrameCase {
                         name: "LIST DISTRIB.PATS rejects non-numeric priority",

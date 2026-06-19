@@ -2957,6 +2957,9 @@ fn validate_overview_fmt_response_content(content: &[u8]) -> bool {
 fn next_strict_crlf_line<'a>(content: &'a [u8], offset: &mut usize) -> Option<&'a [u8]> {
     let line_end = strict_crlf_line_content_end_from(content, *offset)?;
     let line = &content[*offset..line_end];
+    if line.starts_with(b".") && !line.starts_with(b"..") {
+        return None;
+    }
     *offset = line_end + crate::CRLF.len();
     Some(line)
 }
@@ -3167,6 +3170,9 @@ fn validate_capabilities_response_content(content: &[u8]) -> bool {
             return false;
         };
         let line = &content[offset..line_end];
+        if line.starts_with(b".") && !line.starts_with(b"..") {
+            return false;
+        }
         if !validate_capability_response_line(line) {
             return false;
         }
