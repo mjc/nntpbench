@@ -8355,6 +8355,18 @@ mod tests {
                         frame: b"440\r\n",
                     },
                     ResponseFrameCase {
+                        name: "CAPABILITIES accepts syntax error response",
+                        reference: "RFC 3977 section 5.2.2 permits 501 for non-keyword CAPABILITIES arguments https://www.rfc-editor.org/rfc/rfc3977#section-5.2.2",
+                        kind: RequestKind::Capabilities,
+                        frame: b"501 syntax error in keyword\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "QUIT accepts syntax error response",
+                        reference: "RFC 3977 section 5.4.2 permits 501 only when QUIT arguments are provided https://www.rfc-editor.org/rfc/rfc3977#section-5.4.2",
+                        kind: RequestKind::Quit,
+                        frame: b"501 syntax error in arguments\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "STARTTLS accepts unable-to-initiate-TLS response",
                         reference: "RFC 4642 section 2.2 https://www.rfc-editor.org/rfc/rfc4642#section-2.2",
                         kind: RequestKind::StartTls,
@@ -8738,6 +8750,30 @@ mod tests {
                         reference: "RFC 4642 section 2.2 https://www.rfc-editor.org/rfc/rfc4642#section-2.2",
                         kind: RequestKind::StartTls,
                         frame: b"483 command unavailable until TLS has been negotiated\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "CAPABILITIES rejects unknown command response",
+                        reference: "RFC 3977 section 5.2.2 says CAPABILITIES MUST NOT generate response codes other than 101 or 501 https://www.rfc-editor.org/rfc/rfc3977#section-5.2.2",
+                        kind: RequestKind::Capabilities,
+                        frame: b"500 unknown command\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "CAPABILITIES rejects unavailable feature response",
+                        reference: "RFC 3977 section 5.2.2 says CAPABILITIES MUST NOT generate response codes other than 101 or 501 https://www.rfc-editor.org/rfc/rfc3977#section-5.2.2",
+                        kind: RequestKind::Capabilities,
+                        frame: b"503 feature not supported\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "QUIT rejects unknown command response",
+                        reference: "RFC 3977 section 5.4.2 says QUIT MUST NOT generate response codes other than 205 or argument-syntax 501 https://www.rfc-editor.org/rfc/rfc3977#section-5.4.2",
+                        kind: RequestKind::Quit,
+                        frame: b"500 unknown command\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "QUIT rejects permanent unavailable response",
+                        reference: "RFC 3977 section 5.4.2 says QUIT MUST NOT generate response codes other than 205 or argument-syntax 501 https://www.rfc-editor.org/rfc/rfc3977#section-5.4.2",
+                        kind: RequestKind::Quit,
+                        frame: b"502 service unavailable\r\n",
                     },
                     ResponseFrameCase {
                         name: "AUTHINFO USER rejects authentication required 480",

@@ -2285,6 +2285,10 @@ fn is_generic_error_status(code: u16) -> bool {
 }
 
 fn is_generic_error_status_for_request(kind: RequestKind, code: u16) -> bool {
+    if matches!(kind, RequestKind::Capabilities | RequestKind::Quit) {
+        return code == 501;
+    }
+
     // RFC 4642 section 2.2 and RFC 4643 section 2.3 explicitly forbid some
     // otherwise-generic authentication/security states for these commands.
     !matches!(
@@ -6016,37 +6020,31 @@ mod tests {
         // RFC 3977 sections 3.2.1 and 9.4.2 define the generic 401 response
         // as exactly status and one capability-label argument before any
         // optional trailing comment.
-        for (kind, input) in [
-            (
-                RequestKind::Article,
-                b"401 READER mode required\r\n".as_slice(),
+        let kind = RequestKind::Article;
+        let input = b"401 READER mode required\r\n".as_slice();
+        assert!(
+            matches!(
+                ResponseFrame::parse(kind, input),
+                ResponseFrameParse::Complete(response) if response.status() == StatusCode(401)
             ),
-            (
-                RequestKind::Capabilities,
-                b"401 MODE-READER required\r\n".as_slice(),
+            "{kind:?} {input:?}"
+        );
+        assert!(
+            matches!(
+                ResponseInitial::parse(kind, input),
+                ResponseInitialParse::Complete(initial) if initial.status() == StatusCode(401)
             ),
-        ] {
-            assert!(
-                matches!(
-                    ResponseFrame::parse(kind, input),
-                    ResponseFrameParse::Complete(response)
-                        if response.status() == StatusCode(401)
-                ),
-                "{kind:?} {input:?}"
-            );
-            assert!(
-                matches!(
-                    ResponseInitial::parse(kind, input),
-                    ResponseInitialParse::Complete(initial) if initial.status() == StatusCode(401)
-                ),
-                "{kind:?} {input:?}"
-            );
-        }
+            "{kind:?} {input:?}"
+        );
 
         for (kind, input) in [
             (RequestKind::Article, b"401\r\n".as_slice()),
             (RequestKind::Article, b"401 1READER required\r\n".as_slice()),
             (RequestKind::Date, b"401 READER_required\r\n".as_slice()),
+            (
+                RequestKind::Capabilities,
+                b"401 MODE-READER required\r\n".as_slice(),
+            ),
         ] {
             assert!(
                 matches!(
