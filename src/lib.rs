@@ -1014,6 +1014,83 @@ fn client_request_for_command(
     }
 }
 
+fn append_load_workload_request(
+    buffer: &mut Vec<u8>,
+    command_id: u64,
+    request_index: u64,
+    mix: ClientCommandMix,
+    segments: Option<&SegmentSet>,
+    client_index: usize,
+    total_clients: usize,
+) -> io::Result<()> {
+    let kind = client_command_kind(command_id, mix);
+    match kind {
+        ClientCommandMix::Article => buffer.extend_from_slice(b"ARTICLE "),
+        ClientCommandMix::Body => buffer.extend_from_slice(b"BODY "),
+        ClientCommandMix::Alternate => {
+            unreachable!("client_command_kind should normalize Alternate")
+        }
+    }
+
+    if let Some(segments) = segments {
+        let message_id = segment_for_request(segments, client_index, total_clients, request_index);
+        buffer.extend_from_slice(message_id.as_str().as_bytes());
+    } else {
+        write!(buffer, "<bench.{command_id}@nntpbench.local>")?;
+    }
+    buffer.extend_from_slice(CRLF);
+    Ok(())
+}
+
+#[doc(hidden)]
+pub fn bench_append_load_workload_request(
+    buffer: &mut Vec<u8>,
+    command_id: u64,
+    request_index: u64,
+    mix: ClientCommandMix,
+) -> io::Result<()> {
+    append_load_workload_request(buffer, command_id, request_index, mix, None, 0, 1)
+}
+
+#[doc(hidden)]
+pub fn bench_load_response_scan(buffer: &[u8], kind: RequestKind) -> io::Result<usize> {
+    let mut owned = buffer.to_vec();
+    bench_load_response_scan_in_place(&mut owned, kind)
+}
+
+#[doc(hidden)]
+pub fn bench_load_response_scan_in_place(
+    buffer: &mut Vec<u8>,
+    kind: RequestKind,
+) -> io::Result<usize> {
+    let read_buffer_bytes = buffer.capacity().max(1);
+    let mut reader = LoadResponseReader {
+        buffer: std::mem::take(buffer),
+        start: 0,
+        terminator_search_start: 0,
+        read_buffer_bytes,
+    };
+    let result = reader
+        .try_consume_response(kind)?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "incomplete response"));
+    *buffer = reader.buffer;
+    result
+}
+
+fn request_kind_for_client_command(command_id: u64, mix: ClientCommandMix) -> RequestKind {
+    request_kind_for_normalized_client_command(client_command_kind(command_id, mix))
+}
+
+fn request_kind_for_normalized_client_command(kind: ClientCommandMix) -> RequestKind {
+    match kind {
+        ClientCommandMix::Article => RequestKind::Article,
+        ClientCommandMix::Body => RequestKind::Body,
+        ClientCommandMix::Alternate => {
+            unreachable!("client_command_kind should normalize Alternate")
+        }
+    }
+}
+
 #[doc(hidden)]
 pub fn bench_client_request_for_command(
     command_id: u64,

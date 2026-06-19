@@ -7,8 +7,9 @@
 use divan::{Bencher, black_box};
 use nntpbench::client::{bench_streaming_decode_response, bench_write_request_wire_to_sink};
 use nntpbench::{
-    ClientCommandMix, MessageId, Request, RequestKind, bench_client_request_for_command,
-    bench_client_segment_request_for_command,
+    ClientCommandMix, MessageId, Request, RequestKind, bench_append_load_workload_request,
+    bench_client_request_for_command, bench_client_segment_request_for_command,
+    bench_load_response_scan,
 };
 use std::sync::Arc;
 use tokio::runtime::Builder;
@@ -84,7 +85,10 @@ mod request_construction {
 }
 
 mod request_wire {
-    use super::{Bencher, Request, bench_write_request_wire_to_sink, black_box, runtime};
+    use super::{
+        Bencher, ClientCommandMix, Request, bench_append_load_workload_request,
+        bench_write_request_wire_to_sink, black_box, runtime,
+    };
     use std::cell::RefCell;
 
     #[divan::bench(sample_count = 1000, sample_size = 100)]
@@ -138,12 +142,29 @@ mod request_wire {
             black_box(())
         });
     }
+
+    #[divan::bench(sample_count = 1000, sample_size = 100)]
+    fn raw_load_message_id_alternate_to_vec(bencher: Bencher) {
+        let output = RefCell::new(Vec::with_capacity(128));
+        bencher.bench_local(|| {
+            let mut output = output.borrow_mut();
+            output.clear();
+            bench_append_load_workload_request(
+                black_box(&mut output),
+                black_box(42),
+                black_box(42),
+                black_box(ClientCommandMix::Alternate),
+            )
+            .unwrap();
+            black_box(output.len())
+        });
+    }
 }
 
 mod streaming_decode {
     use super::{
         BODY_RESPONSE, Bencher, COMPACT_BODY_RESPONSE, RequestKind,
-        bench_streaming_decode_response, black_box,
+        bench_load_response_scan_in_place, bench_streaming_decode_response, black_box,
     };
 
     #[divan::bench(sample_count = 1000, sample_size = 100)]
@@ -162,6 +183,17 @@ mod streaming_decode {
             black_box(bench_streaming_decode_response(
                 black_box(RequestKind::Body),
                 black_box(BODY_RESPONSE),
+            ))
+        });
+    }
+
+    #[divan::bench(sample_count = 1000, sample_size = 100)]
+    fn raw_load_body_response_scan(bencher: Bencher) {
+        let mut buffer = BODY_RESPONSE.to_vec();
+        bencher.bench(|| {
+            black_box(bench_load_response_scan_in_place(
+                black_box(&mut buffer),
+                black_box(RequestKind::Body),
             ))
         });
     }
