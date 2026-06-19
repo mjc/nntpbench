@@ -6031,15 +6031,39 @@ mod tests {
                     expected: CAPABILITIES_RESPONSE,
                 },
                 ServerResponseCase {
+                    name: "CAPABILITIES keyword with dot",
+                    reference: "RFC 3977 sections 5.2 and 9.8 permit dot in keyword rest characters https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
+                    input: b"CAPABILITIES VENDOR.FEATURE\r\n",
+                    expected: CAPABILITIES_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "CAPABILITIES keyword with hyphen",
+                    reference: "RFC 3977 sections 5.2 and 9.8 permit hyphen in keyword rest characters https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
+                    input: b"CAPABILITIES VENDOR-FEATURE\r\n",
+                    expected: CAPABILITIES_RESPONSE,
+                },
+                ServerResponseCase {
                     name: "CAPABILITIES one-character non-keyword",
                     reference: "RFC 3977 sections 5.2 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
                     input: b"CAPABILITIES X\r\n",
                     expected: b"501 command syntax error\r\n",
                 },
                 ServerResponseCase {
+                    name: "CAPABILITIES two-character non-keyword",
+                    reference: "RFC 3977 section 9.8 requires keyword rest to contain at least two characters https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
+                    input: b"CAPABILITIES XY\r\n",
+                    expected: b"501 command syntax error\r\n",
+                },
+                ServerResponseCase {
                     name: "CAPABILITIES numeric non-keyword",
                     reference: "RFC 3977 sections 5.2 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
                     input: b"CAPABILITIES 123\r\n",
+                    expected: b"501 command syntax error\r\n",
+                },
+                ServerResponseCase {
+                    name: "CAPABILITIES underscore non-keyword",
+                    reference: "RFC 3977 section 9.8 excludes underscore from keyword rest characters https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
+                    input: b"CAPABILITIES VENDOR_FEATURE\r\n",
                     expected: b"501 command syntax error\r\n",
                 },
                 ServerResponseCase {
