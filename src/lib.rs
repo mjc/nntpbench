@@ -3492,6 +3492,7 @@ pub fn process_request_to_buffer<W>(
     request: RequestLine<'_>,
     config: &ServerConfig,
     stats: &Stats,
+    response_buffer: &mut Vec<u8>,
     output: &mut W,
 ) -> bool
 where
@@ -3688,8 +3689,7 @@ where
         RequestKind::ListActive => {
             let args = list_variant_wildmat_args(request.kind(), request.args());
             if let Some(index) = config.article_index() {
-                let mut response = Vec::with_capacity(512);
-                let response = list_active_response_for_index_into(&mut response, args, index);
+                let response = list_active_response_for_index_into(response_buffer, args, index);
                 stats
                     .bytes_sent
                     .fetch_add(response.len() as u64, Ordering::Relaxed);
@@ -3702,9 +3702,8 @@ where
         RequestKind::ListActiveTimes => {
             let args = list_variant_wildmat_args(request.kind(), request.args());
             if let Some(index) = config.article_index() {
-                let mut response = Vec::with_capacity(512);
                 let response =
-                    list_active_times_response_for_index_into(&mut response, args, index);
+                    list_active_times_response_for_index_into(response_buffer, args, index);
                 stats
                     .bytes_sent
                     .fetch_add(response.len() as u64, Ordering::Relaxed);
@@ -3717,8 +3716,7 @@ where
         RequestKind::ListNewsgroups => {
             let args = list_variant_wildmat_args(request.kind(), request.args());
             if let Some(index) = config.article_index() {
-                let mut response = Vec::with_capacity(512);
-                let response = list_newsgroups_response_for_index_into(&mut response, args, index);
+                let response = list_newsgroups_response_for_index_into(response_buffer, args, index);
                 stats
                     .bytes_sent
                     .fetch_add(response.len() as u64, Ordering::Relaxed);
@@ -3737,9 +3735,7 @@ where
         RequestKind::Next => NEXT_RESPONSE,
         RequestKind::NewGroups => {
             if let Some(index) = config.article_index() {
-                let mut response = Vec::with_capacity(512);
-                let response =
-                    newgroups_response_for_index_into(&mut response, request.args(), index);
+                let response = newgroups_response_for_index_into(response_buffer, request.args(), index);
                 stats
                     .bytes_sent
                     .fetch_add(response.len() as u64, Ordering::Relaxed);
@@ -3751,9 +3747,7 @@ where
         }
         RequestKind::NewNews => {
             if let Some(index) = config.article_index() {
-                let mut response = Vec::with_capacity(512);
-                let response =
-                    newnews_response_for_index_into(&mut response, request.args(), index);
+                let response = newnews_response_for_index_into(response_buffer, request.args(), index);
                 stats
                     .bytes_sent
                     .fetch_add(response.len() as u64, Ordering::Relaxed);
@@ -16624,18 +16618,21 @@ mod tests {
     fn process_request_to_buffer_counts_and_returns_quit() {
         let config = test_config();
         let stats = Stats::new();
+        let mut response_buffer = Vec::new();
         let mut output = Vec::new();
 
         assert!(!process_request_to_buffer(
             RequestLine::parse(b"ARTICLE <bench@nntpbench.local>\r\n"),
             &config,
             &stats,
+            &mut response_buffer,
             &mut output,
         ));
         assert!(process_request_to_buffer(
             RequestLine::parse(b"QUIT\r\n"),
             &config,
             &stats,
+            &mut response_buffer,
             &mut output,
         ));
 
@@ -16650,72 +16647,84 @@ mod tests {
     fn process_request_to_buffer_supports_negotiation_commands() {
         let config = test_config();
         let stats = Stats::new();
+        let mut response_buffer = Vec::new();
         let mut output = Vec::new();
 
         assert!(!process_request_to_buffer(
             RequestLine::parse(b"LIST ACTIVE\r\n"),
             &config,
             &stats,
+            &mut response_buffer,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
             RequestLine::parse(b"LIST ACTIVE.TIMES\r\n"),
             &config,
             &stats,
+            &mut response_buffer,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
             RequestLine::parse(b"LIST ACTIVE.TIMES comp.lang.*\r\n"),
             &config,
             &stats,
+            &mut response_buffer,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
             RequestLine::parse(b"LIST NEWSGROUPS\r\n"),
             &config,
             &stats,
+            &mut response_buffer,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
             RequestLine::parse(b"LIST NEWSGROUPS comp.lang.*\r\n"),
             &config,
             &stats,
+            &mut response_buffer,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
             RequestLine::parse(b"LIST OVERVIEW.FMT\r\n"),
             &config,
             &stats,
+            &mut response_buffer,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
             RequestLine::parse(b"LIST HEADERS\r\n"),
             &config,
             &stats,
+            &mut response_buffer,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
             RequestLine::parse(b"LIST DISTRIB.PATS\r\n"),
             &config,
             &stats,
+            &mut response_buffer,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
             RequestLine::parse(b"HELP\r\n"),
             &config,
             &stats,
+            &mut response_buffer,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
             RequestLine::parse(b"MODE READER\r\n"),
             &config,
             &stats,
+            &mut response_buffer,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
             RequestLine::parse(b"DATE\r\n"),
             &config,
             &stats,
+            &mut response_buffer,
             &mut output,
         ));
 
@@ -16741,60 +16750,70 @@ mod tests {
     fn process_request_to_buffer_supports_remaining_rfc_commands() {
         let config = test_config();
         let stats = Stats::new();
+        let mut response_buffer = Vec::new();
         let mut output = Vec::new();
 
         assert!(!process_request_to_buffer(
             RequestLine::parse(b"POST\r\n"),
             &config,
             &stats,
+            &mut response_buffer,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
             RequestLine::parse(b"IHAVE <article@test>\r\n"),
             &config,
             &stats,
+            &mut response_buffer,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
             RequestLine::parse(b"CHECK <article@test>\r\n"),
             &config,
             &stats,
+            &mut response_buffer,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
             RequestLine::parse(b"TAKETHIS <article@test>\r\n"),
             &config,
             &stats,
+            &mut response_buffer,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
             RequestLine::parse(b"AUTHINFO USER bench\r\n"),
             &config,
             &stats,
+            &mut response_buffer,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
             RequestLine::parse(b"AUTHINFO PASS bench\r\n"),
             &config,
             &stats,
+            &mut response_buffer,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
             RequestLine::parse(b"AUTHINFO SASL BENCH\r\n"),
             &config,
             &stats,
+            &mut response_buffer,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
             RequestLine::parse(b"AUTHINFO SASL BENCH AAA=BBB\r\n"),
             &config,
             &stats,
+            &mut response_buffer,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
             RequestLine::parse(b"STARTTLS\r\n"),
             &config,
             &stats,
+            &mut response_buffer,
             &mut output,
         ));
 
@@ -16820,48 +16839,56 @@ mod tests {
     fn process_request_to_buffer_supports_overview_commands() {
         let config = test_config();
         let stats = Stats::new();
+        let mut response_buffer = Vec::new();
         let mut output = Vec::new();
 
         assert!(!process_request_to_buffer(
             RequestLine::parse(b"OVER 1-10\r\n"),
             &config,
             &stats,
+            &mut response_buffer,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
             RequestLine::parse(b"OVER <overview@test>\r\n"),
             &config,
             &stats,
+            &mut response_buffer,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
             RequestLine::parse(b"XOVER 1-10\r\n"),
             &config,
             &stats,
+            &mut response_buffer,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
             RequestLine::parse(b"HDR Subject 1\r\n"),
             &config,
             &stats,
+            &mut response_buffer,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
             RequestLine::parse(b"HDR Message-ID 1\r\n"),
             &config,
             &stats,
+            &mut response_buffer,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
             RequestLine::parse(b"XHDR Subject 1\r\n"),
             &config,
             &stats,
+            &mut response_buffer,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
             RequestLine::parse(b"XHDR Message-ID 1\r\n"),
             &config,
             &stats,
+            &mut response_buffer,
             &mut output,
         ));
 
@@ -16885,54 +16912,63 @@ mod tests {
     fn process_request_to_buffer_supports_group_navigation_commands() {
         let config = test_config();
         let stats = Stats::new();
+        let mut response_buffer = Vec::new();
         let mut output = Vec::new();
 
         assert!(!process_request_to_buffer(
             RequestLine::parse(b"GROUP alt.test\r\n"),
             &config,
             &stats,
+            &mut response_buffer,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
             RequestLine::parse(b"LISTGROUP\r\n"),
             &config,
             &stats,
+            &mut response_buffer,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
             RequestLine::parse(b"LISTGROUP comp.lang.rust\r\n"),
             &config,
             &stats,
+            &mut response_buffer,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
             RequestLine::parse(b"LISTGROUP 1-\r\n"),
             &config,
             &stats,
+            &mut response_buffer,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
             RequestLine::parse(b"LISTGROUP 2-3\r\n"),
             &config,
             &stats,
+            &mut response_buffer,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
             RequestLine::parse(b"LISTGROUP example.valid\r\n"),
             &config,
             &stats,
+            &mut response_buffer,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
             RequestLine::parse(b"LAST\r\n"),
             &config,
             &stats,
+            &mut response_buffer,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
             RequestLine::parse(b"NEXT\r\n"),
             &config,
             &stats,
+            &mut response_buffer,
             &mut output,
         ));
 
@@ -16957,18 +16993,21 @@ mod tests {
     fn process_request_to_buffer_supports_discovery_commands() {
         let config = test_config();
         let stats = Stats::new();
+        let mut response_buffer = Vec::new();
         let mut output = Vec::new();
 
         assert!(!process_request_to_buffer(
             RequestLine::parse(b"NEWGROUPS 231231 235959 GMT\r\n"),
             &config,
             &stats,
+            &mut response_buffer,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
             RequestLine::parse(b"NEWNEWS alt.* 231231 235959 GMT\r\n"),
             &config,
             &stats,
+            &mut response_buffer,
             &mut output,
         ));
 
@@ -16980,48 +17019,56 @@ mod tests {
     fn process_request_to_buffer_supports_body_head_stat_capabilities_and_unknown() {
         let config = test_config();
         let stats = Stats::new();
+        let mut response_buffer = Vec::new();
         let mut output = Vec::new();
 
         assert!(!process_request_to_buffer(
             RequestLine::parse(b"BODY <body@test>\r\n"),
             &config,
             &stats,
+            &mut response_buffer,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
             RequestLine::parse(b"CAPABILITIES\r\n"),
             &config,
             &stats,
+            &mut response_buffer,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
             RequestLine::parse(b"HEAD 1\r\n"),
             &config,
             &stats,
+            &mut response_buffer,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
             RequestLine::parse(b"STAT 1\r\n"),
             &config,
             &stats,
+            &mut response_buffer,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
             RequestLine::parse(b"XYZZY 1\r\n"),
             &config,
             &stats,
+            &mut response_buffer,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
             RequestLine::parse(b"XY\r\n"),
             &config,
             &stats,
+            &mut response_buffer,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
             RequestLine::parse(b"XYZZY bad\0token\r\n"),
             &config,
             &stats,
+            &mut response_buffer,
             &mut output,
         ));
 
@@ -17060,30 +17107,35 @@ mod tests {
         args.article_dir = Some(article_dir.clone());
         let config = ServerConfig::from_args(args);
         let stats = Stats::new();
+        let mut response_buffer = Vec::new();
         let mut output = Vec::new();
 
         assert!(!process_request_to_buffer(
             RequestLine::parse(b"ARTICLE 2\r\n"),
             &config,
             &stats,
+            &mut response_buffer,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
             RequestLine::parse(b"HEAD 2\r\n"),
             &config,
             &stats,
+            &mut response_buffer,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
             RequestLine::parse(b"BODY 2\r\n"),
             &config,
             &stats,
+            &mut response_buffer,
             &mut output,
         ));
         assert!(!process_request_to_buffer(
             RequestLine::parse(b"STAT 2\r\n"),
             &config,
             &stats,
+            &mut response_buffer,
             &mut output,
         ));
 
@@ -17178,6 +17230,7 @@ mod tests {
                     request,
                     &config,
                     &stats,
+                    &mut response_buffer,
                     &mut output,
                 ));
                 assert!(output.as_slice().starts_with(BODY_RESPONSE_PREFIX));
