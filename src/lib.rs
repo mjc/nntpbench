@@ -155,6 +155,7 @@ pub const STARTTLS_RESPONSE: &[u8] = b"382 continue with TLS negotiation\r\n";
 pub const OVER_RESPONSE: &[u8] = b"224 Overview information follows\r\n1\tSubject one\tone@example.com\tFri, 16 May 2026 12:00:00 +0000\t<one@example.com>\t\t123\t4\r\n.\r\n";
 const OVER_MESSAGE_ID_RESPONSE: &[u8] = b"224 Overview information follows\r\n0\tSubject one\tone@example.com\tFri, 16 May 2026 12:00:00 +0000\t<one@example.com>\t\t123\t4\r\n.\r\n";
 const OVER_2_RESPONSE: &[u8] = b"224 Overview information follows\r\n2\tSubject two\ttwo@example.com\tFri, 16 May 2026 12:00:01 +0000\t<two@example.com>\t<ref@example.com>\t456\t8\r\n.\r\n";
+const OVER_3_RESPONSE: &[u8] = b"224 Overview information follows\r\n3\tSubject three\tthree@example.com\tFri, 16 May 2026 12:00:02 +0000\t<three@example.com>\t<two@example.com>\t789\t12\r\n.\r\n";
 const OVER_2_PLUS_RESPONSE: &[u8] = b"224 Overview information follows\r\n2\tSubject two\ttwo@example.com\tFri, 16 May 2026 12:00:01 +0000\t<two@example.com>\t<ref@example.com>\t456\t8\r\n3\tSubject three\tthree@example.com\tFri, 16 May 2026 12:00:02 +0000\t<three@example.com>\t<two@example.com>\t789\t12\r\n.\r\n";
 const OVER_RANGE_RESPONSE: &[u8] = b"224 Overview information follows\r\n1\tSubject one\tone@example.com\tFri, 16 May 2026 12:00:00 +0000\t<one@example.com>\t\t123\t4\r\n2\tSubject two\ttwo@example.com\tFri, 16 May 2026 12:00:01 +0000\t<two@example.com>\t<ref@example.com>\t456\t8\r\n.\r\n";
 const OVER_ALL_RESPONSE: &[u8] = b"224 Overview information follows\r\n1\tSubject one\tone@example.com\tFri, 16 May 2026 12:00:00 +0000\t<one@example.com>\t\t123\t4\r\n2\tSubject two\ttwo@example.com\tFri, 16 May 2026 12:00:01 +0000\t<two@example.com>\t<ref@example.com>\t456\t8\r\n3\tSubject three\tthree@example.com\tFri, 16 May 2026 12:00:02 +0000\t<three@example.com>\t<two@example.com>\t789\t12\r\n.\r\n";
@@ -163,6 +164,7 @@ pub const HDR_RESPONSE: &[u8] = b"225 headers follow\r\n1 example one\r\n2 examp
 const HDR_SUBJECT_MESSAGE_ID_RESPONSE: &[u8] = b"225 headers follow\r\n0 example one\r\n.\r\n";
 const HDR_SUBJECT_1_RESPONSE: &[u8] = b"225 headers follow\r\n1 example one\r\n.\r\n";
 const HDR_SUBJECT_2_RESPONSE: &[u8] = b"225 headers follow\r\n2 example two\r\n.\r\n";
+const HDR_SUBJECT_3_RESPONSE: &[u8] = b"225 headers follow\r\n3 example three\r\n.\r\n";
 const HDR_SUBJECT_2_PLUS_RESPONSE: &[u8] =
     b"225 headers follow\r\n2 example two\r\n3 example three\r\n.\r\n";
 pub const XHDR_RESPONSE: &[u8] = b"221 headers follow\r\n1 example one\r\n2 example two\r\n.\r\n";
@@ -170,6 +172,7 @@ const XHDR_SUBJECT_MESSAGE_ID_RESPONSE: &[u8] =
     b"221 headers follow\r\n<one@example.com> example one\r\n.\r\n";
 const XHDR_SUBJECT_1_RESPONSE: &[u8] = b"221 headers follow\r\n1 example one\r\n.\r\n";
 const XHDR_SUBJECT_2_RESPONSE: &[u8] = b"221 headers follow\r\n2 example two\r\n.\r\n";
+const XHDR_SUBJECT_3_RESPONSE: &[u8] = b"221 headers follow\r\n3 example three\r\n.\r\n";
 const XHDR_SUBJECT_2_PLUS_RESPONSE: &[u8] =
     b"221 headers follow\r\n2 example two\r\n3 example three\r\n.\r\n";
 const HDR_MESSAGE_ID_RESPONSE: &[u8] =
@@ -178,17 +181,20 @@ const HDR_MESSAGE_ID_MESSAGE_ID_RESPONSE: &[u8] =
     b"225 headers follow\r\n0 <one@example.com>\r\n.\r\n";
 const HDR_MESSAGE_ID_1_RESPONSE: &[u8] = b"225 headers follow\r\n1 <one@example.com>\r\n.\r\n";
 const HDR_MESSAGE_ID_2_RESPONSE: &[u8] = b"225 headers follow\r\n2 <two@example.com>\r\n.\r\n";
+const HDR_MESSAGE_ID_3_RESPONSE: &[u8] = b"225 headers follow\r\n3 <three@example.com>\r\n.\r\n";
 const HDR_MESSAGE_ID_2_PLUS_RESPONSE: &[u8] =
     b"225 headers follow\r\n2 <two@example.com>\r\n3 <three@example.com>\r\n.\r\n";
 const HDR_BYTES_RESPONSE: &[u8] = b"225 headers follow\r\n1 123\r\n2 456\r\n.\r\n";
 const HDR_BYTES_MESSAGE_ID_RESPONSE: &[u8] = b"225 headers follow\r\n0 123\r\n.\r\n";
 const HDR_BYTES_1_RESPONSE: &[u8] = b"225 headers follow\r\n1 123\r\n.\r\n";
 const HDR_BYTES_2_RESPONSE: &[u8] = b"225 headers follow\r\n2 456\r\n.\r\n";
+const HDR_BYTES_3_RESPONSE: &[u8] = b"225 headers follow\r\n3 789\r\n.\r\n";
 const HDR_BYTES_2_PLUS_RESPONSE: &[u8] = b"225 headers follow\r\n2 456\r\n3 789\r\n.\r\n";
 const HDR_LINES_RESPONSE: &[u8] = b"225 headers follow\r\n1 4\r\n2 8\r\n.\r\n";
 const HDR_LINES_MESSAGE_ID_RESPONSE: &[u8] = b"225 headers follow\r\n0 4\r\n.\r\n";
 const HDR_LINES_1_RESPONSE: &[u8] = b"225 headers follow\r\n1 4\r\n.\r\n";
 const HDR_LINES_2_RESPONSE: &[u8] = b"225 headers follow\r\n2 8\r\n.\r\n";
+const HDR_LINES_3_RESPONSE: &[u8] = b"225 headers follow\r\n3 12\r\n.\r\n";
 const HDR_LINES_2_PLUS_RESPONSE: &[u8] = b"225 headers follow\r\n2 8\r\n3 12\r\n.\r\n";
 const XHDR_MESSAGE_ID_RESPONSE: &[u8] =
     b"221 headers follow\r\n1 <one@example.com>\r\n2 <two@example.com>\r\n.\r\n";
@@ -196,6 +202,7 @@ const XHDR_MESSAGE_ID_MESSAGE_ID_RESPONSE: &[u8] =
     b"221 headers follow\r\n<one@example.com> <one@example.com>\r\n.\r\n";
 const XHDR_MESSAGE_ID_1_RESPONSE: &[u8] = b"221 headers follow\r\n1 <one@example.com>\r\n.\r\n";
 const XHDR_MESSAGE_ID_2_RESPONSE: &[u8] = b"221 headers follow\r\n2 <two@example.com>\r\n.\r\n";
+const XHDR_MESSAGE_ID_3_RESPONSE: &[u8] = b"221 headers follow\r\n3 <three@example.com>\r\n.\r\n";
 const XHDR_MESSAGE_ID_2_PLUS_RESPONSE: &[u8] =
     b"221 headers follow\r\n2 <two@example.com>\r\n3 <three@example.com>\r\n.\r\n";
 const XHDR_BYTES_RESPONSE: &[u8] = b"221 headers follow\r\n1 123\r\n2 456\r\n.\r\n";
@@ -203,11 +210,13 @@ const XHDR_BYTES_MESSAGE_ID_RESPONSE: &[u8] =
     b"221 headers follow\r\n<one@example.com> 123\r\n.\r\n";
 const XHDR_BYTES_1_RESPONSE: &[u8] = b"221 headers follow\r\n1 123\r\n.\r\n";
 const XHDR_BYTES_2_RESPONSE: &[u8] = b"221 headers follow\r\n2 456\r\n.\r\n";
+const XHDR_BYTES_3_RESPONSE: &[u8] = b"221 headers follow\r\n3 789\r\n.\r\n";
 const XHDR_BYTES_2_PLUS_RESPONSE: &[u8] = b"221 headers follow\r\n2 456\r\n3 789\r\n.\r\n";
 const XHDR_LINES_RESPONSE: &[u8] = b"221 headers follow\r\n1 4\r\n2 8\r\n.\r\n";
 const XHDR_LINES_MESSAGE_ID_RESPONSE: &[u8] = b"221 headers follow\r\n<one@example.com> 4\r\n.\r\n";
 const XHDR_LINES_1_RESPONSE: &[u8] = b"221 headers follow\r\n1 4\r\n.\r\n";
 const XHDR_LINES_2_RESPONSE: &[u8] = b"221 headers follow\r\n2 8\r\n.\r\n";
+const XHDR_LINES_3_RESPONSE: &[u8] = b"221 headers follow\r\n3 12\r\n.\r\n";
 const XHDR_LINES_2_PLUS_RESPONSE: &[u8] = b"221 headers follow\r\n2 8\r\n3 12\r\n.\r\n";
 pub const HEAD_RESPONSE: &[u8] = b"221 1 <article.1@nntpbench.local> article retrieved\r\nPath: nntpbench.local!mock\r\nFrom: Bench User <bench@nntpbench.local>\r\nNewsgroups: alt.binaries.bench\r\nSubject: nntpbench synthetic article\r\nMessage-ID: <article.1@nntpbench.local>\r\nDate: Fri, 15 May 2026 00:00:00 +0000\r\n.\r\n";
 pub const STAT_RESPONSE: &[u8] = b"223 1 <article.1@nntpbench.local> article retrieved\r\n";
@@ -3399,6 +3408,8 @@ fn over_response_for_args(args: &[u8]) -> &'static [u8] {
         OVER_2_PLUS_RESPONSE
     } else if overview_selector_selects_second_only(args) {
         OVER_2_RESPONSE
+    } else if overview_selector_selects_third_only(args) {
+        OVER_3_RESPONSE
     } else {
         OVER_RESPONSE
     }
@@ -3417,6 +3428,8 @@ fn xover_response_for_args(args: &[u8]) -> &'static [u8] {
         OVER_2_PLUS_RESPONSE
     } else if overview_selector_selects_second_only(args) {
         OVER_2_RESPONSE
+    } else if overview_selector_selects_third_only(args) {
+        OVER_3_RESPONSE
     } else {
         XOVER_RESPONSE
     }
@@ -3427,6 +3440,13 @@ fn overview_selector_selects_second_only(selector: &[u8]) -> bool {
         return true;
     }
     listgroup_range_bounds(selector).is_some_and(|(start, end)| start == 2 && end == Some(2))
+}
+
+fn overview_selector_selects_third_only(selector: &[u8]) -> bool {
+    if selector == b"3" {
+        return true;
+    }
+    listgroup_range_bounds(selector).is_some_and(|(start, end)| start == 3 && end == Some(3))
 }
 
 fn overview_selector_selects_first_only(selector: &[u8]) -> bool {
@@ -3646,6 +3666,9 @@ fn hdr_response_for_args(args: &[u8]) -> &'static [u8] {
             if selector.is_some_and(overview_selector_selects_second_only) {
                 return HDR_MESSAGE_ID_2_RESPONSE;
             }
+            if selector.is_some_and(overview_selector_selects_third_only) {
+                return HDR_MESSAGE_ID_3_RESPONSE;
+            }
             return HDR_MESSAGE_ID_RESPONSE;
         }
         if header.eq_ignore_ascii_case(b":bytes") {
@@ -3660,6 +3683,9 @@ fn hdr_response_for_args(args: &[u8]) -> &'static [u8] {
             }
             if selector.is_some_and(overview_selector_selects_second_only) {
                 return HDR_BYTES_2_RESPONSE;
+            }
+            if selector.is_some_and(overview_selector_selects_third_only) {
+                return HDR_BYTES_3_RESPONSE;
             }
             return HDR_BYTES_RESPONSE;
         }
@@ -3676,6 +3702,9 @@ fn hdr_response_for_args(args: &[u8]) -> &'static [u8] {
             if selector.is_some_and(overview_selector_selects_second_only) {
                 return HDR_LINES_2_RESPONSE;
             }
+            if selector.is_some_and(overview_selector_selects_third_only) {
+                return HDR_LINES_3_RESPONSE;
+            }
             return HDR_LINES_RESPONSE;
         }
     }
@@ -3690,6 +3719,9 @@ fn hdr_response_for_args(args: &[u8]) -> &'static [u8] {
     }
     if selector.is_some_and(overview_selector_selects_second_only) {
         return HDR_SUBJECT_2_RESPONSE;
+    }
+    if selector.is_some_and(overview_selector_selects_third_only) {
+        return HDR_SUBJECT_3_RESPONSE;
     }
     HDR_RESPONSE
 }
@@ -3710,6 +3742,9 @@ fn xhdr_response_for_args(args: &[u8]) -> &'static [u8] {
             if selector.is_some_and(overview_selector_selects_second_only) {
                 return XHDR_MESSAGE_ID_2_RESPONSE;
             }
+            if selector.is_some_and(overview_selector_selects_third_only) {
+                return XHDR_MESSAGE_ID_3_RESPONSE;
+            }
             return XHDR_MESSAGE_ID_RESPONSE;
         }
         if header.eq_ignore_ascii_case(b":bytes") {
@@ -3724,6 +3759,9 @@ fn xhdr_response_for_args(args: &[u8]) -> &'static [u8] {
             }
             if selector.is_some_and(overview_selector_selects_second_only) {
                 return XHDR_BYTES_2_RESPONSE;
+            }
+            if selector.is_some_and(overview_selector_selects_third_only) {
+                return XHDR_BYTES_3_RESPONSE;
             }
             return XHDR_BYTES_RESPONSE;
         }
@@ -3740,6 +3778,9 @@ fn xhdr_response_for_args(args: &[u8]) -> &'static [u8] {
             if selector.is_some_and(overview_selector_selects_second_only) {
                 return XHDR_LINES_2_RESPONSE;
             }
+            if selector.is_some_and(overview_selector_selects_third_only) {
+                return XHDR_LINES_3_RESPONSE;
+            }
             return XHDR_LINES_RESPONSE;
         }
     }
@@ -3754,6 +3795,9 @@ fn xhdr_response_for_args(args: &[u8]) -> &'static [u8] {
     }
     if selector.is_some_and(overview_selector_selects_second_only) {
         return XHDR_SUBJECT_2_RESPONSE;
+    }
+    if selector.is_some_and(overview_selector_selects_third_only) {
+        return XHDR_SUBJECT_3_RESPONSE;
     }
     XHDR_RESPONSE
 }
@@ -3810,21 +3854,25 @@ fn current_header_args(args: &[u8], session_state: &SessionState) -> Option<&'st
         b"Subject" => match current {
             b"1" => Some(b"Subject 1"),
             b"2" => Some(b"Subject 2"),
+            b"3" => Some(b"Subject 3"),
             _ => None,
         },
         b"Message-ID" => match current {
             b"1" => Some(b"Message-ID 1"),
             b"2" => Some(b"Message-ID 2"),
+            b"3" => Some(b"Message-ID 3"),
             _ => None,
         },
         b":bytes" => match current {
             b"1" => Some(b":bytes 1"),
             b"2" => Some(b":bytes 2"),
+            b"3" => Some(b":bytes 3"),
             _ => None,
         },
         b":lines" => match current {
             b"1" => Some(b":lines 1"),
             b"2" => Some(b":lines 2"),
+            b"3" => Some(b":lines 3"),
             _ => None,
         },
         _ => None,
@@ -3835,6 +3883,7 @@ fn current_article_selector_args(session_state: &SessionState) -> Option<&'stati
     match session_state.current_article {
         Some(1) => Some(b"1"),
         Some(2) => Some(b"2"),
+        Some(3) => Some(b"3"),
         _ => None,
     }
 }
@@ -6838,10 +6887,22 @@ mod tests {
                     expected: OVER_2_RESPONSE,
                 },
                 ServerResponseCase {
+                    name: "OVER current article follows ARTICLE 3",
+                    reference: "RFC 3977 section 8.3.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.3.2",
+                    input: b"GROUP alt.test\r\nARTICLE 3\r\nOVER\r\n",
+                    expected: OVER_3_RESPONSE,
+                },
+                ServerResponseCase {
                     name: "XOVER current article follows ARTICLE 2",
                     reference: "RFC 2980 section 2.8 https://www.rfc-editor.org/rfc/rfc2980#section-2.8",
                     input: b"GROUP alt.test\r\nARTICLE 2\r\nXOVER\r\n",
                     expected: OVER_2_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "XOVER current article follows ARTICLE 3",
+                    reference: "RFC 2980 section 2.8 https://www.rfc-editor.org/rfc/rfc2980#section-2.8",
+                    input: b"GROUP alt.test\r\nARTICLE 3\r\nXOVER\r\n",
+                    expected: OVER_3_RESPONSE,
                 },
                 ServerResponseCase {
                     name: "HDR current article follows ARTICLE 2",
@@ -6850,10 +6911,22 @@ mod tests {
                     expected: HDR_SUBJECT_2_RESPONSE,
                 },
                 ServerResponseCase {
+                    name: "HDR current article follows ARTICLE 3",
+                    reference: "RFC 3977 section 8.5.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.2",
+                    input: b"GROUP alt.test\r\nARTICLE 3\r\nHDR Subject\r\n",
+                    expected: HDR_SUBJECT_3_RESPONSE,
+                },
+                ServerResponseCase {
                     name: "HDR metadata current article follows ARTICLE 2",
                     reference: "RFC 3977 section 8.5.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.2",
                     input: b"GROUP alt.test\r\nARTICLE 2\r\nHDR :bytes\r\n",
                     expected: HDR_BYTES_2_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "HDR metadata current article follows ARTICLE 3",
+                    reference: "RFC 3977 section 8.5.2 https://www.rfc-editor.org/rfc/rfc3977#section-8.5.2",
+                    input: b"GROUP alt.test\r\nARTICLE 3\r\nHDR :bytes\r\n",
+                    expected: HDR_BYTES_3_RESPONSE,
                 },
                 ServerResponseCase {
                     name: "XHDR current article follows ARTICLE 2",
@@ -6862,10 +6935,22 @@ mod tests {
                     expected: XHDR_SUBJECT_2_RESPONSE,
                 },
                 ServerResponseCase {
+                    name: "XHDR current article follows ARTICLE 3",
+                    reference: "RFC 2980 section 2.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.6",
+                    input: b"GROUP alt.test\r\nARTICLE 3\r\nXHDR Subject\r\n",
+                    expected: XHDR_SUBJECT_3_RESPONSE,
+                },
+                ServerResponseCase {
                     name: "XHDR metadata current article follows ARTICLE 2",
                     reference: "RFC 2980 section 2.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.6",
                     input: b"GROUP alt.test\r\nARTICLE 2\r\nXHDR :bytes\r\n",
                     expected: XHDR_BYTES_2_RESPONSE,
+                },
+                ServerResponseCase {
+                    name: "XHDR metadata current article follows ARTICLE 3",
+                    reference: "RFC 2980 section 2.6 https://www.rfc-editor.org/rfc/rfc2980#section-2.6",
+                    input: b"GROUP alt.test\r\nARTICLE 3\r\nXHDR :bytes\r\n",
+                    expected: XHDR_BYTES_3_RESPONSE,
                 },
             ])
             .await;
