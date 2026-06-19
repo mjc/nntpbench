@@ -4902,7 +4902,7 @@ mod tests {
                 ),
                 (
                     "ARTICLE article number over RFC maximum",
-                    b"220 10000000000000000 <over-max@test>\r\nSubject: bad\r\n\r\nbody\r\n.\r\n"
+                    b"220 2147483648 <over-max@test>\r\nSubject: bad\r\n\r\nbody\r\n.\r\n"
                         .as_slice(),
                 ),
                 (
@@ -4936,10 +4936,11 @@ mod tests {
 
         #[test]
         fn rfc3977_red_article_parser_accepts_rfc_max_article_number() {
-            // RFC 3977 section 9.8 defines article-number as 1*16DIGIT:
-            // https://www.rfc-editor.org/rfc/rfc3977#section-9.8
+            // RFC 3977 section 6.1 caps article numbers at 2,147,483,647
+            // while permitting leading zeroes up to 16 digits:
+            // https://www.rfc-editor.org/rfc/rfc3977#section-6.1
             let article = Article::parse(
-                b"220 9999999999999999 <max@test>\r\nSubject: max\r\n\r\nbody\r\n.\r\n",
+                b"220 0000002147483647 <max@test>\r\nSubject: max\r\n\r\nbody\r\n.\r\n",
             )
             .unwrap();
             assert_eq!(
@@ -7886,9 +7887,9 @@ mod tests {
                         ArticleSelector::from_borrowed("10-1").is_ok(),
                     ),
                     (
-                        "article selector accepts RFC 16-digit maximum",
-                        "RFC 3977 section 9.8 defines article-number as 1*16DIGIT https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
-                        ArticleSelector::from_borrowed("9999999999999999").is_ok(),
+                        "article selector accepts RFC maximum with 16-digit leading-zero form",
+                        "RFC 3977 section 6.1 permits leading zeroes but caps article numbers at 2,147,483,647 https://www.rfc-editor.org/rfc/rfc3977#section-6.1",
+                        ArticleSelector::from_borrowed("0000002147483647").is_ok(),
                     ),
                     (
                         "article selector rejects double hyphen range",
@@ -7902,8 +7903,8 @@ mod tests {
                     ),
                     (
                         "article selector rejects over max article number",
-                        "RFC 3977 section 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
-                        ArticleSelector::from_borrowed("10000000000000000").is_err(),
+                        "RFC 3977 section 6.1 https://www.rfc-editor.org/rfc/rfc3977#section-6.1",
+                        ArticleSelector::from_borrowed("2147483648").is_err(),
                     ),
                     (
                         "LISTGROUP range accepts reversed range as empty",
@@ -8069,22 +8070,22 @@ mod tests {
                         "RFC 3977 section 9.2 https://www.rfc-editor.org/rfc/rfc3977#section-9.2",
                     ),
                     (
-                        "ARTICLE accepts RFC 16-digit maximum article-number",
-                        b"ARTICLE 9999999999999999\r\n",
+                        "ARTICLE accepts RFC maximum with 16-digit leading-zero form",
+                        b"ARTICLE 0000002147483647\r\n",
                         RequestKind::Article,
-                        "RFC 3977 section 9.8 defines article-number as 1*16DIGIT https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
+                        "RFC 3977 section 6.1 permits leading zeroes but caps article numbers at 2,147,483,647 https://www.rfc-editor.org/rfc/rfc3977#section-6.1",
                     ),
                     (
-                        "OVER accepts RFC 16-digit maximum article-number",
-                        b"OVER 9999999999999999\r\n",
+                        "OVER accepts RFC maximum with 16-digit leading-zero form",
+                        b"OVER 0000002147483647\r\n",
                         RequestKind::Over,
-                        "RFC 3977 sections 8.3.1 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
+                        "RFC 3977 sections 6.1 and 8.3.1 https://www.rfc-editor.org/rfc/rfc3977#section-6.1",
                     ),
                     (
-                        "LISTGROUP accepts RFC 16-digit maximum range",
-                        b"LISTGROUP 9999999999999999\r\n",
+                        "LISTGROUP accepts RFC maximum with 16-digit leading-zero range",
+                        b"LISTGROUP alt.test 0000002147483647\r\n",
                         RequestKind::ListGroup,
-                        "RFC 3977 sections 6.1.2 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
+                        "RFC 3977 sections 6.1 and 6.1.2 https://www.rfc-editor.org/rfc/rfc3977#section-6.1",
                     ),
                     (
                         "LIST tab separator",
@@ -8964,9 +8965,9 @@ mod tests {
                     },
                     ResponseFrameCase {
                         name: "NEXT rejects article number over RFC maximum",
-                        reference: "RFC 3977 section 9.8 defines article-number as 1*16DIGIT https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
+                        reference: "RFC 3977 section 6.1 caps article numbers at 2,147,483,647 https://www.rfc-editor.org/rfc/rfc3977#section-6.1",
                         kind: RequestKind::Next,
-                        frame: b"223 10000000000000000 <stat@test> article exists\r\n",
+                        frame: b"223 2147483648 <stat@test> article exists\r\n",
                     },
                     ResponseFrameCase {
                         name: "ARTICLE rejects STAT success code",
@@ -9168,15 +9169,15 @@ mod tests {
                     },
                     ResponseFrameCase {
                         name: "GROUP rejects high-water article number over RFC maximum",
-                        reference: "RFC 3977 sections 6.1.1 and 9.8 define article-number as 1*16DIGIT https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
+                        reference: "RFC 3977 sections 6.1 and 6.1.1 cap article numbers at 2,147,483,647 https://www.rfc-editor.org/rfc/rfc3977#section-6.1",
                         kind: RequestKind::Group,
-                        frame: b"211 3 1 10000000000000000 alt.test\r\n",
+                        frame: b"211 3 1 2147483648 alt.test\r\n",
                     },
                     ResponseFrameCase {
                         name: "GROUP rejects article count over RFC maximum",
-                        reference: "RFC 3977 sections 6.1.1 and 9.8 define article-number as 1*16DIGIT https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
+                        reference: "RFC 3977 sections 6.1 and 6.1.1 cap article-number response fields at 2,147,483,647 https://www.rfc-editor.org/rfc/rfc3977#section-6.1",
                         kind: RequestKind::Group,
-                        frame: b"211 10000000000000000 1 3 alt.test\r\n",
+                        frame: b"211 2147483648 1 3 alt.test\r\n",
                     },
                     ResponseFrameCase {
                         name: "GROUP rejects non-empty count larger than high-low window",
@@ -9588,9 +9589,9 @@ mod tests {
                     },
                     ResponseFrameCase {
                         name: "OVER rejects article number over RFC maximum",
-                        reference: "RFC 3977 sections 8.3.1 and 9.8 define article-number as 1*16DIGIT https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
+                        reference: "RFC 3977 sections 6.1 and 8.3.1 cap article numbers at 2,147,483,647 https://www.rfc-editor.org/rfc/rfc3977#section-6.1",
                         kind: RequestKind::Over,
-                        frame: b"224 overview follows\r\n10000000000000000\tSubject\tfrom@test\r\n.\r\n",
+                        frame: b"224 overview follows\r\n2147483648\tSubject\tfrom@test\r\n.\r\n",
                     },
                     ResponseFrameCase {
                         name: "OVER rejects labeled bytes metadata field",
@@ -9660,9 +9661,9 @@ mod tests {
                     },
                     ResponseFrameCase {
                         name: "HDR rejects article number over RFC maximum",
-                        reference: "RFC 3977 sections 8.5.1 and 9.8 define article-number as 1*16DIGIT https://www.rfc-editor.org/rfc/rfc3977#section-9.8",
+                        reference: "RFC 3977 sections 6.1 and 8.5.1 cap article numbers at 2,147,483,647 https://www.rfc-editor.org/rfc/rfc3977#section-6.1",
                         kind: RequestKind::Hdr,
-                        frame: b"225 headers follow\r\n10000000000000000 value\r\n.\r\n",
+                        frame: b"225 headers follow\r\n2147483648 value\r\n.\r\n",
                     },
                     ResponseFrameCase {
                         name: "XHDR rejects body row without numeric article number",
@@ -10437,7 +10438,7 @@ mod tests {
         match request {
             Request::Article { article_ref } => assert_eq!(
                 article_ref.message_id().map(MessageId::as_str),
-                Some("<bench.10000000000000000@nntpbench.local>")
+                Some("<bench.2147483648@nntpbench.local>")
             ),
             other => panic!("expected message-id ARTICLE fallback, got {other:?}"),
         }
@@ -10455,7 +10456,7 @@ mod tests {
         match request {
             Request::Body { article_ref } => assert_eq!(
                 article_ref.message_id().map(MessageId::as_str),
-                Some("<bench.10000000000000001@nntpbench.local>")
+                Some("<bench.2147483649@nntpbench.local>")
             ),
             other => panic!("expected message-id BODY fallback, got {other:?}"),
         }

@@ -18,7 +18,7 @@ pub mod article;
 
 pub use article::{Article, ArticleNumber, ArticleParseError, HeaderIter, Headers};
 
-pub const MAX_ARTICLE_NUMBER: u64 = 9_999_999_999_999_999;
+pub const MAX_ARTICLE_NUMBER: u64 = 2_147_483_647;
 /// RFC 3977 section 3.1 command lines and response initial lines are limited
 /// to 512 octets, including the terminating CRLF pair.
 pub(crate) const MAX_INITIAL_RESPONSE_LINE_BYTES: usize = 512;
@@ -415,7 +415,7 @@ mod proptests {
             Just("-10".to_string()),
             Just("1-10-20".to_string()),
             Just("1 10".to_string()),
-            Just("10000000000000000".to_string()),
+            Just("2147483648".to_string()),
         ]
         .boxed()
     }
@@ -5977,7 +5977,7 @@ mod tests {
             (RequestKind::Group, b"211 3  1 3 alt.test\r\n".as_slice()),
             (
                 RequestKind::Group,
-                b"211 10000000000000000 1 3 alt.test\r\n".as_slice(),
+                b"211 2147483648 1 3 alt.test\r\n".as_slice(),
             ),
             (
                 RequestKind::ListGroup,
@@ -6197,7 +6197,7 @@ mod tests {
             ),
             (
                 RequestKind::ListGroup,
-                b"211 1 9999999999999999 9999999999999999 alt.test\r\n9999999999999999\r\n.\r\n".as_slice(),
+                b"211 1 0000002147483647 0000002147483647 alt.test\r\n0000002147483647\r\n.\r\n".as_slice(),
             ),
             (
                 RequestKind::List,
@@ -6308,7 +6308,7 @@ mod tests {
             ),
             (
                 RequestKind::Hdr,
-                b"225 headers follow\r\n9999999999999999 value\r\n.\r\n".as_slice(),
+                b"225 headers follow\r\n0000002147483647 value\r\n.\r\n".as_slice(),
             ),
             (
                 RequestKind::Xhdr,
@@ -6336,7 +6336,7 @@ mod tests {
             ),
             (
                 RequestKind::ListGroup,
-                b"211 1 1 10000000000000000 alt.test\r\n1\r\n.\r\n".as_slice(),
+                b"211 1 1 2147483648 alt.test\r\n1\r\n.\r\n".as_slice(),
             ),
             (
                 RequestKind::ListActive,
