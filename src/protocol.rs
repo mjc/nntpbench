@@ -3095,7 +3095,7 @@ fn is_s_text_initial_byte(byte: u8) -> bool {
 }
 
 fn validate_help_text_line(line: &[u8]) -> bool {
-    !line.contains(&b'\0') && std::str::from_utf8(line).is_ok()
+    validate_u_chars(line)
 }
 
 fn validate_capabilities_response_content(content: &[u8]) -> bool {

@@ -9359,6 +9359,12 @@ mod tests {
                         frame: b"101 Capability list:\r\nVERSION 2\r\nSASL plain PLAIN.TEST ABCDEFGHIJKLMNOPQRSTU\r\n.\r\n",
                     },
                     ResponseFrameCase {
+                        name: "HELP rejects UTF-8 BOM in U-CHAR text",
+                        reference: "RFC 3977 sections 3.1, 7.2, and 9.4.3 https://www.rfc-editor.org/rfc/rfc3977#section-3.1",
+                        kind: RequestKind::Help,
+                        frame: b"100 help follows\r\nCommands\xef\xbb\xbf include CAPABILITIES\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "OVER rejects body row without tab-separated overview fields",
                         reference: "RFC 3977 section 8.3.1 https://www.rfc-editor.org/rfc/rfc3977#section-8.3.1",
                         kind: RequestKind::Over,
