@@ -28,6 +28,22 @@ For repeatable client throughput work, use the criterion benchmarks:
 nix develop -c cargo bench --bench client_roundtrip
 ```
 
+For the current end-to-end throughput snapshot, run the direct benchmark on a
+native build:
+
+```bash
+BUILD=0 RUNS=10 ./scripts/direct-e2e-bench.sh
+```
+
+On this machine, the latest 10-run sweep looked like this:
+
+- 128,509 requests on average, ranging from 128,384 to 128,704
+- 101.06 GB transferred on average, ranging from 100.97 GB to 101.22 GB
+- 4.81 s elapsed on average, ranging from 4.00 s to 5.89 s
+- 9.73 CPU s on average, ranging from 7.27 s to 13.51 s
+- 3,126 KiB RSS on average, ranging from 3,096 KiB to 3,164 KiB
+- about 21.0 GB/s average throughput by bytes over elapsed time
+
 ## Profiling
 
 The profiling binaries are built with native CPU and frame pointers:
