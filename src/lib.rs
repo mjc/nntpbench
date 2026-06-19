@@ -1461,7 +1461,11 @@ where
             }
             if config.article_dir.is_some() {
                 let message_id = command_lines.and_then(|lines| command_message_id(command, lines));
-                let article_id = command.article_id.or(session_state.current_article);
+                let article_id = if message_id.is_some() {
+                    command.article_id
+                } else {
+                    command.article_id.or(session_state.current_article)
+                };
                 if write_stored_article_response(
                     writer,
                     pending_write,
