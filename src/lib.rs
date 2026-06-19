@@ -9097,6 +9097,12 @@ mod tests {
                         frame: b"580 can not initiate TLS negotiation\r\n",
                     },
                     ResponseFrameCase {
+                        name: "STARTTLS accepts begin-TLS-negotiation response",
+                        reference: "RFC 4642 section 2.2 defines 382 when the server is ready to begin TLS negotiation https://www.rfc-editor.org/rfc/rfc4642#section-2.2",
+                        kind: RequestKind::StartTls,
+                        frame: b"382 continue with TLS negotiation\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "QUIT accepts UTF-8 trailing comment text",
                         reference: "RFC 3977 sections 9.4.1 and 9.8 https://www.rfc-editor.org/rfc/rfc3977#section-9.4.1",
                         kind: RequestKind::Quit,
@@ -9606,6 +9612,18 @@ mod tests {
                         reference: "RFC 4642 section 2.2 https://www.rfc-editor.org/rfc/rfc4642#section-2.2",
                         kind: RequestKind::StartTls,
                         frame: b"483 command unavailable until TLS has been negotiated\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "STARTTLS rejects QUIT success response",
+                        reference: "RFC 4642 section 2.2 limits STARTTLS success to 382 https://www.rfc-editor.org/rfc/rfc4642#section-2.2",
+                        kind: RequestKind::StartTls,
+                        frame: b"205 closing connection\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "STARTTLS rejects AUTHINFO success response",
+                        reference: "RFC 4642 section 2.2 and RFC 4643 section 4 bind STARTTLS success to 382 and AUTHINFO success to 281 https://www.rfc-editor.org/rfc/rfc4642#section-2.2",
+                        kind: RequestKind::StartTls,
+                        frame: b"281 authentication accepted\r\n",
                     },
                     ResponseFrameCase {
                         name: "CAPABILITIES rejects unknown command response",
