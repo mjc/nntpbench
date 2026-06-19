@@ -8869,6 +8869,18 @@ mod tests {
                         frame: b"211 0 0 0 alt.empty\r\n.\r\n",
                     },
                     ResponseFrameCase {
+                        name: "LISTGROUP accepts sorted article-number body lines",
+                        reference: "RFC 3977 section 6.1.2.2 returns article numbers in numerical order https://www.rfc-editor.org/rfc/rfc3977#section-6.1.2.2",
+                        kind: RequestKind::ListGroup,
+                        frame: b"211 3 1 3 alt.test\r\n1\r\n2\r\n3\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
+                        name: "LISTGROUP accepts RFC maximum article number with leading zeroes",
+                        reference: "RFC 3977 sections 3.2.1, 6.1, and 6.1.2 permit leading zeroes and cap article numbers at 2,147,483,647 https://www.rfc-editor.org/rfc/rfc3977#section-6.1",
+                        kind: RequestKind::ListGroup,
+                        frame: b"211 1 0000002147483647 0000002147483647 alt.test\r\n0000002147483647\r\n.\r\n",
+                    },
+                    ResponseFrameCase {
                         name: "LIST ACTIVE accepts preferred empty group water marks",
                         reference: "RFC 3977 sections 6.1.1.2 and 7.6.3 https://www.rfc-editor.org/rfc/rfc3977#section-7.6.3",
                         kind: RequestKind::ListActive,
