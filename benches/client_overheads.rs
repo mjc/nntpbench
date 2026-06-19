@@ -1,4 +1,4 @@
-//! Focused benchmarks for client per-request overheads.
+//! Focused benchmarks for client per-request overheads and raw request probes.
 //!
 //! These isolate costs that are hard to read from the end-to-end client profile:
 //! request construction, request wire serialization, streaming response decoding,

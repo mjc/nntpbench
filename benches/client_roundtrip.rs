@@ -1,7 +1,8 @@
-//! End-to-end client benchmarks.
+//! End-to-end client benchmarks and raw protocol probes.
 //!
-//! These benches drive the new request/future client surface against the real
-//! mock NNTP server over localhost TCP.
+//! These benches drive the request/future client surface against the real
+//! mock NNTP server over localhost TCP. The one-shot extension paths remain
+//! raw probes unless the benchmark explicitly negotiates capabilities first.
 //!
 //! Run with: `cargo bench --bench client_roundtrip`
 
@@ -184,8 +185,26 @@ fn bench_pipelined_rfc_grammar_requests(bencher: Bencher) {
         });
 }
 
+fn bench_negotiated_session_setup(bencher: Bencher) {
+    let harness = ClientHarness::start(BODY_64K, ARTICLE_64K, 1);
+    bencher
+        .counter(divan::counter::ItemsCount::new(3usize))
+        .bench_local(|| {
+            black_box(harness.rt.block_on(async {
+                let capabilities = harness.client.capabilities().await.unwrap();
+                let mode_reader = harness.client.mode_reader().await.unwrap();
+                let date = harness.client.date().await.unwrap();
+
+                capabilities.as_bytes().len() + mode_reader.as_bytes().len() + date.as_bytes().len()
+            }))
+        });
+}
+
 mod sequential_roundtrip {
-    use super::{Bencher, bench_public_article_roundtrip, bench_raw_capabilities_roundtrip};
+    use super::{
+        Bencher, bench_negotiated_session_setup, bench_public_article_roundtrip,
+        bench_raw_capabilities_roundtrip,
+    };
 
     #[divan::bench(sample_count = 100, sample_size = 20)]
     fn article_64k(bencher: Bencher) {
@@ -195,6 +214,11 @@ mod sequential_roundtrip {
     #[divan::bench(sample_count = 100, sample_size = 100)]
     fn capabilities(bencher: Bencher) {
         bench_raw_capabilities_roundtrip(bencher);
+    }
+
+    #[divan::bench(sample_count = 100, sample_size = 20)]
+    fn negotiated_session_setup(bencher: Bencher) {
+        bench_negotiated_session_setup(bencher);
     }
 }
 

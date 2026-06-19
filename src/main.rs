@@ -15,7 +15,7 @@ struct Args {
 
 #[derive(Debug, clap::Subcommand)]
 enum Command {
-    /// Send one ARTICLE/BODY request and print the raw response.
+    /// Send one NNTP request and print the raw response.
     Fetch(FetchArgs),
 
     /// Send one NNTP request through the request/future client and print the raw response.
@@ -53,6 +53,7 @@ fn build_runtime(threads: usize) -> io::Result<Runtime> {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
 
     #[test]
     fn builds_current_thread_runtime_when_threads_is_zero_or_one() {
@@ -67,5 +68,14 @@ mod tests {
     fn builds_multi_thread_runtime_when_threads_exceeds_one() {
         let runtime = build_runtime(2).unwrap();
         assert_eq!(runtime.block_on(async { 13 }), 13);
+    }
+
+    #[test]
+    fn cli_help_labels_client_and_fetch_as_request_commands() {
+        let help = Args::command().render_long_help().to_string();
+        assert!(
+            help.contains("Send one NNTP request") && !help.contains("raw NNTP request probe"),
+            "help text should describe client and fetch without contradicting capability preflight behavior"
+        );
     }
 }

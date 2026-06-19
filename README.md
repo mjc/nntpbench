@@ -14,7 +14,8 @@ nix develop -c cargo run -- server --listen 127.0.0.1:2119
 
 Send one request and print the raw NNTP response. `client` is the supported
 request/future client command; `fetch` remains as a compatibility alias for the
-same one-request path.
+same one-request path. Extension requests use the client capability preflight
+before sending the selected command.
 
 ```bash
 nix develop -c cargo run -- client --connect 127.0.0.1:2119 --request article --message-id '<article.1@nntpbench.local>'
