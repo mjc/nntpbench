@@ -28,10 +28,12 @@ use tokio::time;
 use crate::terminator::{
     BoundedResponseLineStatus, DOT_TERMINATOR, ResponseLineStatus, append_dot_terminator,
     detect_bounded_response_line_end, detect_response_line_end_from, find_crlf_line_end,
-    find_dot_terminated_block_end, strip_complete_crlf_line,
+    strip_complete_crlf_line,
 };
 #[cfg(test)]
-use crate::terminator::{strip_dot_terminator_suffix, target_before_dot_terminator};
+use crate::terminator::{
+    find_dot_terminated_block_end, strip_dot_terminator_suffix, target_before_dot_terminator,
+};
 
 #[cfg(test)]
 #[global_allocator]
@@ -2380,7 +2382,7 @@ where
         };
         let request = RequestLine::parse(&input[start..end]);
         if matches!(request.kind(), RequestKind::TakeThis) {
-            let Some(body_end) = find_dot_terminated_block_end(input, end) else {
+            let TransferBodyScan::Complete(body_end) = scan_dot_terminated_body(input, end) else {
                 break;
             };
             visit(request);
@@ -4130,6 +4132,48 @@ enum TakeThisBodyState {
     LineCr,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransferBodyScan {
+    Complete(usize),
+    Incomplete,
+    Invalid,
+}
+
+fn scan_dot_terminated_body(data: &[u8], start: usize) -> TransferBodyScan {
+    let Some(slice) = data.get(start..) else {
+        return TransferBodyScan::Incomplete;
+    };
+
+    let mut state = TakeThisBodyState::LineStart;
+    for (offset, &byte) in slice.iter().enumerate() {
+        state = match (state, byte) {
+            (TakeThisBodyState::LineStart, b'.') => TakeThisBodyState::LineStartDot,
+            (TakeThisBodyState::LineStart, b'\r') => TakeThisBodyState::LineCr,
+            (TakeThisBodyState::LineStart, b'\n') => return TransferBodyScan::Invalid,
+            (TakeThisBodyState::LineStart, _) => TakeThisBodyState::Line,
+
+            (TakeThisBodyState::LineStartDot, b'.') => TakeThisBodyState::Line,
+            (TakeThisBodyState::LineStartDot, b'\r') => TakeThisBodyState::LineStartDotCr,
+            (TakeThisBodyState::LineStartDot, b'\n') => return TransferBodyScan::Invalid,
+            (TakeThisBodyState::LineStartDot, _) => return TransferBodyScan::Invalid,
+
+            (TakeThisBodyState::LineStartDotCr, b'\n') => {
+                return TransferBodyScan::Complete(start + offset + 1);
+            }
+            (TakeThisBodyState::LineStartDotCr, _) => return TransferBodyScan::Invalid,
+
+            (TakeThisBodyState::Line, b'\r') => TakeThisBodyState::LineCr,
+            (TakeThisBodyState::Line, b'\n') => return TransferBodyScan::Invalid,
+            (TakeThisBodyState::Line, _) => TakeThisBodyState::Line,
+
+            (TakeThisBodyState::LineCr, b'\n') => TakeThisBodyState::LineStart,
+            (TakeThisBodyState::LineCr, _) => return TransferBodyScan::Invalid,
+        };
+    }
+
+    TransferBodyScan::Incomplete
+}
+
 async fn read_dot_terminated_body<R>(reader: &mut BufReader<R>) -> io::Result<()>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -4160,6 +4204,7 @@ where
                 (TakeThisBodyState::LineStart, _) => TakeThisBodyState::Line,
 
                 (TakeThisBodyState::LineStartDot, b'\r') => TakeThisBodyState::LineStartDotCr,
+                (TakeThisBodyState::LineStartDot, b'.') => TakeThisBodyState::Line,
                 (TakeThisBodyState::LineStartDot, b'\n') => {
                     reader.consume(consumed);
                     return Err(io::Error::new(
@@ -4167,7 +4212,13 @@ where
                         "TAKETHIS body line missing CRLF terminator",
                     ));
                 }
-                (TakeThisBodyState::LineStartDot, _) => TakeThisBodyState::Line,
+                (TakeThisBodyState::LineStartDot, _) => {
+                    reader.consume(consumed);
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "TAKETHIS body line must be dot-stuffed",
+                    ));
+                }
 
                 (TakeThisBodyState::LineStartDotCr, b'\n') => {
                     reader.consume(consumed);
@@ -4277,6 +4328,10 @@ mod tests {
             b'0'..=b'9',
             b'a'..=b'z',
         ]
+    }
+
+    fn valid_takethis_body_bytes() -> impl Strategy<Value = u8> {
+        prop_oneof![Just(b'.'), Just(b' '), b'0'..=b'9', b'a'..=b'z']
     }
 
     fn remove_rfc_dot_terminators(buffer: &mut [u8]) {
@@ -11707,6 +11762,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rfc3977_red_read_command_batch_rejects_unstuffed_dot_takethis_body_line() {
+        // RFC 3977 section 3.1.1 requires a data line beginning with "." in a
+        // command-continuation body to be dot-stuffed. A single-dot-prefixed
+        // content line is invalid, while "." CRLF alone is the terminator:
+        // https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1
+        let (mut client, server) = tokio::io::duplex(1024);
+        client
+            .write_all(b"TAKETHIS <take@test>\r\nHeader: value\r\n\r\n.body\r\n.\r\nQUIT\r\n")
+            .await
+            .unwrap();
+        drop(client);
+
+        let mut reader = BufReader::with_capacity(1024, server);
+        let mut command_buf = [0; MAX_COMMAND_LINE_BYTES];
+        let mut command_lines = CommandLineBatch::default();
+        let mut command_batch = CommandBatch::new();
+
+        let err = read_command_batch(
+            &mut reader,
+            &mut command_buf,
+            Some(&mut command_lines),
+            &mut command_batch,
+            8,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(command_batch.is_empty());
+    }
+
+    #[tokio::test]
     async fn serve_session_returns_pipelined_responses_in_order_and_counts_stats() {
         let (output, stats) = run_session_with_input(
             test_config(),
@@ -12108,6 +12195,22 @@ mod tests {
         assert!(batch.is_empty());
     }
 
+    #[test]
+    fn rfc3977_red_for_each_request_line_in_batch_rejects_unstuffed_dot_takethis_body_line() {
+        // RFC 3977 section 3.1.1 requires dot-prefixed data lines in command
+        // continuations to be dot-stuffed. The batch scanner must not expose an
+        // invalid TAKETHIS body as a complete command followed by pipelined input:
+        // https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1
+        let mut batch = Vec::with_capacity(4);
+        let input = b"TAKETHIS <take@test>\r\nHeader: value\r\n\r\n.body\r\n.\r\nQUIT\r\n";
+        let consumed = for_each_request_line_in_batch(input, 8, |request| {
+            batch.push(request.kind());
+        });
+
+        assert_eq!(consumed, 0);
+        assert!(batch.is_empty());
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(512))]
 
@@ -12151,7 +12254,7 @@ mod tests {
 
         #[test]
         fn batch_scanner_consumes_takethis_through_first_rfc_dot_terminator(
-            mut body in vec(dangerous_takethis_body_bytes(), 0..48),
+            mut body in vec(valid_takethis_body_bytes(), 0..48),
             trailer in "[A-Za-z0-9 ._-]{0,16}",
         ) {
             // RFC 3977 section 3.1.1 says the first "." CRLF line ends a TAKETHIS
