@@ -311,6 +311,7 @@ pub const QUIT_RESPONSE: &[u8] = b"205 closing connection\r\n";
 pub const ARTICLE_NOT_FOUND_RESPONSE: &[u8] = b"430 no article with that number\r\n";
 const BODY_RESPONSE_PREFIX: &[u8] = b"222 1 <article.1@nntpbench.local> body follows\r\n";
 const ARTICLE_RESPONSE_PREFIX: &[u8] = b"220 1 <article.1@nntpbench.local> article follows\r\nPath: nntpbench.local!mock\r\nFrom: Bench User <bench@nntpbench.local>\r\nNewsgroups: alt.binaries.bench\r\nSubject: nntpbench synthetic article\r\nMessage-ID: <article.1@nntpbench.local>\r\nDate: Fri, 15 May 2026 00:00:00 +0000\r\n\r\n";
+const ARTICLE_RESPONSE_HEADER_EXTRA_CAPACITY: usize = 256;
 const MAX_COMMAND_LINE_BYTES: usize = protocol::MAX_AUTHINFO_SASL_COMMAND_LINE_BYTES;
 const MAX_SERVER_PIPELINE_DEPTH: usize = 1024;
 const SERVER_READER_CAPACITY: usize = 256 * 1024;
@@ -2224,12 +2225,15 @@ where
             if let Some(message_id) =
                 command_lines.and_then(|lines| command_message_id(command, lines))
             {
-                let response = build_message_id_article_response_into(
+                write_message_id_article_response(
+                    writer,
+                    pending_write,
                     response_buffer,
                     &message_id,
-                    config.article_bytes,
-                );
-                write_response(writer, pending_write, response, session_stats).await?;
+                    config,
+                    session_stats,
+                )
+                .await?;
                 return Ok(false);
             }
             let article_id = command
@@ -3186,12 +3190,37 @@ fn build_generated_response(prefix: &[u8], target_bytes: usize) -> Box<[u8]> {
     buffer.into_boxed_slice()
 }
 
+fn build_repeated_payload(target_bytes: usize) -> Box<[u8]> {
+    let mut buffer = Vec::with_capacity(target_bytes.saturating_add(BODY_LINE.len()));
+    append_repeated_payload_at_least(&mut buffer, BODY_LINE, target_bytes);
+    buffer.into_boxed_slice()
+}
+
 fn append_synthetic_article_headers(buffer: &mut Vec<u8>, message_id: &str) {
     write!(
         buffer,
         "Path: nntpbench.local!mock\r\nFrom: Bench User <bench@nntpbench.local>\r\nNewsgroups: alt.binaries.bench\r\nSubject: nntpbench synthetic article\r\nMessage-ID: {message_id}\r\nDate: Fri, 15 May 2026 00:00:00 +0000\r\n"
     )
     .expect("write to Vec cannot fail");
+}
+
+fn build_article_response_header_into<'a>(
+    buffer: &'a mut Vec<u8>,
+    article_id: u64,
+    message_id: &str,
+) -> &'a [u8] {
+    buffer.clear();
+    buffer.reserve(
+        ARTICLE_RESPONSE_PREFIX
+            .len()
+            .saturating_add(message_id.len())
+            .saturating_add(ARTICLE_RESPONSE_HEADER_EXTRA_CAPACITY),
+    );
+    write!(buffer, "220 {article_id} {message_id} article follows\r\n")
+        .expect("write to Vec cannot fail");
+    append_synthetic_article_headers(buffer, message_id);
+    buffer.extend_from_slice(CRLF);
+    buffer.as_slice()
 }
 
 fn build_selected_article_response_into<'a>(
@@ -3234,10 +3263,7 @@ fn build_article_response_into<'a>(
     target_bytes: usize,
 ) -> &'a [u8] {
     buffer.clear();
-    write!(buffer, "220 {article_id} {message_id} article follows\r\n")
-        .expect("write to Vec cannot fail");
-    append_synthetic_article_headers(buffer, message_id);
-    buffer.extend_from_slice(CRLF);
+    build_article_response_header_into(buffer, article_id, message_id);
 
     if buffer.len() < target_bytes {
         let missing = target_bytes - buffer.len();
@@ -3397,6 +3423,10 @@ fn append_repeated_payload_at_least(buffer: &mut Vec<u8>, line: &[u8], min_bytes
     for _ in 0..copies {
         buffer.extend_from_slice(line);
     }
+}
+
+fn repeated_payload_len_at_least(min_bytes: usize) -> usize {
+    min_bytes.div_ceil(BODY_LINE.len()) * BODY_LINE.len()
 }
 
 impl GeneratedResponse<'_> {
@@ -3843,6 +3873,34 @@ where
     }
 
     pending_write.write_with_response(writer, response).await
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn write_message_id_article_response<W>(
+    writer: &mut W,
+    pending_write: &mut PendingWrite,
+    response_buffer: &mut Vec<u8>,
+    message_id: &MessageId<'_>,
+    config: &ServerConfig,
+    session_stats: &mut SessionStats,
+) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let header = build_article_response_header_into(response_buffer, 0, message_id.as_str());
+    let payload_len =
+        repeated_payload_len_at_least(config.article_bytes.saturating_sub(header.len()));
+    let payload = &config.article_payload[..payload_len];
+    session_stats.bytes_sent +=
+        header.len() as u64 + payload.len() as u64 + DOT_TERMINATOR.len() as u64;
+
+    pending_write.flush(writer).await?;
+    let mut slices = [
+        IoSlice::new(header),
+        IoSlice::new(payload),
+        IoSlice::new(DOT_TERMINATOR),
+    ];
+    write_all_vectored(writer, &mut slices).await
 }
 
 fn open_stored_article_response(
@@ -4401,6 +4459,7 @@ pub struct ServerConfig {
     pub article_bytes: usize,
     body_response: Box<[u8]>,
     article_response: Box<[u8]>,
+    article_payload: Box<[u8]>,
     pub article_dir: Option<Arc<PathBuf>>,
     article_index: Option<Arc<ArticleStoreIndex>>,
     pub article_index_error: Option<Arc<str>>,
@@ -4419,6 +4478,7 @@ impl ServerConfig {
         let body_response = build_generated_response(BODY_RESPONSE_PREFIX, args.body_bytes);
         let article_response =
             build_generated_response(ARTICLE_RESPONSE_PREFIX, args.article_bytes);
+        let article_payload = build_repeated_payload(args.article_bytes);
         let (article_index, article_index_error) = match args.article_dir.as_deref() {
             Some(root) => match ArticleStoreIndex::build(root) {
                 Ok(index) => (Some(Arc::new(index)), None),
@@ -4431,6 +4491,7 @@ impl ServerConfig {
             article_bytes: args.article_bytes,
             body_response,
             article_response,
+            article_payload,
             article_dir: args.article_dir.map(Arc::new),
             article_index,
             article_index_error,
@@ -13687,6 +13748,39 @@ mod tests {
             writer.bytes,
             [DATE_RESPONSE, b"220 large response\r\nbody\r\n.\r\n"].concat()
         );
+    }
+
+    #[tokio::test]
+    async fn message_id_article_response_vectors_prebuilt_payload_and_matches_full_builder() {
+        let config = ServerConfig::from_args(test_args());
+        let message_id = MessageId::from_borrowed("<bench.123@nntpbench.local>").unwrap();
+        let mut expected_buffer = Vec::new();
+        let expected = build_message_id_article_response_into(
+            &mut expected_buffer,
+            &message_id,
+            config.article_bytes,
+        )
+        .to_vec();
+
+        let mut writer = VectoredWriter::default();
+        let mut pending = PendingWrite::new(DEFAULT_PENDING_WRITE_BYTES);
+        let mut response_buffer = Vec::new();
+        let mut stats = SessionStats::default();
+        write_message_id_article_response(
+            &mut writer,
+            &mut pending,
+            &mut response_buffer,
+            &message_id,
+            &config,
+            &mut stats,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(writer.bytes, expected);
+        assert_eq!(stats.bytes_sent, expected.len() as u64);
+        assert_eq!(pending.len, 0);
+        assert_eq!(writer.vectored_writes, 1);
     }
 
     #[tokio::test]
