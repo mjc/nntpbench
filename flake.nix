@@ -26,12 +26,7 @@
         overlays = [(import rust-overlay)];
       };
 
-      rustToolchainBase =
-        if rustVersion == "nightly"
-        then pkgs.rust-bin.nightly.latest.default
-        else pkgs.rust-bin.stable.${rustVersion}.default;
-
-      rustToolchain = rustToolchainBase.override {
+      rustToolchain = pkgs.rust-bin.stable.${rustVersion}.default.override {
         extensions = [
           "clippy"
           "llvm-tools-preview"
