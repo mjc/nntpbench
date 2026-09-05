@@ -2166,8 +2166,8 @@ pub async fn serve_session(
     stats: Arc<Stats>,
 ) -> io::Result<()> {
     let mut session_stats = SessionStats::default();
-    let result = serve_session_inner(stream, peer_addr, config, &mut session_stats).await;
-    stats.add_session(&session_stats);
+    let result = serve_session_inner(stream, peer_addr, config, &stats, &mut session_stats).await;
+    stats.publish_session_delta(&mut session_stats);
     result
 }
 
@@ -2176,6 +2176,7 @@ async fn serve_session_inner(
     mut stream: TcpStream,
     _peer_addr: SocketAddr,
     config: Arc<ServerConfig>,
+    stats: &Stats,
     session_stats: &mut SessionStats,
 ) -> io::Result<()> {
     let (reader, mut writer) = stream.split();
@@ -2205,7 +2206,7 @@ async fn serve_session_inner(
             break;
         }
 
-        if process_command_batch(
+        let should_close = process_command_batch(
             &command_batch,
             command_lines.as_ref(),
             &config,
@@ -2218,8 +2219,9 @@ async fn serve_session_inner(
             &mut aux_response_buffer,
         )
         .await?
-        .should_close()
-        {
+        .should_close();
+        stats.publish_session_delta(session_stats);
+        if should_close {
             return Ok(());
         }
     }
@@ -5184,6 +5186,11 @@ impl Stats {
         self.bytes_sent
             .fetch_add(session.bytes_sent, Ordering::Relaxed);
     }
+    fn publish_session_delta(&self, session: &mut SessionStats) {
+        self.add_session(session);
+        *session = SessionStats::default();
+    }
+
 }
 
 impl Default for Stats {
@@ -18453,6 +18460,39 @@ mod tests {
         assert_eq!(outcome.drained_requests, 1);
         assert_eq!(outcome.incomplete_requests, 0);
         assert_eq!(outcome.timed_out_connections, 0);
+    }
+
+    #[tokio::test]
+    async fn server_publishes_session_stats_before_client_closes() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let stats = Arc::new(Stats::new());
+        let server_stats = stats.clone();
+        let server = tokio::spawn(async move {
+            let (stream, peer_addr) = listener.accept().await.unwrap();
+            serve_session(stream, peer_addr, test_config(), server_stats).await
+        });
+
+        let mut client = TcpStream::connect(address).await.unwrap();
+        let mut greeting = vec![0_u8; GREETING.len()];
+        client.read_exact(&mut greeting).await.unwrap();
+        assert_eq!(greeting, GREETING);
+        client.write_all(b"CAPABILITIES\r\n").await.unwrap();
+        let mut response = vec![0_u8; CAPABILITIES_RESPONSE.len()];
+        client.read_exact(&mut response).await.unwrap();
+
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.commands, 1);
+        assert_eq!(snapshot.bytes_sent, (GREETING.len() + response.len()) as u64);
+
+        client.shutdown().await.unwrap();
+        server.await.unwrap().unwrap();
+        let final_snapshot = stats.snapshot();
+        assert_eq!(final_snapshot.commands, 1);
+        assert_eq!(
+            final_snapshot.bytes_sent,
+            (GREETING.len() + response.len()) as u64
+        );
     }
 
 }
