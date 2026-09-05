@@ -760,6 +760,14 @@ pub struct FetchArgs {
     /// Seconds to run. Use 0 to disable this limit.
     #[arg(long, default_value_t = 0)]
     pub duration_secs: u64,
+    /// Maximum time allowed to establish a connection and read its greeting.
+    #[arg(long, default_value_t = 30)]
+    pub setup_timeout_secs: u64,
+
+    /// Maximum time allowed for each response while draining in-flight work.
+    #[arg(long, default_value_t = 5)]
+    pub drain_timeout_secs: u64,
+
 
     /// Concurrent TCP connections for load mode.
     #[arg(long, default_value_t = 1)]
@@ -924,6 +932,7 @@ pub async fn run_load(args: FetchArgs) -> io::Result<()> {
     }
 
     let mut sessions = JoinSet::new();
+    let mut lifecycle = LoadSessionOutcome::default();
     for connection_index in 0..config.connections {
         let global_index = config.client_offset + connection_index;
         let requests = requests_for_connection(config.requests, config.total_clients, global_index);
@@ -935,7 +944,7 @@ pub async fn run_load(args: FetchArgs) -> io::Result<()> {
 
     while let Some(result) = sessions.join_next().await {
         match result {
-            Ok(Ok(())) => {}
+            Ok(Ok(outcome)) => lifecycle.merge(outcome),
             Ok(Err(err)) => {
                 stats.errors.fetch_add(1, Ordering::Relaxed);
                 stop.store(true, Ordering::Release);
@@ -951,6 +960,7 @@ pub async fn run_load(args: FetchArgs) -> io::Result<()> {
         }
     }
 
+
     if config.csv {
         let snapshot = stats.snapshot();
         println!(
@@ -965,6 +975,18 @@ pub async fn run_load(args: FetchArgs) -> io::Result<()> {
         stats.print_snapshot("final");
     }
 
+    eprintln!(
+        "load phases setup_secs={:.3} measurement_secs={:.3} drain_secs={:.3} target_bytes={} measured_bytes={} drained_requests={} incomplete_requests={} timed_out_connections={}",
+        lifecycle.setup_elapsed.as_secs_f64(),
+        lifecycle.measurement_elapsed.as_secs_f64(),
+        lifecycle.drain_elapsed.as_secs_f64(),
+        config.transfer_bytes,
+        stats.snapshot().bytes_sent,
+        lifecycle.drained_requests,
+        lifecycle.incomplete_requests,
+        lifecycle.timed_out_connections,
+    );
+
     Ok(())
 }
 
@@ -976,6 +998,8 @@ struct LoadConfig {
     requests: Option<u64>,
     transfer_bytes: u64,
     duration: Duration,
+    setup_timeout: Duration,
+    drain_timeout: Duration,
     connections: usize,
     client_offset: usize,
     total_clients: usize,
@@ -1025,6 +1049,8 @@ impl LoadConfig {
             requests: (args.requests != 0).then_some(args.requests),
             transfer_bytes: args.transfer_bytes,
             duration: Duration::from_secs(args.duration_secs),
+            setup_timeout: Duration::from_secs(args.setup_timeout_secs.max(1)),
+            drain_timeout: Duration::from_secs(args.drain_timeout_secs.max(1)),
             connections,
             client_offset: args.client_offset,
             total_clients,
@@ -1060,12 +1086,35 @@ struct LoadSession {
     transfer_bytes: u64,
     next_id: u64,
     workload_policy: LoadWorkloadPolicy,
+    setup_timeout: Duration,
+    drain_timeout: Duration,
     pipeline_depth: usize,
     command_mix: ClientCommandMix,
     read_buffer_bytes: usize,
     nodelay: bool,
     socket_recv_buffer: usize,
     socket_send_buffer: usize,
+}
+
+#[derive(Debug, Default)]
+struct LoadSessionOutcome {
+    setup_elapsed: Duration,
+    measurement_elapsed: Duration,
+    drain_elapsed: Duration,
+    timed_out_connections: u64,
+    drained_requests: u64,
+    incomplete_requests: u64,
+}
+
+impl LoadSessionOutcome {
+    fn merge(&mut self, other: Self) {
+        self.setup_elapsed = self.setup_elapsed.max(other.setup_elapsed);
+        self.measurement_elapsed = self.measurement_elapsed.max(other.measurement_elapsed);
+        self.drain_elapsed = self.drain_elapsed.max(other.drain_elapsed);
+        self.timed_out_connections += other.timed_out_connections;
+        self.drained_requests += other.drained_requests;
+        self.incomplete_requests += other.incomplete_requests;
+    }
 }
 
 impl LoadSession {
@@ -1079,6 +1128,8 @@ impl LoadSession {
             transfer_bytes: config.transfer_bytes,
             next_id: start_id,
             workload_policy: config.workload_policy,
+            setup_timeout: config.setup_timeout,
+            drain_timeout: config.drain_timeout,
             pipeline_depth: config.pipeline_depth,
             command_mix: config.command_mix,
             read_buffer_bytes: config.read_buffer_bytes,
@@ -1088,7 +1139,7 @@ impl LoadSession {
         }
     }
 
-    async fn run(self, stats: Arc<Stats>, stop: Arc<AtomicBool>) -> io::Result<()> {
+    async fn run(self, stats: Arc<Stats>, stop: Arc<AtomicBool>) -> io::Result<LoadSessionOutcome> {
         stats.accepted_connections.fetch_add(1, Ordering::Relaxed);
         stats.active_connections.fetch_add(1, Ordering::Relaxed);
 
@@ -1097,16 +1148,50 @@ impl LoadSession {
         result
     }
 
-    async fn run_inner(self, stats: &Stats, stop: &AtomicBool) -> io::Result<()> {
-        let mut stream = connect_client_socket(
-            self.connect,
-            self.nodelay,
-            self.socket_recv_buffer,
-            self.socket_send_buffer,
-        )
-        .await?;
-        read_greeting(&mut stream).await?;
+    fn timeout_outcome(
+        &self,
+        mut outcome: LoadSessionOutcome,
+        measurement_started: Instant,
+        in_flight: usize,
+    ) -> LoadSessionOutcome {
+        outcome.measurement_elapsed = measurement_started.elapsed();
+        outcome.drain_elapsed = self.drain_timeout;
+        outcome.timed_out_connections = 1;
+        outcome.incomplete_requests = in_flight as u64;
+        outcome
+    }
 
+    async fn run_inner(self, stats: &Stats, stop: &AtomicBool) -> io::Result<LoadSessionOutcome> {
+        let setup_started = Instant::now();
+        let setup = time::timeout(self.setup_timeout, async {
+            let mut stream = connect_client_socket(
+                self.connect,
+                self.nodelay,
+                self.socket_recv_buffer,
+                self.socket_send_buffer,
+            )
+            .await?;
+            read_greeting(&mut stream).await?;
+            Ok::<_, io::Error>(stream)
+        })
+        .await;
+        let setup_elapsed = setup_started.elapsed();
+        let mut stream = match setup {
+            Ok(stream) => stream?,
+            Err(_) => {
+                return Ok(LoadSessionOutcome {
+                    setup_elapsed,
+                    timed_out_connections: 1,
+                    ..LoadSessionOutcome::default()
+                });
+            }
+        };
+
+        let measurement_started = Instant::now();
+        let mut outcome = LoadSessionOutcome {
+            setup_elapsed,
+            ..LoadSessionOutcome::default()
+        };
         let mut response_reader = LoadResponseReader::new(self.read_buffer_bytes);
         let mut request_buffer = Vec::with_capacity(self.pipeline_depth.saturating_mul(64));
         let mut issued = 0_u64;
@@ -1115,16 +1200,28 @@ impl LoadSession {
         let mut session_stats = SessionStats::default();
         loop {
             if in_flight == 0 {
-                in_flight += self
-                    .write_load_batch(
+                let batch = time::timeout(
+                    self.drain_timeout,
+                    self.write_load_batch(
                         &mut stream,
                         &mut request_buffer,
                         issued,
                         self.pipeline_depth,
                         stats,
                         stop,
-                    )
-                    .await?;
+                    ),
+                )
+                .await;
+                in_flight += match batch {
+                    Ok(result) => result?,
+                    Err(_) => {
+                        return Ok(self.timeout_outcome(
+                            outcome,
+                            measurement_started,
+                            in_flight,
+                        ));
+                    }
+                };
                 issued = issued.wrapping_add(in_flight as u64);
             }
 
@@ -1134,9 +1231,22 @@ impl LoadSession {
 
             let command_id = self.next_id.wrapping_add(received);
             let request_kind = request_kind_for_client_command(command_id, self.command_mix);
-            let response_len = response_reader
-                .read_response(&mut stream, request_kind)
-                .await?;
+            let response = time::timeout(
+                self.drain_timeout,
+                response_reader.read_response(&mut stream, request_kind),
+            )
+            .await;
+            let response_len = match response {
+                Ok(result) => result?,
+                Err(_) => {
+                    return Ok(self.timeout_outcome(
+                        outcome,
+                        measurement_started,
+                        in_flight,
+                    ));
+                }
+            };
+            let was_draining = stop.load(Ordering::Acquire);
             received = received.wrapping_add(1);
             in_flight -= 1;
 
@@ -1144,11 +1254,15 @@ impl LoadSession {
                 .bytes_sent
                 .fetch_add(response_len as u64, Ordering::Relaxed);
             session_stats.commands = session_stats.commands.wrapping_add(1);
+            if was_draining {
+                outcome.drained_requests += 1;
+            }
             #[cfg(feature = "coz")]
             coz::progress!("client.response");
             match client_command_kind(command_id, self.command_mix) {
                 ClientCommandMix::Article => {
-                    session_stats.article_requests = session_stats.article_requests.wrapping_add(1);
+                    session_stats.article_requests =
+                        session_stats.article_requests.wrapping_add(1);
                 }
                 ClientCommandMix::Body => {
                     session_stats.body_requests = session_stats.body_requests.wrapping_add(1);
@@ -1168,26 +1282,39 @@ impl LoadSession {
             }
 
             if in_flight <= self.pipeline_depth / 2 {
-                let capacity = self.pipeline_depth - in_flight;
-                let filled = self
-                    .write_load_batch(
+                let batch = time::timeout(
+                    self.drain_timeout,
+                    self.write_load_batch(
                         &mut stream,
                         &mut request_buffer,
                         issued,
-                        capacity,
+                        self.pipeline_depth - in_flight,
                         stats,
                         stop,
-                    )
-                    .await?;
+                    ),
+                )
+                .await;
+                let filled = match batch {
+                    Ok(result) => result?,
+                    Err(_) => {
+                        return Ok(self.timeout_outcome(
+                            outcome,
+                            measurement_started,
+                            in_flight,
+                        ));
+                    }
+                };
                 issued = issued.wrapping_add(filled as u64);
                 in_flight += filled;
             }
         }
 
+        outcome.measurement_elapsed = measurement_started.elapsed();
         flush_load_session_stats(stats, &mut session_stats);
 
-        Ok(())
+        Ok(outcome)
     }
+
 
     async fn write_load_batch(
         &self,
@@ -1228,7 +1355,9 @@ impl LoadSession {
         }
 
         if filled != 0 {
-            stream.write_all(buffer).await?;
+            time::timeout(self.drain_timeout, stream.write_all(buffer))
+                .await
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "load write timed out"))??;
             stats.pipeline_batches.fetch_add(1, Ordering::Relaxed);
         }
         Ok(filled)
@@ -7735,6 +7864,8 @@ mod tests {
             requests: 0,
             transfer_bytes: 0,
             duration_secs: 0,
+            setup_timeout_secs: 30,
+            drain_timeout_secs: 5,
             connections: 1,
             client_offset: 0,
             total_clients: 0,
@@ -18218,6 +18349,110 @@ mod tests {
             let config = LoadConfig::from_args(args).unwrap();
             assert_eq!(config.workload_policy, workload_policy);
         }
+    }
+
+    #[tokio::test]
+    async fn stalled_load_response_is_bounded_by_drain_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"200 ready\r\n").await.unwrap();
+            let mut request = [0_u8; 512];
+            stream.read(&mut request).await.unwrap();
+            time::sleep(Duration::from_secs(2)).await;
+        });
+
+        let mut args = test_fetch_args();
+        args.connect = address;
+        args.requests = 1;
+        args.total_clients = 1;
+        args.setup_timeout_secs = 1;
+        args.drain_timeout_secs = 1;
+        let config = LoadConfig::from_args(args).unwrap();
+        let stats = Arc::new(Stats::new());
+        let started = Instant::now();
+
+        let outcome = LoadSession::new(&config, 0, config.start_id, config.requests)
+            .run(stats, Arc::new(AtomicBool::new(false)))
+            .await
+            .unwrap();
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(outcome.timed_out_connections, 1);
+        assert_eq!(outcome.incomplete_requests, 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn stalled_load_setup_is_bounded_by_setup_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            time::sleep(Duration::from_secs(2)).await;
+        });
+
+        let mut args = test_fetch_args();
+        args.connect = address;
+        args.requests = 1;
+        args.total_clients = 1;
+        args.setup_timeout_secs = 1;
+        args.drain_timeout_secs = 1;
+        let config = LoadConfig::from_args(args).unwrap();
+        let started = Instant::now();
+
+        let outcome = LoadSession::new(&config, 0, config.start_id, config.requests)
+            .run(Arc::new(Stats::new()), Arc::new(AtomicBool::new(false)))
+            .await
+            .unwrap();
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(outcome.timed_out_connections, 1);
+        assert_eq!(outcome.incomplete_requests, 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn orderly_load_drain_reports_completed_in_flight_work() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"200 ready\r\n").await.unwrap();
+            let mut request = [0_u8; 512];
+            stream.read(&mut request).await.unwrap();
+            time::sleep(Duration::from_millis(50)).await;
+            stream
+                .write_all(b"220 1 <article@test> article follows\r\n.\r\n")
+                .await
+                .unwrap();
+        });
+
+        let mut args = test_fetch_args();
+        args.connect = address;
+        args.requests = 1;
+        args.total_clients = 1;
+        args.setup_timeout_secs = 1;
+        args.drain_timeout_secs = 1;
+        let config = LoadConfig::from_args(args).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_for_task = stop.clone();
+        let stopper = tokio::spawn(async move {
+            time::sleep(Duration::from_millis(10)).await;
+            stop_for_task.store(true, Ordering::Release);
+        });
+
+        let outcome = LoadSession::new(&config, 0, config.start_id, config.requests)
+            .run(Arc::new(Stats::new()), stop)
+            .await
+            .unwrap();
+
+        stopper.await.unwrap();
+        server.await.unwrap();
+        assert_eq!(outcome.drained_requests, 1);
+        assert_eq!(outcome.incomplete_requests, 0);
+        assert_eq!(outcome.timed_out_connections, 0);
     }
 
 }
