@@ -32,7 +32,7 @@ use tokio::time;
 use crate::terminator::{
     BoundedResponseLineStatus, DOT_TERMINATOR, ResponseLineStatus, append_dot_terminator,
     detect_bounded_response_line_end, detect_response_line_end_from, find_crlf_line_end,
-    strip_complete_crlf_line,
+    find_dot_terminated_block, strip_complete_crlf_line,
 };
 #[cfg(test)]
 use crate::terminator::{
@@ -1146,7 +1146,6 @@ impl LoadSession {
 struct LoadResponseReader {
     buffer: Vec<u8>,
     start: usize,
-    terminator_search_start: usize,
     read_buffer_bytes: usize,
 }
 
@@ -1155,7 +1154,6 @@ impl LoadResponseReader {
         Self {
             buffer: Vec::with_capacity(read_buffer_bytes),
             start: 0,
-            terminator_search_start: 0,
             read_buffer_bytes,
         }
     }
@@ -1184,38 +1182,27 @@ impl LoadResponseReader {
 
     fn try_consume_response(&mut self, kind: RequestKind) -> io::Result<Option<usize>> {
         let data = &self.buffer[self.start..];
-        let Some(line_end) = find_crlf_line_end(data, 0) else {
-            return Ok(None);
+        let initial = match protocol::ResponseInitial::parse(kind, data) {
+            protocol::ResponseInitialParse::Complete(initial) => initial,
+            protocol::ResponseInitialParse::NeedMore => return Ok(None),
+            protocol::ResponseInitialParse::Invalid => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid server response initial line",
+                ));
+            }
         };
-        if line_end < 5 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "server response line is too short",
-            ));
-        }
-
-        if !load_response_is_multiline(kind, data) {
+        let line_end = find_crlf_line_end(data, 0).expect("validated response line");
+        if !initial.descriptor().framing().is_multiline() {
             self.start += line_end;
-            self.terminator_search_start = self.start;
             return Ok(Some(line_end));
         }
 
-        let search_start = self
-            .terminator_search_start
-            .max(self.start + line_end)
-            .min(self.buffer.len());
-        let Some(relative_end) = memchr::memmem::find(&self.buffer[search_start..], TERMINATOR)
-        else {
-            self.terminator_search_start = self
-                .buffer
-                .len()
-                .saturating_sub(TERMINATOR.len().saturating_sub(1))
-                .max(self.start + line_end);
+        let Some(block) = find_dot_terminated_block(data, line_end) else {
             return Ok(None);
         };
-        let consumed = search_start - self.start + relative_end + TERMINATOR.len();
+        let consumed = block.block_end();
         self.start += consumed;
-        self.terminator_search_start = self.start;
         Ok(Some(consumed))
     }
 
@@ -1226,14 +1213,11 @@ impl LoadResponseReader {
         if self.start == self.buffer.len() {
             self.buffer.clear();
             self.start = 0;
-            self.terminator_search_start = 0;
             return;
         }
         if self.start >= self.read_buffer_bytes {
-            let consumed = self.start;
             self.buffer.drain(..self.start);
             self.start = 0;
-            self.terminator_search_start = self.terminator_search_start.saturating_sub(consumed);
         }
     }
 }
@@ -1270,10 +1254,6 @@ where
     .await
 }
 
-fn load_response_is_multiline(kind: RequestKind, data: &[u8]) -> bool {
-    matches!(kind, RequestKind::Article | RequestKind::Body)
-        && matches!(&data.get(..3), Some(b"220" | b"222"))
-}
 
 fn fetch_request(args: &FetchArgs) -> Result<Request<'static>, ClientError> {
     let request = args.request.ok_or(ClientError::MissingArticleSelector)?;
@@ -1601,7 +1581,6 @@ pub fn bench_load_response_scan_in_place(
     let mut reader = LoadResponseReader {
         buffer: std::mem::take(buffer),
         start: 0,
-        terminator_search_start: 0,
         read_buffer_bytes,
     };
     let result = reader
@@ -18068,5 +18047,41 @@ mod tests {
                 bench_load_response_scan_in_place(&mut response_buffer, RequestKind::Body).unwrap();
             assert_eq!(consumed, response.len());
         });
+    }
+
+    #[test]
+    fn load_response_scan_accepts_empty_multiline_article() {
+        let response = b"220 1 <article@test> article follows\r\n.\r\n";
+        assert_eq!(
+            bench_load_response_scan(response, RequestKind::Article).unwrap(),
+            response.len()
+        );
+    }
+
+    #[test]
+    fn load_response_scan_preserves_adjacent_frames() {
+        let first = b"220 1 <article@test> article follows\r\n.\r\n";
+        let second = b"220 2 <article@test> article follows\r\n.\r\n";
+        let mut buffer = first.to_vec();
+        buffer.extend_from_slice(second);
+
+        let consumed =
+            bench_load_response_scan_in_place(&mut buffer, RequestKind::Article).unwrap();
+        assert_eq!(consumed, first.len());
+        assert_eq!(&buffer[consumed..], second);
+    }
+
+    #[test]
+    fn load_response_scan_rejects_command_incompatible_success() {
+        let response = b"222 1 <article@test> body follows\r\n.\r\n";
+        let error = bench_load_response_scan(response, RequestKind::Article).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn load_response_scan_rejects_malformed_status_line() {
+        let error = bench_load_response_scan(b"not an NNTP response\r\n", RequestKind::Article)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 }
