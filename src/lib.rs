@@ -551,6 +551,45 @@ mod proptests {
             let expected = segment_for_request(&segments, client_index, total_clients, request_index);
             prop_assert_eq!(segmented.message_id().unwrap().as_str(), expected.as_str());
         }
+
+        #[test]
+        fn disjoint_workload_split_matches_single_process(
+            start_id in 0_u64..10_000,
+            total_clients in 1_usize..8,
+            requests in 1_usize..16,
+            split in 0_usize..8,
+        ) {
+            let split = split.min(total_clients);
+            let single_process: Vec<_> = (0..total_clients)
+                .flat_map(|client_index| {
+                    (0..requests).map(move |request_index| {
+                        synthetic_request_id(
+                            start_id,
+                            client_index,
+                            request_index as u64,
+                            total_clients,
+                            LoadWorkloadPolicy::Disjoint,
+                        )
+                    })
+                })
+                .collect();
+            let split_processes: Vec<_> = (0..split)
+                .chain(split..total_clients)
+                .flat_map(|client_index| {
+                    (0..requests).map(move |request_index| {
+                        synthetic_request_id(
+                            start_id,
+                            client_index,
+                            request_index as u64,
+                            total_clients,
+                            LoadWorkloadPolicy::Disjoint,
+                        )
+                    })
+                })
+                .collect();
+
+            prop_assert_eq!(split_processes, single_process);
+        }
     }
 }
 
@@ -611,6 +650,33 @@ pub enum ClientCommandMix {
     Article,
     Body,
     Alternate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum LoadWorkloadPolicy {
+    /// Give each client a disjoint synthetic stream.
+    Disjoint,
+    /// Repeat one shared synthetic sequence across all clients.
+    Shared,
+    /// Repeat one synthetic article on every request.
+    Repeat,
+}
+
+#[must_use]
+fn synthetic_request_id(
+    start_id: u64,
+    client_index: usize,
+    request_index: u64,
+    total_clients: usize,
+    policy: LoadWorkloadPolicy,
+) -> u64 {
+    match policy {
+        LoadWorkloadPolicy::Disjoint => start_id
+            .wrapping_add(client_index as u64)
+            .wrapping_add(request_index.wrapping_mul(total_clients as u64)),
+        LoadWorkloadPolicy::Shared => start_id.wrapping_add(request_index),
+        LoadWorkloadPolicy::Repeat => start_id,
+    }
 }
 
 #[derive(Debug, Parser, Clone)]
@@ -714,6 +780,9 @@ pub struct FetchArgs {
     /// First numeric article id used in generated Message-IDs.
     #[arg(long, default_value_t = 1)]
     pub start_id: u64,
+    /// Synthetic workload identity policy used when no segment file is supplied.
+    #[arg(long, value_enum, default_value_t = LoadWorkloadPolicy::Disjoint)]
+    pub workload_policy: LoadWorkloadPolicy,
 
     /// Print final machine-readable CSV: requests,bytes,elapsed_s,cpu_s,rss_kib.
     #[arg(long, default_value_t = false)]
@@ -816,7 +885,7 @@ pub async fn run_load(args: FetchArgs) -> io::Result<()> {
 
     if !config.csv {
         eprintln!(
-            "nntpbench client connecting to {} requests={:?} transfer_bytes={} duration_secs={} connections={} total_clients={} client_offset={} pipeline_depth={} command_mix={:?}",
+            "nntpbench client connecting to {} requests={:?} transfer_bytes={} duration_secs={} connections={} total_clients={} client_offset={} pipeline_depth={} command_mix={:?} workload_policy={:?}",
             config.connect,
             config.requests,
             config.transfer_bytes,
@@ -825,7 +894,8 @@ pub async fn run_load(args: FetchArgs) -> io::Result<()> {
             config.total_clients,
             config.client_offset,
             config.pipeline_depth,
-            config.command_mix
+            config.command_mix,
+            config.workload_policy
         );
     }
 
@@ -854,12 +924,10 @@ pub async fn run_load(args: FetchArgs) -> io::Result<()> {
     }
 
     let mut sessions = JoinSet::new();
-    let mut next_start_id = config.start_id;
     for connection_index in 0..config.connections {
         let global_index = config.client_offset + connection_index;
         let requests = requests_for_connection(config.requests, config.total_clients, global_index);
-        let session = LoadSession::new(&config, global_index, next_start_id, requests);
-        next_start_id = next_start_id.wrapping_add(requests.unwrap_or_default());
+        let session = LoadSession::new(&config, global_index, config.start_id, requests);
         let stats = stats.clone();
         let stop = stop.clone();
         sessions.spawn(async move { session.run(stats, stop).await });
@@ -914,6 +982,7 @@ struct LoadConfig {
     pipeline_depth: usize,
     command_mix: ClientCommandMix,
     start_id: u64,
+    workload_policy: LoadWorkloadPolicy,
     read_buffer_bytes: usize,
     nodelay: bool,
     socket_recv_buffer: usize,
@@ -930,6 +999,18 @@ impl LoadConfig {
         } else {
             args.total_clients
         };
+        if matches!(args.workload_policy, LoadWorkloadPolicy::Disjoint)
+            && args
+                .client_offset
+                .checked_add(connections)
+                .is_none_or(|end| end > total_clients)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "disjoint workload clients exceed total_clients",
+            ));
+        }
+
         let segments = args
             .segments
             .as_deref()
@@ -950,6 +1031,7 @@ impl LoadConfig {
             pipeline_depth: args.pipeline_depth.clamp(1, 4096),
             command_mix: args.command_mix,
             start_id: args.start_id,
+            workload_policy: args.workload_policy,
             read_buffer_bytes: args.read_buffer_bytes.max(terminator::TERMINATOR_TAIL_SIZE),
             nodelay: args.nodelay,
             socket_recv_buffer: args.socket_recv_buffer,
@@ -977,6 +1059,7 @@ struct LoadSession {
     requests: Option<u64>,
     transfer_bytes: u64,
     next_id: u64,
+    workload_policy: LoadWorkloadPolicy,
     pipeline_depth: usize,
     command_mix: ClientCommandMix,
     read_buffer_bytes: usize,
@@ -995,6 +1078,7 @@ impl LoadSession {
             requests,
             transfer_bytes: config.transfer_bytes,
             next_id: start_id,
+            workload_policy: config.workload_policy,
             pipeline_depth: config.pipeline_depth,
             command_mix: config.command_mix,
             read_buffer_bytes: config.read_buffer_bytes,
@@ -1123,9 +1207,17 @@ impl LoadSession {
         {
             let request_index = issued + filled as u64;
             let command_id = self.next_id.wrapping_add(request_index);
+            let synthetic_id = synthetic_request_id(
+                self.next_id,
+                self.client_index,
+                request_index,
+                self.total_clients,
+                self.workload_policy,
+            );
             append_load_workload_request(
                 buffer,
                 command_id,
+                synthetic_id,
                 request_index,
                 self.command_mix,
                 self.segments.as_deref(),
@@ -1531,6 +1623,7 @@ fn client_request_for_command(
 fn append_load_workload_request(
     buffer: &mut Vec<u8>,
     command_id: u64,
+    synthetic_id: u64,
     request_index: u64,
     mix: ClientCommandMix,
     segments: Option<&SegmentSet>,
@@ -1550,7 +1643,7 @@ fn append_load_workload_request(
         let message_id = segment_for_request(segments, client_index, total_clients, request_index);
         buffer.extend_from_slice(message_id.as_str().as_bytes());
     } else {
-        write!(buffer, "<bench.{command_id}@nntpbench.local>")?;
+        write!(buffer, "<bench.{synthetic_id}@nntpbench.local>")?;
     }
     buffer.extend_from_slice(CRLF);
     Ok(())
@@ -1563,7 +1656,7 @@ pub fn bench_append_load_workload_request(
     request_index: u64,
     mix: ClientCommandMix,
 ) -> io::Result<()> {
-    append_load_workload_request(buffer, command_id, request_index, mix, None, 0, 1)
+    append_load_workload_request(buffer, command_id, command_id, request_index, mix, None, 0, 1)
 }
 
 #[doc(hidden)]
@@ -7513,6 +7606,7 @@ mod tests {
             total_clients: 0,
             command_mix: ClientCommandMix::Alternate,
             start_id: 1,
+            workload_policy: LoadWorkloadPolicy::Disjoint,
             csv: false,
             stats_interval_secs: 1,
             nodelay: true,
@@ -17923,4 +18017,46 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
+
+    #[test]
+    fn synthetic_workload_policies_map_request_ids_explicitly() {
+        assert_eq!(
+            synthetic_request_id(10, 2, 3, 4, LoadWorkloadPolicy::Disjoint),
+            24
+        );
+        assert_eq!(
+            synthetic_request_id(10, 2, 3, 4, LoadWorkloadPolicy::Shared),
+            13
+        );
+        assert_eq!(
+            synthetic_request_id(10, 2, 3, 4, LoadWorkloadPolicy::Repeat),
+            10
+        );
+    }
+
+    #[test]
+    fn disjoint_workload_rejects_out_of_range_process_shard() {
+        let mut args = test_fetch_args();
+        args.connections = 2;
+        args.client_offset = 1;
+        args.total_clients = 2;
+
+        let error = LoadConfig::from_args(args).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn shared_and_repeat_workloads_allow_deliberate_overlap() {
+        for workload_policy in [LoadWorkloadPolicy::Shared, LoadWorkloadPolicy::Repeat] {
+            let mut args = test_fetch_args();
+            args.connections = 2;
+            args.client_offset = 1;
+            args.total_clients = 2;
+            args.workload_policy = workload_policy;
+
+            let config = LoadConfig::from_args(args).unwrap();
+            assert_eq!(config.workload_policy, workload_policy);
+        }
+    }
+
 }
