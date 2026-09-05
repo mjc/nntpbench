@@ -163,8 +163,8 @@ mod request_wire {
 
 mod streaming_decode {
     use super::{
-        BODY_RESPONSE, Bencher, COMPACT_BODY_RESPONSE, RequestKind,
-        bench_load_response_scan_in_place, bench_streaming_decode_response, black_box,
+        BODY_RESPONSE, Bencher, COMPACT_BODY_RESPONSE, RequestKind, bench_load_response_scan,
+        bench_streaming_decode_response, black_box,
     };
     use std::cell::RefCell;
 

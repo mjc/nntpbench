@@ -770,6 +770,7 @@ pub enum FetchRequestKind {
     Capabilities,
     Date,
     ModeReader,
+    ModeStream,
     Quit,
 }
 
@@ -1059,6 +1060,8 @@ impl LoadSession {
                 .bytes_sent
                 .fetch_add(response_len as u64, Ordering::Relaxed);
             session_stats.commands = session_stats.commands.wrapping_add(1);
+            #[cfg(feature = "coz")]
+            coz::progress!("client.response");
             match client_command_kind(command_id, self.command_mix) {
                 ClientCommandMix::Article => {
                     session_stats.article_requests = session_stats.article_requests.wrapping_add(1);
@@ -1372,6 +1375,7 @@ fn fetch_request(args: &FetchArgs) -> Result<Request<'static>, ClientError> {
         FetchRequestKind::Capabilities => Ok(Request::capabilities()),
         FetchRequestKind::Date => Ok(Request::date()),
         FetchRequestKind::ModeReader => Ok(Request::mode_reader()),
+        FetchRequestKind::ModeStream => Ok(Request::mode_stream()),
         FetchRequestKind::Quit => Ok(Request::quit()),
     }
 }
@@ -1955,11 +1959,10 @@ async fn serve_session_inner(
     let mut command_line = [0; MAX_COMMAND_LINE_BYTES];
     let mut command_lines = Some(CommandLineBatch::with_capacity(max_pipeline_depth));
     let mut command_batch: Box<CommandBatch> = Box::default();
-    let mut pending_write = PendingWrite::from_pool(&config.pending_write_pool);
+    let mut pending_write = config.pending_write_pool.acquire();
     let mut article_path = PathBuf::new();
     let mut session_state = SessionState::default();
-    let mut response_buffer =
-        GeneratedResponseBuffer::from_pool(&config.generated_response_buffer_pool);
+    let mut response_buffer = config.generated_response_buffer_pool.acquire();
     let mut aux_response_buffer = Vec::new();
 
     send_greeting(&mut writer, &config, session_stats).await?;
@@ -2181,6 +2184,10 @@ where
             )
             .await?;
             if batched != 0 {
+                #[cfg(feature = "coz")]
+                for _ in 0..batched {
+                    coz::progress!("server.command");
+                }
                 command_index += batched;
                 continue;
             }
@@ -2200,6 +2207,8 @@ where
             aux_response_buffer,
         )
         .await?;
+        #[cfg(feature = "coz")]
+        coz::progress!("server.command");
         if should_close {
             flush_session_writer(writer, pending_write, config).await?;
             return Ok(BatchOutcome::Close);
@@ -3191,6 +3200,10 @@ where
             write_response(writer, pending_write, MODE_READER_RESPONSE, session_stats).await?;
             Ok(false)
         }
+        RequestKind::ModeStream => {
+            write_response(writer, pending_write, b"203 streaming enabled\r\n", session_stats).await?;
+            Ok(false)
+        }
         RequestKind::Quit => {
             write_response(writer, pending_write, QUIT_RESPONSE, session_stats).await?;
             Ok(true)
@@ -3220,7 +3233,14 @@ where
 }
 
 #[derive(Debug, Clone)]
-struct BufferPool {
+struct PendingWritePool {
+    inner: Arc<Mutex<Vec<Vec<u8>>>>,
+    capacity: usize,
+    max_buffers: usize,
+}
+
+#[derive(Debug, Clone)]
+struct GeneratedResponseBufferPool {
     inner: Arc<Mutex<Vec<Vec<u8>>>>,
     capacity: usize,
     max_buffers: usize,
@@ -3228,12 +3248,12 @@ struct BufferPool {
 
 struct PendingWrite {
     buf: Vec<u8>,
-    pool: Option<BufferPool>,
+    pool: Option<PendingWritePool>,
 }
 
 struct GeneratedResponseBuffer {
     buf: Vec<u8>,
-    pool: Option<BufferPool>,
+    pool: Option<GeneratedResponseBufferPool>,
 }
 
 struct GeneratedResponse<'a> {
@@ -3505,7 +3525,7 @@ impl GeneratedResponse<'_> {
     }
 }
 
-impl BufferPool {
+impl PendingWritePool {
     fn new(capacity: usize, max_buffers: usize) -> Self {
         let max_buffers = max_buffers.max(1);
         Self {
@@ -3515,7 +3535,7 @@ impl BufferPool {
         }
     }
 
-    fn acquire(&self) -> Vec<u8> {
+    fn acquire(&self) -> PendingWrite {
         let buf = self
             .inner
             .lock()
@@ -3524,7 +3544,53 @@ impl BufferPool {
             .unwrap_or_else(|| Vec::with_capacity(self.capacity));
 
         debug_assert_eq!(buf.len(), 0);
-        buf
+        PendingWrite {
+            buf,
+            pool: Some(self.clone()),
+        }
+    }
+
+    fn release(&self, mut buf: Vec<u8>) {
+        if buf.capacity() != self.capacity {
+            return;
+        }
+        buf.clear();
+        if let Ok(mut buffers) = self.inner.lock()
+            && buffers.len() < self.max_buffers
+        {
+            buffers.push(buf);
+        }
+    }
+
+    #[cfg(test)]
+    fn available_for_test(&self) -> usize {
+        self.inner.lock().map_or(0, |buffers| buffers.len())
+    }
+}
+
+impl GeneratedResponseBufferPool {
+    fn new(capacity: usize, max_buffers: usize) -> Self {
+        let max_buffers = max_buffers.max(1);
+        Self {
+            inner: Arc::new(Mutex::new(Vec::with_capacity(max_buffers))),
+            capacity: capacity.max(1),
+            max_buffers,
+        }
+    }
+
+    fn acquire(&self) -> GeneratedResponseBuffer {
+        let buf = self
+            .inner
+            .lock()
+            .ok()
+            .and_then(|mut buffers| buffers.pop())
+            .unwrap_or_else(|| Vec::with_capacity(self.capacity));
+
+        debug_assert_eq!(buf.len(), 0);
+        GeneratedResponseBuffer {
+            buf,
+            pool: Some(self.clone()),
+        }
     }
 
     fn release(&self, mut buf: Vec<u8>) {
@@ -3547,12 +3613,6 @@ impl BufferPool {
 
 #[cfg_attr(coverage_nightly, coverage(off))]
 impl PendingWrite {
-    fn from_pool(pool: &BufferPool) -> Self {
-        Self {
-            buf: pool.acquire(),
-            pool: Some(pool.clone()),
-        }
-    }
     #[cfg(test)]
     fn new(capacity: usize) -> Self {
         Self {
@@ -3649,12 +3709,6 @@ impl DerefMut for GeneratedResponseBuffer {
 }
 
 impl GeneratedResponseBuffer {
-    fn from_pool(pool: &BufferPool) -> Self {
-        Self {
-            buf: pool.acquire(),
-            pool: Some(pool.clone()),
-        }
-    }
     #[cfg(test)]
     fn capacity_for_test(&self) -> usize {
         self.buf.capacity()
@@ -3998,6 +4052,7 @@ where
         RequestKind::Capabilities => CAPABILITIES_RESPONSE,
         RequestKind::Help => HELP_RESPONSE,
         RequestKind::ModeReader => MODE_READER_RESPONSE,
+        RequestKind::ModeStream => b"203 streaming enabled\r\n",
         RequestKind::Quit => QUIT_RESPONSE,
         RequestKind::Unknown if is_known_request_syntax_error(request) => {
             if authinfo_sasl_initial_response_base64_error(request.verb(), request.args()) {
@@ -4128,9 +4183,7 @@ where
         append_message_id_article_response_header(response_buffer, message_id);
         let header_end = response_buffer.len();
         let payload_len = repeated_payload_len_at_least(
-            config
-                .article_bytes
-                .saturating_sub(header_end - header_start),
+            config.article_bytes.saturating_sub(header_end - header_start),
         );
         let response_len = (header_end - header_start) + payload_len + DOT_TERMINATOR.len();
         if !ranges.is_empty()
@@ -4555,6 +4608,7 @@ fn build_stored_article_response(kind: RequestKind, article_bytes: &[u8]) -> io:
         | RequestKind::AuthInfoPass
         | RequestKind::AuthInfo
         | RequestKind::ModeReader
+        | RequestKind::ModeStream
         | RequestKind::Quit
         | RequestKind::Unknown => {
             unreachable!("stored article response requested for non-article kind")
@@ -4736,8 +4790,8 @@ pub struct ServerConfig {
     pub stats_interval: Duration,
     pub flush: bool,
     pub pending_write_bytes: usize,
-    pending_write_pool: BufferPool,
-    generated_response_buffer_pool: BufferPool,
+    pending_write_pool: PendingWritePool,
+    generated_response_buffer_pool: GeneratedResponseBufferPool,
     pub nodelay: bool,
     pub socket_recv_buffer: usize,
     pub socket_send_buffer: usize,
@@ -4770,13 +4824,13 @@ impl ServerConfig {
             stats_interval: Duration::from_secs(args.stats_interval_secs),
             flush: args.flush,
             pending_write_bytes: args.pending_write_bytes.max(1),
-            pending_write_pool: BufferPool::new(
+            pending_write_pool: PendingWritePool::new(
                 args.pending_write_bytes.max(1),
                 args.max_connections
                     .max(1)
                     .min(DEFAULT_PENDING_WRITE_POOL_BUFFERS),
             ),
-            generated_response_buffer_pool: BufferPool::new(
+            generated_response_buffer_pool: GeneratedResponseBufferPool::new(
                 generated_response_buffer_capacity(args.article_bytes, args.body_bytes),
                 args.max_connections
                     .max(1)
@@ -5438,7 +5492,7 @@ fn command_message_id<'a>(
 ) -> Option<MessageId<'a>> {
     let bytes = command_message_id_bytes(command, command_lines)?;
     let value = std::str::from_utf8(bytes).ok()?;
-    MessageId::from_borrowed(value).ok()
+    Some(MessageId::from_validated_borrowed(value))
 }
 
 fn command_message_id_bytes<'a>(
@@ -14284,9 +14338,9 @@ mod tests {
 
     #[test]
     fn pending_write_hot_path_does_not_allocate() {
-        let pool = BufferPool::new(DEFAULT_PENDING_WRITE_BYTES, 1);
+        let pool = PendingWritePool::new(DEFAULT_PENDING_WRITE_BYTES, 1);
         let oversized = vec![b'x'; DEFAULT_PENDING_WRITE_BYTES + 1];
-        let pending = PendingWrite::from_pool(&pool);
+        let pending = pool.acquire();
         let mut sink = tokio::io::sink();
 
         assert_no_allocations("pending write hot path", move || {
@@ -14299,11 +14353,11 @@ mod tests {
 
     #[tokio::test]
     async fn pending_write_pool_reuses_returned_buffer() {
-        let pool = BufferPool::new(4096, 1);
+        let pool = PendingWritePool::new(4096, 1);
         assert_eq!(pool.available_for_test(), 0);
 
         let first_ptr = {
-            let mut pending = PendingWrite::from_pool(&pool);
+            let mut pending = pool.acquire();
             let ptr = pending.buffer_ptr_for_test();
             pending
                 .push(&mut tokio::io::sink(), DATE_RESPONSE)
@@ -14315,7 +14369,7 @@ mod tests {
 
         assert_eq!(pool.available_for_test(), 1);
 
-        let pending = PendingWrite::from_pool(&pool);
+        let pending = pool.acquire();
         assert_eq!(pool.available_for_test(), 0);
         assert_eq!(pending.capacity_for_test(), 4096);
         assert_eq!(pending.len(), 0);
@@ -14324,11 +14378,11 @@ mod tests {
 
     #[test]
     fn generated_response_buffer_pool_reuses_returned_buffer() {
-        let pool = BufferPool::new(4096, 1);
+        let pool = GeneratedResponseBufferPool::new(4096, 1);
         assert_eq!(pool.available_for_test(), 0);
 
         let first_ptr = {
-            let mut response = GeneratedResponseBuffer::from_pool(&pool);
+            let mut response = pool.acquire();
             let ptr = response.buffer_ptr_for_test();
             response.extend_from_slice(BODY_RESPONSE_PREFIX);
             assert_eq!(pool.available_for_test(), 0);
@@ -14337,7 +14391,7 @@ mod tests {
 
         assert_eq!(pool.available_for_test(), 1);
 
-        let response = GeneratedResponseBuffer::from_pool(&pool);
+        let response = pool.acquire();
         assert_eq!(pool.available_for_test(), 0);
         assert_eq!(response.capacity_for_test(), 4096);
         assert_eq!(response.len(), 0);
@@ -14346,11 +14400,11 @@ mod tests {
 
     #[test]
     fn generated_response_buffer_pool_drops_mismatched_capacity() {
-        let pool = BufferPool::new(4096, 1);
+        let pool = GeneratedResponseBufferPool::new(4096, 1);
         assert_eq!(pool.available_for_test(), 0);
 
         {
-            let mut response = GeneratedResponseBuffer::from_pool(&pool);
+            let mut response = pool.acquire();
             response.reserve_exact(4097);
             assert!(response.capacity_for_test() > 4096);
         }
@@ -15313,8 +15367,17 @@ mod tests {
             let (mut sixth, _) = listener.accept().await.unwrap();
             sixth.write_all(b"201 fetch ready\r\n").await.unwrap();
             let read = sixth.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"MODE STREAM\r\n");
+            sixth
+                .write_all(b"203 streaming enabled\r\n")
+                .await
+                .unwrap();
+
+            let (mut seventh, _) = listener.accept().await.unwrap();
+            seventh.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = seventh.read(&mut request).await.unwrap();
             assert_eq!(&request[..read], b"QUIT\r\n");
-            sixth.write_all(QUIT_RESPONSE).await.unwrap();
+            seventh.write_all(QUIT_RESPONSE).await.unwrap();
         });
 
         let mut list_args = test_fetch_args();
@@ -15356,6 +15419,14 @@ mod tests {
         let mode_reader = fetch_response(&mode_reader_args).await.unwrap();
         assert_eq!(mode_reader.kind(), RequestKind::ModeReader);
         assert_eq!(mode_reader.status().as_u16(), 201);
+
+        let mut mode_stream_args = test_fetch_args();
+        mode_stream_args.connect = addr;
+        mode_stream_args.request = Some(FetchRequestKind::ModeStream);
+        mode_stream_args.message_id = None;
+        let mode_stream = fetch_response(&mode_stream_args).await.unwrap();
+        assert_eq!(mode_stream.kind(), RequestKind::ModeStream);
+        assert_eq!(mode_stream.status().as_u16(), 203);
 
         let mut quit_args = test_fetch_args();
         quit_args.connect = addr;
