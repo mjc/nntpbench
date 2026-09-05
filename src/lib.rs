@@ -816,7 +816,7 @@ pub async fn run_load(args: FetchArgs) -> io::Result<()> {
 
     if !config.csv {
         eprintln!(
-            "nntpbench client connecting to {} requests={} transfer_bytes={} duration_secs={} connections={} total_clients={} client_offset={} pipeline_depth={} command_mix={:?}",
+            "nntpbench client connecting to {} requests={:?} transfer_bytes={} duration_secs={} connections={} total_clients={} client_offset={} pipeline_depth={} command_mix={:?}",
             config.connect,
             config.requests,
             config.transfer_bytes,
@@ -859,7 +859,7 @@ pub async fn run_load(args: FetchArgs) -> io::Result<()> {
         let global_index = config.client_offset + connection_index;
         let requests = requests_for_connection(config.requests, config.total_clients, global_index);
         let session = LoadSession::new(&config, global_index, next_start_id, requests);
-        next_start_id = next_start_id.wrapping_add(requests);
+        next_start_id = next_start_id.wrapping_add(requests.unwrap_or_default());
         let stats = stats.clone();
         let stop = stop.clone();
         sessions.spawn(async move { session.run(stats, stop).await });
@@ -905,7 +905,7 @@ struct LoadConfig {
     connect: SocketAddr,
     ports: Box<[u16]>,
     segments: Option<Arc<SegmentSet>>,
-    requests: u64,
+    requests: Option<u64>,
     transfer_bytes: u64,
     duration: Duration,
     connections: usize,
@@ -941,7 +941,7 @@ impl LoadConfig {
             connect: args.connect,
             ports: args.ports.into_boxed_slice(),
             segments,
-            requests: args.requests,
+            requests: (args.requests != 0).then_some(args.requests),
             transfer_bytes: args.transfer_bytes,
             duration: Duration::from_secs(args.duration_secs),
             connections,
@@ -974,7 +974,7 @@ struct LoadSession {
     segments: Option<Arc<SegmentSet>>,
     client_index: usize,
     total_clients: usize,
-    requests: u64,
+    requests: Option<u64>,
     transfer_bytes: u64,
     next_id: u64,
     pipeline_depth: usize,
@@ -986,7 +986,7 @@ struct LoadSession {
 }
 
 impl LoadSession {
-    fn new(config: &LoadConfig, global_index: usize, start_id: u64, requests: u64) -> Self {
+    fn new(config: &LoadConfig, global_index: usize, start_id: u64, requests: Option<u64>) -> Self {
         Self {
             connect: config.endpoint_for(global_index),
             segments: config.segments.clone(),
@@ -1118,7 +1118,7 @@ impl LoadSession {
         let mut filled = 0;
         while filled < capacity
             && !stop.load(Ordering::Acquire)
-            && (self.requests == 0 || issued + (filled as u64) < self.requests)
+            && self.requests.is_none_or(|requests| issued + (filled as u64) < requests)
             && !transfer_limit_reached(stats, self.transfer_bytes)
         {
             let request_index = issued + filled as u64;
@@ -1924,14 +1924,38 @@ fn flush_load_session_stats(stats: &Stats, session_stats: &mut SessionStats) {
     *session_stats = SessionStats::default();
 }
 
-fn requests_for_connection(total: u64, connections: usize, index: usize) -> u64 {
-    if total == 0 {
-        return 0;
-    }
-
+fn requests_for_connection(total: Option<u64>, connections: usize, index: usize) -> Option<u64> {
+    let total = total?;
     let base = total / connections as u64;
     let remainder = total % connections as u64;
-    base + u64::from((index as u64) < remainder)
+    Some(base + u64::from((index as u64) < remainder))
+}
+
+#[cfg(test)]
+mod request_budget_tests {
+    use super::requests_for_connection;
+
+    #[test]
+    fn finite_zero_quota_is_finished_not_unlimited() {
+        assert_eq!(requests_for_connection(Some(10), 16, 10), Some(0));
+    }
+
+    #[test]
+    fn finite_quotas_conserve_requests() {
+        for total in 1..=64 {
+            for connections in 1..=16 {
+                let assigned: u64 = (0..connections)
+                    .map(|index| requests_for_connection(Some(total), connections, index).unwrap())
+                    .sum();
+                assert_eq!(assigned, total);
+            }
+        }
+    }
+
+    #[test]
+    fn unlimited_budget_is_explicit() {
+        assert_eq!(requests_for_connection(None, 16, 10), None);
+    }
 }
 
 pub async fn serve_session(
