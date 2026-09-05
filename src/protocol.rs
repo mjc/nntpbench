@@ -609,10 +609,11 @@ mod proptests {
         StartTls,
         List,
         Help,
-        Capabilities,
-        Date,
-        ModeReader,
-        Quit,
+    Capabilities,
+    Date,
+    ModeReader,
+    ModeStream,
+    Quit,
         Last,
         Next,
     }
@@ -627,6 +628,7 @@ mod proptests {
                 Self::Capabilities => "CAPABILITIES",
                 Self::Date => "DATE",
                 Self::ModeReader => "MODE READER",
+                Self::ModeStream => "MODE STREAM",
                 Self::Quit => "QUIT",
                 Self::Last => "LAST",
                 Self::Next => "NEXT",
@@ -642,6 +644,7 @@ mod proptests {
                 Self::Capabilities => RequestKind::Capabilities,
                 Self::Date => RequestKind::Date,
                 Self::ModeReader => RequestKind::ModeReader,
+                Self::ModeStream => RequestKind::ModeStream,
                 Self::Quit => RequestKind::Quit,
                 Self::Last => RequestKind::Last,
                 Self::Next => RequestKind::Next,
@@ -657,6 +660,7 @@ mod proptests {
                 Self::Capabilities => Request::capabilities(),
                 Self::Date => Request::date(),
                 Self::ModeReader => Request::mode_reader(),
+                Self::ModeStream => Request::mode_stream(),
                 Self::Quit => Request::quit(),
                 Self::Last => Request::last(),
                 Self::Next => Request::next(),
@@ -673,6 +677,7 @@ mod proptests {
             Just(FixedCommand::Capabilities),
             Just(FixedCommand::Date),
             Just(FixedCommand::ModeReader),
+            Just(FixedCommand::ModeStream),
             Just(FixedCommand::Quit),
             Just(FixedCommand::Last),
             Just(FixedCommand::Next),
@@ -1518,6 +1523,11 @@ impl<'a> MessageId<'a> {
         Ok(Self(MessageIdStorage::Borrowed(value)))
     }
 
+    /// Construct a borrowed message-id that has already been validated.
+    pub(crate) fn from_validated_borrowed(value: &'a str) -> Self {
+        Self(MessageIdStorage::Borrowed(value))
+    }
+
     /// Construct an owned message-id, auto-wrapping in angle brackets if needed.
     pub fn from_str_or_wrap(
         value: impl AsRef<str>,
@@ -2200,6 +2210,7 @@ pub enum RequestKind {
     AuthInfo,
     StartTls,
     ModeReader,
+    ModeStream,
     Quit,
     Unknown,
 }
@@ -2415,6 +2426,7 @@ static RESPONSE_DESCRIPTORS: &[ResponseDescriptor] = &[
     response_descriptor(RequestKind::Capabilities, 101, ResponseFraming::Multiline),
     response_descriptor(RequestKind::ModeReader, 200, ResponseFraming::SingleLine),
     response_descriptor(RequestKind::ModeReader, 201, ResponseFraming::SingleLine),
+    response_descriptor(RequestKind::ModeStream, 203, ResponseFraming::SingleLine),
     response_descriptor(RequestKind::Quit, 205, ResponseFraming::SingleLine),
     response_descriptor(RequestKind::StartTls, 382, ResponseFraming::SingleLine),
 ];
@@ -3455,12 +3467,17 @@ pub enum Request<'a> {
         kind: AuthInfoKind,
         value: AuthInfoValue<'a>,
     },
+    AuthInfoSasl {
+        mechanism: AuthInfoValue<'a>,
+        initial_response: Option<AuthInfoValue<'a>>,
+    },
     StartTls,
     List,
     Help,
     Capabilities,
     Date,
     ModeReader,
+    ModeStream,
     Quit,
 }
 
@@ -3499,12 +3516,14 @@ impl<'a> Request<'a> {
                 AuthInfoKind::User => RequestKind::AuthInfoUser,
                 AuthInfoKind::Pass => RequestKind::AuthInfoPass,
             },
+            Self::AuthInfoSasl { .. } => RequestKind::AuthInfo,
             Self::StartTls => RequestKind::StartTls,
             Self::List => RequestKind::List,
             Self::Help => RequestKind::Help,
             Self::Capabilities => RequestKind::Capabilities,
             Self::Date => RequestKind::Date,
             Self::ModeReader => RequestKind::ModeReader,
+            Self::ModeStream => RequestKind::ModeStream,
             Self::Quit => RequestKind::Quit,
         }
     }
@@ -3581,12 +3600,17 @@ impl<'a> Request<'a> {
             Self::AuthInfo { kind, value } => {
                 write_authinfo_request_wire(output, *kind, value.as_bytes())
             }
+            Self::AuthInfoSasl {
+                mechanism,
+                initial_response,
+            } => write_authinfo_sasl_request_wire(output, mechanism.as_bytes(), initial_response),
             Self::StartTls => write_simple_request_wire(output, b"STARTTLS"),
             Self::List => write_simple_request_wire(output, b"LIST"),
             Self::Help => write_simple_request_wire(output, b"HELP"),
             Self::Capabilities => write_simple_request_wire(output, b"CAPABILITIES"),
             Self::Date => write_simple_request_wire(output, b"DATE"),
             Self::ModeReader => write_simple_request_wire(output, b"MODE READER"),
+            Self::ModeStream => write_simple_request_wire(output, b"MODE STREAM"),
             Self::Quit => write_simple_request_wire(output, b"QUIT"),
         }
     }
@@ -3615,12 +3639,14 @@ impl<'a> Request<'a> {
             | Self::NewNews { .. }
             | Self::Post
             | Self::AuthInfo { .. }
+            | Self::AuthInfoSasl { .. }
             | Self::StartTls => None,
             Self::List
             | Self::Help
             | Self::Capabilities
             | Self::Date
             | Self::ModeReader
+            | Self::ModeStream
             | Self::Quit => None,
         }
     }
@@ -3649,12 +3675,14 @@ impl<'a> Request<'a> {
             | Self::Check { .. }
             | Self::TakeThis { .. }
             | Self::AuthInfo { .. }
+            | Self::AuthInfoSasl { .. }
             | Self::StartTls
             | Self::List
             | Self::Help
             | Self::Capabilities
             | Self::Date
             | Self::ModeReader
+            | Self::ModeStream
             | Self::Quit => None,
         }
     }
@@ -3684,12 +3712,14 @@ impl<'a> Request<'a> {
             | Self::Check { .. }
             | Self::TakeThis { .. }
             | Self::AuthInfo { .. }
+            | Self::AuthInfoSasl { .. }
             | Self::StartTls
             | Self::List
             | Self::Help
             | Self::Capabilities
             | Self::Date
             | Self::ModeReader
+            | Self::ModeStream
             | Self::Quit => None,
         }
     }
@@ -3718,12 +3748,14 @@ impl<'a> Request<'a> {
             | Self::Check { .. }
             | Self::TakeThis { .. }
             | Self::AuthInfo { .. }
+            | Self::AuthInfoSasl { .. }
             | Self::StartTls
             | Self::List
             | Self::Help
             | Self::Capabilities
             | Self::Date
             | Self::ModeReader
+            | Self::ModeStream
             | Self::Quit => None,
         }
     }
@@ -3752,12 +3784,14 @@ impl<'a> Request<'a> {
             | Self::Check { .. }
             | Self::TakeThis { .. }
             | Self::AuthInfo { .. }
+            | Self::AuthInfoSasl { .. }
             | Self::StartTls
             | Self::List
             | Self::Help
             | Self::Capabilities
             | Self::Date
             | Self::ModeReader
+            | Self::ModeStream
             | Self::Quit => None,
         }
     }
@@ -3786,12 +3820,14 @@ impl<'a> Request<'a> {
             | Self::Check { .. }
             | Self::TakeThis { .. }
             | Self::AuthInfo { .. }
+            | Self::AuthInfoSasl { .. }
             | Self::StartTls
             | Self::List
             | Self::Help
             | Self::Capabilities
             | Self::Date
             | Self::ModeReader
+            | Self::ModeStream
             | Self::Quit => None,
         }
     }
@@ -3822,12 +3858,14 @@ impl<'a> Request<'a> {
             | Self::Check { .. }
             | Self::TakeThis { .. }
             | Self::AuthInfo { .. }
+            | Self::AuthInfoSasl { .. }
             | Self::StartTls
             | Self::List
             | Self::Help
             | Self::Capabilities
             | Self::Date
             | Self::ModeReader
+            | Self::ModeStream
             | Self::Quit => None,
         }
     }
@@ -3860,12 +3898,14 @@ impl<'a> Request<'a> {
             | Self::Check { .. }
             | Self::TakeThis { .. }
             | Self::AuthInfo { .. }
+            | Self::AuthInfoSasl { .. }
             | Self::StartTls
             | Self::List
             | Self::Help
             | Self::Capabilities
             | Self::Date
             | Self::ModeReader
+            | Self::ModeStream
             | Self::Quit => None,
         }
     }
@@ -3894,12 +3934,14 @@ impl<'a> Request<'a> {
             | Self::Ihave { .. }
             | Self::Check { .. }
             | Self::TakeThis { .. }
+            | Self::AuthInfoSasl { .. }
             | Self::StartTls
             | Self::List
             | Self::Help
             | Self::Capabilities
             | Self::Date
             | Self::ModeReader
+            | Self::ModeStream
             | Self::Quit => None,
         }
     }
@@ -3928,12 +3970,14 @@ impl<'a> Request<'a> {
             | Self::Ihave { .. }
             | Self::Check { .. }
             | Self::AuthInfo { .. }
+            | Self::AuthInfoSasl { .. }
             | Self::StartTls
             | Self::List
             | Self::Help
             | Self::Capabilities
             | Self::Date
             | Self::ModeReader
+            | Self::ModeStream
             | Self::Quit => None,
         }
     }
@@ -3962,12 +4006,14 @@ impl<'a> Request<'a> {
             | Self::Check { .. }
             | Self::TakeThis { .. }
             | Self::AuthInfo { .. }
+            | Self::AuthInfoSasl { .. }
             | Self::StartTls
             | Self::List
             | Self::Help
             | Self::Capabilities
             | Self::Date
             | Self::ModeReader
+            | Self::ModeStream
             | Self::Quit => None,
         }
     }
@@ -4304,6 +4350,30 @@ impl Request<'static> {
         })
     }
 
+    /// Build an AUTHINFO SASL request.
+    pub fn authinfo_sasl(
+        mechanism: impl AsRef<str>,
+        initial_response: Option<impl AsRef<str>>,
+    ) -> Result<Self, InvalidAuthInfoValue> {
+        Self::authinfo_sasl_bytes(
+            mechanism.as_ref(),
+            initial_response.map(|value| value.as_ref().as_bytes().to_vec()),
+        )
+    }
+
+    /// Build an AUTHINFO SASL request from byte-oriented RFC 4643 B-CHAR data.
+    pub fn authinfo_sasl_bytes(
+        mechanism: impl AsRef<[u8]>,
+        initial_response: Option<impl AsRef<[u8]>>,
+    ) -> Result<Self, InvalidAuthInfoValue> {
+        Ok(Self::AuthInfoSasl {
+            mechanism: AuthInfoValue::from_owned_bytes(mechanism)?,
+            initial_response: initial_response
+                .map(AuthInfoValue::from_owned_bytes)
+                .transpose()?,
+        })
+    }
+
     /// Build a STARTTLS request.
     #[must_use]
     pub const fn starttls() -> Self {
@@ -4416,6 +4486,12 @@ impl Request<'static> {
     #[must_use]
     pub const fn mode_reader() -> Self {
         Self::ModeReader
+    }
+
+    /// Build a MODE STREAM request.
+    #[must_use]
+    pub const fn mode_stream() -> Self {
+        Self::ModeStream
     }
 
     /// Build a QUIT request.
@@ -4667,6 +4743,7 @@ fn classify_request_kind(verb: &[u8], args: &[u8]) -> RequestKind {
         CommandKind::List => classify_subcommand(args, LIST_SUBCOMMANDS, RequestKind::List),
         CommandKind::AuthInfo => classify_authinfo_command(args),
         CommandKind::Mode if eq_ignore_ascii_case_const(args, b"READER") => RequestKind::ModeReader,
+        CommandKind::Mode if eq_ignore_ascii_case_const(args, b"STREAM") => RequestKind::ModeStream,
         CommandKind::Mode => RequestKind::Unknown,
     }
 }
@@ -5251,6 +5328,22 @@ where
     write_bytes(output, kind.as_wire());
     write_bytes(output, b" ");
     write_bytes(output, value);
+    write_crlf(output);
+}
+
+fn write_authinfo_sasl_request_wire<W>(
+    output: &mut W,
+    mechanism: &[u8],
+    initial_response: &Option<AuthInfoValue<'_>>,
+) where
+    W: Write,
+{
+    write_bytes(output, b"AUTHINFO SASL ");
+    write_bytes(output, mechanism);
+    if let Some(initial_response) = initial_response {
+        write_bytes(output, b" ");
+        write_bytes(output, initial_response.as_bytes());
+    }
     write_crlf(output);
 }
 

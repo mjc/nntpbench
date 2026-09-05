@@ -58,6 +58,7 @@
           [
             rustToolchain
             pkgs.cargo-llvm-cov
+            pkgs.coz
           ]
           ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
             pkgs.heaptrack
@@ -82,6 +83,7 @@
           echo "  cargo llvm-cov --fail-under-lines 100 --summary-only"
           echo "  cargo bench --bench server_roundtrip"
           echo "  cargo bench --bench server_callgrind"
+          echo "  ./scripts/profile-coz.sh"
           echo "  ./scripts/profile.sh"
           echo "  ./scripts/profile-mem.sh"
           echo "  ./scripts/profile-latency.sh strace"

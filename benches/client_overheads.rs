@@ -163,9 +163,10 @@ mod request_wire {
 
 mod streaming_decode {
     use super::{
-        BODY_RESPONSE, Bencher, COMPACT_BODY_RESPONSE, RequestKind,
-        bench_load_response_scan_in_place, bench_streaming_decode_response, black_box,
+        BODY_RESPONSE, Bencher, COMPACT_BODY_RESPONSE, RequestKind, bench_load_response_scan,
+        bench_streaming_decode_response, black_box,
     };
+    use std::sync::Mutex;
 
     #[divan::bench(sample_count = 1000, sample_size = 100)]
     fn compact_body_response(bencher: Bencher) {
@@ -189,10 +190,12 @@ mod streaming_decode {
 
     #[divan::bench(sample_count = 1000, sample_size = 100)]
     fn raw_load_body_response_scan(bencher: Bencher) {
-        let mut buffer = BODY_RESPONSE.to_vec();
+        let buffer = Mutex::new(BODY_RESPONSE.to_vec());
         bencher.bench(|| {
-            black_box(bench_load_response_scan_in_place(
-                black_box(&mut buffer),
+            let mut buffer = buffer.lock().unwrap();
+            buffer.clear();
+            black_box(bench_load_response_scan(
+                black_box(&mut *buffer),
                 black_box(RequestKind::Body),
             ))
         });
