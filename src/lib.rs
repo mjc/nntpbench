@@ -4,7 +4,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 #[cfg(test)]
 use std::cell::Cell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::future::poll_fn;
@@ -324,6 +324,161 @@ const MAX_BATCHED_ARTICLE_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_PENDING_WRITE_BYTES: usize = 64 * 1024;
 const DEFAULT_PENDING_WRITE_POOL_BUFFERS: usize = 4096;
 const GENERATED_RESPONSE_EXTRA_CAPACITY: usize = MAX_COMMAND_LINE_BYTES + 512;
+const MAX_LATENCY_HISTOGRAM_BINS: usize = 1_000_000;
+const DEFAULT_LATENCY_RANGE_MS: u64 = 60_000;
+const DEFAULT_LATENCY_PRECISION_US: u64 = 1_000;
+
+#[derive(Debug, Clone)]
+struct LatencyHistogram {
+    precision: Duration,
+    bins: Box<[u64]>,
+    samples: u64,
+    overflow: u64,
+}
+
+impl LatencyHistogram {
+    fn new(range: Duration, precision: Duration) -> io::Result<Self> {
+        if range.is_zero() || precision.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "latency range and precision must be non-zero",
+            ));
+        }
+        let bin_count = range.as_nanos().div_ceil(precision.as_nanos());
+        let bin_count = usize::try_from(bin_count).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "latency histogram is too large",
+            )
+        })?;
+        if bin_count == 0 || bin_count > MAX_LATENCY_HISTOGRAM_BINS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "latency histogram exceeds configured bin limit",
+            ));
+        }
+        Ok(Self {
+            precision,
+            bins: vec![0; bin_count].into_boxed_slice(),
+            samples: 0,
+            overflow: 0,
+        })
+    }
+
+    fn record(&mut self, elapsed: Duration) {
+        self.samples = self.samples.saturating_add(1);
+        let index = elapsed.as_nanos() / self.precision.as_nanos();
+        let Ok(index) = usize::try_from(index) else {
+            self.overflow = self.overflow.saturating_add(1);
+            return;
+        };
+        let Some(bin) = self.bins.get_mut(index) else {
+            self.overflow = self.overflow.saturating_add(1);
+            return;
+        };
+        *bin = bin.saturating_add(1);
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    fn bin_count(&self) -> usize {
+        self.bins.len()
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    fn sample_count(&self) -> u64 {
+        self.samples
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    fn overflow_count(&self) -> u64 {
+        self.overflow
+    }
+
+    #[must_use]
+    fn percentile(&self, quantile: f64) -> Option<Duration> {
+        if self.samples == 0 || !(0.0..=1.0).contains(&quantile) {
+            return None;
+        }
+        let rank = ((self.samples as f64) * quantile).ceil().max(1.0) as u64;
+        let mut seen = 0_u64;
+        for (index, count) in self.bins.iter().copied().enumerate() {
+            seen = seen.saturating_add(count);
+            if seen >= rank {
+                return Some(self.precision.saturating_mul(index as u32));
+            }
+        }
+        (self.overflow != 0).then_some(self.precision.saturating_mul(self.bins.len() as u32))
+    }
+    fn merge(&mut self, other: Self) {
+        debug_assert_eq!(self.precision, other.precision);
+        debug_assert_eq!(self.bins.len(), other.bins.len());
+        self.samples = self.samples.saturating_add(other.samples);
+        self.overflow = self.overflow.saturating_add(other.overflow);
+        for (bin, other_bin) in self.bins.iter_mut().zip(other.bins) {
+            *bin = bin.saturating_add(other_bin);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OfferedLoadSchedule {
+    started: Instant,
+    interval: Duration,
+}
+
+impl OfferedLoadSchedule {
+    fn new(rate: f64, started: Instant) -> io::Result<Self> {
+        if !rate.is_finite() || rate <= 0.0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "offered rate must be finite and greater than zero",
+            ));
+        }
+        let interval_secs = 1.0 / rate;
+        if !interval_secs.is_finite() || interval_secs > Duration::MAX.as_secs_f64() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "offered rate is too low for timer range",
+            ));
+        }
+        let interval = Duration::from_secs_f64(interval_secs);
+        if interval.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "offered rate is too high for timer precision",
+            ));
+        }
+        Ok(Self { started, interval })
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    fn interval(self) -> Duration {
+        self.interval
+    }
+
+    #[must_use]
+    fn deadline(self, request_index: u64) -> Instant {
+        self.started
+            .checked_add(self.interval.saturating_mul(request_index as u32))
+            .unwrap_or(self.started)
+    }
+
+    #[must_use]
+    fn due_count(self, now: Instant) -> u64 {
+        let Some(elapsed) = now.checked_duration_since(self.started) else {
+            return 0;
+        };
+        (elapsed.as_nanos() / self.interval.as_nanos())
+            .saturating_add(1)
+            .try_into()
+            .unwrap_or(u64::MAX)
+    }
+}
+
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 const HIGH_THROUGHPUT_SOCKET_BUFFER: usize = 16 * 1024 * 1024;
 #[cfg(target_os = "macos")]
@@ -793,6 +948,17 @@ pub struct FetchArgs {
     #[arg(long, default_value_t = 5)]
     pub drain_timeout_secs: u64,
 
+    /// Target request arrival rate for an offered-load latency experiment.
+    #[arg(long)]
+    pub offered_rate: Option<f64>,
+
+    /// Maximum latency represented by the bounded histogram.
+    #[arg(long, default_value_t = DEFAULT_LATENCY_RANGE_MS)]
+    pub latency_range_ms: u64,
+
+    /// Histogram precision in microseconds.
+    #[arg(long, default_value_t = DEFAULT_LATENCY_PRECISION_US)]
+    pub latency_precision_us: u64,
 
     /// Concurrent TCP connections for load mode.
     #[arg(long, default_value_t = 1)]
@@ -937,7 +1103,7 @@ pub async fn run_load(args: FetchArgs) -> io::Result<()> {
 
     if !config.csv {
         eprintln!(
-            "nntpbench client connecting to {} requests={:?} transfer_bytes={} duration_secs={} connections={} total_clients={} client_offset={} pipeline_depth={} command_mix={:?} workload_policy={:?} verification_policy={:?} segments={} declared_segment_bytes={}",
+            "nntpbench client connecting to {} requests={:?} transfer_bytes={} duration_secs={} connections={} total_clients={} client_offset={} pipeline_depth={} command_mix={:?} workload_policy={:?} verification_policy={:?} segments={} declared_segment_bytes={} offered_rate={:?} latency_range_ms={} latency_precision_us={}",
             config.connect,
             config.requests,
             config.transfer_bytes,
@@ -949,11 +1115,17 @@ pub async fn run_load(args: FetchArgs) -> io::Result<()> {
             config.command_mix,
             config.workload_policy,
             config.verification_policy,
-            config.segments.as_ref().map_or(0, |segments| segments.ids.len()),
+            config
+                .segments
+                .as_ref()
+                .map_or(0, |segments| segments.ids.len()),
             config
                 .segments
                 .as_ref()
                 .map_or(0, |segments| segments.total_declared_size()),
+            config.offered_rate,
+            config.latency_range.as_millis(),
+            config.latency_precision.as_micros(),
         );
     }
 
@@ -1026,7 +1198,7 @@ pub async fn run_load(args: FetchArgs) -> io::Result<()> {
     }
 
     eprintln!(
-        "load phases setup_secs={:.3} measurement_secs={:.3} drain_secs={:.3} target_bytes={} measured_bytes={} drained_requests={} incomplete_requests={} timed_out_connections={}",
+        "load phases setup_secs={:.3} measurement_secs={:.3} drain_secs={:.3} target_bytes={} measured_bytes={} drained_requests={} incomplete_requests={} timed_out_connections={} offered_scheduled={} offered_issued={} offered_completed={} missed_issue_deadlines={} peak_backlog={} schedule_p50_us={} schedule_p95_us={} response_p50_us={} response_p95_us={}",
         lifecycle.setup_elapsed.as_secs_f64(),
         lifecycle.measurement_elapsed.as_secs_f64(),
         lifecycle.drain_elapsed.as_secs_f64(),
@@ -1035,9 +1207,26 @@ pub async fn run_load(args: FetchArgs) -> io::Result<()> {
         lifecycle.drained_requests,
         lifecycle.incomplete_requests,
         lifecycle.timed_out_connections,
+        lifecycle.scheduled_requests,
+        lifecycle.issued_requests,
+        lifecycle.completed_requests,
+        lifecycle.missed_issue_deadlines,
+        lifecycle.peak_backlog,
+        histogram_percentile_us(lifecycle.schedule_delay_histogram.as_ref(), 0.50),
+        histogram_percentile_us(lifecycle.schedule_delay_histogram.as_ref(), 0.95),
+        histogram_percentile_us(lifecycle.latency_histogram.as_ref(), 0.50),
+        histogram_percentile_us(lifecycle.latency_histogram.as_ref(), 0.95),
     );
 
     Ok(())
+}
+
+fn histogram_percentile_us(histogram: Option<&LatencyHistogram>, quantile: f64) -> u64 {
+    histogram
+        .and_then(|histogram| histogram.percentile(quantile))
+        .map_or(0, |duration| {
+            duration.as_micros().try_into().unwrap_or(u64::MAX)
+        })
 }
 
 #[derive(Debug, Clone)]
@@ -1050,6 +1239,9 @@ struct LoadConfig {
     duration: Duration,
     setup_timeout: Duration,
     drain_timeout: Duration,
+    offered_rate: Option<f64>,
+    latency_range: Duration,
+    latency_precision: Duration,
     connections: usize,
     client_offset: usize,
     total_clients: usize,
@@ -1086,6 +1278,10 @@ impl LoadConfig {
             ));
         }
 
+        let latency_range = Duration::from_millis(args.latency_range_ms);
+        let latency_precision = Duration::from_micros(args.latency_precision_us);
+        LatencyHistogram::new(latency_range, latency_precision)?;
+
         let segments = args
             .segments
             .as_deref()
@@ -1102,6 +1298,9 @@ impl LoadConfig {
             duration: Duration::from_secs(args.duration_secs),
             setup_timeout: Duration::from_secs(args.setup_timeout_secs.max(1)),
             drain_timeout: Duration::from_secs(args.drain_timeout_secs.max(1)),
+            offered_rate: args.offered_rate,
+            latency_range,
+            latency_precision,
             connections,
             client_offset: args.client_offset,
             total_clients,
@@ -1141,6 +1340,9 @@ struct LoadSession {
     verification_policy: LoadVerificationPolicy,
     setup_timeout: Duration,
     drain_timeout: Duration,
+    offered_rate: Option<f64>,
+    latency_range: Duration,
+    latency_precision: Duration,
     pipeline_depth: usize,
     command_mix: ClientCommandMix,
     read_buffer_bytes: usize,
@@ -1157,6 +1359,13 @@ struct LoadSessionOutcome {
     timed_out_connections: u64,
     drained_requests: u64,
     incomplete_requests: u64,
+    scheduled_requests: u64,
+    issued_requests: u64,
+    completed_requests: u64,
+    missed_issue_deadlines: u64,
+    peak_backlog: u64,
+    latency_histogram: Option<LatencyHistogram>,
+    schedule_delay_histogram: Option<LatencyHistogram>,
 }
 
 impl LoadSessionOutcome {
@@ -1167,6 +1376,24 @@ impl LoadSessionOutcome {
         self.timed_out_connections += other.timed_out_connections;
         self.drained_requests += other.drained_requests;
         self.incomplete_requests += other.incomplete_requests;
+        self.scheduled_requests += other.scheduled_requests;
+        self.issued_requests += other.issued_requests;
+        self.completed_requests += other.completed_requests;
+        self.missed_issue_deadlines += other.missed_issue_deadlines;
+        self.peak_backlog = self.peak_backlog.max(other.peak_backlog);
+        match (&mut self.latency_histogram, other.latency_histogram) {
+            (Some(histogram), Some(other)) => histogram.merge(other),
+            (None, Some(other)) => self.latency_histogram = Some(other),
+            _ => {}
+        }
+        match (
+            &mut self.schedule_delay_histogram,
+            other.schedule_delay_histogram,
+        ) {
+            (Some(histogram), Some(other)) => histogram.merge(other),
+            (None, Some(other)) => self.schedule_delay_histogram = Some(other),
+            _ => {}
+        }
     }
 }
 
@@ -1184,6 +1411,9 @@ impl LoadSession {
             verification_policy: config.verification_policy,
             setup_timeout: config.setup_timeout,
             drain_timeout: config.drain_timeout,
+            offered_rate: config.offered_rate,
+            latency_range: config.latency_range,
+            latency_precision: config.latency_precision,
             pipeline_depth: config.pipeline_depth,
             command_mix: config.command_mix,
             read_buffer_bytes: config.read_buffer_bytes,
@@ -1261,27 +1491,45 @@ impl LoadSession {
         };
 
         let measurement_started = Instant::now();
+        let schedule = self
+            .offered_rate
+            .map(|rate| OfferedLoadSchedule::new(rate, measurement_started))
+            .transpose()?;
         let mut outcome = LoadSessionOutcome {
             setup_elapsed,
             ..LoadSessionOutcome::default()
         };
+        if schedule.is_some() {
+            outcome.latency_histogram = Some(LatencyHistogram::new(
+                self.latency_range,
+                self.latency_precision,
+            )?);
+            outcome.schedule_delay_histogram = Some(LatencyHistogram::new(
+                self.latency_range,
+                self.latency_precision,
+            )?);
+        }
         let mut response_reader = LoadResponseReader::new(self.read_buffer_bytes);
         let mut request_buffer = Vec::with_capacity(self.pipeline_depth.saturating_mul(64));
         let mut issued = 0_u64;
         let mut received = 0_u64;
         let mut in_flight = 0_usize;
+        let mut issued_times = VecDeque::with_capacity(self.pipeline_depth);
         let mut session_stats = SessionStats::default();
         loop {
             if in_flight == 0 {
                 let batch = time::timeout(
                     self.drain_timeout,
-                    self.write_load_batch(
+                    self.issue_load_batch(
                         &mut stream,
                         &mut request_buffer,
                         issued,
                         self.pipeline_depth,
                         stats,
                         stop,
+                        schedule,
+                        &mut outcome,
+                        &mut issued_times,
                     ),
                 )
                 .await;
@@ -1327,6 +1575,14 @@ impl LoadSession {
             let was_draining = stop.load(Ordering::Acquire);
             received = received.wrapping_add(1);
             in_flight -= 1;
+            if schedule.is_some() {
+                outcome.completed_requests += 1;
+                if let Some(issued_at) = issued_times.pop_front()
+                    && let Some(histogram) = outcome.latency_histogram.as_mut()
+                {
+                    histogram.record(Instant::now().saturating_duration_since(issued_at));
+                }
+            }
 
             stats
                 .bytes_sent
@@ -1362,13 +1618,16 @@ impl LoadSession {
             if in_flight <= self.pipeline_depth / 2 {
                 let batch = time::timeout(
                     self.drain_timeout,
-                    self.write_load_batch(
+                    self.issue_load_batch(
                         &mut stream,
                         &mut request_buffer,
                         issued,
                         self.pipeline_depth - in_flight,
                         stats,
                         stop,
+                        schedule,
+                        &mut outcome,
+                        &mut issued_times,
                     ),
                 )
                 .await;
@@ -1393,6 +1652,55 @@ impl LoadSession {
         Ok(outcome)
     }
 
+
+    #[allow(clippy::too_many_arguments)]
+    async fn issue_load_batch(
+        &self,
+        stream: &mut TcpStream,
+        buffer: &mut Vec<u8>,
+        issued: u64,
+        capacity: usize,
+        stats: &Stats,
+        stop: &AtomicBool,
+        schedule: Option<OfferedLoadSchedule>,
+        outcome: &mut LoadSessionOutcome,
+        issued_times: &mut VecDeque<Instant>,
+    ) -> io::Result<usize> {
+        if let Some(schedule) = schedule
+            && let Some(delay) = schedule
+                .deadline(issued)
+                .checked_duration_since(Instant::now())
+        {
+            time::sleep(delay).await;
+        }
+
+        let filled = self
+            .write_load_batch(stream, buffer, issued, capacity, stats, stop)
+            .await?;
+        if let Some(schedule) = schedule {
+            let actual_issue = Instant::now();
+            for index in 0..filled {
+                let request_index = issued.saturating_add(index as u64);
+                let deadline = schedule.deadline(request_index);
+                let delay = actual_issue.saturating_duration_since(deadline);
+                outcome.scheduled_requests = outcome.scheduled_requests.saturating_add(1);
+                outcome.issued_requests = outcome.issued_requests.saturating_add(1);
+                if !delay.is_zero() {
+                    outcome.missed_issue_deadlines =
+                        outcome.missed_issue_deadlines.saturating_add(1);
+                }
+                if let Some(histogram) = outcome.schedule_delay_histogram.as_mut() {
+                    histogram.record(delay);
+                }
+                issued_times.push_back(actual_issue);
+            }
+            let backlog = schedule
+                .due_count(actual_issue)
+                .saturating_sub(issued.saturating_add(filled as u64));
+            outcome.peak_backlog = outcome.peak_backlog.max(backlog);
+        }
+        Ok(filled)
+    }
 
     async fn write_load_batch(
         &self,
@@ -7849,6 +8157,9 @@ mod tests {
             duration_secs: 0,
             setup_timeout_secs: 30,
             drain_timeout_secs: 5,
+            offered_rate: None,
+            latency_range_ms: DEFAULT_LATENCY_RANGE_MS,
+            latency_precision_us: DEFAULT_LATENCY_PRECISION_US,
             connections: 1,
             client_offset: 0,
             total_clients: 0,
@@ -18275,6 +18586,108 @@ mod tests {
         assert!(!LoadVerificationPolicy::Sampled.verifies(1));
         assert!(LoadVerificationPolicy::Sampled.verifies(100));
         assert!(LoadVerificationPolicy::Full.verifies(u64::MAX));
+    }
+
+    #[test]
+    fn offered_load_histogram_is_bounded_and_tracks_percentiles() {
+        let mut histogram =
+            LatencyHistogram::new(Duration::from_millis(10), Duration::from_millis(1)).unwrap();
+        histogram.record(Duration::from_millis(1));
+        histogram.record(Duration::from_millis(100));
+
+        assert_eq!(histogram.bin_count(), 10);
+        assert_eq!(histogram.sample_count(), 2);
+        assert_eq!(histogram.overflow_count(), 1);
+        assert_eq!(histogram.percentile(0.5), Some(Duration::from_millis(1)));
+        assert!(
+            LatencyHistogram::new(Duration::from_secs(2_000), Duration::from_micros(1),).is_err()
+        );
+
+        let started = Instant::now();
+        let schedule = OfferedLoadSchedule::new(100.0, started).unwrap();
+        assert_eq!(schedule.interval(), Duration::from_millis(10));
+        assert_eq!(schedule.deadline(0), started);
+        assert_eq!(schedule.due_count(started), 1);
+        assert_eq!(
+            schedule.due_count(started.checked_add(Duration::from_millis(10)).unwrap()),
+            2
+        );
+        assert_eq!(
+            schedule.due_count(started.checked_sub(Duration::from_millis(1)).unwrap()),
+            0
+        );
+        assert!(OfferedLoadSchedule::new(0.0, started).is_err());
+        assert!(OfferedLoadSchedule::new(1e-20, started).is_err());
+    }
+
+    #[tokio::test]
+    async fn offered_load_records_mixed_article_body_latency() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            reader.get_mut().write_all(b"200 ready\r\n").await.unwrap();
+            for _ in 0..4 {
+                let mut request = String::new();
+                reader.read_line(&mut request).await.unwrap();
+                if request.starts_with("ARTICLE") {
+                    time::sleep(Duration::from_millis(20)).await;
+                    let mut response = b"220 1 <article@test> article follows\r\n".to_vec();
+                    response.extend_from_slice(&vec![b'x'; 8192]);
+                    response.extend_from_slice(b"\r\n.\r\n");
+                    reader.get_mut().write_all(&response).await.unwrap();
+                } else {
+                    reader
+                        .get_mut()
+                        .write_all(b"222 1 <body@test> body follows\r\nsmall\r\n.\r\n")
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+
+        let mut args = test_fetch_args();
+        args.connect = address;
+        args.requests = 4;
+        args.connections = 1;
+        args.total_clients = 1;
+        args.pipeline_depth = 2;
+        args.command_mix = ClientCommandMix::Alternate;
+        args.offered_rate = Some(1_000.0);
+        args.setup_timeout_secs = 1;
+        args.drain_timeout_secs = 1;
+        let config = LoadConfig::from_args(args).unwrap();
+        let outcome = LoadSession::new(&config, 0, config.start_id, config.requests)
+            .run(Arc::new(Stats::new()), Arc::new(AtomicBool::new(false)))
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(outcome.scheduled_requests, 4);
+        assert_eq!(outcome.issued_requests, 4);
+        assert_eq!(outcome.completed_requests, 4);
+        assert_eq!(
+            outcome
+                .schedule_delay_histogram
+                .as_ref()
+                .unwrap()
+                .sample_count(),
+            4
+        );
+        assert_eq!(
+            outcome.latency_histogram.as_ref().unwrap().sample_count(),
+            4
+        );
+        assert!(
+            outcome
+                .latency_histogram
+                .as_ref()
+                .unwrap()
+                .percentile(0.95)
+                .unwrap()
+                >= Duration::from_millis(10)
+        );
     }
 
     #[test]
