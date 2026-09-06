@@ -480,12 +480,16 @@ mod proptests {
 
     fn segment_set_strategy() -> BoxedStrategy<SegmentSet> {
         vec(message_id_strategy(), 1..=4)
-            .prop_map(|ids| SegmentSet {
-                ids: ids
-                    .into_iter()
-                    .map(|id| MessageId::from_shared(Arc::<str>::from(id)).unwrap())
-                    .collect::<Vec<_>>()
-                    .into_boxed_slice(),
+            .prop_map(|ids| {
+                let declared_sizes = vec![0; ids.len()];
+                SegmentSet {
+                    ids: ids
+                        .into_iter()
+                        .map(|id| MessageId::from_shared(Arc::<str>::from(id)).unwrap())
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice(),
+                    declared_sizes: declared_sizes.into_boxed_slice(),
+                }
             })
             .boxed()
     }
@@ -662,6 +666,27 @@ pub enum LoadWorkloadPolicy {
     Repeat,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum LoadVerificationPolicy {
+    /// Do not verify response identity beyond framing.
+    None,
+    /// Verify the first response and every 100th response thereafter.
+    Sampled,
+    /// Verify every response against its requested Message-ID.
+    Full,
+}
+
+impl LoadVerificationPolicy {
+    #[must_use]
+    fn verifies(self, request_index: u64) -> bool {
+        match self {
+            Self::None => false,
+            Self::Sampled => request_index.is_multiple_of(100),
+            Self::Full => true,
+        }
+    }
+}
+
 #[must_use]
 fn synthetic_request_id(
     start_id: u64,
@@ -745,7 +770,7 @@ pub struct FetchArgs {
     #[arg(long, value_delimiter = ',')]
     pub ports: Vec<u16>,
 
-    /// Tab-separated segment file. Lines are SIZE<TAB>MSGID; MSGID is normalized into angle brackets.
+    /// Tab-separated segment file. Lines are SIZE<TAB>MSGID; SIZE is the input-declared segment size, not complete NNTP wire-frame bytes.
     #[arg(long)]
     pub segments: Option<PathBuf>,
 
@@ -791,6 +816,10 @@ pub struct FetchArgs {
     /// Synthetic workload identity policy used when no segment file is supplied.
     #[arg(long, value_enum, default_value_t = LoadWorkloadPolicy::Disjoint)]
     pub workload_policy: LoadWorkloadPolicy,
+
+    /// Response identity verification policy for load mode.
+    #[arg(long, value_enum, default_value_t = LoadVerificationPolicy::None)]
+    pub verification_policy: LoadVerificationPolicy,
 
     /// Print final machine-readable CSV: requests,bytes,elapsed_s,cpu_s,rss_kib.
     #[arg(long, default_value_t = false)]
@@ -854,6 +883,21 @@ pub enum FetchRequestKind {
 #[derive(Debug)]
 struct SegmentSet {
     ids: Box<[MessageId<'static>]>,
+    /// Declared input segment size, not complete NNTP wire-frame bytes.
+    declared_sizes: Box<[u64]>,
+}
+
+impl SegmentSet {
+    #[must_use]
+    fn declared_size(&self, index: usize) -> u64 {
+        self.declared_sizes[index]
+    }
+    #[must_use]
+    fn total_declared_size(&self) -> u64 {
+        (0..self.ids.len()).fold(0, |total, index| {
+            total.saturating_add(self.declared_size(index))
+        })
+    }
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -893,7 +937,7 @@ pub async fn run_load(args: FetchArgs) -> io::Result<()> {
 
     if !config.csv {
         eprintln!(
-            "nntpbench client connecting to {} requests={:?} transfer_bytes={} duration_secs={} connections={} total_clients={} client_offset={} pipeline_depth={} command_mix={:?} workload_policy={:?}",
+            "nntpbench client connecting to {} requests={:?} transfer_bytes={} duration_secs={} connections={} total_clients={} client_offset={} pipeline_depth={} command_mix={:?} workload_policy={:?} verification_policy={:?} segments={} declared_segment_bytes={}",
             config.connect,
             config.requests,
             config.transfer_bytes,
@@ -903,7 +947,13 @@ pub async fn run_load(args: FetchArgs) -> io::Result<()> {
             config.client_offset,
             config.pipeline_depth,
             config.command_mix,
-            config.workload_policy
+            config.workload_policy,
+            config.verification_policy,
+            config.segments.as_ref().map_or(0, |segments| segments.ids.len()),
+            config
+                .segments
+                .as_ref()
+                .map_or(0, |segments| segments.total_declared_size()),
         );
     }
 
@@ -1007,6 +1057,7 @@ struct LoadConfig {
     command_mix: ClientCommandMix,
     start_id: u64,
     workload_policy: LoadWorkloadPolicy,
+    verification_policy: LoadVerificationPolicy,
     read_buffer_bytes: usize,
     nodelay: bool,
     socket_recv_buffer: usize,
@@ -1058,6 +1109,7 @@ impl LoadConfig {
             command_mix: args.command_mix,
             start_id: args.start_id,
             workload_policy: args.workload_policy,
+            verification_policy: args.verification_policy,
             read_buffer_bytes: args.read_buffer_bytes.max(terminator::TERMINATOR_TAIL_SIZE),
             nodelay: args.nodelay,
             socket_recv_buffer: args.socket_recv_buffer,
@@ -1086,6 +1138,7 @@ struct LoadSession {
     transfer_bytes: u64,
     next_id: u64,
     workload_policy: LoadWorkloadPolicy,
+    verification_policy: LoadVerificationPolicy,
     setup_timeout: Duration,
     drain_timeout: Duration,
     pipeline_depth: usize,
@@ -1128,6 +1181,7 @@ impl LoadSession {
             transfer_bytes: config.transfer_bytes,
             next_id: start_id,
             workload_policy: config.workload_policy,
+            verification_policy: config.verification_policy,
             setup_timeout: config.setup_timeout,
             drain_timeout: config.drain_timeout,
             pipeline_depth: config.pipeline_depth,
@@ -1138,6 +1192,25 @@ impl LoadSession {
             socket_send_buffer: config.socket_send_buffer,
         }
     }
+    fn expected_message_id(
+        &self,
+        command_id: u64,
+        request_index: u64,
+    ) -> io::Result<Option<MessageId<'static>>> {
+        if !self.verification_policy.verifies(request_index) {
+            return Ok(None);
+        }
+        request_message_id_for_command(
+            client_command_kind(command_id, self.command_mix),
+            command_id,
+            request_index,
+            self.segments.as_deref(),
+            self.client_index,
+            self.total_clients,
+        )
+        .map(Some)
+    }
+
 
     async fn run(self, stats: Arc<Stats>, stop: Arc<AtomicBool>) -> io::Result<LoadSessionOutcome> {
         stats.accepted_connections.fetch_add(1, Ordering::Relaxed);
@@ -1231,9 +1304,14 @@ impl LoadSession {
 
             let command_id = self.next_id.wrapping_add(received);
             let request_kind = request_kind_for_client_command(command_id, self.command_mix);
+            let expected_message_id = self.expected_message_id(command_id, received)?;
             let response = time::timeout(
                 self.drain_timeout,
-                response_reader.read_response(&mut stream, request_kind),
+                response_reader.read_response(
+                    &mut stream,
+                    request_kind,
+                    expected_message_id.as_ref().map(MessageId::as_str),
+                ),
             )
             .await;
             let response_len = match response {
@@ -1370,6 +1448,12 @@ struct LoadResponseReader {
     read_buffer_bytes: usize,
 }
 
+fn response_message_id(line: &[u8]) -> Option<&[u8]> {
+    let start = memchr::memchr(b'<', line)?;
+    let end = memchr::memchr(b'>', &line[start..])?;
+    Some(&line[start..=start + end])
+}
+
 impl LoadResponseReader {
     fn new(read_buffer_bytes: usize) -> Self {
         Self {
@@ -1383,9 +1467,10 @@ impl LoadResponseReader {
         &mut self,
         stream: &mut TcpStream,
         kind: RequestKind,
+        expected_message_id: Option<&str>,
     ) -> io::Result<usize> {
         loop {
-            if let Some(frame_len) = self.try_consume_response(kind)? {
+            if let Some(frame_len) = self.try_consume_response(kind, expected_message_id)? {
                 return Ok(frame_len);
             }
 
@@ -1401,7 +1486,11 @@ impl LoadResponseReader {
         }
     }
 
-    fn try_consume_response(&mut self, kind: RequestKind) -> io::Result<Option<usize>> {
+    fn try_consume_response(
+        &mut self,
+        kind: RequestKind,
+        expected_message_id: Option<&str>,
+    ) -> io::Result<Option<usize>> {
         let data = &self.buffer[self.start..];
         let initial = match protocol::ResponseInitial::parse(kind, data) {
             protocol::ResponseInitialParse::Complete(initial) => initial,
@@ -1414,6 +1503,20 @@ impl LoadResponseReader {
             }
         };
         let line_end = find_crlf_line_end(data, 0).expect("validated response line");
+        if let Some(expected) = expected_message_id {
+            let actual = response_message_id(&data[..line_end]).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "response did not include a Message-ID",
+                )
+            })?;
+            if actual != expected.as_bytes() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "response Message-ID did not match request",
+                ));
+            }
+        }
         if !initial.descriptor().framing().is_multiline() {
             self.start += line_end;
             return Ok(Some(line_end));
@@ -1806,7 +1909,7 @@ pub fn bench_load_response_scan_in_place(
         read_buffer_bytes,
     };
     let result = reader
-        .try_consume_response(kind)?
+        .try_consume_response(kind, None)?
         .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "incomplete response"));
     *buffer = reader.buffer;
     result
@@ -1891,6 +1994,7 @@ fn read_segments(path: &std::path::Path) -> io::Result<SegmentSet> {
     let mut reader = io::BufReader::new(file);
     let mut line_buf = Vec::with_capacity(512);
     let mut ids = Vec::new();
+    let mut declared_sizes = Vec::new();
     let mut line_index = 0;
 
     loop {
@@ -1911,8 +2015,13 @@ fn read_segments(path: &std::path::Path) -> io::Result<SegmentSet> {
                 format!("invalid segment line {line_index}: expected SIZE<TAB>MSGID"),
             )
         })?;
+        let declared_size = std::str::from_utf8(trim_ascii_line(&line[..tab]))
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "segment size is not utf-8"))?
+            .parse::<u64>()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid segment size"))?;
         let msgid = trim_ascii_line(&line[tab + 1..]);
         let id = shared_message_id_from_bytes(msgid)?;
+        declared_sizes.push(declared_size);
         ids.push(id);
     }
 
@@ -1925,6 +2034,7 @@ fn read_segments(path: &std::path::Path) -> io::Result<SegmentSet> {
 
     Ok(SegmentSet {
         ids: ids.into_boxed_slice(),
+        declared_sizes: declared_sizes.into_boxed_slice(),
     })
 }
 
@@ -7745,6 +7855,7 @@ mod tests {
             command_mix: ClientCommandMix::Alternate,
             start_id: 1,
             workload_policy: LoadWorkloadPolicy::Disjoint,
+            verification_policy: LoadVerificationPolicy::None,
             csv: false,
             stats_interval_secs: 1,
             nodelay: true,
@@ -14884,6 +14995,20 @@ mod tests {
             "<wrapped@test>"
         );
     }
+    #[test]
+    fn segment_parsing_preserves_declared_sizes() {
+        let path = write_temp_segments("declared-size", "42\tsegment@test\n");
+        let segments = read_segments(&path).unwrap();
+        fs::remove_file(path).unwrap();
+
+        assert_eq!(segments.declared_size(0), 42);
+        let invalid_path = write_temp_segments("invalid-size", "not-a-size\tsegment@test\n");
+        let error = read_segments(&invalid_path).unwrap_err();
+        fs::remove_file(invalid_path).unwrap();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
 
     #[test]
     fn client_request_for_command_uses_message_ids_without_selected_group() {
@@ -18009,6 +18134,7 @@ mod tests {
         let segments = SegmentSet {
             ids: vec![MessageId::from_shared(Arc::<str>::from("<segment@test>")).unwrap()]
                 .into_boxed_slice(),
+            declared_sizes: vec![0].into_boxed_slice(),
         };
         let long_message = format!("<{}@example.test>", "a".repeat(235));
         let long_command = format!("ARTICLE {long_message}\r\n");
@@ -18140,6 +18266,42 @@ mod tests {
             bench_load_response_scan_in_place(&mut buffer, RequestKind::Article).unwrap();
         assert_eq!(consumed, first.len());
         assert_eq!(&buffer[consumed..], second);
+    }
+
+    #[test]
+    fn load_verification_policy_samples_deterministically() {
+        assert!(!LoadVerificationPolicy::None.verifies(0));
+        assert!(LoadVerificationPolicy::Sampled.verifies(0));
+        assert!(!LoadVerificationPolicy::Sampled.verifies(1));
+        assert!(LoadVerificationPolicy::Sampled.verifies(100));
+        assert!(LoadVerificationPolicy::Full.verifies(u64::MAX));
+    }
+
+    #[test]
+    fn load_response_identity_policy_rejects_wrong_article_but_none_accepts() {
+        let response = b"220 1 <actual@test> article follows\r\n.\r\n";
+
+        let mut verifying = LoadResponseReader {
+            buffer: response.to_vec(),
+            start: 0,
+            read_buffer_bytes: response.len(),
+        };
+        let error = verifying
+            .try_consume_response(RequestKind::Article, Some("<expected@test>"))
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+        let mut framing_only = LoadResponseReader {
+            buffer: response.to_vec(),
+            start: 0,
+            read_buffer_bytes: response.len(),
+        };
+        assert_eq!(
+            framing_only
+                .try_consume_response(RequestKind::Article, None)
+                .unwrap(),
+            Some(response.len())
+        );
     }
 
     #[test]
