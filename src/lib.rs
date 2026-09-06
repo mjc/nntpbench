@@ -30,7 +30,8 @@ use tokio::task::JoinSet;
 use tokio::time;
 
 use crate::terminator::{
-    BoundedResponseLineStatus, DOT_TERMINATOR, ResponseLineStatus, append_dot_terminator,
+    BoundedResponseLineStatus, DOT_TERMINATOR, EmptyMultilineTerminator, EmptyTerminatorStatus,
+    MultilineTerminatorDetector, ResponseLineStatus, TerminatorStatus, append_dot_terminator,
     detect_bounded_response_line_end, detect_response_line_end_from, find_crlf_line_end,
     find_dot_terminated_block, strip_complete_crlf_line,
 };
@@ -317,6 +318,7 @@ const MAX_COMMAND_LINE_BYTES: usize = protocol::MAX_AUTHINFO_SASL_COMMAND_LINE_B
 const MAX_SERVER_PIPELINE_DEPTH: usize = 1024;
 const SERVER_READER_CAPACITY: usize = 8 * 1024;
 const CLIENT_READER_CAPACITY: usize = 256 * 1024;
+const DEFAULT_MAX_LOAD_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 const LOAD_STATS_FLUSH_COMMANDS: u64 = 1024;
 const MAX_BATCHED_ARTICLE_RESPONSES: usize = 8;
 const MAX_BATCHED_ARTICLE_RESPONSE_SLICES: usize = MAX_BATCHED_ARTICLE_RESPONSES * 3;
@@ -916,6 +918,9 @@ pub struct FetchArgs {
     /// Per-connection read buffer size.
     #[arg(long, default_value_t = CLIENT_READER_CAPACITY)]
     pub read_buffer_bytes: usize,
+    /// Maximum response frame size accepted by load mode.
+    #[arg(long, default_value_t = DEFAULT_MAX_LOAD_RESPONSE_BYTES)]
+    pub max_response_bytes: usize,
 
     /// Maximum in-flight requests allowed on the connection.
     #[arg(long, default_value_t = 64)]
@@ -1103,7 +1108,7 @@ pub async fn run_load(args: FetchArgs) -> io::Result<()> {
 
     if !config.csv {
         eprintln!(
-            "nntpbench client connecting to {} requests={:?} transfer_bytes={} duration_secs={} connections={} total_clients={} client_offset={} pipeline_depth={} command_mix={:?} workload_policy={:?} verification_policy={:?} segments={} declared_segment_bytes={} offered_rate={:?} latency_range_ms={} latency_precision_us={}",
+            "nntpbench client connecting to {} requests={:?} transfer_bytes={} duration_secs={} connections={} total_clients={} client_offset={} pipeline_depth={} command_mix={:?} workload_policy={:?} verification_policy={:?} segments={} declared_segment_bytes={} offered_rate={:?} latency_range_ms={} latency_precision_us={} max_response_bytes={}",
             config.connect,
             config.requests,
             config.transfer_bytes,
@@ -1126,6 +1131,7 @@ pub async fn run_load(args: FetchArgs) -> io::Result<()> {
             config.offered_rate,
             config.latency_range.as_millis(),
             config.latency_precision.as_micros(),
+            config.max_response_bytes,
         );
     }
 
@@ -1251,6 +1257,7 @@ struct LoadConfig {
     workload_policy: LoadWorkloadPolicy,
     verification_policy: LoadVerificationPolicy,
     read_buffer_bytes: usize,
+    max_response_bytes: usize,
     nodelay: bool,
     socket_recv_buffer: usize,
     socket_send_buffer: usize,
@@ -1261,6 +1268,12 @@ struct LoadConfig {
 impl LoadConfig {
     fn from_args(args: FetchArgs) -> io::Result<Self> {
         let connections = args.connections.max(1);
+        if args.max_response_bytes == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "max response bytes must be positive",
+            ));
+        }
         let total_clients = if args.total_clients == 0 {
             connections
         } else {
@@ -1310,6 +1323,7 @@ impl LoadConfig {
             workload_policy: args.workload_policy,
             verification_policy: args.verification_policy,
             read_buffer_bytes: args.read_buffer_bytes.max(terminator::TERMINATOR_TAIL_SIZE),
+            max_response_bytes: args.max_response_bytes,
             nodelay: args.nodelay,
             socket_recv_buffer: args.socket_recv_buffer,
             socket_send_buffer: args.socket_send_buffer,
@@ -1346,6 +1360,7 @@ struct LoadSession {
     pipeline_depth: usize,
     command_mix: ClientCommandMix,
     read_buffer_bytes: usize,
+    max_response_bytes: usize,
     nodelay: bool,
     socket_recv_buffer: usize,
     socket_send_buffer: usize,
@@ -1417,6 +1432,7 @@ impl LoadSession {
             pipeline_depth: config.pipeline_depth,
             command_mix: config.command_mix,
             read_buffer_bytes: config.read_buffer_bytes,
+            max_response_bytes: config.max_response_bytes,
             nodelay: config.nodelay,
             socket_recv_buffer: config.socket_recv_buffer,
             socket_send_buffer: config.socket_send_buffer,
@@ -1509,7 +1525,8 @@ impl LoadSession {
                 self.latency_precision,
             )?);
         }
-        let mut response_reader = LoadResponseReader::new(self.read_buffer_bytes);
+        let mut response_reader =
+            LoadResponseReader::new(self.read_buffer_bytes, self.max_response_bytes);
         let mut request_buffer = Vec::with_capacity(self.pipeline_depth.saturating_mul(64));
         let mut issued = 0_u64;
         let mut received = 0_u64;
@@ -1754,6 +1771,7 @@ struct LoadResponseReader {
     buffer: Vec<u8>,
     start: usize,
     read_buffer_bytes: usize,
+    max_response_bytes: usize,
 }
 
 fn response_message_id(line: &[u8]) -> Option<&[u8]> {
@@ -1762,24 +1780,99 @@ fn response_message_id(line: &[u8]) -> Option<&[u8]> {
     Some(&line[start..=start + end])
 }
 
+fn bounded_response_len(response_len: usize, added: usize, max: usize) -> io::Result<usize> {
+    let response_len = response_len.checked_add(added).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "response exceeded configured maximum",
+        )
+    })?;
+    if response_len > max {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "response exceeded configured maximum",
+        ));
+    }
+    Ok(response_len)
+}
+
 impl LoadResponseReader {
-    fn new(read_buffer_bytes: usize) -> Self {
+    fn new(read_buffer_bytes: usize, max_response_bytes: usize) -> Self {
+        let read_buffer_bytes = read_buffer_bytes.max(1);
         Self {
             buffer: Vec::with_capacity(read_buffer_bytes),
             start: 0,
             read_buffer_bytes,
+            max_response_bytes,
         }
     }
 
-    async fn read_response(
+    async fn read_response<R>(
         &mut self,
-        stream: &mut TcpStream,
+        stream: &mut R,
         kind: RequestKind,
         expected_message_id: Option<&str>,
-    ) -> io::Result<usize> {
+    ) -> io::Result<usize>
+    where
+        R: AsyncRead + Unpin,
+    {
+        let mut empty_detector = EmptyMultilineTerminator::default();
+        let mut content_started = false;
+        let mut detector = MultilineTerminatorDetector::default();
+        let mut response_len = 0_usize;
+        let mut multiline = false;
+
         loop {
-            if let Some(frame_len) = self.try_consume_response(kind, expected_message_id)? {
-                return Ok(frame_len);
+            if !multiline
+                && let Some((line_end, is_multiline)) =
+                    self.validate_initial_line(kind, expected_message_id)?
+            {
+                if !is_multiline {
+                    self.start += line_end;
+                    return Ok(line_end);
+                }
+                response_len = line_end;
+                self.start += line_end;
+                multiline = true;
+            }
+
+            if multiline {
+                let data = &self.buffer[self.start..];
+                if !content_started {
+                    match empty_detector.detect(data) {
+                        EmptyTerminatorStatus::FoundAt(consumed) => {
+                            let frame_len =
+                                bounded_response_len(response_len, consumed, self.max_response_bytes)?;
+                            self.start += consumed;
+                            return Ok(frame_len);
+                        }
+                        EmptyTerminatorStatus::NeedMore => {
+                            response_len =
+                                bounded_response_len(response_len, data.len(), self.max_response_bytes)?;
+                            self.start = self.buffer.len();
+                        }
+                        EmptyTerminatorStatus::NotFound { .. } => {
+                            content_started = true;
+                        }
+                    }
+                }
+
+                if content_started {
+                    match detector.detect_terminator(data) {
+                        TerminatorStatus::FoundAt(consumed) => {
+                            let frame_len =
+                                bounded_response_len(response_len, consumed, self.max_response_bytes)?;
+                            self.start += consumed;
+                            return Ok(frame_len);
+                        }
+                        TerminatorStatus::NotFound => {
+                            response_len =
+                                bounded_response_len(response_len, data.len(), self.max_response_bytes)?;
+                            detector.update(data);
+                            self.start = self.buffer.len();
+                        }
+                    }
+                }
             }
 
             self.compact_if_needed();
@@ -1794,11 +1887,11 @@ impl LoadResponseReader {
         }
     }
 
-    fn try_consume_response(
-        &mut self,
+    fn validate_initial_line(
+        &self,
         kind: RequestKind,
         expected_message_id: Option<&str>,
-    ) -> io::Result<Option<usize>> {
+    ) -> io::Result<Option<(usize, bool)>> {
         let data = &self.buffer[self.start..];
         let initial = match protocol::ResponseInitial::parse(kind, data) {
             protocol::ResponseInitialParse::Complete(initial) => initial,
@@ -1825,15 +1918,33 @@ impl LoadResponseReader {
                 ));
             }
         }
-        if !initial.descriptor().framing().is_multiline() {
+        Ok(Some((
+            line_end,
+            initial.descriptor().framing().is_multiline(),
+        )))
+    }
+
+    fn try_consume_response(
+        &mut self,
+        kind: RequestKind,
+        expected_message_id: Option<&str>,
+    ) -> io::Result<Option<usize>> {
+        let Some((line_end, multiline)) = self.validate_initial_line(kind, expected_message_id)?
+        else {
+            return Ok(None);
+        };
+        let data = &self.buffer[self.start..];
+        if !multiline {
             self.start += line_end;
             return Ok(Some(line_end));
         }
 
         let Some(block) = find_dot_terminated_block(data, line_end) else {
+            bounded_response_len(0, data.len(), self.max_response_bytes)?;
             return Ok(None);
         };
         let consumed = block.block_end();
+        bounded_response_len(0, consumed, self.max_response_bytes)?;
         self.start += consumed;
         Ok(Some(consumed))
     }
@@ -2215,6 +2326,7 @@ pub fn bench_load_response_scan_in_place(
         buffer: std::mem::take(buffer),
         start: 0,
         read_buffer_bytes,
+        max_response_bytes: usize::MAX,
     };
     let result = reader
         .try_consume_response(kind, None)?
@@ -8149,6 +8261,7 @@ mod tests {
             selector: None,
             threads: 1,
             read_buffer_bytes: CLIENT_READER_CAPACITY,
+            max_response_bytes: DEFAULT_MAX_LOAD_RESPONSE_BYTES,
             pipeline_depth: 64,
             ports: Vec::new(),
             segments: None,
@@ -18698,6 +18811,7 @@ mod tests {
             buffer: response.to_vec(),
             start: 0,
             read_buffer_bytes: response.len(),
+            max_response_bytes: response.len(),
         };
         let error = verifying
             .try_consume_response(RequestKind::Article, Some("<expected@test>"))
@@ -18708,6 +18822,7 @@ mod tests {
             buffer: response.to_vec(),
             start: 0,
             read_buffer_bytes: response.len(),
+            max_response_bytes: response.len(),
         };
         assert_eq!(
             framing_only
@@ -18715,6 +18830,87 @@ mod tests {
                 .unwrap(),
             Some(response.len())
         );
+    }
+
+    #[tokio::test]
+    async fn load_response_reader_rejects_unterminated_response_at_bound() {
+        let mut response = b"220 1 <article@test> body follows\r\n".to_vec();
+        response.extend(std::iter::repeat_n(b'x', 32));
+        let (mut writer, mut reader_stream) = tokio::io::duplex(64);
+        let writer_task = tokio::spawn(async move {
+            writer.write_all(&response).await.unwrap();
+            writer.shutdown().await.unwrap();
+        });
+
+        let mut response_reader = LoadResponseReader::new(8, 64);
+        let error = response_reader
+            .read_response(&mut reader_stream, RequestKind::Article, None)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        writer_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn load_response_reader_capacity_stays_bounded_as_articles_grow() {
+        let mut measurements = Vec::new();
+
+        for article_bytes in [1024_usize, 64 * 1024] {
+            let mut response = b"220 1 <article@test> article follows\r\n".to_vec();
+            response.extend(std::iter::repeat_n(b'x', article_bytes));
+            response.extend_from_slice(b"\r\n.\r\n");
+            let expected_len = response.len();
+            let (mut writer, mut reader_stream) = tokio::io::duplex(128);
+            let writer_task = tokio::spawn(async move {
+                writer.write_all(&response).await.unwrap();
+                writer.shutdown().await.unwrap();
+            });
+
+            let mut response_reader = LoadResponseReader::new(8, expected_len);
+            let frame_len = response_reader
+                .read_response(&mut reader_stream, RequestKind::Article, None)
+                .await
+                .unwrap();
+
+            assert_eq!(frame_len, expected_len);
+            measurements.push((
+                response_reader.buffer.len(),
+                response_reader.buffer.capacity(),
+            ));
+            writer_task.await.unwrap();
+        }
+
+        assert!(measurements[0].0 <= 16);
+        assert!(measurements[1].0 <= 16);
+        assert!(measurements[1].1 <= measurements[0].1 + 8);
+    }
+
+    #[test]
+    fn load_config_rejects_zero_max_response_bytes() {
+        let mut args = test_fetch_args();
+        args.max_response_bytes = 0;
+
+        let error = LoadConfig::from_args(args).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn load_response_reader_rejects_overlong_initial_line() {
+        let mut response = b"220 ".to_vec();
+        response.extend(std::iter::repeat_n(
+            b'x',
+            protocol::MAX_INITIAL_RESPONSE_LINE_BYTES,
+        ));
+        let mut response_reader = LoadResponseReader::new(8, usize::MAX);
+        response_reader.buffer = response;
+
+        let error = response_reader
+            .try_consume_response(RequestKind::Article, None)
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
