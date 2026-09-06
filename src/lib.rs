@@ -995,6 +995,9 @@ pub struct FetchArgs {
     /// Print final machine-readable CSV: requests,bytes,elapsed_s,cpu_s,rss_kib.
     #[arg(long, default_value_t = false)]
     pub csv: bool,
+    /// Print the complete load result and configuration as a JSON manifest.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
 
     /// Print benchmark statistics at this interval. Use 0 to disable periodic output.
     #[arg(long, default_value_t = 1)]
@@ -1106,7 +1109,7 @@ pub async fn run_load(args: FetchArgs) -> io::Result<()> {
     let stats = Arc::new(Stats::new());
     let stop = Arc::new(AtomicBool::new(false));
 
-    if !config.csv {
+    if !config.csv && !config.json {
         eprintln!(
             "nntpbench client connecting to {} requests={:?} transfer_bytes={} duration_secs={} connections={} total_clients={} client_offset={} pipeline_depth={} command_mix={:?} workload_policy={:?} verification_policy={:?} segments={} declared_segment_bytes={} offered_rate={:?} latency_range_ms={} latency_precision_us={} max_response_bytes={}",
             config.connect,
@@ -1199,6 +1202,18 @@ pub async fn run_load(args: FetchArgs) -> io::Result<()> {
             cpu_seconds_since(start_cpu_ticks),
             process_rss_kib()
         );
+    } else if config.json {
+        println!(
+            "{}",
+            render_load_manifest(
+                &config,
+                stats.snapshot(),
+                &lifecycle,
+                started.elapsed(),
+                cpu_seconds_since(start_cpu_ticks),
+                process_rss_kib(),
+            )
+        );
     } else {
         stats.print_snapshot("final");
     }
@@ -1227,6 +1242,180 @@ pub async fn run_load(args: FetchArgs) -> io::Result<()> {
     Ok(())
 }
 
+fn json_string(value: &str) -> String {
+    let mut result = String::with_capacity(value.len() + 2);
+    result.push('"');
+    for character in value.chars() {
+        match character {
+            '"' => result.push_str("\\\""),
+            '\\' => result.push_str("\\\\"),
+            '\n' => result.push_str("\\n"),
+            '\r' => result.push_str("\\r"),
+            '\t' => result.push_str("\\t"),
+            character if character.is_control() => {
+                let _ = write!(result, "\\u{:04x}", character as u32);
+            }
+            character => result.push(character),
+        }
+    }
+    result.push('"');
+    result
+}
+
+fn json_debug<T: std::fmt::Debug>(value: &T) -> String {
+    json_string(&format!("{value:?}"))
+}
+
+fn json_option_u64(value: Option<u64>) -> String {
+    value.map_or_else(|| "null".to_string(), |value| value.to_string())
+}
+
+fn json_option_f64(value: Option<f64>) -> String {
+    value
+        .filter(|value| value.is_finite())
+        .map_or_else(|| "null".to_string(), |value| format!("{value:.9}"))
+}
+
+fn json_u16_array(values: &[u16]) -> String {
+    let mut result = String::from("[");
+    for (index, value) in values.iter().enumerate() {
+        if index != 0 {
+            result.push(',');
+        }
+        result.push_str(&value.to_string());
+    }
+    result.push(']');
+    result
+}
+
+fn cpu_model() -> Option<String> {
+    fs::read_to_string("/proc/cpuinfo")
+        .ok()?
+        .lines()
+        .find_map(|line| {
+            let (_, value) = line.split_once(':')?;
+            line.starts_with("model name")
+                .then(|| value.trim().to_owned())
+        })
+}
+
+fn render_load_manifest(
+    config: &LoadConfig,
+    snapshot: Snapshot,
+    lifecycle: &LoadSessionOutcome,
+    elapsed: Duration,
+    cpu_seconds: f64,
+    rss_kib: u64,
+) -> String {
+    let segments = config.segments.as_ref().map_or_else(
+        || "null".to_string(),
+        |segments| {
+            format!(
+                "{{\"count\":{},\"declared_bytes\":{}}}",
+                segments.ids.len(),
+                segments.total_declared_size()
+            )
+        },
+    );
+    let article_store = if config.segments.is_some() {
+        "segment_file"
+    } else {
+        "synthetic"
+    };
+
+    format!(
+        concat!(
+            "{{\"schema_version\":1,\"tool\":\"nntpbench\",\"version\":{},\"mode\":\"load\",",
+            "\"host\":{{\"os\":{},\"arch\":{},\"cpu_model\":{},\"loopback\":{}}},",
+            "\"byte_counter\":\"client response wire-frame bytes\",\"byte_counter_includes\":\"status line, headers, body, and terminator\",",
+            "\"config\":{{",
+            "\"connect\":{},\"runtime_threads\":{},\"ports\":{},\"requests\":{},\"transfer_bytes\":{},",
+            "\"duration_secs\":{:.9},\"setup_timeout_secs\":{:.9},\"drain_timeout_secs\":{:.9},",
+            "\"offered_rate\":{},\"latency_range_ms\":{},\"latency_precision_us\":{},",
+            "\"connections\":{},\"client_offset\":{},\"total_clients\":{},\"pipeline_depth\":{},",
+            "\"command_mix\":{},\"start_id\":{},\"workload_policy\":{},\"verification_policy\":{},",
+            "\"segments\":{},\"read_buffer_bytes\":{},\"max_response_bytes\":{},",
+            "\"nodelay\":{},\"socket_recv_buffer\":{},\"socket_send_buffer\":{},",
+            "\"csv\":{},\"json\":{},\"stats_interval_secs\":{}",
+            "}},",
+            "\"workload\":{{\"article_store\":{},\"article_size_bytes\":null,",
+            "\"body_size_bytes\":null,\"tls\":false,\"auth\":false}},",
+            "\"phases\":{{\"setup_secs\":{:.9},\"measurement_secs\":{:.9},",
+            "\"drain_secs\":{:.9},\"total_elapsed_secs\":{:.9}}},",
+            "\"results\":{{\"commands\":{},\"article_responses\":{},\"body_responses\":{},",
+            "\"response_wire_bytes\":{},\"errors\":{},\"accepted_connections\":{},",
+            "\"outcomes\":{{\"scheduled\":{},\"issued\":{},\"completed\":{},",
+            "\"drained\":{},\"incomplete\":{},\"timed_out_connections\":{},",
+            "\"missed_issue_deadlines\":{},\"peak_backlog\":{}}},",
+            "\"latency_us\":{{\"p50\":{},\"p95\":{}}},",
+            "\"schedule_delay_us\":{{\"p50\":{},\"p95\":{}}}}},",
+            "\"process\":{{\"role\":\"client\",\"cpu_seconds\":{:.9},\"rss_kib\":{}}}}}"
+        ),
+        json_string(env!("CARGO_PKG_VERSION")),
+        json_string(std::env::consts::OS),
+        json_string(std::env::consts::ARCH),
+        json_option_string(cpu_model()),
+        config.connect.ip().is_loopback(),
+        json_string(&config.connect.to_string()),
+        config.runtime_threads,
+        json_u16_array(&config.ports),
+        json_option_u64(config.requests),
+        config.transfer_bytes,
+        config.duration.as_secs_f64(),
+        config.setup_timeout.as_secs_f64(),
+        config.drain_timeout.as_secs_f64(),
+        json_option_f64(config.offered_rate),
+        config.latency_range.as_millis(),
+        config.latency_precision.as_micros(),
+        config.connections,
+        config.client_offset,
+        config.total_clients,
+        config.pipeline_depth,
+        json_debug(&config.command_mix),
+        config.start_id,
+        json_debug(&config.workload_policy),
+        json_debug(&config.verification_policy),
+        segments,
+        config.read_buffer_bytes,
+        config.max_response_bytes,
+        config.nodelay,
+        config.socket_recv_buffer,
+        config.socket_send_buffer,
+        config.csv,
+        config.json,
+        config.stats_interval.as_secs(),
+        json_string(article_store),
+        lifecycle.setup_elapsed.as_secs_f64(),
+        lifecycle.measurement_elapsed.as_secs_f64(),
+        lifecycle.drain_elapsed.as_secs_f64(),
+        elapsed.as_secs_f64(),
+        snapshot.commands,
+        snapshot.article_requests,
+        snapshot.body_requests,
+        snapshot.bytes_sent,
+        snapshot.errors,
+        snapshot.accepted_connections,
+        lifecycle.scheduled_requests,
+        lifecycle.issued_requests,
+        lifecycle.completed_requests,
+        lifecycle.drained_requests,
+        lifecycle.incomplete_requests,
+        lifecycle.timed_out_connections,
+        lifecycle.missed_issue_deadlines,
+        lifecycle.peak_backlog,
+        histogram_percentile_us(lifecycle.latency_histogram.as_ref(), 0.50),
+        histogram_percentile_us(lifecycle.latency_histogram.as_ref(), 0.95),
+        histogram_percentile_us(lifecycle.schedule_delay_histogram.as_ref(), 0.50),
+        histogram_percentile_us(lifecycle.schedule_delay_histogram.as_ref(), 0.95),
+        cpu_seconds,
+        rss_kib,
+    )
+}
+
+fn json_option_string(value: Option<String>) -> String {
+    value.map_or_else(|| "null".to_string(), |value| json_string(&value))
+}
+
 fn histogram_percentile_us(histogram: Option<&LatencyHistogram>, quantile: f64) -> u64 {
     histogram
         .and_then(|histogram| histogram.percentile(quantile))
@@ -1238,6 +1427,7 @@ fn histogram_percentile_us(histogram: Option<&LatencyHistogram>, quantile: f64) 
 #[derive(Debug, Clone)]
 struct LoadConfig {
     connect: SocketAddr,
+    runtime_threads: usize,
     ports: Box<[u16]>,
     segments: Option<Arc<SegmentSet>>,
     requests: Option<u64>,
@@ -1262,12 +1452,19 @@ struct LoadConfig {
     socket_recv_buffer: usize,
     socket_send_buffer: usize,
     csv: bool,
+    json: bool,
     stats_interval: Duration,
 }
 
 impl LoadConfig {
     fn from_args(args: FetchArgs) -> io::Result<Self> {
         let connections = args.connections.max(1);
+        if args.csv && args.json {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "csv and json output are mutually exclusive",
+            ));
+        }
         if args.max_response_bytes == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1304,6 +1501,7 @@ impl LoadConfig {
 
         Ok(Self {
             connect: args.connect,
+            runtime_threads: args.threads,
             ports: args.ports.into_boxed_slice(),
             segments,
             requests: (args.requests != 0).then_some(args.requests),
@@ -1328,6 +1526,7 @@ impl LoadConfig {
             socket_recv_buffer: args.socket_recv_buffer,
             socket_send_buffer: args.socket_send_buffer,
             csv: args.csv,
+            json: args.json,
             stats_interval: Duration::from_secs(args.stats_interval_secs),
         })
     }
@@ -8415,11 +8614,46 @@ mod tests {
             workload_policy: LoadWorkloadPolicy::Disjoint,
             verification_policy: LoadVerificationPolicy::None,
             csv: false,
+            json: false,
             stats_interval_secs: 1,
             nodelay: true,
             socket_recv_buffer: HIGH_THROUGHPUT_SOCKET_BUFFER,
             socket_send_buffer: HIGH_THROUGHPUT_SOCKET_BUFFER,
         }
+    }
+
+    #[test]
+    fn load_manifest_names_wire_bytes_and_reproduction_fields() {
+        let config = LoadConfig::from_args(test_fetch_args()).unwrap();
+        let manifest = render_load_manifest(
+            &config,
+            Stats::new().snapshot(),
+            &LoadSessionOutcome::default(),
+            Duration::from_secs(7),
+            0.25,
+            1234,
+        );
+
+        assert!(manifest.starts_with("{\"schema_version\":1"));
+        assert!(manifest.contains("\"tool\":\"nntpbench\""));
+        assert!(manifest.contains("\"byte_counter\":\"client response wire-frame bytes\""));
+        assert!(manifest.contains("\"response_wire_bytes\":0"));
+        assert!(manifest.contains("\"connections\":1"));
+        assert!(manifest.contains("\"pipeline_depth\":64"));
+        assert!(manifest.contains("\"measurement_secs\":0.000"));
+        assert!(manifest.contains("\"cpu_seconds\":0.250000000"));
+        assert!(manifest.contains("\"rss_kib\":1234"));
+    }
+
+    #[test]
+    fn load_config_rejects_csv_and_json_together() {
+        let mut args = test_fetch_args();
+        args.csv = true;
+        args.json = true;
+
+        let error = LoadConfig::from_args(args).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 
     async fn assert_read_request(stream: &mut TcpStream, expected: &[u8]) {
