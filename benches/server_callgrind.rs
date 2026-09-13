@@ -1,4 +1,4 @@
-//! IAI-Callgrind benchmarks for deterministic mock NNTP server hot paths.
+//! Gungraun benchmarks for deterministic mock NNTP server hot paths.
 //!
 //! These benches avoid live TCP so instruction counts focus on command parsing,
 //! response selection, stats accounting, and buffer writes.
@@ -15,7 +15,7 @@ macro_rules! supported {
 }
 
 supported! {
-    use iai_callgrind::{
+    use gungraun::{
         Callgrind, LibraryBenchmarkConfig, library_benchmark, library_benchmark_group, main,
     };
     use nntpbench::{
