@@ -20,6 +20,8 @@ supported! {
     };
     use nntpbench::{
         RequestKind, RequestLine, ServerArgs, ServerConfig, Stats,
+        bench_format_indexed_group_response, bench_format_indexed_listgroup_range_response,
+        bench_format_indexed_listgroup_response,
         bench_load_response_scan_in_place, bench_load_response_verify_in_place,
         for_each_request_line_in_batch, process_request_to_buffer,
     };

@@ -90,7 +90,6 @@ mod request_wire {
         bench_write_request_wire_to_sink, black_box, runtime,
     };
     use std::cell::RefCell;
-
     #[divan::bench(sample_count = 1000, sample_size = 100)]
     fn sync_numeric_article_to_vec(bencher: Bencher) {
         let request = Request::article_number(42).unwrap();
@@ -167,8 +166,6 @@ mod streaming_decode {
         bench_load_response_scan_in_place, bench_load_response_verify_in_place,
         bench_streaming_decode_response, black_box,
     };
-    use std::cell::RefCell;
-
     #[divan::bench(sample_count = 1000, sample_size = 100)]
     fn compact_body_response(bencher: Bencher) {
         bencher.bench(|| {

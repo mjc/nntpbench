@@ -2091,13 +2091,15 @@ impl LoadSession {
             );
             append_load_workload_request(
                 buffer,
-                command_id,
-                synthetic_id,
-                request_index,
-                self.command_mix,
-                self.segments.as_deref(),
-                self.client_index,
-                self.total_clients,
+                LoadWorkloadRequest {
+                    command_id,
+                    synthetic_id,
+                    request_index,
+                    mix: self.command_mix,
+                    segments: self.segments.as_deref(),
+                    client_index: self.client_index,
+                    total_clients: self.total_clients,
+                },
             )?;
             filled += 1;
         }
@@ -2627,16 +2629,29 @@ fn client_request_for_command(
     }
 }
 
-fn append_load_workload_request(
-    buffer: &mut Vec<u8>,
+struct LoadWorkloadRequest<'a> {
     command_id: u64,
     synthetic_id: u64,
     request_index: u64,
     mix: ClientCommandMix,
-    segments: Option<&SegmentSet>,
+    segments: Option<&'a SegmentSet>,
     client_index: usize,
     total_clients: usize,
+}
+
+fn append_load_workload_request(
+    buffer: &mut Vec<u8>,
+    workload: LoadWorkloadRequest<'_>,
 ) -> io::Result<()> {
+    let LoadWorkloadRequest {
+        command_id,
+        synthetic_id,
+        request_index,
+        mix,
+        segments,
+        client_index,
+        total_clients,
+    } = workload;
     let kind = client_command_kind(command_id, mix);
     match kind {
         ClientCommandMix::Article => buffer.extend_from_slice(b"ARTICLE "),
@@ -2665,13 +2680,15 @@ pub fn bench_append_load_workload_request(
 ) -> io::Result<()> {
     append_load_workload_request(
         buffer,
-        command_id,
-        command_id,
-        request_index,
-        mix,
-        None,
-        0,
-        1,
+        LoadWorkloadRequest {
+            command_id,
+            synthetic_id: command_id,
+            request_index,
+            mix,
+            segments: None,
+            client_index: 0,
+            total_clients: 1,
+        },
     )
 }
 
@@ -4955,7 +4972,7 @@ where
                 stats
                     .bytes_sent
                     .fetch_add(response.len() as u64, Ordering::Relaxed);
-                output.write_all(&response).expect("response write failed");
+                output.write_all(response).expect("response write failed");
                 return false;
             }
             if let Some(article_id) = parse_article_id_arg(request.args()).filter(|id| *id != 1) {
@@ -4967,7 +4984,7 @@ where
                 stats
                     .bytes_sent
                     .fetch_add(response.len() as u64, Ordering::Relaxed);
-                output.write_all(&response).expect("response write failed");
+                output.write_all(response).expect("response write failed");
                 return false;
             }
             stats
@@ -4985,7 +5002,7 @@ where
                 stats
                     .bytes_sent
                     .fetch_add(response.len() as u64, Ordering::Relaxed);
-                output.write_all(&response).expect("response write failed");
+                output.write_all(response).expect("response write failed");
                 return false;
             }
             let article_id = parse_article_id_arg(request.args()).unwrap_or(1);
@@ -5007,7 +5024,7 @@ where
                 stats
                     .bytes_sent
                     .fetch_add(response.len() as u64, Ordering::Relaxed);
-                output.write_all(&response).expect("response write failed");
+                output.write_all(response).expect("response write failed");
                 return false;
             }
             stats
@@ -5025,7 +5042,7 @@ where
                 stats
                     .bytes_sent
                     .fetch_add(response.len() as u64, Ordering::Relaxed);
-                output.write_all(&response).expect("response write failed");
+                output.write_all(response).expect("response write failed");
                 return false;
             }
             let article_id = parse_article_id_arg(request.args()).unwrap_or(1);
@@ -5047,7 +5064,7 @@ where
                 stats
                     .bytes_sent
                     .fetch_add(response.len() as u64, Ordering::Relaxed);
-                output.write_all(&response).expect("response write failed");
+                output.write_all(response).expect("response write failed");
                 return false;
             }
             stats
@@ -5069,7 +5086,7 @@ where
                 stats
                     .bytes_sent
                     .fetch_add(response.len() as u64, Ordering::Relaxed);
-                output.write_all(&response).expect("response write failed");
+                output.write_all(response).expect("response write failed");
                 return false;
             }
             let article_id = parse_article_id_arg(request.args()).unwrap_or(1);
@@ -5095,7 +5112,7 @@ where
                 stats
                     .bytes_sent
                     .fetch_add(response.len() as u64, Ordering::Relaxed);
-                output.write_all(&response).expect("response write failed");
+                output.write_all(response).expect("response write failed");
                 return false;
             }
             stats
@@ -5982,13 +5999,13 @@ impl ServerConfig {
                 args.pending_write_bytes.max(1),
                 args.max_connections
                     .max(1)
-                    .min(DEFAULT_PENDING_WRITE_POOL_BUFFERS),
+                    .clamp(1, DEFAULT_PENDING_WRITE_POOL_BUFFERS),
             ),
             generated_response_buffer_pool: GeneratedResponseBufferPool::new(
                 generated_response_buffer_capacity(args.article_bytes, args.body_bytes),
                 args.max_connections
                     .max(1)
-                    .min(DEFAULT_PENDING_WRITE_POOL_BUFFERS),
+                    .clamp(1, DEFAULT_PENDING_WRITE_POOL_BUFFERS),
             ),
             nodelay: args.nodelay,
             socket_recv_buffer: args.socket_recv_buffer,
@@ -7426,10 +7443,17 @@ fn group_response_for_args_with_index_into<'a>(
 ) -> Option<group_response_framing::CompleteGroupResponse<'a>> {
     let group_name = std::str::from_utf8(args).ok()?.trim();
     if let Some(articles) = index.article_numbers_for_group(group_name) {
-        return Some(format_group_response_into(response, group_name, articles));
+        return Some(group_response_framing::write_group_response(
+            response, group_name, articles,
+        ));
     }
-    fixture_group_from_name(args)
-        .map(|group| format_group_response_into(response, group.name(), group.article_numbers()))
+    fixture_group_from_name(args).map(|group| {
+        group_response_framing::write_group_response(
+            response,
+            group.name(),
+            group.article_numbers(),
+        )
+    })
 }
 
 fn benchmark_article_store_index() -> &'static ArticleStoreIndex {
@@ -7551,36 +7575,126 @@ fn listgroup_response_for_args_with_index_into<'a>(
     })
 }
 
-fn format_listgroup_response_into<'a>(
-    response: &'a mut Vec<u8>,
-    group_name: &str,
-    articles: &[u64],
-    filtered: &[u64],
-) -> &'a [u8] {
-    format_group_response_into(response, group_name, articles);
-    for article in filtered {
-        write!(response, "{article}\r\n").expect("write to Vec cannot fail");
-    }
-    response.extend_from_slice(b".\r\n");
-    response.as_slice()
-}
-
-fn format_group_response_into<'a>(
-    response: &'a mut Vec<u8>,
-    group_name: &str,
-    articles: &[u64],
-) -> &'a [u8] {
-    let low = articles.first().copied().unwrap_or(0);
-    let high = articles.last().copied().unwrap_or(0);
-    response.clear();
-    write!(
+#[doc(hidden)]
+pub fn bench_format_indexed_listgroup_response(response: &mut Vec<u8>) -> usize {
+    let complete = listgroup_response_for_args_with_index_into(
         response,
         b"alt.test",
         None,
         benchmark_article_store_index(),
     )
-    .expect("write to Vec cannot fail");
-    response.as_slice()
+    .expect("indexed group must exist");
+    complete.as_bytes().len()
+}
+
+#[doc(hidden)]
+pub fn bench_format_indexed_listgroup_range_response(response: &mut Vec<u8>) -> usize {
+    let complete = listgroup_response_for_args_with_index_into(
+        response,
+        b"alt.test 2-3",
+        None,
+        benchmark_article_store_index(),
+    )
+    .expect("indexed group must exist");
+    complete.as_bytes().len()
+}
+
+mod group_response_framing {
+    use std::io::Write as _;
+
+    pub(super) struct CompleteGroupResponse<'a>(&'a [u8]);
+
+    impl<'a> CompleteGroupResponse<'a> {
+        pub(super) fn as_bytes(&self) -> &'a [u8] {
+            self.0
+        }
+    }
+
+    struct IncompleteListGroupResponse(usize);
+
+    impl IncompleteListGroupResponse {
+        fn write_all_article_lines_and_terminator<'a>(
+            self,
+            response: &'a mut Vec<u8>,
+            articles: &[u64],
+        ) -> CompleteListGroupResponse<'a> {
+            debug_assert_eq!(self.0, response.len());
+            for article in articles {
+                write!(response, "{article}\r\n").expect("write to Vec cannot fail");
+            }
+            Self::write_terminator(response)
+        }
+
+        fn write_selected_article_lines_and_terminator<'a>(
+            self,
+            response: &'a mut Vec<u8>,
+            articles: &[u64],
+            start: u64,
+            end: Option<u64>,
+        ) -> CompleteListGroupResponse<'a> {
+            debug_assert_eq!(self.0, response.len());
+            let end = end.unwrap_or(u64::MAX);
+            for article in articles {
+                if *article >= start && *article <= end {
+                    write!(response, "{article}\r\n").expect("write to Vec cannot fail");
+                }
+            }
+            Self::write_terminator(response)
+        }
+
+        fn write_terminator(response: &mut Vec<u8>) -> CompleteListGroupResponse<'_> {
+            response.extend_from_slice(b".\r\n");
+            CompleteListGroupResponse(response.as_slice())
+        }
+    }
+
+    pub(super) struct CompleteListGroupResponse<'a>(&'a [u8]);
+
+    impl<'a> CompleteListGroupResponse<'a> {
+        pub(super) fn as_bytes(&self) -> &'a [u8] {
+            self.0
+        }
+    }
+
+    fn write_status_line(response: &mut Vec<u8>, group_name: &str, articles: &[u64]) -> usize {
+        let low = articles.first().copied().unwrap_or(0);
+        let high = articles.last().copied().unwrap_or(0);
+        response.clear();
+        write!(
+            response,
+            "211 {} {} {} {}\r\n",
+            articles.len(),
+            low,
+            high,
+            group_name
+        )
+        .expect("write to Vec cannot fail");
+        response.len()
+    }
+
+    pub(super) fn write_group_response<'a>(
+        response: &'a mut Vec<u8>,
+        group_name: &str,
+        articles: &[u64],
+    ) -> CompleteGroupResponse<'a> {
+        write_status_line(response, group_name, articles);
+        CompleteGroupResponse(response.as_slice())
+    }
+
+    pub(super) fn write_listgroup_response<'a>(
+        response: &'a mut Vec<u8>,
+        group_name: &str,
+        articles: &[u64],
+        range: Option<(u64, Option<u64>)>,
+    ) -> CompleteListGroupResponse<'a> {
+        let incomplete =
+            IncompleteListGroupResponse(write_status_line(response, group_name, articles));
+        match range {
+            Some((start, end)) => incomplete
+                .write_selected_article_lines_and_terminator(response, articles, start, end),
+            None => incomplete.write_all_article_lines_and_terminator(response, articles),
+        }
+    }
 }
 
 fn listgroup_range_arg(args: &[u8]) -> Option<&[u8]> {
@@ -19198,6 +19312,33 @@ mod tests {
     }
 
     #[test]
+    fn indexed_listgroup_range_formatting_does_not_allocate() {
+        let index = benchmark_article_store_index();
+        let mut response = Vec::with_capacity(256);
+        let complete = listgroup_response_for_args_with_index_into(
+            &mut response,
+            b"alt.test 2-3",
+            None,
+            index,
+        )
+        .expect("indexed group must exist");
+        assert_eq!(complete.as_bytes(), LISTGROUP_2_3_RESPONSE);
+        response.clear();
+
+        assert_no_allocations("indexed LISTGROUP range formatting", || {
+            let complete = listgroup_response_for_args_with_index_into(
+                &mut response,
+                b"alt.test 2-3",
+                None,
+                index,
+            )
+            .expect("indexed group must exist");
+            assert_eq!(complete.as_bytes(), LISTGROUP_2_3_RESPONSE);
+            response.clear();
+        });
+    }
+
+    #[test]
     fn command_line_batch_construction_does_not_allocate() {
         assert_no_allocations("command line batch construction", || {
             let batch = CommandLineBatch::default();
@@ -19576,7 +19717,8 @@ mod tests {
             let (mut stream, _) = listener.accept().await.unwrap();
             stream.write_all(b"200 ready\r\n").await.unwrap();
             let mut request = [0_u8; 512];
-            stream.read(&mut request).await.unwrap();
+            let read = stream.read(&mut request).await.unwrap();
+            assert!(read > 0);
             time::sleep(Duration::from_secs(2)).await;
         });
 
@@ -19638,7 +19780,8 @@ mod tests {
             let (mut stream, _) = listener.accept().await.unwrap();
             stream.write_all(b"200 ready\r\n").await.unwrap();
             let mut request = [0_u8; 512];
-            stream.read(&mut request).await.unwrap();
+            let read = stream.read(&mut request).await.unwrap();
+            assert!(read > 0);
             time::sleep(Duration::from_millis(50)).await;
             stream
                 .write_all(b"220 1 <article@test> article follows\r\n.\r\n")
