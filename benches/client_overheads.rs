@@ -15,7 +15,7 @@ use nntpbench::client::{
 use nntpbench::{
     ClientCommandMix, MessageId, Request, RequestKind, bench_append_load_workload_request,
     bench_client_request_for_command, bench_client_segment_request_for_command,
-    bench_load_read_capacity, bench_load_response_scan_in_place,
+    bench_load_read_capacity_in_place, bench_load_response_scan_in_place,
     bench_load_response_verify_in_place,
 };
 use std::sync::Arc;
@@ -230,7 +230,7 @@ mod streaming_decode {
 mod public_client_experiments {
     use super::{
         Bencher, RequestKind, bench_article_validation_and_parse,
-        bench_article_validation_and_two_parses, bench_load_read_capacity,
+        bench_article_validation_and_two_parses, bench_load_read_capacity_in_place,
         bench_owned_article_accessor_parse, bench_owned_response_from_bytes,
         bench_pending_read_capacity, bench_public_response_decode_chunks,
         bench_public_response_decode_chunks_stateless, black_box, fixtures, runtime,
@@ -489,29 +489,32 @@ mod public_client_experiments {
         initial_capacity: usize,
         read_chunk_bytes: usize,
     ) {
-        let source = vec![0_u8; source_size];
-        let rt = runtime();
-        bencher.bench(|| {
-            black_box(rt.block_on(bench_load_read_capacity(
-                black_box(&source),
-                black_box(initial_len),
-                black_box(initial_capacity),
-                black_box(read_chunk_bytes),
-            )))
-        });
+        bencher
+            .with_inputs(|| {
+                let mut buffer = Vec::with_capacity(initial_capacity);
+                buffer.resize(initial_len, 0);
+                (runtime(), vec![0_u8; source_size], buffer)
+            })
+            .bench_local_values(|(rt, source, mut buffer)| {
+                black_box(rt.block_on(bench_load_read_capacity_in_place(
+                    black_box(&source),
+                    black_box(&mut buffer),
+                    black_box(read_chunk_bytes),
+                )))
+            });
     }
 
-    #[divan::bench(sample_count = 100, sample_size = 20)]
+    #[divan::bench(sample_count = 100, sample_size = 20, skip_ext_time)]
     fn load_read_64k_with_spare_capacity(bencher: Bencher) {
         bench_load_read(bencher, BODY_64K, 32 * 1024, BODY_64K, 768);
     }
 
-    #[divan::bench(sample_count = 100, sample_size = 20)]
+    #[divan::bench(sample_count = 100, sample_size = 20, skip_ext_time)]
     fn load_read_64k_at_capacity_boundary(bencher: Bencher) {
         bench_load_read(bencher, BODY_64K, BODY_64K - 256, BODY_64K, 768);
     }
 
-    #[divan::bench(sample_count = 100, sample_size = 20)]
+    #[divan::bench(sample_count = 100, sample_size = 20, skip_ext_time)]
     fn load_read_768k_reused_capacity(bencher: Bencher) {
         bench_load_read(bencher, BODY_768K, BODY_64K - 256, BODY_768K, 768);
     }

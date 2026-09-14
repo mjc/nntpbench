@@ -22,9 +22,7 @@ supported! {
         bench_owned_article_accessor_parse, bench_owned_response_from_bytes,
         bench_public_response_decode_chunks, bench_public_response_decode_chunks_stateless,
     };
-    use nntpbench::{
-        OwnedResponse, RequestKind, bench_load_read_capacity,
-    };
+    use nntpbench::{OwnedResponse, RequestKind, bench_load_read_capacity_in_place};
     use std::hint::black_box;
     use tokio::runtime::{Builder, Runtime};
 
@@ -212,30 +210,24 @@ supported! {
         (setup_body_response(BODY_768K), BODY_768K)
     }
 
-    type LoadReadSetup = (Runtime, Vec<u8>, usize, usize, usize);
+    type LoadReadSetup = (Runtime, Vec<u8>, Vec<u8>, usize);
 
     fn setup_load_read_64k_with_spare() -> LoadReadSetup {
-        (runtime(), vec![0_u8; BODY_64K], 32 * 1024, BODY_64K, 768)
+        let mut buffer = Vec::with_capacity(BODY_64K);
+        buffer.resize(32 * 1024, 0);
+        (runtime(), vec![0_u8; BODY_64K], buffer, 768)
     }
 
     fn setup_load_read_64k_boundary() -> LoadReadSetup {
-        (
-            runtime(),
-            vec![0_u8; BODY_64K],
-            BODY_64K - 256,
-            BODY_64K,
-            768,
-        )
+        let mut buffer = Vec::with_capacity(BODY_64K);
+        buffer.resize(BODY_64K - 256, 0);
+        (runtime(), vec![0_u8; BODY_64K], buffer, 768)
     }
 
     fn setup_load_read_768k_reused() -> LoadReadSetup {
-        (
-            runtime(),
-            vec![0_u8; BODY_768K],
-            BODY_64K - 256,
-            BODY_768K,
-            768,
-        )
+        let mut buffer = Vec::with_capacity(BODY_768K);
+        buffer.resize(BODY_64K - 256, 0);
+        (runtime(), vec![0_u8; BODY_768K], buffer, 768)
     }
 
     #[library_benchmark]
@@ -243,13 +235,12 @@ supported! {
     #[bench::at_boundary(setup = setup_load_read_64k_boundary)]
     #[bench::reused_768k(setup = setup_load_read_768k_reused)]
     fn load_read_capacity(
-        (runtime, source, initial_len, initial_capacity, read_chunk_bytes): LoadReadSetup,
+        (runtime, source, mut buffer, read_chunk_bytes): LoadReadSetup,
     ) -> usize {
         let (read, capacity) = runtime
-            .block_on(bench_load_read_capacity(
+            .block_on(bench_load_read_capacity_in_place(
                 black_box(&source),
-                black_box(initial_len),
-                black_box(initial_capacity),
+                black_box(&mut buffer),
                 black_box(read_chunk_bytes),
             ))
             .unwrap();
