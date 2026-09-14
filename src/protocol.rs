@@ -6288,6 +6288,13 @@ mod tests {
             ResponseFrameParse::Complete(response)
                 if response.content().is_empty() && response.terminator() == b".\r\n"
         ));
+        assert!(matches!(
+            ResponseFrame::parse(
+                RequestKind::Article,
+                b"220 1 <article@test>\r\nSubject: folded\r\n continuation\r\n\r\n..payload\r\n.\r\n"
+            ),
+            ResponseFrameParse::Complete(_)
+        ));
 
         crate::COUNT_TEST_ALLOCATIONS.with(|enabled| enabled.set(false));
         let allocations = crate::TEST_ALLOCATIONS.load(std::sync::atomic::Ordering::Relaxed);
