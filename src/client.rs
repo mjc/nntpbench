@@ -14,7 +14,8 @@ use tokio::sync::{Mutex, OwnedMutexGuard, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::protocol::{
-    ArticleRef, Request, ResponseFrameDecoder, ResponseFrameParse, ResponseInitialParse,
+    ArticleLayout, ArticleRef, Request, ResponseFrameDecoder, ResponseFrameParse,
+    ResponseInitialParse,
 };
 use crate::terminator::{
     DOT_TERMINATOR, MultilineFrameProgress, MultilineFramer, crlf_normalized_payload_lines,
@@ -2012,6 +2013,7 @@ pub struct OwnedResponse {
     status: StatusCode,
     content_start: usize,
     content_end: usize,
+    article_layout: Option<ArticleLayout>,
     bytes: Bytes,
 }
 
@@ -2042,7 +2044,15 @@ impl OwnedResponse {
 
     /// Parse the response as an ARTICLE/HEAD/BODY/STAT article-style frame.
     pub fn parse_article(&self) -> Result<Article<'_>, ArticleParseError> {
-        Article::parse_framed(&self.bytes, self.content_start, self.content_end)
+        match self.article_layout {
+            Some(layout) => Article::parse_framed_with_layout(
+                &self.bytes,
+                self.content_start,
+                self.content_end,
+                layout,
+            ),
+            None => Article::parse_framed(&self.bytes, self.content_start, self.content_end),
+        }
     }
 }
 
@@ -2359,6 +2369,7 @@ impl ResponseDecoder {
                         consumed: response.consumed(),
                         content_start: response.content_start(),
                         content_end: response.content_end(),
+                        article_layout: response.article_layout(),
                     }),
                     ResponseFrameParse::NeedMore => Ok(DecodeProgress::NeedMore),
                     ResponseFrameParse::Invalid => Err(ClientError::InvalidStatusLine),
@@ -2376,6 +2387,7 @@ enum DecodeProgress {
         consumed: usize,
         content_start: usize,
         content_end: usize,
+        article_layout: Option<ArticleLayout>,
     },
 }
 
@@ -2516,6 +2528,7 @@ pub fn bench_owned_response_from_bytes(
         status: frame.status(),
         content_start: frame.content_start(),
         content_end: frame.content_end(),
+        article_layout: frame.article_layout(),
         bytes: Bytes::copy_from_slice(&bytes[..frame.consumed()]),
     })
 }
@@ -2556,7 +2569,8 @@ pub fn bench_article_validation_and_two_parses(
         .saturating_add(second.message_id.as_str().len()))
 }
 
-/// Measure frame validation followed by one on-demand article transformation.
+/// Measure frame validation followed by one on-demand article transformation,
+/// reusing the offsets found by validation.
 #[doc(hidden)]
 pub fn bench_article_validation_and_parse(
     kind: RequestKind,
@@ -2565,8 +2579,14 @@ pub fn bench_article_validation_and_parse(
     let ResponseFrameParse::Complete(frame) = ResponseFrameDecoder::new(kind).decode(bytes) else {
         return Err(ClientError::UnexpectedEof);
     };
-    let parsed = Article::parse_framed(bytes, frame.content_start(), frame.content_end())
-        .map_err(|_| ClientError::UnexpectedEof)?;
+    let layout = frame.article_layout().ok_or(ClientError::UnexpectedEof)?;
+    let parsed = Article::parse_framed_with_layout(
+        bytes,
+        frame.content_start(),
+        frame.content_end(),
+        layout,
+    )
+    .map_err(|_| ClientError::UnexpectedEof)?;
     Ok(parsed
         .body
         .as_ref()
@@ -3298,6 +3318,7 @@ async fn run_reader_task(
                         consumed,
                         content_start,
                         content_end,
+                        article_layout,
                     }) => {
                         let bytes = pending_read.split_to(consumed).freeze();
                         let response = CompletedResponse::Owned(OwnedResponse {
@@ -3305,6 +3326,7 @@ async fn run_reader_task(
                             status,
                             content_start,
                             content_end,
+                            article_layout,
                             bytes,
                         });
                         let _ = response_tx.send(Ok(CompletedRequest { request, response }));
@@ -3617,12 +3639,14 @@ mod tests {
                             consumed,
                             content_start,
                             content_end,
+                            article_layout,
                         },
                     ) => {
                         assert_eq!(status, expected.status());
                         assert_eq!(consumed, expected.consumed());
                         assert_eq!(content_start, expected.content_start());
                         assert_eq!(content_end, expected.content_end());
+                        assert_eq!(article_layout, expected.article_layout());
                     }
                     (ResponseFrameParse::Complete(expected), progress) => panic!(
                         "incremental decoder did not match complete stateless frame at split ({first}, {second}): expected {expected:?}, got {progress:?}"
@@ -3653,6 +3677,7 @@ mod tests {
             status,
             content_start: frame.content_start(),
             content_end: frame.content_end(),
+            article_layout: frame.article_layout(),
             bytes: Bytes::copy_from_slice(bytes),
         }
     }
