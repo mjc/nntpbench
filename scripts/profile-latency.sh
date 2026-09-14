@@ -14,8 +14,6 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-cd "$PROJECT_DIR"
-
 PLATFORM="$(uname -s)"
 case "${1:-}" in
     -h|--help|strace|offcpu|sample|dtrace)
@@ -41,6 +39,8 @@ if [ $# -gt 0 ]; then
 fi
 
 EXTRA_ARGS=("$@")
+OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_DIR/target/profiling/profile-latency}"
+mkdir -p "$OUTPUT_DIR"
 
 if [ "$MODE" = "-h" ] || [ "$MODE" = "--help" ]; then
     echo "Usage: $0 [MODE] [TARGET] [ARGS...]"
@@ -54,6 +54,7 @@ if [ "$MODE" = "-h" ] || [ "$MODE" = "--help" ]; then
     echo "  dtrace  - macOS syscall latency aggregation"
     echo ""
     echo "Environment:"
+    echo "  OUTPUT_DIR            artifact directory, default target/profiling/profile-latency"
     echo "  PROFILE_SECONDS       macOS sample/dtrace duration, default 10"
     echo "  SAMPLE_INTERVAL_MS    macOS sample interval, default 1"
     echo ""
@@ -100,7 +101,7 @@ echo "=== Latency Profile Mode: $MODE ==="
 echo ""
 
 run_macos_sample() {
-    local output="latency-sample.txt"
+    local output="$OUTPUT_DIR/latency-sample.txt"
     local seconds="${PROFILE_SECONDS:-10}"
     local interval_ms="${SAMPLE_INTERVAL_MS:-1}"
 
@@ -109,7 +110,9 @@ run_macos_sample() {
         exit 1
     fi
 
+    cd "$PROJECT_DIR"
     build_profile_binary
+    cd "$OUTPUT_DIR"
     echo "Profiling: $BINARY ${RUN_ARGS[*]} ${EXTRA_ARGS[*]}"
     "$BINARY" "${RUN_ARGS[@]}" "${EXTRA_ARGS[@]}" &
     APP_PID=$!
@@ -135,7 +138,9 @@ run_macos_dtrace() {
         exit 1
     fi
 
+    cd "$PROJECT_DIR"
     build_profile_binary
+    cd "$OUTPUT_DIR"
     echo "Profiling: $BINARY ${RUN_ARGS[*]} ${EXTRA_ARGS[*]}"
     "$BINARY" "${RUN_ARGS[@]}" "${EXTRA_ARGS[@]}" &
     APP_PID=$!
@@ -186,7 +191,9 @@ case "$PLATFORM:$MODE" in
     ;;
 
   Linux:strace)
+    cd "$PROJECT_DIR"
     build_profile_binary
+    cd "$OUTPUT_DIR"
 
     echo "Recording syscall latency with strace..."
     echo "Stop nntpbench to generate report."
@@ -225,7 +232,7 @@ case "$PLATFORM:$MODE" in
       sort -rn | head -20 || echo "(no data)"
 
     echo ""
-    echo "Full logs: strace.log"
+    echo "Full logs: $OUTPUT_DIR/strace.log"
     ;;
 
   Linux:offcpu)
@@ -233,7 +240,9 @@ case "$PLATFORM:$MODE" in
     echo -1 | sudo tee /proc/sys/kernel/perf_event_paranoid > /dev/null
     sudo chmod -R a+rx /sys/kernel/tracing 2>/dev/null || true
     sudo chmod -R a+rx /sys/kernel/debug/tracing 2>/dev/null || true
+    cd "$PROJECT_DIR"
     build_profile_binary
+    cd "$OUTPUT_DIR"
 
     echo "Recording off-CPU time (what we're waiting on)..."
     echo "Stop nntpbench to generate flamegraph."
@@ -242,7 +251,7 @@ case "$PLATFORM:$MODE" in
     OFFCPU_METHOD=""
 
     if perf record -e sched:sched_switch -a -- sleep 0.01 2>/dev/null; then
-      rm -f perf.data
+        rm -f perf.data
       echo "Using perf sched:sched_switch..."
       OFFCPU_METHOD="perf-sched"
     elif perf record -e cpu-clock -a -- sleep 0.01 2>/dev/null; then
@@ -308,7 +317,7 @@ case "$PLATFORM:$MODE" in
     fi
 
     echo ""
-    echo "Output files: perf-offcpu.data (and flamegraph-offcpu.svg if generated)"
+    echo "Output files: $OUTPUT_DIR/perf-offcpu.data (and $OUTPUT_DIR/flamegraph-offcpu.svg if generated)"
     ;;
 
   *)
