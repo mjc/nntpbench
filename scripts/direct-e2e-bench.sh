@@ -32,9 +32,9 @@ run_with_optional_taskset() {
     shift
 
     if [[ -n "$cpu_list" && "$PINNING_SUPPORTED" -eq 1 ]]; then
-        taskset -c "$cpu_list" "$@"
+        exec taskset -c "$cpu_list" "$@"
     else
-        "$@"
+        exec "$@"
     fi
 }
 
