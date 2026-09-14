@@ -2523,6 +2523,106 @@ pub fn bench_streaming_decode_response(
     }
 }
 
+/// Construct the owned response representation used by the benchmark-only
+/// public-client probes.
+#[doc(hidden)]
+pub fn bench_owned_response_from_bytes(
+    kind: RequestKind,
+    bytes: &[u8],
+) -> Result<OwnedResponse, ClientError> {
+    let ResponseFrameParse::Complete(frame) = ResponseFrameDecoder::new(kind).decode(bytes) else {
+        return Err(ClientError::UnexpectedEof);
+    };
+
+    Ok(OwnedResponse {
+        kind,
+        status: frame.status(),
+        content_start: frame.content_start(),
+        content_end: frame.content_end(),
+        bytes: Bytes::copy_from_slice(&bytes[..frame.consumed()]),
+    })
+}
+
+/// Measure the two post-frame article parses performed by the current owned
+/// article path: conversion to `OwnedArticle` and the typed accessor.
+#[doc(hidden)]
+pub fn bench_owned_article_parse_passes(response: &OwnedResponse) -> Result<usize, ClientError> {
+    let article = OwnedArticle::try_from(response.clone())?;
+    let parsed = article.article().map_err(|_| ClientError::UnexpectedEof)?;
+    Ok(parsed
+        .body
+        .as_ref()
+        .map_or(0, |body| body.len())
+        .saturating_add(parsed.message_id.as_str().len()))
+}
+
+/// Measure frame validation plus the two later article parses without copying
+/// the input into an owned response. This is the allocation-producing baseline
+/// for the full public-client parse sequence.
+#[doc(hidden)]
+pub fn bench_article_validation_and_two_parses(
+    kind: RequestKind,
+    bytes: &[u8],
+) -> Result<usize, ClientError> {
+    let ResponseFrameParse::Complete(frame) = ResponseFrameDecoder::new(kind).decode(bytes) else {
+        return Err(ClientError::UnexpectedEof);
+    };
+    let first = Article::parse_framed(bytes, frame.content_start(), frame.content_end())
+        .map_err(|_| ClientError::UnexpectedEof)?;
+    let second = Article::parse_framed(bytes, frame.content_start(), frame.content_end())
+        .map_err(|_| ClientError::UnexpectedEof)?;
+    Ok(first
+        .body
+        .as_ref()
+        .map_or(0, |body| body.len())
+        .saturating_add(second.message_id.as_str().len()))
+}
+
+/// Run the current stateless public response decoder against a fragmented
+/// response. This intentionally preserves the existing whole-pending-buffer
+/// decode behavior so an incremental decoder can be compared against it.
+#[doc(hidden)]
+pub fn bench_public_response_decode_chunks(
+    kind: RequestKind,
+    response: &[u8],
+    chunk_bytes: usize,
+) -> Result<(StatusCode, usize), ClientError> {
+    let chunk_bytes = chunk_bytes.max(1);
+    let mut decoder = ResponseDecoder::new(kind);
+    let mut pending = BytesMut::with_capacity(response.len());
+    let mut offset = 0;
+
+    while offset < response.len() {
+        let end = (offset + chunk_bytes).min(response.len());
+        pending.extend_from_slice(&response[offset..end]);
+        offset = end;
+
+        if let DecodeProgress::Complete {
+            status, consumed, ..
+        } = decoder.push(&pending)?
+        {
+            return Ok((status, consumed));
+        }
+    }
+
+    Err(ClientError::UnexpectedEof)
+}
+
+/// Measure one owned-client receive into a caller-controlled buffer state.
+#[doc(hidden)]
+pub async fn bench_pending_read_capacity(
+    source: &[u8],
+    initial_len: usize,
+    initial_capacity: usize,
+    read_chunk_bytes: usize,
+) -> io::Result<(usize, usize)> {
+    let mut reader = io::Cursor::new(source);
+    let mut pending = BytesMut::with_capacity(initial_capacity);
+    pending.resize(initial_len, 0);
+    let read = read_into_pending_bytes(&mut reader, &mut pending, read_chunk_bytes).await?;
+    Ok((read, pending.capacity()))
+}
+
 #[derive(Debug)]
 struct QueuedRequest {
     request: Request<'static>,
