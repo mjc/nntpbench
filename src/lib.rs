@@ -2691,7 +2691,7 @@ where
                     session_state.selected_group = Some(SelectedGroup::Fixture(group));
                     session_state.current_article = group.first_article();
                 }
-                response
+                response.as_bytes()
             } else {
                 let Some(group) = fixture_group_from_name(args) else {
                     write_response(
@@ -2752,7 +2752,7 @@ where
                     session_state.selected_group = Some(SelectedGroup::Fixture(group));
                     session_state.current_article = group.first_article();
                 }
-                write_response(writer, pending_write, response, session_stats).await?;
+                write_response(writer, pending_write, response.as_bytes(), session_stats).await?;
             } else {
                 let current_group = match session_state.selected_group.as_ref() {
                     Some(SelectedGroup::Fixture(group)) => Some(*group),
@@ -5854,43 +5854,46 @@ fn group_response_for_args_with_index_into<'a>(
     response: &'a mut Vec<u8>,
     args: &[u8],
     index: &ArticleStoreIndex,
-) -> Option<&'a [u8]> {
+) -> Option<group_response_framing::CompleteGroupResponse<'a>> {
     let group_name = std::str::from_utf8(args).ok()?.trim();
     if let Some(articles) = index.article_numbers_for_group(group_name) {
-        response.clear();
-        write!(
-            response,
-            "211 {} {} {} {}\r\n",
-            articles.len(),
-            articles.first().copied().unwrap_or(0),
-            articles.last().copied().unwrap_or(0),
-            group_name
-        )
-        .expect("write to Vec cannot fail");
-        for article in articles {
-            write!(response, "{article}\r\n").expect("write to Vec cannot fail");
-        }
-        response.extend_from_slice(b".\r\n");
-        return Some(response.as_slice());
+        return Some(group_response_framing::write_group_response(
+            response, group_name, articles,
+        ));
     }
     fixture_group_from_name(args).map(|group| {
-        response.clear();
-        let articles = group.article_numbers();
-        write!(
+        group_response_framing::write_group_response(
             response,
-            "211 {} {} {} {}\r\n",
-            articles.len(),
-            articles.first().copied().unwrap_or(0),
-            articles.last().copied().unwrap_or(0),
-            group.name()
+            group.name(),
+            group.article_numbers(),
         )
-        .expect("write to Vec cannot fail");
-        for article in articles {
-            write!(response, "{article}\r\n").expect("write to Vec cannot fail");
-        }
-        response.extend_from_slice(b".\r\n");
-        response.as_slice()
     })
+}
+
+fn benchmark_article_store_index() -> &'static ArticleStoreIndex {
+    static INDEX: std::sync::OnceLock<ArticleStoreIndex> = std::sync::OnceLock::new();
+    INDEX.get_or_init(|| ArticleStoreIndex {
+        groups: BTreeMap::from([(
+            Arc::<str>::from("alt.test"),
+            ArticleStoreGroup {
+                article_numbers: Box::new([1, 2, 3]),
+                active_time: 0,
+            },
+        )]),
+        articles_by_number: BTreeMap::new(),
+        articles_by_message_id: HashMap::new(),
+    })
+}
+
+#[doc(hidden)]
+pub fn bench_format_indexed_group_response(response: &mut Vec<u8>) -> usize {
+    let complete = group_response_for_args_with_index_into(
+        response,
+        b"alt.test",
+        benchmark_article_store_index(),
+    )
+    .expect("indexed group must exist");
+    complete.as_bytes().len()
 }
 
 fn last_response_for_article(article_id: u64) -> &'static [u8] {
@@ -5963,7 +5966,7 @@ fn listgroup_response_for_args_with_index_into<'a>(
     args: &[u8],
     current_group: Option<&str>,
     index: &ArticleStoreIndex,
-) -> Option<&'a [u8]> {
+) -> Option<group_response_framing::CompleteListGroupResponse<'a>> {
     let group_name = listgroup_explicit_group_arg(args)
         .and_then(|group| std::str::from_utf8(group).ok())
         .map(str::trim)
@@ -5972,54 +5975,140 @@ fn listgroup_response_for_args_with_index_into<'a>(
         .unwrap_or("alt.test");
     if let Some(articles) = index.article_numbers_for_group(group_name) {
         let range = listgroup_range_arg(args).and_then(listgroup_range_bounds);
-        let filtered: Vec<u64> = match range {
-            Some((start, end)) => articles
-                .iter()
-                .copied()
-                .filter(|article| {
-                    let end = end.unwrap_or(u64::MAX);
-                    *article >= start && *article <= end
-                })
-                .collect(),
-            None => articles.to_vec(),
-        };
-        return Some(format_listgroup_response_into(
-            response, group_name, articles, &filtered,
+        return Some(group_response_framing::write_listgroup_response(
+            response, group_name, articles, range,
         ));
     }
     fixture_group_from_name(group_name.as_bytes()).map(|group| {
-        format_listgroup_response_into(
+        group_response_framing::write_listgroup_response(
             response,
             group_name,
             group.article_numbers(),
-            group.article_numbers(),
+            None,
         )
     })
 }
 
-fn format_listgroup_response_into<'a>(
-    response: &'a mut Vec<u8>,
-    group_name: &str,
-    articles: &[u64],
-    filtered: &[u64],
-) -> &'a [u8] {
-    let low = articles.first().copied().unwrap_or(0);
-    let high = articles.last().copied().unwrap_or(0);
-    response.clear();
-    write!(
+#[doc(hidden)]
+pub fn bench_format_indexed_listgroup_response(response: &mut Vec<u8>) -> usize {
+    let complete = listgroup_response_for_args_with_index_into(
         response,
-        "211 {} {} {} {}\r\n",
-        articles.len(),
-        low,
-        high,
-        group_name
+        b"alt.test",
+        None,
+        benchmark_article_store_index(),
     )
-    .expect("write to Vec cannot fail");
-    for article in filtered {
-        write!(response, "{article}\r\n").expect("write to Vec cannot fail");
+    .expect("indexed group must exist");
+    complete.as_bytes().len()
+}
+
+#[doc(hidden)]
+pub fn bench_format_indexed_listgroup_range_response(response: &mut Vec<u8>) -> usize {
+    let complete = listgroup_response_for_args_with_index_into(
+        response,
+        b"alt.test 2-3",
+        None,
+        benchmark_article_store_index(),
+    )
+    .expect("indexed group must exist");
+    complete.as_bytes().len()
+}
+
+mod group_response_framing {
+    use std::io::Write as _;
+
+    pub(super) struct CompleteGroupResponse<'a>(&'a [u8]);
+
+    impl<'a> CompleteGroupResponse<'a> {
+        pub(super) fn as_bytes(&self) -> &'a [u8] {
+            self.0
+        }
     }
-    response.extend_from_slice(b".\r\n");
-    response.as_slice()
+
+    struct IncompleteListGroupResponse(usize);
+
+    impl IncompleteListGroupResponse {
+        fn write_all_article_lines_and_terminator<'a>(
+            self,
+            response: &'a mut Vec<u8>,
+            articles: &[u64],
+        ) -> CompleteListGroupResponse<'a> {
+            debug_assert_eq!(self.0, response.len());
+            for article in articles {
+                write!(response, "{article}\r\n").expect("write to Vec cannot fail");
+            }
+            Self::write_terminator(response)
+        }
+
+        fn write_selected_article_lines_and_terminator<'a>(
+            self,
+            response: &'a mut Vec<u8>,
+            articles: &[u64],
+            start: u64,
+            end: Option<u64>,
+        ) -> CompleteListGroupResponse<'a> {
+            debug_assert_eq!(self.0, response.len());
+            let end = end.unwrap_or(u64::MAX);
+            for article in articles {
+                if *article >= start && *article <= end {
+                    write!(response, "{article}\r\n").expect("write to Vec cannot fail");
+                }
+            }
+            Self::write_terminator(response)
+        }
+
+        fn write_terminator(response: &mut Vec<u8>) -> CompleteListGroupResponse<'_> {
+            response.extend_from_slice(b".\r\n");
+            CompleteListGroupResponse(response.as_slice())
+        }
+    }
+
+    pub(super) struct CompleteListGroupResponse<'a>(&'a [u8]);
+
+    impl<'a> CompleteListGroupResponse<'a> {
+        pub(super) fn as_bytes(&self) -> &'a [u8] {
+            self.0
+        }
+    }
+
+    fn write_status_line(response: &mut Vec<u8>, group_name: &str, articles: &[u64]) -> usize {
+        let low = articles.first().copied().unwrap_or(0);
+        let high = articles.last().copied().unwrap_or(0);
+        response.clear();
+        write!(
+            response,
+            "211 {} {} {} {}\r\n",
+            articles.len(),
+            low,
+            high,
+            group_name
+        )
+        .expect("write to Vec cannot fail");
+        response.len()
+    }
+
+    pub(super) fn write_group_response<'a>(
+        response: &'a mut Vec<u8>,
+        group_name: &str,
+        articles: &[u64],
+    ) -> CompleteGroupResponse<'a> {
+        write_status_line(response, group_name, articles);
+        CompleteGroupResponse(response.as_slice())
+    }
+
+    pub(super) fn write_listgroup_response<'a>(
+        response: &'a mut Vec<u8>,
+        group_name: &str,
+        articles: &[u64],
+        range: Option<(u64, Option<u64>)>,
+    ) -> CompleteListGroupResponse<'a> {
+        let incomplete =
+            IncompleteListGroupResponse(write_status_line(response, group_name, articles));
+        match range {
+            Some((start, end)) => incomplete
+                .write_selected_article_lines_and_terminator(response, articles, start, end),
+            None => incomplete.write_all_article_lines_and_terminator(response, articles),
+        }
+    }
 }
 
 fn listgroup_range_arg(args: &[u8]) -> Option<&[u8]> {
@@ -17361,6 +17450,33 @@ mod tests {
             let response = GeneratedResponse::new(BODY_RESPONSE_PREFIX, 1024 * 1024);
             assert_eq!(response.prefix, BODY_RESPONSE_PREFIX);
             assert_eq!(response.target_bytes, 1024 * 1024);
+        });
+    }
+
+    #[test]
+    fn indexed_listgroup_range_formatting_does_not_allocate() {
+        let index = benchmark_article_store_index();
+        let mut response = Vec::with_capacity(256);
+        let complete = listgroup_response_for_args_with_index_into(
+            &mut response,
+            b"alt.test 2-3",
+            None,
+            index,
+        )
+        .expect("indexed group must exist");
+        assert_eq!(complete.as_bytes(), LISTGROUP_2_3_RESPONSE);
+        response.clear();
+
+        assert_no_allocations("indexed LISTGROUP range formatting", || {
+            let complete = listgroup_response_for_args_with_index_into(
+                &mut response,
+                b"alt.test 2-3",
+                None,
+                index,
+            )
+            .expect("indexed group must exist");
+            assert_eq!(complete.as_bytes(), LISTGROUP_2_3_RESPONSE);
+            response.clear();
         });
     }
 
