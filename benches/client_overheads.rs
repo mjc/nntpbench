@@ -6,9 +6,10 @@
 
 use divan::{Bencher, black_box};
 use nntpbench::client::{
-    bench_article_validation_and_two_parses, bench_owned_article_parse_passes,
-    bench_owned_response_from_bytes, bench_pending_read_capacity,
-    bench_public_response_decode_chunks, bench_streaming_decode_response,
+    bench_article_validation_and_parse, bench_article_validation_and_two_parses,
+    bench_owned_article_accessor_parse, bench_owned_response_from_bytes,
+    bench_pending_read_capacity, bench_public_response_decode_chunks,
+    bench_public_response_decode_chunks_stateless, bench_streaming_decode_response,
     bench_write_request_wire_to_sink,
 };
 use nntpbench::{
@@ -227,10 +228,11 @@ mod streaming_decode {
 
 mod public_client_experiments {
     use super::{
-        Bencher, RequestKind, bench_article_validation_and_two_parses,
-        bench_owned_article_parse_passes, bench_owned_response_from_bytes,
-        bench_pending_read_capacity, bench_public_response_decode_chunks, black_box, fixtures,
-        runtime,
+        Bencher, RequestKind, bench_article_validation_and_parse,
+        bench_article_validation_and_two_parses, bench_owned_article_accessor_parse,
+        bench_owned_response_from_bytes, bench_pending_read_capacity,
+        bench_public_response_decode_chunks, bench_public_response_decode_chunks_stateless,
+        black_box, fixtures, runtime,
     };
     use fixtures::ArticleVariant;
 
@@ -249,7 +251,7 @@ mod public_client_experiments {
 
     fn bench_article_parse_passes(bencher: Bencher, size: usize, variant: ArticleVariant) {
         let response = owned_response(size, variant);
-        bencher.bench(|| black_box(bench_owned_article_parse_passes(black_box(&response))));
+        bencher.bench(|| black_box(bench_owned_article_accessor_parse(black_box(&response))));
     }
 
     fn bench_full_article_parse_path(bencher: Bencher, size: usize, variant: ArticleVariant) {
@@ -261,6 +263,21 @@ mod public_client_experiments {
         let response = fixtures::article_response(size, variant);
         bencher.bench(|| {
             black_box(bench_article_validation_and_two_parses(
+                black_box(kind),
+                black_box(&response),
+            ))
+        });
+    }
+
+    fn bench_single_article_parse_path(bencher: Bencher, size: usize, variant: ArticleVariant) {
+        let kind = if matches!(variant, ArticleVariant::FoldedHeaders) {
+            RequestKind::Article
+        } else {
+            RequestKind::Body
+        };
+        let response = fixtures::article_response(size, variant);
+        bencher.bench(|| {
+            black_box(bench_article_validation_and_parse(
                 black_box(kind),
                 black_box(&response),
             ))
@@ -295,6 +312,36 @@ mod public_client_experiments {
     #[divan::bench(sample_count = 20, sample_size = 5)]
     fn full_article_parse_path_folded_headers_768k(bencher: Bencher) {
         bench_full_article_parse_path(bencher, BODY_768K, ArticleVariant::FoldedHeaders);
+    }
+
+    #[divan::bench(sample_count = 50, sample_size = 10)]
+    fn single_article_parse_path_plain_64k(bencher: Bencher) {
+        bench_single_article_parse_path(bencher, BODY_64K, ArticleVariant::PlainBody);
+    }
+
+    #[divan::bench(sample_count = 50, sample_size = 10)]
+    fn single_article_parse_path_dot_stuffed_64k(bencher: Bencher) {
+        bench_single_article_parse_path(bencher, BODY_64K, ArticleVariant::DotStuffedBody);
+    }
+
+    #[divan::bench(sample_count = 50, sample_size = 10)]
+    fn single_article_parse_path_folded_headers_64k(bencher: Bencher) {
+        bench_single_article_parse_path(bencher, BODY_64K, ArticleVariant::FoldedHeaders);
+    }
+
+    #[divan::bench(sample_count = 20, sample_size = 5)]
+    fn single_article_parse_path_plain_768k(bencher: Bencher) {
+        bench_single_article_parse_path(bencher, BODY_768K, ArticleVariant::PlainBody);
+    }
+
+    #[divan::bench(sample_count = 20, sample_size = 5)]
+    fn single_article_parse_path_dot_stuffed_768k(bencher: Bencher) {
+        bench_single_article_parse_path(bencher, BODY_768K, ArticleVariant::DotStuffedBody);
+    }
+
+    #[divan::bench(sample_count = 20, sample_size = 5)]
+    fn single_article_parse_path_folded_headers_768k(bencher: Bencher) {
+        bench_single_article_parse_path(bencher, BODY_768K, ArticleVariant::FoldedHeaders);
     }
 
     #[divan::bench(sample_count = 100, sample_size = 20)]
@@ -338,6 +385,17 @@ mod public_client_experiments {
         });
     }
 
+    fn bench_stateless_decode(bencher: Bencher, size: usize, chunk_bytes: usize) {
+        let response = fixtures::body_response(size, false);
+        bencher.bench(|| {
+            black_box(bench_public_response_decode_chunks_stateless(
+                black_box(RequestKind::Body),
+                black_box(&response),
+                black_box(chunk_bytes),
+            ))
+        });
+    }
+
     #[divan::bench(sample_count = 50, sample_size = 10)]
     fn fragmented_decode_64k_1_byte(bencher: Bencher) {
         bench_fragmented_decode(bencher, BODY_64K, 1);
@@ -367,6 +425,26 @@ mod public_client_experiments {
     #[divan::bench(sample_count = 20, sample_size = 5)]
     fn fragmented_decode_768k_whole_read(bencher: Bencher) {
         bench_fragmented_decode(bencher, BODY_768K, BODY_768K);
+    }
+
+    #[divan::bench(sample_count = 50, sample_size = 10)]
+    fn stateless_decode_control_64k_256_bytes(bencher: Bencher) {
+        bench_stateless_decode(bencher, BODY_64K, 256);
+    }
+
+    #[divan::bench(sample_count = 50, sample_size = 10)]
+    fn stateless_decode_control_64k_whole_read(bencher: Bencher) {
+        bench_stateless_decode(bencher, BODY_64K, BODY_64K);
+    }
+
+    #[divan::bench(sample_count = 20, sample_size = 5)]
+    fn stateless_decode_control_768k_256k(bencher: Bencher) {
+        bench_stateless_decode(bencher, BODY_768K, 256 * 1024);
+    }
+
+    #[divan::bench(sample_count = 20, sample_size = 5)]
+    fn stateless_decode_control_768k_whole_read(bencher: Bencher) {
+        bench_stateless_decode(bencher, BODY_768K, BODY_768K);
     }
 
     fn bench_read_capacity(
