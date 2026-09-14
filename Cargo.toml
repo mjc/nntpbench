@@ -38,6 +38,10 @@ name = "server_gungraun"
 harness = false
 
 [[bench]]
+name = "client_gungraun"
+harness = false
+
+[[bench]]
 name = "client_roundtrip"
 harness = false
 

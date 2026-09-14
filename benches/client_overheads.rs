@@ -5,7 +5,12 @@
 //! and Tokio channel/future handoffs.
 
 use divan::{Bencher, black_box};
-use nntpbench::client::{bench_streaming_decode_response, bench_write_request_wire_to_sink};
+use nntpbench::client::{
+    bench_article_validation_and_two_parses, bench_owned_article_parse_passes,
+    bench_owned_response_from_bytes, bench_pending_read_capacity,
+    bench_public_response_decode_chunks, bench_streaming_decode_response,
+    bench_write_request_wire_to_sink,
+};
 use nntpbench::{
     ClientCommandMix, MessageId, Request, RequestKind, bench_append_load_workload_request,
     bench_client_request_for_command, bench_client_segment_request_for_command,
@@ -13,6 +18,8 @@ use nntpbench::{
 };
 use std::sync::Arc;
 use tokio::runtime::Builder;
+
+mod fixtures;
 
 fn main() {
     divan::main();
@@ -215,5 +222,184 @@ mod streaming_decode {
                     .unwrap(),
                 )
             });
+    }
+}
+
+mod public_client_experiments {
+    use super::{
+        Bencher, RequestKind, bench_article_validation_and_two_parses,
+        bench_owned_article_parse_passes, bench_owned_response_from_bytes,
+        bench_pending_read_capacity, bench_public_response_decode_chunks, black_box, fixtures,
+        runtime,
+    };
+    use fixtures::ArticleVariant;
+
+    const BODY_64K: usize = 64 * 1024;
+    const BODY_768K: usize = 768 * 1024;
+
+    fn owned_response(size: usize, variant: ArticleVariant) -> nntpbench::OwnedResponse {
+        let kind = if matches!(variant, ArticleVariant::FoldedHeaders) {
+            RequestKind::Article
+        } else {
+            RequestKind::Body
+        };
+        let response = fixtures::article_response(size, variant);
+        bench_owned_response_from_bytes(kind, &response).unwrap()
+    }
+
+    fn bench_article_parse_passes(bencher: Bencher, size: usize, variant: ArticleVariant) {
+        let response = owned_response(size, variant);
+        bencher.bench(|| black_box(bench_owned_article_parse_passes(black_box(&response))));
+    }
+
+    fn bench_full_article_parse_path(bencher: Bencher, size: usize, variant: ArticleVariant) {
+        let kind = if matches!(variant, ArticleVariant::FoldedHeaders) {
+            RequestKind::Article
+        } else {
+            RequestKind::Body
+        };
+        let response = fixtures::article_response(size, variant);
+        bencher.bench(|| {
+            black_box(bench_article_validation_and_two_parses(
+                black_box(kind),
+                black_box(&response),
+            ))
+        });
+    }
+
+    #[divan::bench(sample_count = 50, sample_size = 10)]
+    fn full_article_parse_path_plain_64k(bencher: Bencher) {
+        bench_full_article_parse_path(bencher, BODY_64K, ArticleVariant::PlainBody);
+    }
+
+    #[divan::bench(sample_count = 50, sample_size = 10)]
+    fn full_article_parse_path_dot_stuffed_64k(bencher: Bencher) {
+        bench_full_article_parse_path(bencher, BODY_64K, ArticleVariant::DotStuffedBody);
+    }
+
+    #[divan::bench(sample_count = 50, sample_size = 10)]
+    fn full_article_parse_path_folded_headers_64k(bencher: Bencher) {
+        bench_full_article_parse_path(bencher, BODY_64K, ArticleVariant::FoldedHeaders);
+    }
+
+    #[divan::bench(sample_count = 20, sample_size = 5)]
+    fn full_article_parse_path_plain_768k(bencher: Bencher) {
+        bench_full_article_parse_path(bencher, BODY_768K, ArticleVariant::PlainBody);
+    }
+
+    #[divan::bench(sample_count = 20, sample_size = 5)]
+    fn full_article_parse_path_dot_stuffed_768k(bencher: Bencher) {
+        bench_full_article_parse_path(bencher, BODY_768K, ArticleVariant::DotStuffedBody);
+    }
+
+    #[divan::bench(sample_count = 20, sample_size = 5)]
+    fn full_article_parse_path_folded_headers_768k(bencher: Bencher) {
+        bench_full_article_parse_path(bencher, BODY_768K, ArticleVariant::FoldedHeaders);
+    }
+
+    #[divan::bench(sample_count = 100, sample_size = 20)]
+    fn repeated_article_parse_plain_64k(bencher: Bencher) {
+        bench_article_parse_passes(bencher, BODY_64K, ArticleVariant::PlainBody);
+    }
+
+    #[divan::bench(sample_count = 100, sample_size = 20)]
+    fn repeated_article_parse_dot_stuffed_64k(bencher: Bencher) {
+        bench_article_parse_passes(bencher, BODY_64K, ArticleVariant::DotStuffedBody);
+    }
+
+    #[divan::bench(sample_count = 100, sample_size = 20)]
+    fn repeated_article_parse_folded_headers_64k(bencher: Bencher) {
+        bench_article_parse_passes(bencher, BODY_64K, ArticleVariant::FoldedHeaders);
+    }
+
+    #[divan::bench(sample_count = 50, sample_size = 10)]
+    fn repeated_article_parse_plain_768k(bencher: Bencher) {
+        bench_article_parse_passes(bencher, BODY_768K, ArticleVariant::PlainBody);
+    }
+
+    #[divan::bench(sample_count = 50, sample_size = 10)]
+    fn repeated_article_parse_dot_stuffed_768k(bencher: Bencher) {
+        bench_article_parse_passes(bencher, BODY_768K, ArticleVariant::DotStuffedBody);
+    }
+
+    #[divan::bench(sample_count = 50, sample_size = 10)]
+    fn repeated_article_parse_folded_headers_768k(bencher: Bencher) {
+        bench_article_parse_passes(bencher, BODY_768K, ArticleVariant::FoldedHeaders);
+    }
+
+    fn bench_fragmented_decode(bencher: Bencher, size: usize, chunk_bytes: usize) {
+        let response = fixtures::body_response(size, false);
+        bencher.bench(|| {
+            black_box(bench_public_response_decode_chunks(
+                black_box(RequestKind::Body),
+                black_box(&response),
+                black_box(chunk_bytes),
+            ))
+        });
+    }
+
+    #[divan::bench(sample_count = 50, sample_size = 10)]
+    fn fragmented_decode_64k_1_byte(bencher: Bencher) {
+        bench_fragmented_decode(bencher, BODY_64K, 1);
+    }
+
+    #[divan::bench(sample_count = 50, sample_size = 10)]
+    fn fragmented_decode_64k_256_bytes(bencher: Bencher) {
+        bench_fragmented_decode(bencher, BODY_64K, 256);
+    }
+
+    #[divan::bench(sample_count = 50, sample_size = 10)]
+    fn fragmented_decode_64k_whole_read(bencher: Bencher) {
+        bench_fragmented_decode(bencher, BODY_64K, BODY_64K);
+    }
+
+    #[divan::bench(sample_count = 20, sample_size = 5)]
+    #[ignore]
+    fn fragmented_decode_768k_1_byte(bencher: Bencher) {
+        bench_fragmented_decode(bencher, BODY_768K, 1);
+    }
+
+    #[divan::bench(sample_count = 20, sample_size = 5)]
+    fn fragmented_decode_768k_256k(bencher: Bencher) {
+        bench_fragmented_decode(bencher, BODY_768K, 256 * 1024);
+    }
+
+    #[divan::bench(sample_count = 20, sample_size = 5)]
+    fn fragmented_decode_768k_whole_read(bencher: Bencher) {
+        bench_fragmented_decode(bencher, BODY_768K, BODY_768K);
+    }
+
+    fn bench_read_capacity(
+        bencher: Bencher,
+        source_size: usize,
+        initial_len: usize,
+        initial_capacity: usize,
+        read_chunk_bytes: usize,
+    ) {
+        let source = vec![0_u8; source_size];
+        let rt = runtime();
+        bencher.bench(|| {
+            black_box(rt.block_on(bench_pending_read_capacity(
+                black_box(&source),
+                black_box(initial_len),
+                black_box(initial_capacity),
+                black_box(read_chunk_bytes),
+            )))
+        });
+    }
+
+    #[divan::bench(sample_count = 100, sample_size = 20)]
+    fn pending_read_64k_with_spare_capacity(bencher: Bencher) {
+        bench_read_capacity(bencher, BODY_64K, 32 * 1024, BODY_64K, 768);
+    }
+
+    #[divan::bench(sample_count = 100, sample_size = 20)]
+    fn pending_read_64k_at_capacity_boundary(bencher: Bencher) {
+        bench_read_capacity(bencher, BODY_64K, BODY_64K - 256, BODY_64K, 768);
+    }
+
+    #[divan::bench(sample_count = 100, sample_size = 20)]
+    fn pending_read_768k_reused_capacity(bencher: Bencher) {
+        bench_read_capacity(bencher, BODY_768K, BODY_64K - 256, BODY_768K, 768);
     }
 }
