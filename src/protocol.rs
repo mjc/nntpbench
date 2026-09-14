@@ -612,6 +612,7 @@ mod proptests {
         Capabilities,
         Date,
         ModeReader,
+        ModeStream,
         Quit,
         Last,
         Next,
@@ -627,6 +628,7 @@ mod proptests {
                 Self::Capabilities => "CAPABILITIES",
                 Self::Date => "DATE",
                 Self::ModeReader => "MODE READER",
+                Self::ModeStream => "MODE STREAM",
                 Self::Quit => "QUIT",
                 Self::Last => "LAST",
                 Self::Next => "NEXT",
@@ -642,6 +644,7 @@ mod proptests {
                 Self::Capabilities => RequestKind::Capabilities,
                 Self::Date => RequestKind::Date,
                 Self::ModeReader => RequestKind::ModeReader,
+                Self::ModeStream => RequestKind::ModeStream,
                 Self::Quit => RequestKind::Quit,
                 Self::Last => RequestKind::Last,
                 Self::Next => RequestKind::Next,
@@ -657,6 +660,7 @@ mod proptests {
                 Self::Capabilities => Request::capabilities(),
                 Self::Date => Request::date(),
                 Self::ModeReader => Request::mode_reader(),
+                Self::ModeStream => Request::mode_stream(),
                 Self::Quit => Request::quit(),
                 Self::Last => Request::last(),
                 Self::Next => Request::next(),
@@ -673,6 +677,7 @@ mod proptests {
             Just(FixedCommand::Capabilities),
             Just(FixedCommand::Date),
             Just(FixedCommand::ModeReader),
+            Just(FixedCommand::ModeStream),
             Just(FixedCommand::Quit),
             Just(FixedCommand::Last),
             Just(FixedCommand::Next),
@@ -1518,6 +1523,11 @@ impl<'a> MessageId<'a> {
         Ok(Self(MessageIdStorage::Borrowed(value)))
     }
 
+    /// Construct a borrowed message-id that has already been validated.
+    pub(crate) fn from_validated_borrowed(value: &'a str) -> Self {
+        Self(MessageIdStorage::Borrowed(value))
+    }
+
     /// Construct an owned message-id, auto-wrapping in angle brackets if needed.
     pub fn from_str_or_wrap(
         value: impl AsRef<str>,
@@ -2200,6 +2210,7 @@ pub enum RequestKind {
     AuthInfo,
     StartTls,
     ModeReader,
+    ModeStream,
     Quit,
     Unknown,
 }
@@ -2415,6 +2426,7 @@ static RESPONSE_DESCRIPTORS: &[ResponseDescriptor] = &[
     response_descriptor(RequestKind::Capabilities, 101, ResponseFraming::Multiline),
     response_descriptor(RequestKind::ModeReader, 200, ResponseFraming::SingleLine),
     response_descriptor(RequestKind::ModeReader, 201, ResponseFraming::SingleLine),
+    response_descriptor(RequestKind::ModeStream, 203, ResponseFraming::SingleLine),
     response_descriptor(RequestKind::Quit, 205, ResponseFraming::SingleLine),
     response_descriptor(RequestKind::StartTls, 382, ResponseFraming::SingleLine),
 ];
@@ -3461,6 +3473,7 @@ pub enum Request<'a> {
     Capabilities,
     Date,
     ModeReader,
+    ModeStream,
     Quit,
 }
 
@@ -3505,6 +3518,7 @@ impl<'a> Request<'a> {
             Self::Capabilities => RequestKind::Capabilities,
             Self::Date => RequestKind::Date,
             Self::ModeReader => RequestKind::ModeReader,
+            Self::ModeStream => RequestKind::ModeStream,
             Self::Quit => RequestKind::Quit,
         }
     }
@@ -3587,6 +3601,7 @@ impl<'a> Request<'a> {
             Self::Capabilities => write_simple_request_wire(output, b"CAPABILITIES"),
             Self::Date => write_simple_request_wire(output, b"DATE"),
             Self::ModeReader => write_simple_request_wire(output, b"MODE READER"),
+            Self::ModeStream => write_simple_request_wire(output, b"MODE STREAM"),
             Self::Quit => write_simple_request_wire(output, b"QUIT"),
         }
     }
@@ -3621,6 +3636,7 @@ impl<'a> Request<'a> {
             | Self::Capabilities
             | Self::Date
             | Self::ModeReader
+            | Self::ModeStream
             | Self::Quit => None,
         }
     }
@@ -3655,6 +3671,7 @@ impl<'a> Request<'a> {
             | Self::Capabilities
             | Self::Date
             | Self::ModeReader
+            | Self::ModeStream
             | Self::Quit => None,
         }
     }
@@ -3690,6 +3707,7 @@ impl<'a> Request<'a> {
             | Self::Capabilities
             | Self::Date
             | Self::ModeReader
+            | Self::ModeStream
             | Self::Quit => None,
         }
     }
@@ -3724,6 +3742,7 @@ impl<'a> Request<'a> {
             | Self::Capabilities
             | Self::Date
             | Self::ModeReader
+            | Self::ModeStream
             | Self::Quit => None,
         }
     }
@@ -3758,6 +3777,7 @@ impl<'a> Request<'a> {
             | Self::Capabilities
             | Self::Date
             | Self::ModeReader
+            | Self::ModeStream
             | Self::Quit => None,
         }
     }
@@ -3792,6 +3812,7 @@ impl<'a> Request<'a> {
             | Self::Capabilities
             | Self::Date
             | Self::ModeReader
+            | Self::ModeStream
             | Self::Quit => None,
         }
     }
@@ -3828,6 +3849,7 @@ impl<'a> Request<'a> {
             | Self::Capabilities
             | Self::Date
             | Self::ModeReader
+            | Self::ModeStream
             | Self::Quit => None,
         }
     }
@@ -3866,6 +3888,7 @@ impl<'a> Request<'a> {
             | Self::Capabilities
             | Self::Date
             | Self::ModeReader
+            | Self::ModeStream
             | Self::Quit => None,
         }
     }
@@ -3900,6 +3923,7 @@ impl<'a> Request<'a> {
             | Self::Capabilities
             | Self::Date
             | Self::ModeReader
+            | Self::ModeStream
             | Self::Quit => None,
         }
     }
@@ -3934,6 +3958,7 @@ impl<'a> Request<'a> {
             | Self::Capabilities
             | Self::Date
             | Self::ModeReader
+            | Self::ModeStream
             | Self::Quit => None,
         }
     }
@@ -3968,6 +3993,7 @@ impl<'a> Request<'a> {
             | Self::Capabilities
             | Self::Date
             | Self::ModeReader
+            | Self::ModeStream
             | Self::Quit => None,
         }
     }
@@ -4418,6 +4444,12 @@ impl Request<'static> {
         Self::ModeReader
     }
 
+    /// Build a MODE STREAM request.
+    #[must_use]
+    pub const fn mode_stream() -> Self {
+        Self::ModeStream
+    }
+
     /// Build a QUIT request.
     #[must_use]
     pub const fn quit() -> Self {
@@ -4667,6 +4699,7 @@ fn classify_request_kind(verb: &[u8], args: &[u8]) -> RequestKind {
         CommandKind::List => classify_subcommand(args, LIST_SUBCOMMANDS, RequestKind::List),
         CommandKind::AuthInfo => classify_authinfo_command(args),
         CommandKind::Mode if eq_ignore_ascii_case_const(args, b"READER") => RequestKind::ModeReader,
+        CommandKind::Mode if eq_ignore_ascii_case_const(args, b"STREAM") => RequestKind::ModeStream,
         CommandKind::Mode => RequestKind::Unknown,
     }
 }

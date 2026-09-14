@@ -4,7 +4,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 #[cfg(test)]
 use std::cell::Cell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::future::poll_fn;
@@ -19,6 +19,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arrayvec::ArrayVec;
 use clap::{ArgAction, Parser, ValueEnum};
+use md5::{Digest, Md5};
 use socket2::{Domain, Protocol, SockRef, Socket, Type};
 use tokio::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
@@ -30,9 +31,10 @@ use tokio::task::JoinSet;
 use tokio::time;
 
 use crate::terminator::{
-    BoundedResponseLineStatus, DOT_TERMINATOR, ResponseLineStatus, append_dot_terminator,
+    BoundedResponseLineStatus, DOT_TERMINATOR, EmptyMultilineTerminator, EmptyTerminatorStatus,
+    MultilineTerminatorDetector, ResponseLineStatus, TerminatorStatus, append_dot_terminator,
     detect_bounded_response_line_end, detect_response_line_end_from, find_crlf_line_end,
-    strip_complete_crlf_line,
+    find_dot_terminated_block, strip_complete_crlf_line,
 };
 #[cfg(test)]
 use crate::terminator::{
@@ -317,6 +319,7 @@ const MAX_COMMAND_LINE_BYTES: usize = protocol::MAX_AUTHINFO_SASL_COMMAND_LINE_B
 const MAX_SERVER_PIPELINE_DEPTH: usize = 1024;
 const SERVER_READER_CAPACITY: usize = 8 * 1024;
 const CLIENT_READER_CAPACITY: usize = 256 * 1024;
+const DEFAULT_MAX_LOAD_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 const LOAD_STATS_FLUSH_COMMANDS: u64 = 1024;
 const MAX_BATCHED_ARTICLE_RESPONSES: usize = 8;
 const MAX_BATCHED_ARTICLE_RESPONSE_SLICES: usize = MAX_BATCHED_ARTICLE_RESPONSES * 3;
@@ -324,6 +327,161 @@ const MAX_BATCHED_ARTICLE_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_PENDING_WRITE_BYTES: usize = 64 * 1024;
 const DEFAULT_PENDING_WRITE_POOL_BUFFERS: usize = 4096;
 const GENERATED_RESPONSE_EXTRA_CAPACITY: usize = MAX_COMMAND_LINE_BYTES + 512;
+const MAX_LATENCY_HISTOGRAM_BINS: usize = 1_000_000;
+const DEFAULT_LATENCY_RANGE_MS: u64 = 60_000;
+const DEFAULT_LATENCY_PRECISION_US: u64 = 1_000;
+
+#[derive(Debug, Clone)]
+struct LatencyHistogram {
+    precision: Duration,
+    bins: Box<[u64]>,
+    samples: u64,
+    overflow: u64,
+}
+
+impl LatencyHistogram {
+    fn new(range: Duration, precision: Duration) -> io::Result<Self> {
+        if range.is_zero() || precision.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "latency range and precision must be non-zero",
+            ));
+        }
+        let bin_count = range.as_nanos().div_ceil(precision.as_nanos());
+        let bin_count = usize::try_from(bin_count).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "latency histogram is too large",
+            )
+        })?;
+        if bin_count == 0 || bin_count > MAX_LATENCY_HISTOGRAM_BINS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "latency histogram exceeds configured bin limit",
+            ));
+        }
+        Ok(Self {
+            precision,
+            bins: vec![0; bin_count].into_boxed_slice(),
+            samples: 0,
+            overflow: 0,
+        })
+    }
+
+    fn record(&mut self, elapsed: Duration) {
+        self.samples = self.samples.saturating_add(1);
+        let index = elapsed.as_nanos() / self.precision.as_nanos();
+        let Ok(index) = usize::try_from(index) else {
+            self.overflow = self.overflow.saturating_add(1);
+            return;
+        };
+        let Some(bin) = self.bins.get_mut(index) else {
+            self.overflow = self.overflow.saturating_add(1);
+            return;
+        };
+        *bin = bin.saturating_add(1);
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    fn bin_count(&self) -> usize {
+        self.bins.len()
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    fn sample_count(&self) -> u64 {
+        self.samples
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    fn overflow_count(&self) -> u64 {
+        self.overflow
+    }
+
+    #[must_use]
+    fn percentile(&self, quantile: f64) -> Option<Duration> {
+        if self.samples == 0 || !(0.0..=1.0).contains(&quantile) {
+            return None;
+        }
+        let rank = ((self.samples as f64) * quantile).ceil().max(1.0) as u64;
+        let mut seen = 0_u64;
+        for (index, count) in self.bins.iter().copied().enumerate() {
+            seen = seen.saturating_add(count);
+            if seen >= rank {
+                return Some(self.precision.saturating_mul(index as u32));
+            }
+        }
+        (self.overflow != 0).then_some(self.precision.saturating_mul(self.bins.len() as u32))
+    }
+    fn merge(&mut self, other: Self) {
+        debug_assert_eq!(self.precision, other.precision);
+        debug_assert_eq!(self.bins.len(), other.bins.len());
+        self.samples = self.samples.saturating_add(other.samples);
+        self.overflow = self.overflow.saturating_add(other.overflow);
+        for (bin, other_bin) in self.bins.iter_mut().zip(other.bins) {
+            *bin = bin.saturating_add(other_bin);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OfferedLoadSchedule {
+    started: Instant,
+    interval: Duration,
+}
+
+impl OfferedLoadSchedule {
+    fn new(rate: f64, started: Instant) -> io::Result<Self> {
+        if !rate.is_finite() || rate <= 0.0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "offered rate must be finite and greater than zero",
+            ));
+        }
+        let interval_secs = 1.0 / rate;
+        if !interval_secs.is_finite() || interval_secs > Duration::MAX.as_secs_f64() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "offered rate is too low for timer range",
+            ));
+        }
+        let interval = Duration::from_secs_f64(interval_secs);
+        if interval.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "offered rate is too high for timer precision",
+            ));
+        }
+        Ok(Self { started, interval })
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    fn interval(self) -> Duration {
+        self.interval
+    }
+
+    #[must_use]
+    fn deadline(self, request_index: u64) -> Instant {
+        self.started
+            .checked_add(self.interval.saturating_mul(request_index as u32))
+            .unwrap_or(self.started)
+    }
+
+    #[must_use]
+    fn due_count(self, now: Instant) -> u64 {
+        let Some(elapsed) = now.checked_duration_since(self.started) else {
+            return 0;
+        };
+        (elapsed.as_nanos() / self.interval.as_nanos())
+            .saturating_add(1)
+            .try_into()
+            .unwrap_or(u64::MAX)
+    }
+}
+
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 const HIGH_THROUGHPUT_SOCKET_BUFFER: usize = 16 * 1024 * 1024;
 #[cfg(target_os = "macos")]
@@ -460,6 +618,10 @@ pub struct ServerArgs {
     /// Per-session pending write buffer used to coalesce small generated response chunks.
     #[arg(long, default_value_t = DEFAULT_PENDING_WRITE_BYTES)]
     pub pending_write_bytes: usize,
+
+    /// Print one machine-readable server manifest on graceful shutdown.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
 }
 
 #[cfg(test)]
@@ -480,12 +642,16 @@ mod proptests {
 
     fn segment_set_strategy() -> BoxedStrategy<SegmentSet> {
         vec(message_id_strategy(), 1..=4)
-            .prop_map(|ids| SegmentSet {
-                ids: ids
-                    .into_iter()
-                    .map(|id| MessageId::from_shared(Arc::<str>::from(id)).unwrap())
-                    .collect::<Vec<_>>()
-                    .into_boxed_slice(),
+            .prop_map(|ids| {
+                let declared_sizes = vec![0; ids.len()];
+                SegmentSet {
+                    ids: ids
+                        .into_iter()
+                        .map(|id| MessageId::from_shared(Arc::<str>::from(id)).unwrap())
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice(),
+                    declared_sizes: declared_sizes.into_boxed_slice(),
+                }
             })
             .boxed()
     }
@@ -551,14 +717,56 @@ mod proptests {
             let expected = segment_for_request(&segments, client_index, total_clients, request_index);
             prop_assert_eq!(segmented.message_id().unwrap().as_str(), expected.as_str());
         }
+
+        #[test]
+        fn disjoint_workload_split_matches_single_process(
+            start_id in 0_u64..10_000,
+            total_clients in 1_usize..8,
+            requests in 1_usize..16,
+            split in 0_usize..8,
+        ) {
+            let split = split.min(total_clients);
+            let single_process: Vec<_> = (0..total_clients)
+                .flat_map(|client_index| {
+                    (0..requests).map(move |request_index| {
+                        synthetic_request_id(
+                            start_id,
+                            client_index,
+                            request_index as u64,
+                            total_clients,
+                            LoadWorkloadPolicy::Disjoint,
+                        )
+                    })
+                })
+                .collect();
+            let split_processes: Vec<_> = (0..split)
+                .chain(split..total_clients)
+                .flat_map(|client_index| {
+                    (0..requests).map(move |request_index| {
+                        synthetic_request_id(
+                            start_id,
+                            client_index,
+                            request_index as u64,
+                            total_clients,
+                            LoadWorkloadPolicy::Disjoint,
+                        )
+                    })
+                })
+                .collect();
+
+            prop_assert_eq!(split_processes, single_process);
+        }
     }
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
 pub async fn run_server(args: ServerArgs) -> io::Result<()> {
+    let started = Instant::now();
+    let start_cpu_ticks = process_cpu_ticks();
+    let json = args.json;
     let listener = bind_listener(args.listen, args.backlog, args.reuse_port)?;
     let local_addr = listener.local_addr()?;
-    let config = Arc::new(ServerConfig::from_args(args));
+    let config = Arc::new(ServerConfig::from_bound_args(args, local_addr));
     let stats = Arc::new(Stats::new());
     let limiter = Arc::new(Semaphore::new(config.max_connections));
 
@@ -599,7 +807,20 @@ pub async fn run_server(args: ServerArgs) -> io::Result<()> {
             shutdown = tokio::signal::ctrl_c() => {
                 shutdown?;
                 eprintln!("shutdown requested");
-                stats.print_snapshot("final");
+                if json {
+                    println!(
+                        "{}",
+                        render_server_manifest(
+                            &config,
+                            stats.snapshot(),
+                            started.elapsed(),
+                            cpu_seconds_since(start_cpu_ticks),
+                            process_rss_kib(),
+                        )
+                    );
+                } else {
+                    stats.print_snapshot("final");
+                }
                 return Ok(());
             }
         }
@@ -611,6 +832,54 @@ pub enum ClientCommandMix {
     Article,
     Body,
     Alternate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum LoadWorkloadPolicy {
+    /// Give each client a disjoint synthetic stream.
+    Disjoint,
+    /// Repeat one shared synthetic sequence across all clients.
+    Shared,
+    /// Repeat one synthetic article on every request.
+    Repeat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum LoadVerificationPolicy {
+    /// Do not verify response identity beyond framing.
+    None,
+    /// Verify the first response and every 100th response thereafter.
+    Sampled,
+    /// Verify every response against its requested Message-ID.
+    Full,
+}
+
+impl LoadVerificationPolicy {
+    #[must_use]
+    fn verifies(self, request_index: u64) -> bool {
+        match self {
+            Self::None => false,
+            Self::Sampled => request_index.is_multiple_of(100),
+            Self::Full => true,
+        }
+    }
+}
+
+#[must_use]
+fn synthetic_request_id(
+    start_id: u64,
+    client_index: usize,
+    request_index: u64,
+    total_clients: usize,
+    policy: LoadWorkloadPolicy,
+) -> u64 {
+    match policy {
+        LoadWorkloadPolicy::Disjoint => start_id
+            .wrapping_add(client_index as u64)
+            .wrapping_add(request_index.wrapping_mul(total_clients as u64)),
+        LoadWorkloadPolicy::Shared => start_id.wrapping_add(request_index),
+        LoadWorkloadPolicy::Repeat => start_id,
+    }
 }
 
 #[derive(Debug, Parser, Clone)]
@@ -670,6 +939,9 @@ pub struct FetchArgs {
     /// Per-connection read buffer size.
     #[arg(long, default_value_t = CLIENT_READER_CAPACITY)]
     pub read_buffer_bytes: usize,
+    /// Maximum response frame size accepted by load mode.
+    #[arg(long, default_value_t = DEFAULT_MAX_LOAD_RESPONSE_BYTES)]
+    pub max_response_bytes: usize,
 
     /// Maximum in-flight requests allowed on the connection.
     #[arg(long, default_value_t = 64)]
@@ -679,7 +951,7 @@ pub struct FetchArgs {
     #[arg(long, value_delimiter = ',')]
     pub ports: Vec<u16>,
 
-    /// Tab-separated segment file. Lines are SIZE<TAB>MSGID; MSGID is normalized into angle brackets.
+    /// Tab-separated segment file. Lines are SIZE<TAB>MSGID; SIZE is the input-declared segment size, not complete NNTP wire-frame bytes.
     #[arg(long)]
     pub segments: Option<PathBuf>,
 
@@ -694,6 +966,25 @@ pub struct FetchArgs {
     /// Seconds to run. Use 0 to disable this limit.
     #[arg(long, default_value_t = 0)]
     pub duration_secs: u64,
+    /// Maximum time allowed to establish a connection and read its greeting.
+    #[arg(long, default_value_t = 30)]
+    pub setup_timeout_secs: u64,
+
+    /// Maximum time allowed for each response while draining in-flight work.
+    #[arg(long, default_value_t = 5)]
+    pub drain_timeout_secs: u64,
+
+    /// Target request arrival rate for an offered-load latency experiment.
+    #[arg(long)]
+    pub offered_rate: Option<f64>,
+
+    /// Maximum latency represented by the bounded histogram.
+    #[arg(long, default_value_t = DEFAULT_LATENCY_RANGE_MS)]
+    pub latency_range_ms: u64,
+
+    /// Histogram precision in microseconds.
+    #[arg(long, default_value_t = DEFAULT_LATENCY_PRECISION_US)]
+    pub latency_precision_us: u64,
 
     /// Concurrent TCP connections for load mode.
     #[arg(long, default_value_t = 1)]
@@ -714,10 +1005,20 @@ pub struct FetchArgs {
     /// First numeric article id used in generated Message-IDs.
     #[arg(long, default_value_t = 1)]
     pub start_id: u64,
+    /// Synthetic workload identity policy used when no segment file is supplied.
+    #[arg(long, value_enum, default_value_t = LoadWorkloadPolicy::Disjoint)]
+    pub workload_policy: LoadWorkloadPolicy,
+
+    /// Response identity verification policy for load mode.
+    #[arg(long, value_enum, default_value_t = LoadVerificationPolicy::None)]
+    pub verification_policy: LoadVerificationPolicy,
 
     /// Print final machine-readable CSV: requests,bytes,elapsed_s,cpu_s,rss_kib.
     #[arg(long, default_value_t = false)]
     pub csv: bool,
+    /// Print the complete load result and configuration as a JSON manifest.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
 
     /// Print benchmark statistics at this interval. Use 0 to disable periodic output.
     #[arg(long, default_value_t = 1)]
@@ -770,12 +1071,28 @@ pub enum FetchRequestKind {
     Capabilities,
     Date,
     ModeReader,
+    ModeStream,
     Quit,
 }
 
 #[derive(Debug)]
 struct SegmentSet {
     ids: Box<[MessageId<'static>]>,
+    /// Declared input segment size, not complete NNTP wire-frame bytes.
+    declared_sizes: Box<[u64]>,
+}
+
+impl SegmentSet {
+    #[must_use]
+    fn declared_size(&self, index: usize) -> u64 {
+        self.declared_sizes[index]
+    }
+    #[must_use]
+    fn total_declared_size(&self) -> u64 {
+        (0..self.ids.len()).fold(0, |total, index| {
+            total.saturating_add(self.declared_size(index))
+        })
+    }
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -813,9 +1130,9 @@ pub async fn run_load(args: FetchArgs) -> io::Result<()> {
     let stats = Arc::new(Stats::new());
     let stop = Arc::new(AtomicBool::new(false));
 
-    if !config.csv {
+    if !config.csv && !config.json {
         eprintln!(
-            "nntpbench client connecting to {} requests={} transfer_bytes={} duration_secs={} connections={} total_clients={} client_offset={} pipeline_depth={} command_mix={:?}",
+            "nntpbench client connecting to {} requests={:?} transfer_bytes={} duration_secs={} connections={} total_clients={} client_offset={} pipeline_depth={} command_mix={:?} workload_policy={:?} verification_policy={:?} segments={} declared_segment_bytes={} offered_rate={:?} latency_range_ms={} latency_precision_us={} max_response_bytes={}",
             config.connect,
             config.requests,
             config.transfer_bytes,
@@ -824,7 +1141,21 @@ pub async fn run_load(args: FetchArgs) -> io::Result<()> {
             config.total_clients,
             config.client_offset,
             config.pipeline_depth,
-            config.command_mix
+            config.command_mix,
+            config.workload_policy,
+            config.verification_policy,
+            config
+                .segments
+                .as_ref()
+                .map_or(0, |segments| segments.ids.len()),
+            config
+                .segments
+                .as_ref()
+                .map_or(0, |segments| segments.total_declared_size()),
+            config.offered_rate,
+            config.latency_range.as_millis(),
+            config.latency_precision.as_micros(),
+            config.max_response_bytes,
         );
     }
 
@@ -853,12 +1184,11 @@ pub async fn run_load(args: FetchArgs) -> io::Result<()> {
     }
 
     let mut sessions = JoinSet::new();
-    let mut next_start_id = config.start_id;
+    let mut lifecycle = LoadSessionOutcome::default();
     for connection_index in 0..config.connections {
         let global_index = config.client_offset + connection_index;
         let requests = requests_for_connection(config.requests, config.total_clients, global_index);
-        let session = LoadSession::new(&config, global_index, next_start_id, requests);
-        next_start_id = next_start_id.wrapping_add(requests);
+        let session = LoadSession::new(&config, global_index, config.start_id, requests);
         let stats = stats.clone();
         let stop = stop.clone();
         sessions.spawn(async move { session.run(stats, stop).await });
@@ -866,7 +1196,7 @@ pub async fn run_load(args: FetchArgs) -> io::Result<()> {
 
     while let Some(result) = sessions.join_next().await {
         match result {
-            Ok(Ok(())) => {}
+            Ok(Ok(outcome)) => lifecycle.merge(outcome),
             Ok(Err(err)) => {
                 stats.errors.fetch_add(1, Ordering::Relaxed);
                 stop.store(true, Ordering::Release);
@@ -892,43 +1222,428 @@ pub async fn run_load(args: FetchArgs) -> io::Result<()> {
             cpu_seconds_since(start_cpu_ticks),
             process_rss_kib()
         );
+    } else if config.json {
+        println!(
+            "{}",
+            render_load_manifest(
+                &config,
+                stats.snapshot(),
+                &lifecycle,
+                started.elapsed(),
+                cpu_seconds_since(start_cpu_ticks),
+                process_rss_kib(),
+            )
+        );
     } else {
         stats.print_snapshot("final");
     }
 
+    eprintln!(
+        "load phases setup_secs={:.3} measurement_secs={:.3} drain_secs={:.3} target_bytes={} measured_bytes={} drained_requests={} incomplete_requests={} timed_out_connections={} offered_scheduled={} offered_issued={} offered_completed={} missed_issue_deadlines={} peak_backlog={} schedule_p50_us={} schedule_p95_us={} response_p50_us={} response_p95_us={}",
+        lifecycle.setup_elapsed.as_secs_f64(),
+        lifecycle.measurement_elapsed.as_secs_f64(),
+        lifecycle.drain_elapsed.as_secs_f64(),
+        config.transfer_bytes,
+        stats.snapshot().bytes_sent,
+        lifecycle.drained_requests,
+        lifecycle.incomplete_requests,
+        lifecycle.timed_out_connections,
+        lifecycle.scheduled_requests,
+        lifecycle.issued_requests,
+        lifecycle.completed_requests,
+        lifecycle.missed_issue_deadlines,
+        lifecycle.peak_backlog,
+        histogram_percentile_us(lifecycle.schedule_delay_histogram.as_ref(), 0.50),
+        histogram_percentile_us(lifecycle.schedule_delay_histogram.as_ref(), 0.95),
+        histogram_percentile_us(lifecycle.latency_histogram.as_ref(), 0.50),
+        histogram_percentile_us(lifecycle.latency_histogram.as_ref(), 0.95),
+    );
+
     Ok(())
+}
+
+fn json_string(value: &str) -> String {
+    let mut result = String::with_capacity(value.len() + 2);
+    result.push('"');
+    for character in value.chars() {
+        match character {
+            '"' => result.push_str("\\\""),
+            '\\' => result.push_str("\\\\"),
+            '\n' => result.push_str("\\n"),
+            '\r' => result.push_str("\\r"),
+            '\t' => result.push_str("\\t"),
+            character if character.is_control() => {
+                let _ = write!(result, "\\u{:04x}", character as u32);
+            }
+            character => result.push(character),
+        }
+    }
+    result.push('"');
+    result
+}
+
+fn json_debug<T: std::fmt::Debug>(value: &T) -> String {
+    json_string(&format!("{value:?}"))
+}
+
+fn json_option_u64(value: Option<u64>) -> String {
+    value.map_or_else(|| "null".to_string(), |value| value.to_string())
+}
+
+fn json_option_f64(value: Option<f64>) -> String {
+    value
+        .filter(|value| value.is_finite())
+        .map_or_else(|| "null".to_string(), |value| format!("{value:.9}"))
+}
+
+fn json_u16_array(values: &[u16]) -> String {
+    let mut result = String::from("[");
+    for (index, value) in values.iter().enumerate() {
+        if index != 0 {
+            result.push(',');
+        }
+        result.push_str(&value.to_string());
+    }
+    result.push(']');
+    result
+}
+
+fn cpu_model() -> Option<String> {
+    fs::read_to_string("/proc/cpuinfo")
+        .ok()?
+        .lines()
+        .find_map(|line| {
+            let (_, value) = line.split_once(':')?;
+            line.starts_with("model name")
+                .then(|| value.trim().to_owned())
+        })
+}
+
+fn update_workload_identity(hasher: &mut Md5, tag: u8, value: &[u8]) {
+    hasher.update([tag]);
+    hasher.update((value.len() as u64).to_le_bytes());
+    hasher.update(value);
+}
+
+fn workload_identity(config: &LoadConfig) -> String {
+    let mut hasher = Md5::new();
+    hasher.update(b"nntpbench-workload-v1");
+    update_workload_identity(
+        &mut hasher,
+        0,
+        &config.requests.unwrap_or_default().to_le_bytes(),
+    );
+    update_workload_identity(&mut hasher, 1, &config.transfer_bytes.to_le_bytes());
+    update_workload_identity(&mut hasher, 2, &config.duration.as_nanos().to_le_bytes());
+    match config.offered_rate {
+        Some(rate) => {
+            update_workload_identity(&mut hasher, 3, &[1]);
+            update_workload_identity(&mut hasher, 4, &rate.to_bits().to_le_bytes());
+        }
+        None => update_workload_identity(&mut hasher, 3, &[0]),
+    }
+    update_workload_identity(&mut hasher, 5, &(config.connections as u64).to_le_bytes());
+    update_workload_identity(&mut hasher, 6, &(config.client_offset as u64).to_le_bytes());
+    update_workload_identity(&mut hasher, 7, &(config.total_clients as u64).to_le_bytes());
+    update_workload_identity(
+        &mut hasher,
+        8,
+        &(config.pipeline_depth as u64).to_le_bytes(),
+    );
+    update_workload_identity(
+        &mut hasher,
+        9,
+        &[match config.command_mix {
+            ClientCommandMix::Article => 0,
+            ClientCommandMix::Body => 1,
+            ClientCommandMix::Alternate => 2,
+        }],
+    );
+    update_workload_identity(&mut hasher, 10, &config.start_id.to_le_bytes());
+    update_workload_identity(
+        &mut hasher,
+        11,
+        &[match config.workload_policy {
+            LoadWorkloadPolicy::Disjoint => 0,
+            LoadWorkloadPolicy::Shared => 1,
+            LoadWorkloadPolicy::Repeat => 2,
+        }],
+    );
+    if let Some(segments) = &config.segments {
+        for (index, message_id) in segments.ids.iter().enumerate() {
+            update_workload_identity(
+                &mut hasher,
+                12,
+                &segments.declared_size(index).to_le_bytes(),
+            );
+            update_workload_identity(&mut hasher, 13, message_id.as_str().as_bytes());
+        }
+    }
+    let digest = hasher.finalize();
+    let mut identity = String::with_capacity(36);
+    identity.push_str("md5:");
+    for byte in digest {
+        write!(&mut identity, "{byte:02x}").expect("writing to a string cannot fail");
+    }
+    identity
+}
+
+fn render_load_manifest(
+    config: &LoadConfig,
+    snapshot: Snapshot,
+    lifecycle: &LoadSessionOutcome,
+    elapsed: Duration,
+    cpu_seconds: f64,
+    rss_kib: u64,
+) -> String {
+    let segments = config.segments.as_ref().map_or_else(
+        || "null".to_string(),
+        |segments| {
+            format!(
+                "{{\"count\":{},\"declared_bytes\":{}}}",
+                segments.ids.len(),
+                segments.total_declared_size()
+            )
+        },
+    );
+    let article_store = if config.segments.is_some() {
+        "segment_file"
+    } else {
+        "synthetic"
+    };
+
+    format!(
+        concat!(
+            "{{\"schema_version\":1,\"tool\":\"nntpbench\",\"version\":{},\"mode\":\"load\",",
+            "\"workload_identity\":{},",
+            "\"host\":{{\"os\":{},\"arch\":{},\"cpu_model\":{},\"loopback\":{}}},",
+            "\"byte_counter\":\"client response wire-frame bytes\",\"byte_counter_includes\":\"status line, headers, body, and terminator\",",
+            "\"config\":{{",
+            "\"connect\":{},\"runtime_threads\":{},\"ports\":{},\"requests\":{},\"transfer_bytes\":{},",
+            "\"duration_secs\":{:.9},\"setup_timeout_secs\":{:.9},\"drain_timeout_secs\":{:.9},",
+            "\"offered_rate\":{},\"latency_range_ms\":{},\"latency_precision_us\":{},",
+            "\"connections\":{},\"client_offset\":{},\"total_clients\":{},\"pipeline_depth\":{},",
+            "\"command_mix\":{},\"start_id\":{},\"workload_policy\":{},\"verification_policy\":{},",
+            "\"segments\":{},\"read_buffer_bytes\":{},\"max_response_bytes\":{},",
+            "\"nodelay\":{},\"socket_recv_buffer\":{},\"socket_send_buffer\":{},",
+            "\"csv\":{},\"json\":{},\"stats_interval_secs\":{}",
+            "}},",
+            "\"workload\":{{\"article_store\":{},\"article_size_bytes\":null,",
+            "\"body_size_bytes\":null,\"tls\":false,\"auth\":false}},",
+            "\"phases\":{{\"setup_secs\":{:.9},\"measurement_secs\":{:.9},",
+            "\"drain_secs\":{:.9},\"total_elapsed_secs\":{:.9}}},",
+            "\"results\":{{\"commands\":{},\"article_responses\":{},\"body_responses\":{},",
+            "\"response_wire_bytes\":{},\"errors\":{},\"accepted_connections\":{},",
+            "\"outcomes\":{{\"scheduled\":{},\"issued\":{},\"completed\":{},",
+            "\"drained\":{},\"incomplete\":{},\"timed_out_connections\":{},",
+            "\"missed_issue_deadlines\":{},\"peak_backlog\":{}}},",
+            "\"latency_us\":{{\"p50\":{},\"p95\":{}}},",
+            "\"schedule_delay_us\":{{\"p50\":{},\"p95\":{}}}}},",
+            "\"process\":{{\"role\":\"client\",\"cpu_seconds\":{:.9},\"rss_kib\":{}}}}}"
+        ),
+        json_string(env!("CARGO_PKG_VERSION")),
+        json_string(&workload_identity(config)),
+        json_string(std::env::consts::OS),
+        json_string(std::env::consts::ARCH),
+        json_option_string(cpu_model()),
+        config.connect.ip().is_loopback(),
+        json_string(&config.connect.to_string()),
+        config.runtime_threads,
+        json_u16_array(&config.ports),
+        json_option_u64(config.requests),
+        config.transfer_bytes,
+        config.duration.as_secs_f64(),
+        config.setup_timeout.as_secs_f64(),
+        config.drain_timeout.as_secs_f64(),
+        json_option_f64(config.offered_rate),
+        config.latency_range.as_millis(),
+        config.latency_precision.as_micros(),
+        config.connections,
+        config.client_offset,
+        config.total_clients,
+        config.pipeline_depth,
+        json_debug(&config.command_mix),
+        config.start_id,
+        json_debug(&config.workload_policy),
+        json_debug(&config.verification_policy),
+        segments,
+        config.read_buffer_bytes,
+        config.max_response_bytes,
+        config.nodelay,
+        config.socket_recv_buffer,
+        config.socket_send_buffer,
+        config.csv,
+        config.json,
+        config.stats_interval.as_secs(),
+        json_string(article_store),
+        lifecycle.setup_elapsed.as_secs_f64(),
+        lifecycle.measurement_elapsed.as_secs_f64(),
+        lifecycle.drain_elapsed.as_secs_f64(),
+        elapsed.as_secs_f64(),
+        snapshot.commands,
+        snapshot.article_requests,
+        snapshot.body_requests,
+        snapshot.bytes_sent,
+        snapshot.errors,
+        snapshot.accepted_connections,
+        lifecycle.scheduled_requests,
+        lifecycle.issued_requests,
+        lifecycle.completed_requests,
+        lifecycle.drained_requests,
+        lifecycle.incomplete_requests,
+        lifecycle.timed_out_connections,
+        lifecycle.missed_issue_deadlines,
+        lifecycle.peak_backlog,
+        histogram_percentile_us(lifecycle.latency_histogram.as_ref(), 0.50),
+        histogram_percentile_us(lifecycle.latency_histogram.as_ref(), 0.95),
+        histogram_percentile_us(lifecycle.schedule_delay_histogram.as_ref(), 0.50),
+        histogram_percentile_us(lifecycle.schedule_delay_histogram.as_ref(), 0.95),
+        cpu_seconds,
+        rss_kib,
+    )
+}
+
+fn render_server_manifest(
+    config: &ServerConfig,
+    snapshot: Snapshot,
+    elapsed: Duration,
+    cpu_seconds: f64,
+    rss_kib: u64,
+) -> String {
+    format!(
+        concat!(
+            "{{\"schema_version\":1,\"tool\":\"nntpbench\",\"version\":{},\"mode\":\"server\",",
+            "\"host\":{{\"os\":{},\"arch\":{},\"cpu_model\":{},\"loopback\":{}}},",
+            "\"config\":{{\"listen\":{},\"body_bytes\":{},\"article_bytes\":{},",
+            "\"article_dir\":{},\"max_connections\":{},\"max_pipeline_depth\":{},",
+            "\"stats_interval_secs\":{},\"flush\":{},\"pending_write_bytes\":{},",
+            "\"nodelay\":{},\"socket_recv_buffer\":{},\"socket_send_buffer\":{}}},",
+            "\"results\":{{\"accepted_connections\":{},\"refused_connections\":{},",
+            "\"active_connections\":{},\"commands\":{},\"pipeline_batches\":{},",
+            "\"article_responses\":{},\"body_responses\":{},",
+            "\"wire_bytes_sent\":{},",
+            "\"wire_bytes_includes\":\"greeting, status line, headers, body, and terminator\",",
+            "\"errors\":{}}},",
+            "\"process\":{{\"role\":\"server\",\"elapsed_seconds\":{:.9},",
+            "\"cpu_seconds\":{:.9},\"rss_kib\":{}}}}}"
+        ),
+        json_string(env!("CARGO_PKG_VERSION")),
+        json_string(std::env::consts::OS),
+        json_string(std::env::consts::ARCH),
+        json_option_string(cpu_model()),
+        config.listen.ip().is_loopback(),
+        json_string(&config.listen.to_string()),
+        config.body_bytes,
+        config.article_bytes,
+        json_option_string(
+            config
+                .article_dir
+                .as_deref()
+                .map(|path| path.display().to_string())
+        ),
+        config.max_connections,
+        config.max_pipeline_depth,
+        config.stats_interval.as_secs(),
+        config.flush,
+        config.pending_write_bytes,
+        config.nodelay,
+        config.socket_recv_buffer,
+        config.socket_send_buffer,
+        snapshot.accepted_connections,
+        snapshot.refused_connections,
+        snapshot.active_connections,
+        snapshot.commands,
+        snapshot.pipeline_batches,
+        snapshot.article_requests,
+        snapshot.body_requests,
+        snapshot.bytes_sent,
+        snapshot.errors,
+        elapsed.as_secs_f64(),
+        cpu_seconds,
+        rss_kib,
+    )
+}
+
+fn json_option_string(value: Option<String>) -> String {
+    value.map_or_else(|| "null".to_string(), |value| json_string(&value))
+}
+
+fn histogram_percentile_us(histogram: Option<&LatencyHistogram>, quantile: f64) -> u64 {
+    histogram
+        .and_then(|histogram| histogram.percentile(quantile))
+        .map_or(0, |duration| {
+            duration.as_micros().try_into().unwrap_or(u64::MAX)
+        })
 }
 
 #[derive(Debug, Clone)]
 struct LoadConfig {
     connect: SocketAddr,
+    runtime_threads: usize,
     ports: Box<[u16]>,
     segments: Option<Arc<SegmentSet>>,
-    requests: u64,
+    requests: Option<u64>,
     transfer_bytes: u64,
     duration: Duration,
+    setup_timeout: Duration,
+    drain_timeout: Duration,
+    offered_rate: Option<f64>,
+    latency_range: Duration,
+    latency_precision: Duration,
     connections: usize,
     client_offset: usize,
     total_clients: usize,
     pipeline_depth: usize,
     command_mix: ClientCommandMix,
     start_id: u64,
+    workload_policy: LoadWorkloadPolicy,
+    verification_policy: LoadVerificationPolicy,
     read_buffer_bytes: usize,
+    max_response_bytes: usize,
     nodelay: bool,
     socket_recv_buffer: usize,
     socket_send_buffer: usize,
     csv: bool,
+    json: bool,
     stats_interval: Duration,
 }
 
 impl LoadConfig {
     fn from_args(args: FetchArgs) -> io::Result<Self> {
         let connections = args.connections.max(1);
+        if args.csv && args.json {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "csv and json output are mutually exclusive",
+            ));
+        }
+        if args.max_response_bytes == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "max response bytes must be positive",
+            ));
+        }
         let total_clients = if args.total_clients == 0 {
             connections
         } else {
             args.total_clients
         };
+        if matches!(args.workload_policy, LoadWorkloadPolicy::Disjoint)
+            && args
+                .client_offset
+                .checked_add(connections)
+                .is_none_or(|end| end > total_clients)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "disjoint workload clients exceed total_clients",
+            ));
+        }
+
+        let latency_range = Duration::from_millis(args.latency_range_ms);
+        let latency_precision = Duration::from_micros(args.latency_precision_us);
+        LatencyHistogram::new(latency_range, latency_precision)?;
+
         let segments = args
             .segments
             .as_deref()
@@ -938,22 +1653,32 @@ impl LoadConfig {
 
         Ok(Self {
             connect: args.connect,
+            runtime_threads: args.threads,
             ports: args.ports.into_boxed_slice(),
             segments,
-            requests: args.requests,
+            requests: (args.requests != 0).then_some(args.requests),
             transfer_bytes: args.transfer_bytes,
             duration: Duration::from_secs(args.duration_secs),
+            setup_timeout: Duration::from_secs(args.setup_timeout_secs.max(1)),
+            drain_timeout: Duration::from_secs(args.drain_timeout_secs.max(1)),
+            offered_rate: args.offered_rate,
+            latency_range,
+            latency_precision,
             connections,
             client_offset: args.client_offset,
             total_clients,
             pipeline_depth: args.pipeline_depth.clamp(1, 4096),
             command_mix: args.command_mix,
             start_id: args.start_id,
+            workload_policy: args.workload_policy,
+            verification_policy: args.verification_policy,
             read_buffer_bytes: args.read_buffer_bytes.max(terminator::TERMINATOR_TAIL_SIZE),
+            max_response_bytes: args.max_response_bytes,
             nodelay: args.nodelay,
             socket_recv_buffer: args.socket_recv_buffer,
             socket_send_buffer: args.socket_send_buffer,
             csv: args.csv,
+            json: args.json,
             stats_interval: Duration::from_secs(args.stats_interval_secs),
         })
     }
@@ -973,19 +1698,73 @@ struct LoadSession {
     segments: Option<Arc<SegmentSet>>,
     client_index: usize,
     total_clients: usize,
-    requests: u64,
+    requests: Option<u64>,
     transfer_bytes: u64,
     next_id: u64,
+    workload_policy: LoadWorkloadPolicy,
+    verification_policy: LoadVerificationPolicy,
+    setup_timeout: Duration,
+    drain_timeout: Duration,
+    offered_rate: Option<f64>,
+    latency_range: Duration,
+    latency_precision: Duration,
     pipeline_depth: usize,
     command_mix: ClientCommandMix,
     read_buffer_bytes: usize,
+    max_response_bytes: usize,
     nodelay: bool,
     socket_recv_buffer: usize,
     socket_send_buffer: usize,
 }
 
+#[derive(Debug, Default)]
+struct LoadSessionOutcome {
+    setup_elapsed: Duration,
+    measurement_elapsed: Duration,
+    drain_elapsed: Duration,
+    timed_out_connections: u64,
+    drained_requests: u64,
+    incomplete_requests: u64,
+    scheduled_requests: u64,
+    issued_requests: u64,
+    completed_requests: u64,
+    missed_issue_deadlines: u64,
+    peak_backlog: u64,
+    latency_histogram: Option<LatencyHistogram>,
+    schedule_delay_histogram: Option<LatencyHistogram>,
+}
+
+impl LoadSessionOutcome {
+    fn merge(&mut self, other: Self) {
+        self.setup_elapsed = self.setup_elapsed.max(other.setup_elapsed);
+        self.measurement_elapsed = self.measurement_elapsed.max(other.measurement_elapsed);
+        self.drain_elapsed = self.drain_elapsed.max(other.drain_elapsed);
+        self.timed_out_connections += other.timed_out_connections;
+        self.drained_requests += other.drained_requests;
+        self.incomplete_requests += other.incomplete_requests;
+        self.scheduled_requests += other.scheduled_requests;
+        self.issued_requests += other.issued_requests;
+        self.completed_requests += other.completed_requests;
+        self.missed_issue_deadlines += other.missed_issue_deadlines;
+        self.peak_backlog = self.peak_backlog.max(other.peak_backlog);
+        match (&mut self.latency_histogram, other.latency_histogram) {
+            (Some(histogram), Some(other)) => histogram.merge(other),
+            (None, Some(other)) => self.latency_histogram = Some(other),
+            _ => {}
+        }
+        match (
+            &mut self.schedule_delay_histogram,
+            other.schedule_delay_histogram,
+        ) {
+            (Some(histogram), Some(other)) => histogram.merge(other),
+            (None, Some(other)) => self.schedule_delay_histogram = Some(other),
+            _ => {}
+        }
+    }
+}
+
 impl LoadSession {
-    fn new(config: &LoadConfig, global_index: usize, start_id: u64, requests: u64) -> Self {
+    fn new(config: &LoadConfig, global_index: usize, start_id: u64, requests: Option<u64>) -> Self {
         Self {
             connect: config.endpoint_for(global_index),
             segments: config.segments.clone(),
@@ -994,16 +1773,49 @@ impl LoadSession {
             requests,
             transfer_bytes: config.transfer_bytes,
             next_id: start_id,
+            workload_policy: config.workload_policy,
+            verification_policy: config.verification_policy,
+            setup_timeout: config.setup_timeout,
+            drain_timeout: config.drain_timeout,
+            offered_rate: config.offered_rate,
+            latency_range: config.latency_range,
+            latency_precision: config.latency_precision,
             pipeline_depth: config.pipeline_depth,
             command_mix: config.command_mix,
             read_buffer_bytes: config.read_buffer_bytes,
+            max_response_bytes: config.max_response_bytes,
             nodelay: config.nodelay,
             socket_recv_buffer: config.socket_recv_buffer,
             socket_send_buffer: config.socket_send_buffer,
         }
     }
+    fn expected_message_id(
+        &self,
+        command_id: u64,
+        request_index: u64,
+    ) -> io::Result<Option<MessageId<'static>>> {
+        if !self.verification_policy.verifies(request_index) {
+            return Ok(None);
+        }
+        let synthetic_id = synthetic_request_id(
+            self.next_id,
+            self.client_index,
+            request_index,
+            self.total_clients,
+            self.workload_policy,
+        );
+        request_message_id_for_command(
+            client_command_kind(command_id, self.command_mix),
+            synthetic_id,
+            request_index,
+            self.segments.as_deref(),
+            self.client_index,
+            self.total_clients,
+        )
+        .map(Some)
+    }
 
-    async fn run(self, stats: Arc<Stats>, stop: Arc<AtomicBool>) -> io::Result<()> {
+    async fn run(self, stats: Arc<Stats>, stop: Arc<AtomicBool>) -> io::Result<LoadSessionOutcome> {
         stats.accepted_connections.fetch_add(1, Ordering::Relaxed);
         stats.active_connections.fetch_add(1, Ordering::Relaxed);
 
@@ -1012,34 +1824,95 @@ impl LoadSession {
         result
     }
 
-    async fn run_inner(self, stats: &Stats, stop: &AtomicBool) -> io::Result<()> {
-        let mut stream = connect_client_socket(
-            self.connect,
-            self.nodelay,
-            self.socket_recv_buffer,
-            self.socket_send_buffer,
-        )
-        .await?;
-        read_greeting(&mut stream).await?;
+    fn timeout_outcome(
+        &self,
+        mut outcome: LoadSessionOutcome,
+        measurement_started: Instant,
+        in_flight: usize,
+    ) -> LoadSessionOutcome {
+        outcome.measurement_elapsed = measurement_started.elapsed();
+        outcome.drain_elapsed = self.drain_timeout;
+        outcome.timed_out_connections = 1;
+        outcome.incomplete_requests = in_flight as u64;
+        outcome
+    }
 
-        let mut response_reader = LoadResponseReader::new(self.read_buffer_bytes);
+    async fn run_inner(self, stats: &Stats, stop: &AtomicBool) -> io::Result<LoadSessionOutcome> {
+        let setup_started = Instant::now();
+        let setup = time::timeout(self.setup_timeout, async {
+            let mut stream = connect_client_socket(
+                self.connect,
+                self.nodelay,
+                self.socket_recv_buffer,
+                self.socket_send_buffer,
+            )
+            .await?;
+            read_greeting(&mut stream).await?;
+            Ok::<_, io::Error>(stream)
+        })
+        .await;
+        let setup_elapsed = setup_started.elapsed();
+        let mut stream = match setup {
+            Ok(stream) => stream?,
+            Err(_) => {
+                return Ok(LoadSessionOutcome {
+                    setup_elapsed,
+                    timed_out_connections: 1,
+                    ..LoadSessionOutcome::default()
+                });
+            }
+        };
+
+        let measurement_started = Instant::now();
+        let schedule = self
+            .offered_rate
+            .map(|rate| OfferedLoadSchedule::new(rate, measurement_started))
+            .transpose()?;
+        let mut outcome = LoadSessionOutcome {
+            setup_elapsed,
+            ..LoadSessionOutcome::default()
+        };
+        if schedule.is_some() {
+            outcome.latency_histogram = Some(LatencyHistogram::new(
+                self.latency_range,
+                self.latency_precision,
+            )?);
+            outcome.schedule_delay_histogram = Some(LatencyHistogram::new(
+                self.latency_range,
+                self.latency_precision,
+            )?);
+        }
+        let mut response_reader =
+            LoadResponseReader::new(self.read_buffer_bytes, self.max_response_bytes);
         let mut request_buffer = Vec::with_capacity(self.pipeline_depth.saturating_mul(64));
         let mut issued = 0_u64;
         let mut received = 0_u64;
         let mut in_flight = 0_usize;
+        let mut issued_times = VecDeque::with_capacity(self.pipeline_depth);
         let mut session_stats = SessionStats::default();
         loop {
             if in_flight == 0 {
-                in_flight += self
-                    .write_load_batch(
+                let batch = time::timeout(
+                    self.drain_timeout,
+                    self.issue_load_batch(
                         &mut stream,
                         &mut request_buffer,
                         issued,
                         self.pipeline_depth,
                         stats,
                         stop,
-                    )
-                    .await?;
+                        schedule,
+                        &mut outcome,
+                        &mut issued_times,
+                    ),
+                )
+                .await;
+                in_flight += match batch {
+                    Ok(result) => result?,
+                    Err(_) => {
+                        return Ok(self.timeout_outcome(outcome, measurement_started, in_flight));
+                    }
+                };
                 issued = issued.wrapping_add(in_flight as u64);
             }
 
@@ -1049,16 +1922,43 @@ impl LoadSession {
 
             let command_id = self.next_id.wrapping_add(received);
             let request_kind = request_kind_for_client_command(command_id, self.command_mix);
-            let response_len = response_reader
-                .read_response(&mut stream, request_kind)
-                .await?;
+            let expected_message_id = self.expected_message_id(command_id, received)?;
+            let response = time::timeout(
+                self.drain_timeout,
+                response_reader.read_response(
+                    &mut stream,
+                    request_kind,
+                    expected_message_id.as_ref().map(MessageId::as_str),
+                ),
+            )
+            .await;
+            let response_len = match response {
+                Ok(result) => result?,
+                Err(_) => {
+                    return Ok(self.timeout_outcome(outcome, measurement_started, in_flight));
+                }
+            };
+            let was_draining = stop.load(Ordering::Acquire);
             received = received.wrapping_add(1);
             in_flight -= 1;
+            if schedule.is_some() {
+                outcome.completed_requests += 1;
+                if let Some(issued_at) = issued_times.pop_front()
+                    && let Some(histogram) = outcome.latency_histogram.as_mut()
+                {
+                    histogram.record(Instant::now().saturating_duration_since(issued_at));
+                }
+            }
 
             stats
                 .bytes_sent
                 .fetch_add(response_len as u64, Ordering::Relaxed);
             session_stats.commands = session_stats.commands.wrapping_add(1);
+            if was_draining {
+                outcome.drained_requests += 1;
+            }
+            #[cfg(feature = "coz")]
+            coz::progress!("client.response");
             match client_command_kind(command_id, self.command_mix) {
                 ClientCommandMix::Article => {
                     session_stats.article_requests = session_stats.article_requests.wrapping_add(1);
@@ -1081,25 +1981,85 @@ impl LoadSession {
             }
 
             if in_flight <= self.pipeline_depth / 2 {
-                let capacity = self.pipeline_depth - in_flight;
-                let filled = self
-                    .write_load_batch(
+                let batch = time::timeout(
+                    self.drain_timeout,
+                    self.issue_load_batch(
                         &mut stream,
                         &mut request_buffer,
                         issued,
-                        capacity,
+                        self.pipeline_depth - in_flight,
                         stats,
                         stop,
-                    )
-                    .await?;
+                        schedule,
+                        &mut outcome,
+                        &mut issued_times,
+                    ),
+                )
+                .await;
+                let filled = match batch {
+                    Ok(result) => result?,
+                    Err(_) => {
+                        return Ok(self.timeout_outcome(outcome, measurement_started, in_flight));
+                    }
+                };
                 issued = issued.wrapping_add(filled as u64);
                 in_flight += filled;
             }
         }
 
+        outcome.measurement_elapsed = measurement_started.elapsed();
         flush_load_session_stats(stats, &mut session_stats);
 
-        Ok(())
+        Ok(outcome)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn issue_load_batch(
+        &self,
+        stream: &mut TcpStream,
+        buffer: &mut Vec<u8>,
+        issued: u64,
+        capacity: usize,
+        stats: &Stats,
+        stop: &AtomicBool,
+        schedule: Option<OfferedLoadSchedule>,
+        outcome: &mut LoadSessionOutcome,
+        issued_times: &mut VecDeque<Instant>,
+    ) -> io::Result<usize> {
+        if let Some(schedule) = schedule
+            && let Some(delay) = schedule
+                .deadline(issued)
+                .checked_duration_since(Instant::now())
+        {
+            time::sleep(delay).await;
+        }
+
+        let filled = self
+            .write_load_batch(stream, buffer, issued, capacity, stats, stop)
+            .await?;
+        if let Some(schedule) = schedule {
+            let actual_issue = Instant::now();
+            for index in 0..filled {
+                let request_index = issued.saturating_add(index as u64);
+                let deadline = schedule.deadline(request_index);
+                let delay = actual_issue.saturating_duration_since(deadline);
+                outcome.scheduled_requests = outcome.scheduled_requests.saturating_add(1);
+                outcome.issued_requests = outcome.issued_requests.saturating_add(1);
+                if !delay.is_zero() {
+                    outcome.missed_issue_deadlines =
+                        outcome.missed_issue_deadlines.saturating_add(1);
+                }
+                if let Some(histogram) = outcome.schedule_delay_histogram.as_mut() {
+                    histogram.record(delay);
+                }
+                issued_times.push_back(actual_issue);
+            }
+            let backlog = schedule
+                .due_count(actual_issue)
+                .saturating_sub(issued.saturating_add(filled as u64));
+            outcome.peak_backlog = outcome.peak_backlog.max(backlog);
+        }
+        Ok(filled)
     }
 
     async fn write_load_batch(
@@ -1115,25 +2075,39 @@ impl LoadSession {
         let mut filled = 0;
         while filled < capacity
             && !stop.load(Ordering::Acquire)
-            && (self.requests == 0 || issued + (filled as u64) < self.requests)
+            && self
+                .requests
+                .is_none_or(|requests| issued + (filled as u64) < requests)
             && !transfer_limit_reached(stats, self.transfer_bytes)
         {
             let request_index = issued + filled as u64;
             let command_id = self.next_id.wrapping_add(request_index);
+            let synthetic_id = synthetic_request_id(
+                self.next_id,
+                self.client_index,
+                request_index,
+                self.total_clients,
+                self.workload_policy,
+            );
             append_load_workload_request(
                 buffer,
-                command_id,
-                request_index,
-                self.command_mix,
-                self.segments.as_deref(),
-                self.client_index,
-                self.total_clients,
+                LoadWorkloadRequest {
+                    command_id,
+                    synthetic_id,
+                    request_index,
+                    mix: self.command_mix,
+                    segments: self.segments.as_deref(),
+                    client_index: self.client_index,
+                    total_clients: self.total_clients,
+                },
             )?;
             filled += 1;
         }
 
         if filled != 0 {
-            stream.write_all(buffer).await?;
+            time::timeout(self.drain_timeout, stream.write_all(buffer))
+                .await
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "load write timed out"))??;
             stats.pipeline_batches.fetch_add(1, Ordering::Relaxed);
         }
         Ok(filled)
@@ -1143,28 +2117,121 @@ impl LoadSession {
 struct LoadResponseReader {
     buffer: Vec<u8>,
     start: usize,
-    terminator_search_start: usize,
     read_buffer_bytes: usize,
+    max_response_bytes: usize,
+}
+
+fn response_message_id(line: &[u8]) -> Option<&[u8]> {
+    let start = memchr::memchr(b'<', line)?;
+    let end = memchr::memchr(b'>', &line[start..])?;
+    Some(&line[start..=start + end])
+}
+
+fn bounded_response_len(response_len: usize, added: usize, max: usize) -> io::Result<usize> {
+    let response_len = response_len.checked_add(added).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "response exceeded configured maximum",
+        )
+    })?;
+    if response_len > max {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "response exceeded configured maximum",
+        ));
+    }
+    Ok(response_len)
 }
 
 impl LoadResponseReader {
-    fn new(read_buffer_bytes: usize) -> Self {
+    fn new(read_buffer_bytes: usize, max_response_bytes: usize) -> Self {
+        let read_buffer_bytes = read_buffer_bytes.max(1);
         Self {
             buffer: Vec::with_capacity(read_buffer_bytes),
             start: 0,
-            terminator_search_start: 0,
             read_buffer_bytes,
+            max_response_bytes,
         }
     }
 
-    async fn read_response(
+    async fn read_response<R>(
         &mut self,
-        stream: &mut TcpStream,
+        stream: &mut R,
         kind: RequestKind,
-    ) -> io::Result<usize> {
+        expected_message_id: Option<&str>,
+    ) -> io::Result<usize>
+    where
+        R: AsyncRead + Unpin,
+    {
+        let mut empty_detector = EmptyMultilineTerminator::default();
+        let mut content_started = false;
+        let mut detector = MultilineTerminatorDetector::default();
+        let mut response_len = 0_usize;
+        let mut multiline = false;
+
         loop {
-            if let Some(frame_len) = self.try_consume_response(kind)? {
-                return Ok(frame_len);
+            if !multiline
+                && let Some((line_end, is_multiline)) =
+                    self.validate_initial_line(kind, expected_message_id)?
+            {
+                if !is_multiline {
+                    self.start += line_end;
+                    return Ok(line_end);
+                }
+                response_len = line_end;
+                self.start += line_end;
+                multiline = true;
+            }
+
+            if multiline {
+                let data = &self.buffer[self.start..];
+                if !content_started {
+                    match empty_detector.detect(data) {
+                        EmptyTerminatorStatus::FoundAt(consumed) => {
+                            let frame_len = bounded_response_len(
+                                response_len,
+                                consumed,
+                                self.max_response_bytes,
+                            )?;
+                            self.start += consumed;
+                            return Ok(frame_len);
+                        }
+                        EmptyTerminatorStatus::NeedMore => {
+                            response_len = bounded_response_len(
+                                response_len,
+                                data.len(),
+                                self.max_response_bytes,
+                            )?;
+                            self.start = self.buffer.len();
+                        }
+                        EmptyTerminatorStatus::NotFound { .. } => {
+                            content_started = true;
+                        }
+                    }
+                }
+
+                if content_started {
+                    match detector.detect_terminator(data) {
+                        TerminatorStatus::FoundAt(consumed) => {
+                            let frame_len = bounded_response_len(
+                                response_len,
+                                consumed,
+                                self.max_response_bytes,
+                            )?;
+                            self.start += consumed;
+                            return Ok(frame_len);
+                        }
+                        TerminatorStatus::NotFound => {
+                            response_len = bounded_response_len(
+                                response_len,
+                                data.len(),
+                                self.max_response_bytes,
+                            )?;
+                            detector.update(data);
+                            self.start = self.buffer.len();
+                        }
+                    }
+                }
             }
 
             self.compact_if_needed();
@@ -1179,40 +2246,65 @@ impl LoadResponseReader {
         }
     }
 
-    fn try_consume_response(&mut self, kind: RequestKind) -> io::Result<Option<usize>> {
+    fn validate_initial_line(
+        &self,
+        kind: RequestKind,
+        expected_message_id: Option<&str>,
+    ) -> io::Result<Option<(usize, bool)>> {
         let data = &self.buffer[self.start..];
-        let Some(line_end) = find_crlf_line_end(data, 0) else {
+        let initial = match protocol::ResponseInitial::parse(kind, data) {
+            protocol::ResponseInitialParse::Complete(initial) => initial,
+            protocol::ResponseInitialParse::NeedMore => return Ok(None),
+            protocol::ResponseInitialParse::Invalid => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid server response initial line",
+                ));
+            }
+        };
+        let line_end = find_crlf_line_end(data, 0).expect("validated response line");
+        if let Some(expected) = expected_message_id {
+            let actual = response_message_id(&data[..line_end]).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "response did not include a Message-ID",
+                )
+            })?;
+            if actual != expected.as_bytes() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "response Message-ID did not match request",
+                ));
+            }
+        }
+        Ok(Some((
+            line_end,
+            initial.descriptor().framing().is_multiline(),
+        )))
+    }
+
+    fn try_consume_response(
+        &mut self,
+        kind: RequestKind,
+        expected_message_id: Option<&str>,
+    ) -> io::Result<Option<usize>> {
+        let Some((line_end, multiline)) = self.validate_initial_line(kind, expected_message_id)?
+        else {
             return Ok(None);
         };
-        if line_end < 5 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "server response line is too short",
-            ));
-        }
-
-        if !load_response_is_multiline(kind, data) {
+        let data = &self.buffer[self.start..];
+        if !multiline {
             self.start += line_end;
-            self.terminator_search_start = self.start;
             return Ok(Some(line_end));
         }
 
-        let search_start = self
-            .terminator_search_start
-            .max(self.start + line_end)
-            .min(self.buffer.len());
-        let Some(relative_end) = memchr::memmem::find(&self.buffer[search_start..], TERMINATOR)
-        else {
-            self.terminator_search_start = self
-                .buffer
-                .len()
-                .saturating_sub(TERMINATOR.len().saturating_sub(1))
-                .max(self.start + line_end);
+        let Some(block) = find_dot_terminated_block(data, line_end) else {
+            bounded_response_len(0, data.len(), self.max_response_bytes)?;
             return Ok(None);
         };
-        let consumed = search_start - self.start + relative_end + TERMINATOR.len();
+        let consumed = block.block_end();
+        bounded_response_len(0, consumed, self.max_response_bytes)?;
         self.start += consumed;
-        self.terminator_search_start = self.start;
         Ok(Some(consumed))
     }
 
@@ -1223,14 +2315,11 @@ impl LoadResponseReader {
         if self.start == self.buffer.len() {
             self.buffer.clear();
             self.start = 0;
-            self.terminator_search_start = 0;
             return;
         }
         if self.start >= self.read_buffer_bytes {
-            let consumed = self.start;
             self.buffer.drain(..self.start);
             self.start = 0;
-            self.terminator_search_start = self.terminator_search_start.saturating_sub(consumed);
         }
     }
 }
@@ -1265,11 +2354,6 @@ where
         }
     })
     .await
-}
-
-fn load_response_is_multiline(kind: RequestKind, data: &[u8]) -> bool {
-    matches!(kind, RequestKind::Article | RequestKind::Body)
-        && matches!(&data.get(..3), Some(b"220" | b"222"))
 }
 
 fn fetch_request(args: &FetchArgs) -> Result<Request<'static>, ClientError> {
@@ -1372,6 +2456,7 @@ fn fetch_request(args: &FetchArgs) -> Result<Request<'static>, ClientError> {
         FetchRequestKind::Capabilities => Ok(Request::capabilities()),
         FetchRequestKind::Date => Ok(Request::date()),
         FetchRequestKind::ModeReader => Ok(Request::mode_reader()),
+        FetchRequestKind::ModeStream => Ok(Request::mode_stream()),
         FetchRequestKind::Quit => Ok(Request::quit()),
     }
 }
@@ -1544,15 +2629,29 @@ fn client_request_for_command(
     }
 }
 
-fn append_load_workload_request(
-    buffer: &mut Vec<u8>,
+struct LoadWorkloadRequest<'a> {
     command_id: u64,
+    synthetic_id: u64,
     request_index: u64,
     mix: ClientCommandMix,
-    segments: Option<&SegmentSet>,
+    segments: Option<&'a SegmentSet>,
     client_index: usize,
     total_clients: usize,
+}
+
+fn append_load_workload_request(
+    buffer: &mut Vec<u8>,
+    workload: LoadWorkloadRequest<'_>,
 ) -> io::Result<()> {
+    let LoadWorkloadRequest {
+        command_id,
+        synthetic_id,
+        request_index,
+        mix,
+        segments,
+        client_index,
+        total_clients,
+    } = workload;
     let kind = client_command_kind(command_id, mix);
     match kind {
         ClientCommandMix::Article => buffer.extend_from_slice(b"ARTICLE "),
@@ -1566,7 +2665,7 @@ fn append_load_workload_request(
         let message_id = segment_for_request(segments, client_index, total_clients, request_index);
         buffer.extend_from_slice(message_id.as_str().as_bytes());
     } else {
-        write!(buffer, "<bench.{command_id}@nntpbench.local>")?;
+        write!(buffer, "<bench.{synthetic_id}@nntpbench.local>")?;
     }
     buffer.extend_from_slice(CRLF);
     Ok(())
@@ -1579,7 +2678,18 @@ pub fn bench_append_load_workload_request(
     request_index: u64,
     mix: ClientCommandMix,
 ) -> io::Result<()> {
-    append_load_workload_request(buffer, command_id, request_index, mix, None, 0, 1)
+    append_load_workload_request(
+        buffer,
+        LoadWorkloadRequest {
+            command_id,
+            synthetic_id: command_id,
+            request_index,
+            mix,
+            segments: None,
+            client_index: 0,
+            total_clients: 1,
+        },
+    )
 }
 
 #[doc(hidden)]
@@ -1593,15 +2703,32 @@ pub fn bench_load_response_scan_in_place(
     buffer: &mut Vec<u8>,
     kind: RequestKind,
 ) -> io::Result<usize> {
+    bench_load_response_verify_inner(buffer, kind, None)
+}
+
+#[doc(hidden)]
+pub fn bench_load_response_verify_in_place(
+    buffer: &mut Vec<u8>,
+    kind: RequestKind,
+    expected: &str,
+) -> io::Result<usize> {
+    bench_load_response_verify_inner(buffer, kind, Some(expected))
+}
+
+fn bench_load_response_verify_inner(
+    buffer: &mut Vec<u8>,
+    kind: RequestKind,
+    expected: Option<&str>,
+) -> io::Result<usize> {
     let read_buffer_bytes = buffer.capacity().max(1);
     let mut reader = LoadResponseReader {
         buffer: std::mem::take(buffer),
         start: 0,
-        terminator_search_start: 0,
         read_buffer_bytes,
+        max_response_bytes: usize::MAX,
     };
     let result = reader
-        .try_consume_response(kind)?
+        .try_consume_response(kind, expected)?
         .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "incomplete response"));
     *buffer = reader.buffer;
     result
@@ -1686,6 +2813,7 @@ fn read_segments(path: &std::path::Path) -> io::Result<SegmentSet> {
     let mut reader = io::BufReader::new(file);
     let mut line_buf = Vec::with_capacity(512);
     let mut ids = Vec::new();
+    let mut declared_sizes = Vec::new();
     let mut line_index = 0;
 
     loop {
@@ -1706,8 +2834,13 @@ fn read_segments(path: &std::path::Path) -> io::Result<SegmentSet> {
                 format!("invalid segment line {line_index}: expected SIZE<TAB>MSGID"),
             )
         })?;
+        let declared_size = std::str::from_utf8(trim_ascii_line(&line[..tab]))
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "segment size is not utf-8"))?
+            .parse::<u64>()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid segment size"))?;
         let msgid = trim_ascii_line(&line[tab + 1..]);
         let id = shared_message_id_from_bytes(msgid)?;
+        declared_sizes.push(declared_size);
         ids.push(id);
     }
 
@@ -1720,6 +2853,7 @@ fn read_segments(path: &std::path::Path) -> io::Result<SegmentSet> {
 
     Ok(SegmentSet {
         ids: ids.into_boxed_slice(),
+        declared_sizes: declared_sizes.into_boxed_slice(),
     })
 }
 
@@ -1920,14 +3054,38 @@ fn flush_load_session_stats(stats: &Stats, session_stats: &mut SessionStats) {
     *session_stats = SessionStats::default();
 }
 
-fn requests_for_connection(total: u64, connections: usize, index: usize) -> u64 {
-    if total == 0 {
-        return 0;
-    }
-
+fn requests_for_connection(total: Option<u64>, connections: usize, index: usize) -> Option<u64> {
+    let total = total?;
     let base = total / connections as u64;
     let remainder = total % connections as u64;
-    base + u64::from((index as u64) < remainder)
+    Some(base + u64::from((index as u64) < remainder))
+}
+
+#[cfg(test)]
+mod request_budget_tests {
+    use super::requests_for_connection;
+
+    #[test]
+    fn finite_zero_quota_is_finished_not_unlimited() {
+        assert_eq!(requests_for_connection(Some(10), 16, 10), Some(0));
+    }
+
+    #[test]
+    fn finite_quotas_conserve_requests() {
+        for total in 1..=64 {
+            for connections in 1..=16 {
+                let assigned: u64 = (0..connections)
+                    .map(|index| requests_for_connection(Some(total), connections, index).unwrap())
+                    .sum();
+                assert_eq!(assigned, total);
+            }
+        }
+    }
+
+    #[test]
+    fn unlimited_budget_is_explicit() {
+        assert_eq!(requests_for_connection(None, 16, 10), None);
+    }
 }
 
 pub async fn serve_session(
@@ -1937,8 +3095,8 @@ pub async fn serve_session(
     stats: Arc<Stats>,
 ) -> io::Result<()> {
     let mut session_stats = SessionStats::default();
-    let result = serve_session_inner(stream, peer_addr, config, &mut session_stats).await;
-    stats.add_session(&session_stats);
+    let result = serve_session_inner(stream, peer_addr, config, &stats, &mut session_stats).await;
+    stats.publish_session_delta(&mut session_stats);
     result
 }
 
@@ -1947,6 +3105,7 @@ async fn serve_session_inner(
     mut stream: TcpStream,
     _peer_addr: SocketAddr,
     config: Arc<ServerConfig>,
+    stats: &Stats,
     session_stats: &mut SessionStats,
 ) -> io::Result<()> {
     let (reader, mut writer) = stream.split();
@@ -1955,11 +3114,10 @@ async fn serve_session_inner(
     let mut command_line = [0; MAX_COMMAND_LINE_BYTES];
     let mut command_lines = Some(CommandLineBatch::with_capacity(max_pipeline_depth));
     let mut command_batch: Box<CommandBatch> = Box::default();
-    let mut pending_write = PendingWrite::from_pool(&config.pending_write_pool);
+    let mut pending_write = config.pending_write_pool.acquire();
     let mut article_path = PathBuf::new();
     let mut session_state = SessionState::default();
-    let mut response_buffer =
-        GeneratedResponseBuffer::from_pool(&config.generated_response_buffer_pool);
+    let mut response_buffer = config.generated_response_buffer_pool.acquire();
     let mut aux_response_buffer = Vec::new();
 
     send_greeting(&mut writer, &config, session_stats).await?;
@@ -1977,7 +3135,7 @@ async fn serve_session_inner(
             break;
         }
 
-        if process_command_batch(
+        let should_close = process_command_batch(
             &command_batch,
             command_lines.as_ref(),
             &config,
@@ -1990,8 +3148,9 @@ async fn serve_session_inner(
             &mut aux_response_buffer,
         )
         .await?
-        .should_close()
-        {
+        .should_close();
+        stats.publish_session_delta(session_stats);
+        if should_close {
             return Ok(());
         }
     }
@@ -2181,6 +3340,10 @@ where
             )
             .await?;
             if batched != 0 {
+                #[cfg(feature = "coz")]
+                for _ in 0..batched {
+                    coz::progress!("server.command");
+                }
                 command_index += batched;
                 continue;
             }
@@ -2200,6 +3363,8 @@ where
             aux_response_buffer,
         )
         .await?;
+        #[cfg(feature = "coz")]
+        coz::progress!("server.command");
         if should_close {
             flush_session_writer(writer, pending_write, config).await?;
             return Ok(BatchOutcome::Close);
@@ -3191,6 +4356,16 @@ where
             write_response(writer, pending_write, MODE_READER_RESPONSE, session_stats).await?;
             Ok(false)
         }
+        RequestKind::ModeStream => {
+            write_response(
+                writer,
+                pending_write,
+                b"203 streaming enabled\r\n",
+                session_stats,
+            )
+            .await?;
+            Ok(false)
+        }
         RequestKind::Quit => {
             write_response(writer, pending_write, QUIT_RESPONSE, session_stats).await?;
             Ok(true)
@@ -3220,7 +4395,14 @@ where
 }
 
 #[derive(Debug, Clone)]
-struct BufferPool {
+struct PendingWritePool {
+    inner: Arc<Mutex<Vec<Vec<u8>>>>,
+    capacity: usize,
+    max_buffers: usize,
+}
+
+#[derive(Debug, Clone)]
+struct GeneratedResponseBufferPool {
     inner: Arc<Mutex<Vec<Vec<u8>>>>,
     capacity: usize,
     max_buffers: usize,
@@ -3228,12 +4410,12 @@ struct BufferPool {
 
 struct PendingWrite {
     buf: Vec<u8>,
-    pool: Option<BufferPool>,
+    pool: Option<PendingWritePool>,
 }
 
 struct GeneratedResponseBuffer {
     buf: Vec<u8>,
-    pool: Option<BufferPool>,
+    pool: Option<GeneratedResponseBufferPool>,
 }
 
 struct GeneratedResponse<'a> {
@@ -3505,7 +4687,7 @@ impl GeneratedResponse<'_> {
     }
 }
 
-impl BufferPool {
+impl PendingWritePool {
     fn new(capacity: usize, max_buffers: usize) -> Self {
         let max_buffers = max_buffers.max(1);
         Self {
@@ -3515,7 +4697,7 @@ impl BufferPool {
         }
     }
 
-    fn acquire(&self) -> Vec<u8> {
+    fn acquire(&self) -> PendingWrite {
         let buf = self
             .inner
             .lock()
@@ -3524,7 +4706,53 @@ impl BufferPool {
             .unwrap_or_else(|| Vec::with_capacity(self.capacity));
 
         debug_assert_eq!(buf.len(), 0);
-        buf
+        PendingWrite {
+            buf,
+            pool: Some(self.clone()),
+        }
+    }
+
+    fn release(&self, mut buf: Vec<u8>) {
+        if buf.capacity() != self.capacity {
+            return;
+        }
+        buf.clear();
+        if let Ok(mut buffers) = self.inner.lock()
+            && buffers.len() < self.max_buffers
+        {
+            buffers.push(buf);
+        }
+    }
+
+    #[cfg(test)]
+    fn available_for_test(&self) -> usize {
+        self.inner.lock().map_or(0, |buffers| buffers.len())
+    }
+}
+
+impl GeneratedResponseBufferPool {
+    fn new(capacity: usize, max_buffers: usize) -> Self {
+        let max_buffers = max_buffers.max(1);
+        Self {
+            inner: Arc::new(Mutex::new(Vec::with_capacity(max_buffers))),
+            capacity: capacity.max(1),
+            max_buffers,
+        }
+    }
+
+    fn acquire(&self) -> GeneratedResponseBuffer {
+        let buf = self
+            .inner
+            .lock()
+            .ok()
+            .and_then(|mut buffers| buffers.pop())
+            .unwrap_or_else(|| Vec::with_capacity(self.capacity));
+
+        debug_assert_eq!(buf.len(), 0);
+        GeneratedResponseBuffer {
+            buf,
+            pool: Some(self.clone()),
+        }
     }
 
     fn release(&self, mut buf: Vec<u8>) {
@@ -3547,12 +4775,6 @@ impl BufferPool {
 
 #[cfg_attr(coverage_nightly, coverage(off))]
 impl PendingWrite {
-    fn from_pool(pool: &BufferPool) -> Self {
-        Self {
-            buf: pool.acquire(),
-            pool: Some(pool.clone()),
-        }
-    }
     #[cfg(test)]
     fn new(capacity: usize) -> Self {
         Self {
@@ -3649,12 +4871,6 @@ impl DerefMut for GeneratedResponseBuffer {
 }
 
 impl GeneratedResponseBuffer {
-    fn from_pool(pool: &BufferPool) -> Self {
-        Self {
-            buf: pool.acquire(),
-            pool: Some(pool.clone()),
-        }
-    }
     #[cfg(test)]
     fn capacity_for_test(&self) -> usize {
         self.buf.capacity()
@@ -3756,7 +4972,7 @@ where
                 stats
                     .bytes_sent
                     .fetch_add(response.len() as u64, Ordering::Relaxed);
-                output.write_all(&response).expect("response write failed");
+                output.write_all(response).expect("response write failed");
                 return false;
             }
             if let Some(article_id) = parse_article_id_arg(request.args()).filter(|id| *id != 1) {
@@ -3768,7 +4984,7 @@ where
                 stats
                     .bytes_sent
                     .fetch_add(response.len() as u64, Ordering::Relaxed);
-                output.write_all(&response).expect("response write failed");
+                output.write_all(response).expect("response write failed");
                 return false;
             }
             stats
@@ -3786,7 +5002,7 @@ where
                 stats
                     .bytes_sent
                     .fetch_add(response.len() as u64, Ordering::Relaxed);
-                output.write_all(&response).expect("response write failed");
+                output.write_all(response).expect("response write failed");
                 return false;
             }
             let article_id = parse_article_id_arg(request.args()).unwrap_or(1);
@@ -3808,7 +5024,7 @@ where
                 stats
                     .bytes_sent
                     .fetch_add(response.len() as u64, Ordering::Relaxed);
-                output.write_all(&response).expect("response write failed");
+                output.write_all(response).expect("response write failed");
                 return false;
             }
             stats
@@ -3826,7 +5042,7 @@ where
                 stats
                     .bytes_sent
                     .fetch_add(response.len() as u64, Ordering::Relaxed);
-                output.write_all(&response).expect("response write failed");
+                output.write_all(response).expect("response write failed");
                 return false;
             }
             let article_id = parse_article_id_arg(request.args()).unwrap_or(1);
@@ -3848,7 +5064,7 @@ where
                 stats
                     .bytes_sent
                     .fetch_add(response.len() as u64, Ordering::Relaxed);
-                output.write_all(&response).expect("response write failed");
+                output.write_all(response).expect("response write failed");
                 return false;
             }
             stats
@@ -3870,7 +5086,7 @@ where
                 stats
                     .bytes_sent
                     .fetch_add(response.len() as u64, Ordering::Relaxed);
-                output.write_all(&response).expect("response write failed");
+                output.write_all(response).expect("response write failed");
                 return false;
             }
             let article_id = parse_article_id_arg(request.args()).unwrap_or(1);
@@ -3896,7 +5112,7 @@ where
                 stats
                     .bytes_sent
                     .fetch_add(response.len() as u64, Ordering::Relaxed);
-                output.write_all(&response).expect("response write failed");
+                output.write_all(response).expect("response write failed");
                 return false;
             }
             stats
@@ -3998,6 +5214,7 @@ where
         RequestKind::Capabilities => CAPABILITIES_RESPONSE,
         RequestKind::Help => HELP_RESPONSE,
         RequestKind::ModeReader => MODE_READER_RESPONSE,
+        RequestKind::ModeStream => b"203 streaming enabled\r\n",
         RequestKind::Quit => QUIT_RESPONSE,
         RequestKind::Unknown if is_known_request_syntax_error(request) => {
             if authinfo_sasl_initial_response_base64_error(request.verb(), request.args()) {
@@ -4555,6 +5772,7 @@ fn build_stored_article_response(kind: RequestKind, article_bytes: &[u8]) -> io:
         | RequestKind::AuthInfoPass
         | RequestKind::AuthInfo
         | RequestKind::ModeReader
+        | RequestKind::ModeStream
         | RequestKind::Quit
         | RequestKind::Unknown => {
             unreachable!("stored article response requested for non-article kind")
@@ -4723,6 +5941,7 @@ where
 
 #[derive(Debug)]
 pub struct ServerConfig {
+    pub listen: SocketAddr,
     pub body_bytes: usize,
     pub article_bytes: usize,
     body_response: Box<[u8]>,
@@ -4736,8 +5955,8 @@ pub struct ServerConfig {
     pub stats_interval: Duration,
     pub flush: bool,
     pub pending_write_bytes: usize,
-    pending_write_pool: BufferPool,
-    generated_response_buffer_pool: BufferPool,
+    pending_write_pool: PendingWritePool,
+    generated_response_buffer_pool: GeneratedResponseBufferPool,
     pub nodelay: bool,
     pub socket_recv_buffer: usize,
     pub socket_send_buffer: usize,
@@ -4745,6 +5964,11 @@ pub struct ServerConfig {
 
 impl ServerConfig {
     pub fn from_args(args: ServerArgs) -> Self {
+        let listen = args.listen;
+        Self::from_bound_args(args, listen)
+    }
+
+    fn from_bound_args(args: ServerArgs, listen: SocketAddr) -> Self {
         let body_response = build_generated_response(BODY_RESPONSE_PREFIX, args.body_bytes);
         let article_response =
             build_generated_response(ARTICLE_RESPONSE_PREFIX, args.article_bytes);
@@ -4757,6 +5981,7 @@ impl ServerConfig {
             None => (None, None),
         };
         Self {
+            listen,
             body_bytes: args.body_bytes,
             article_bytes: args.article_bytes,
             body_response,
@@ -4770,17 +5995,17 @@ impl ServerConfig {
             stats_interval: Duration::from_secs(args.stats_interval_secs),
             flush: args.flush,
             pending_write_bytes: args.pending_write_bytes.max(1),
-            pending_write_pool: BufferPool::new(
+            pending_write_pool: PendingWritePool::new(
                 args.pending_write_bytes.max(1),
                 args.max_connections
                     .max(1)
-                    .min(DEFAULT_PENDING_WRITE_POOL_BUFFERS),
+                    .clamp(1, DEFAULT_PENDING_WRITE_POOL_BUFFERS),
             ),
-            generated_response_buffer_pool: BufferPool::new(
+            generated_response_buffer_pool: GeneratedResponseBufferPool::new(
                 generated_response_buffer_capacity(args.article_bytes, args.body_bytes),
                 args.max_connections
                     .max(1)
-                    .min(DEFAULT_PENDING_WRITE_POOL_BUFFERS),
+                    .clamp(1, DEFAULT_PENDING_WRITE_POOL_BUFFERS),
             ),
             nodelay: args.nodelay,
             socket_recv_buffer: args.socket_recv_buffer,
@@ -4904,6 +6129,10 @@ impl Stats {
             .fetch_add(session.body_requests, Ordering::Relaxed);
         self.bytes_sent
             .fetch_add(session.bytes_sent, Ordering::Relaxed);
+    }
+    fn publish_session_delta(&self, session: &mut SessionStats) {
+        self.add_session(session);
+        *session = SessionStats::default();
     }
 }
 
@@ -5438,7 +6667,7 @@ fn command_message_id<'a>(
 ) -> Option<MessageId<'a>> {
     let bytes = command_message_id_bytes(command, command_lines)?;
     let value = std::str::from_utf8(bytes).ok()?;
-    MessageId::from_borrowed(value).ok()
+    Some(MessageId::from_validated_borrowed(value))
 }
 
 fn command_message_id_bytes<'a>(
@@ -7436,6 +8665,7 @@ mod tests {
             stats_interval_secs: 0,
             flush: false,
             pending_write_bytes: DEFAULT_PENDING_WRITE_BYTES,
+            json: false,
         }
     }
 
@@ -7579,23 +8809,161 @@ mod tests {
             selector: None,
             threads: 1,
             read_buffer_bytes: CLIENT_READER_CAPACITY,
+            max_response_bytes: DEFAULT_MAX_LOAD_RESPONSE_BYTES,
             pipeline_depth: 64,
             ports: Vec::new(),
             segments: None,
             requests: 0,
             transfer_bytes: 0,
             duration_secs: 0,
+            setup_timeout_secs: 30,
+            drain_timeout_secs: 5,
+            offered_rate: None,
+            latency_range_ms: DEFAULT_LATENCY_RANGE_MS,
+            latency_precision_us: DEFAULT_LATENCY_PRECISION_US,
             connections: 1,
             client_offset: 0,
             total_clients: 0,
             command_mix: ClientCommandMix::Alternate,
             start_id: 1,
+            workload_policy: LoadWorkloadPolicy::Disjoint,
+            verification_policy: LoadVerificationPolicy::None,
             csv: false,
+            json: false,
             stats_interval_secs: 1,
             nodelay: true,
             socket_recv_buffer: HIGH_THROUGHPUT_SOCKET_BUFFER,
             socket_send_buffer: HIGH_THROUGHPUT_SOCKET_BUFFER,
         }
+    }
+
+    #[test]
+    fn load_manifest_names_wire_bytes_and_reproduction_fields() {
+        let config = LoadConfig::from_args(test_fetch_args()).unwrap();
+        let manifest = render_load_manifest(
+            &config,
+            Stats::new().snapshot(),
+            &LoadSessionOutcome::default(),
+            Duration::from_secs(7),
+            0.25,
+            1234,
+        );
+
+        assert!(manifest.starts_with("{\"schema_version\":1"));
+        assert!(manifest.contains("\"tool\":\"nntpbench\""));
+        assert!(manifest.contains("\"byte_counter\":\"client response wire-frame bytes\""));
+        assert!(manifest.contains("\"response_wire_bytes\":0"));
+        assert!(manifest.contains("\"connections\":1"));
+        assert!(manifest.contains("\"pipeline_depth\":64"));
+        assert!(manifest.contains("\"workload_identity\":\"md5:"));
+        assert!(manifest.contains("\"measurement_secs\":0.000"));
+        assert!(manifest.contains("\"cpu_seconds\":0.250000000"));
+        assert!(manifest.contains("\"rss_kib\":1234"));
+        let parsed: serde_json::Value =
+            serde_json::from_str(&manifest).expect("load manifest must be valid JSON");
+        assert_eq!(parsed["workload_identity"], workload_identity(&config));
+    }
+
+    #[test]
+    fn server_manifest_records_limits_results_and_process_cost() {
+        let config = ServerConfig::from_args(test_args());
+        let stats = Stats::new();
+        stats.accepted_connections.store(3, Ordering::Relaxed);
+        stats.refused_connections.store(2, Ordering::Relaxed);
+        stats.commands.store(11, Ordering::Relaxed);
+        stats.bytes_sent.store(4096, Ordering::Relaxed);
+
+        let manifest =
+            render_server_manifest(&config, stats.snapshot(), Duration::from_secs(7), 0.5, 2048);
+
+        assert!(manifest.starts_with("{\"schema_version\":1"));
+        assert!(manifest.contains("\"mode\":\"server\""));
+        assert!(manifest.contains("\"listen\":\"127.0.0.1:0\""));
+        assert!(manifest.contains("\"article_bytes\":2048"));
+        assert!(manifest.contains("\"max_connections\":16"));
+        assert!(manifest.contains("\"max_pipeline_depth\":8"));
+        assert!(manifest.contains("\"accepted_connections\":3"));
+        assert!(manifest.contains("\"refused_connections\":2"));
+        assert!(manifest.contains("\"commands\":11"));
+        assert!(manifest.contains("\"wire_bytes_sent\":4096"));
+        assert!(manifest.contains(
+            "\"wire_bytes_includes\":\"greeting, status line, headers, body, and terminator\""
+        ));
+        assert!(manifest.contains("\"cpu_seconds\":0.500000000"));
+        assert!(manifest.contains("\"rss_kib\":2048"));
+        serde_json::from_str::<serde_json::Value>(&manifest)
+            .expect("server manifest must be valid JSON");
+    }
+
+    #[test]
+    fn server_config_records_the_bound_listener_address() {
+        let bound = "127.0.0.1:18119".parse().unwrap();
+        let config = ServerConfig::from_bound_args(test_args(), bound);
+
+        assert_eq!(config.listen, bound);
+    }
+
+    #[test]
+    fn server_json_flag_is_explicit_and_defaults_off() {
+        let default = ServerArgs::try_parse_from(["nntpbench"]).unwrap();
+        let enabled = ServerArgs::try_parse_from(["nntpbench", "--json"]).unwrap();
+
+        assert!(!default.json);
+        assert!(enabled.json);
+    }
+
+    #[test]
+    fn workload_identity_matches_direct_and_proxy_endpoints_but_changes_with_input() {
+        let direct = LoadConfig::from_args(test_fetch_args()).unwrap();
+        let mut proxy_args = test_fetch_args();
+        proxy_args.connect = "127.0.0.1:8119".parse().unwrap();
+        let proxy = LoadConfig::from_args(proxy_args.clone()).unwrap();
+
+        assert_eq!(workload_identity(&direct), workload_identity(&proxy));
+
+        proxy_args.pipeline_depth += 1;
+        let changed = LoadConfig::from_args(proxy_args).unwrap();
+        assert_ne!(workload_identity(&direct), workload_identity(&changed));
+
+        let mut scheduled_args = test_fetch_args();
+        scheduled_args.offered_rate = Some(0.0);
+        let scheduled = LoadConfig::from_args(scheduled_args).unwrap();
+        assert_ne!(workload_identity(&direct), workload_identity(&scheduled));
+    }
+
+    #[test]
+    fn workload_identity_covers_segment_sizes_and_message_ids_but_not_endpoint() {
+        let segments =
+            write_temp_segments("workload-identity", "1024\tfirst@test\n2048\tsecond@test\n");
+        let mut direct_args = test_fetch_args();
+        direct_args.segments = Some(segments.clone());
+        let direct = LoadConfig::from_args(direct_args.clone()).unwrap();
+        direct_args.connect = "127.0.0.1:8119".parse().unwrap();
+        let proxy = LoadConfig::from_args(direct_args).unwrap();
+        fs::remove_file(segments).unwrap();
+
+        let changed_segments = write_temp_segments(
+            "workload-identity-changed",
+            "1024\tfirst@test\n4096\tsecond@test\n",
+        );
+        let mut changed_args = test_fetch_args();
+        changed_args.segments = Some(changed_segments.clone());
+        let changed = LoadConfig::from_args(changed_args).unwrap();
+        fs::remove_file(changed_segments).unwrap();
+
+        assert_eq!(workload_identity(&direct), workload_identity(&proxy));
+        assert_ne!(workload_identity(&direct), workload_identity(&changed));
+    }
+
+    #[test]
+    fn load_config_rejects_csv_and_json_together() {
+        let mut args = test_fetch_args();
+        args.csv = true;
+        args.json = true;
+
+        let error = LoadConfig::from_args(args).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 
     async fn assert_read_request(stream: &mut TcpStream, expected: &[u8]) {
@@ -14284,9 +15652,9 @@ mod tests {
 
     #[test]
     fn pending_write_hot_path_does_not_allocate() {
-        let pool = BufferPool::new(DEFAULT_PENDING_WRITE_BYTES, 1);
+        let pool = PendingWritePool::new(DEFAULT_PENDING_WRITE_BYTES, 1);
         let oversized = vec![b'x'; DEFAULT_PENDING_WRITE_BYTES + 1];
-        let pending = PendingWrite::from_pool(&pool);
+        let pending = pool.acquire();
         let mut sink = tokio::io::sink();
 
         assert_no_allocations("pending write hot path", move || {
@@ -14299,11 +15667,11 @@ mod tests {
 
     #[tokio::test]
     async fn pending_write_pool_reuses_returned_buffer() {
-        let pool = BufferPool::new(4096, 1);
+        let pool = PendingWritePool::new(4096, 1);
         assert_eq!(pool.available_for_test(), 0);
 
         let first_ptr = {
-            let mut pending = PendingWrite::from_pool(&pool);
+            let mut pending = pool.acquire();
             let ptr = pending.buffer_ptr_for_test();
             pending
                 .push(&mut tokio::io::sink(), DATE_RESPONSE)
@@ -14315,7 +15683,7 @@ mod tests {
 
         assert_eq!(pool.available_for_test(), 1);
 
-        let pending = PendingWrite::from_pool(&pool);
+        let pending = pool.acquire();
         assert_eq!(pool.available_for_test(), 0);
         assert_eq!(pending.capacity_for_test(), 4096);
         assert_eq!(pending.len(), 0);
@@ -14324,11 +15692,11 @@ mod tests {
 
     #[test]
     fn generated_response_buffer_pool_reuses_returned_buffer() {
-        let pool = BufferPool::new(4096, 1);
+        let pool = GeneratedResponseBufferPool::new(4096, 1);
         assert_eq!(pool.available_for_test(), 0);
 
         let first_ptr = {
-            let mut response = GeneratedResponseBuffer::from_pool(&pool);
+            let mut response = pool.acquire();
             let ptr = response.buffer_ptr_for_test();
             response.extend_from_slice(BODY_RESPONSE_PREFIX);
             assert_eq!(pool.available_for_test(), 0);
@@ -14337,7 +15705,7 @@ mod tests {
 
         assert_eq!(pool.available_for_test(), 1);
 
-        let response = GeneratedResponseBuffer::from_pool(&pool);
+        let response = pool.acquire();
         assert_eq!(pool.available_for_test(), 0);
         assert_eq!(response.capacity_for_test(), 4096);
         assert_eq!(response.len(), 0);
@@ -14346,11 +15714,11 @@ mod tests {
 
     #[test]
     fn generated_response_buffer_pool_drops_mismatched_capacity() {
-        let pool = BufferPool::new(4096, 1);
+        let pool = GeneratedResponseBufferPool::new(4096, 1);
         assert_eq!(pool.available_for_test(), 0);
 
         {
-            let mut response = GeneratedResponseBuffer::from_pool(&pool);
+            let mut response = pool.acquire();
             response.reserve_exact(4097);
             assert!(response.capacity_for_test() > 4096);
         }
@@ -14728,6 +16096,19 @@ mod tests {
             segment_for_request(&segments, 1, 2, 0).as_str(),
             "<wrapped@test>"
         );
+    }
+    #[test]
+    fn segment_parsing_preserves_declared_sizes() {
+        let path = write_temp_segments("declared-size", "42\tsegment@test\n");
+        let segments = read_segments(&path).unwrap();
+        fs::remove_file(path).unwrap();
+
+        assert_eq!(segments.declared_size(0), 42);
+        let invalid_path = write_temp_segments("invalid-size", "not-a-size\tsegment@test\n");
+        let error = read_segments(&invalid_path).unwrap_err();
+        fs::remove_file(invalid_path).unwrap();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
@@ -15313,8 +16694,14 @@ mod tests {
             let (mut sixth, _) = listener.accept().await.unwrap();
             sixth.write_all(b"201 fetch ready\r\n").await.unwrap();
             let read = sixth.read(&mut request).await.unwrap();
+            assert_eq!(&request[..read], b"MODE STREAM\r\n");
+            sixth.write_all(b"203 streaming enabled\r\n").await.unwrap();
+
+            let (mut seventh, _) = listener.accept().await.unwrap();
+            seventh.write_all(b"201 fetch ready\r\n").await.unwrap();
+            let read = seventh.read(&mut request).await.unwrap();
             assert_eq!(&request[..read], b"QUIT\r\n");
-            sixth.write_all(QUIT_RESPONSE).await.unwrap();
+            seventh.write_all(QUIT_RESPONSE).await.unwrap();
         });
 
         let mut list_args = test_fetch_args();
@@ -15356,6 +16743,14 @@ mod tests {
         let mode_reader = fetch_response(&mode_reader_args).await.unwrap();
         assert_eq!(mode_reader.kind(), RequestKind::ModeReader);
         assert_eq!(mode_reader.status().as_u16(), 201);
+
+        let mut mode_stream_args = test_fetch_args();
+        mode_stream_args.connect = addr;
+        mode_stream_args.request = Some(FetchRequestKind::ModeStream);
+        mode_stream_args.message_id = None;
+        let mode_stream = fetch_response(&mode_stream_args).await.unwrap();
+        assert_eq!(mode_stream.kind(), RequestKind::ModeStream);
+        assert_eq!(mode_stream.status().as_u16(), 203);
 
         let mut quit_args = test_fetch_args();
         quit_args.connect = addr;
@@ -17837,6 +19232,7 @@ mod tests {
         let segments = SegmentSet {
             ids: vec![MessageId::from_shared(Arc::<str>::from("<segment@test>")).unwrap()]
                 .into_boxed_slice(),
+            declared_sizes: vec![0].into_boxed_slice(),
         };
         let long_message = format!("<{}@example.test>", "a".repeat(235));
         let long_command = format!("ARTICLE {long_message}\r\n");
@@ -17973,5 +19369,485 @@ mod tests {
                 bench_load_response_scan_in_place(&mut response_buffer, RequestKind::Body).unwrap();
             assert_eq!(consumed, response.len());
         });
+    }
+
+    #[test]
+    fn load_response_scan_accepts_empty_multiline_article() {
+        let response = b"220 1 <article@test> article follows\r\n.\r\n";
+        assert_eq!(
+            bench_load_response_scan(response, RequestKind::Article).unwrap(),
+            response.len()
+        );
+    }
+
+    #[test]
+    fn load_response_scan_preserves_adjacent_frames() {
+        let first = b"220 1 <article@test> article follows\r\n.\r\n";
+        let second = b"220 2 <article@test> article follows\r\n.\r\n";
+        let mut buffer = first.to_vec();
+        buffer.extend_from_slice(second);
+
+        let consumed =
+            bench_load_response_scan_in_place(&mut buffer, RequestKind::Article).unwrap();
+        assert_eq!(consumed, first.len());
+        assert_eq!(&buffer[consumed..], second);
+    }
+
+    #[test]
+    fn benchmark_load_response_verifier_checks_message_identity() {
+        let response = b"222 1 <article@test> body follows\r\nbody\r\n.\r\n";
+        let expected = "<article@test>";
+        let wrong = "<other@test>";
+
+        assert_eq!(
+            bench_load_response_verify_in_place(
+                &mut response.to_vec(),
+                RequestKind::Body,
+                expected,
+            )
+            .unwrap(),
+            response.len()
+        );
+        assert_eq!(
+            bench_load_response_verify_in_place(&mut response.to_vec(), RequestKind::Body, wrong,)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn disjoint_load_session_verifies_the_message_id_it_puts_on_the_wire() {
+        let mut args = test_fetch_args();
+        args.connections = 2;
+        args.total_clients = 2;
+        args.verification_policy = LoadVerificationPolicy::Full;
+        let config = LoadConfig::from_args(args).unwrap();
+        let session = LoadSession::new(&config, 1, config.start_id, None);
+
+        let expected = session.expected_message_id(config.start_id, 0).unwrap();
+
+        assert_eq!(
+            expected.as_ref().map(MessageId::as_str),
+            Some("<bench.2@nntpbench.local>")
+        );
+    }
+
+    #[test]
+    fn load_verification_policy_samples_deterministically() {
+        assert!(!LoadVerificationPolicy::None.verifies(0));
+        assert!(LoadVerificationPolicy::Sampled.verifies(0));
+        assert!(!LoadVerificationPolicy::Sampled.verifies(1));
+        assert!(LoadVerificationPolicy::Sampled.verifies(100));
+        assert!(LoadVerificationPolicy::Full.verifies(u64::MAX));
+    }
+
+    #[test]
+    fn offered_load_histogram_is_bounded_and_tracks_percentiles() {
+        let mut histogram =
+            LatencyHistogram::new(Duration::from_millis(10), Duration::from_millis(1)).unwrap();
+        histogram.record(Duration::from_millis(1));
+        histogram.record(Duration::from_millis(100));
+
+        assert_eq!(histogram.bin_count(), 10);
+        assert_eq!(histogram.sample_count(), 2);
+        assert_eq!(histogram.overflow_count(), 1);
+        assert_eq!(histogram.percentile(0.5), Some(Duration::from_millis(1)));
+        assert!(
+            LatencyHistogram::new(Duration::from_secs(2_000), Duration::from_micros(1),).is_err()
+        );
+
+        let started = Instant::now();
+        let schedule = OfferedLoadSchedule::new(100.0, started).unwrap();
+        assert_eq!(schedule.interval(), Duration::from_millis(10));
+        assert_eq!(schedule.deadline(0), started);
+        assert_eq!(schedule.due_count(started), 1);
+        assert_eq!(
+            schedule.due_count(started.checked_add(Duration::from_millis(10)).unwrap()),
+            2
+        );
+        assert_eq!(
+            schedule.due_count(started.checked_sub(Duration::from_millis(1)).unwrap()),
+            0
+        );
+        assert!(OfferedLoadSchedule::new(0.0, started).is_err());
+        assert!(OfferedLoadSchedule::new(1e-20, started).is_err());
+    }
+
+    #[tokio::test]
+    async fn offered_load_records_mixed_article_body_latency() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            reader.get_mut().write_all(b"200 ready\r\n").await.unwrap();
+            for _ in 0..4 {
+                let mut request = String::new();
+                reader.read_line(&mut request).await.unwrap();
+                if request.starts_with("ARTICLE") {
+                    time::sleep(Duration::from_millis(20)).await;
+                    let mut response = b"220 1 <article@test> article follows\r\n".to_vec();
+                    response.extend_from_slice(&vec![b'x'; 8192]);
+                    response.extend_from_slice(b"\r\n.\r\n");
+                    reader.get_mut().write_all(&response).await.unwrap();
+                } else {
+                    reader
+                        .get_mut()
+                        .write_all(b"222 1 <body@test> body follows\r\nsmall\r\n.\r\n")
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+
+        let mut args = test_fetch_args();
+        args.connect = address;
+        args.requests = 4;
+        args.connections = 1;
+        args.total_clients = 1;
+        args.pipeline_depth = 2;
+        args.command_mix = ClientCommandMix::Alternate;
+        args.offered_rate = Some(1_000.0);
+        args.setup_timeout_secs = 1;
+        args.drain_timeout_secs = 1;
+        let config = LoadConfig::from_args(args).unwrap();
+        let outcome = LoadSession::new(&config, 0, config.start_id, config.requests)
+            .run(Arc::new(Stats::new()), Arc::new(AtomicBool::new(false)))
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(outcome.scheduled_requests, 4);
+        assert_eq!(outcome.issued_requests, 4);
+        assert_eq!(outcome.completed_requests, 4);
+        assert_eq!(
+            outcome
+                .schedule_delay_histogram
+                .as_ref()
+                .unwrap()
+                .sample_count(),
+            4
+        );
+        assert_eq!(
+            outcome.latency_histogram.as_ref().unwrap().sample_count(),
+            4
+        );
+        assert!(
+            outcome
+                .latency_histogram
+                .as_ref()
+                .unwrap()
+                .percentile(0.95)
+                .unwrap()
+                >= Duration::from_millis(10)
+        );
+    }
+
+    #[test]
+    fn load_response_identity_policy_rejects_wrong_article_but_none_accepts() {
+        let response = b"220 1 <actual@test> article follows\r\n.\r\n";
+
+        let mut verifying = LoadResponseReader {
+            buffer: response.to_vec(),
+            start: 0,
+            read_buffer_bytes: response.len(),
+            max_response_bytes: response.len(),
+        };
+        let error = verifying
+            .try_consume_response(RequestKind::Article, Some("<expected@test>"))
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+        let mut framing_only = LoadResponseReader {
+            buffer: response.to_vec(),
+            start: 0,
+            read_buffer_bytes: response.len(),
+            max_response_bytes: response.len(),
+        };
+        assert_eq!(
+            framing_only
+                .try_consume_response(RequestKind::Article, None)
+                .unwrap(),
+            Some(response.len())
+        );
+    }
+
+    #[tokio::test]
+    async fn load_response_reader_rejects_unterminated_response_at_bound() {
+        let mut response = b"220 1 <article@test> body follows\r\n".to_vec();
+        response.extend(std::iter::repeat_n(b'x', 32));
+        let (mut writer, mut reader_stream) = tokio::io::duplex(64);
+        let writer_task = tokio::spawn(async move {
+            writer.write_all(&response).await.unwrap();
+            writer.shutdown().await.unwrap();
+        });
+
+        let mut response_reader = LoadResponseReader::new(8, 64);
+        let error = response_reader
+            .read_response(&mut reader_stream, RequestKind::Article, None)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        writer_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn load_response_reader_capacity_stays_bounded_as_articles_grow() {
+        let mut measurements = Vec::new();
+
+        for article_bytes in [1024_usize, 64 * 1024] {
+            let mut response = b"220 1 <article@test> article follows\r\n".to_vec();
+            response.extend(std::iter::repeat_n(b'x', article_bytes));
+            response.extend_from_slice(b"\r\n.\r\n");
+            let expected_len = response.len();
+            let (mut writer, mut reader_stream) = tokio::io::duplex(128);
+            let writer_task = tokio::spawn(async move {
+                writer.write_all(&response).await.unwrap();
+                writer.shutdown().await.unwrap();
+            });
+
+            let mut response_reader = LoadResponseReader::new(8, expected_len);
+            let frame_len = response_reader
+                .read_response(&mut reader_stream, RequestKind::Article, None)
+                .await
+                .unwrap();
+
+            assert_eq!(frame_len, expected_len);
+            measurements.push((
+                response_reader.buffer.len(),
+                response_reader.buffer.capacity(),
+            ));
+            writer_task.await.unwrap();
+        }
+
+        assert!(measurements[0].0 <= 16);
+        assert!(measurements[1].0 <= 16);
+        assert!(measurements[1].1 <= measurements[0].1 + 8);
+    }
+
+    #[test]
+    fn load_config_rejects_zero_max_response_bytes() {
+        let mut args = test_fetch_args();
+        args.max_response_bytes = 0;
+
+        let error = LoadConfig::from_args(args).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn load_response_reader_rejects_overlong_initial_line() {
+        let mut response = b"220 ".to_vec();
+        response.extend(std::iter::repeat_n(
+            b'x',
+            protocol::MAX_INITIAL_RESPONSE_LINE_BYTES,
+        ));
+        let mut response_reader = LoadResponseReader::new(8, usize::MAX);
+        response_reader.buffer = response;
+
+        let error = response_reader
+            .try_consume_response(RequestKind::Article, None)
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn load_response_scan_rejects_command_incompatible_success() {
+        let response = b"222 1 <article@test> body follows\r\n.\r\n";
+        let error = bench_load_response_scan(response, RequestKind::Article).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn load_response_scan_rejects_malformed_status_line() {
+        let error = bench_load_response_scan(b"not an NNTP response\r\n", RequestKind::Article)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn synthetic_workload_policies_map_request_ids_explicitly() {
+        assert_eq!(
+            synthetic_request_id(10, 2, 3, 4, LoadWorkloadPolicy::Disjoint),
+            24
+        );
+        assert_eq!(
+            synthetic_request_id(10, 2, 3, 4, LoadWorkloadPolicy::Shared),
+            13
+        );
+        assert_eq!(
+            synthetic_request_id(10, 2, 3, 4, LoadWorkloadPolicy::Repeat),
+            10
+        );
+    }
+
+    #[test]
+    fn disjoint_workload_rejects_out_of_range_process_shard() {
+        let mut args = test_fetch_args();
+        args.connections = 2;
+        args.client_offset = 1;
+        args.total_clients = 2;
+
+        let error = LoadConfig::from_args(args).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn shared_and_repeat_workloads_allow_deliberate_overlap() {
+        for workload_policy in [LoadWorkloadPolicy::Shared, LoadWorkloadPolicy::Repeat] {
+            let mut args = test_fetch_args();
+            args.connections = 2;
+            args.client_offset = 1;
+            args.total_clients = 2;
+            args.workload_policy = workload_policy;
+
+            let config = LoadConfig::from_args(args).unwrap();
+            assert_eq!(config.workload_policy, workload_policy);
+        }
+    }
+
+    #[tokio::test]
+    async fn stalled_load_response_is_bounded_by_drain_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"200 ready\r\n").await.unwrap();
+            let mut request = [0_u8; 512];
+            let read = stream.read(&mut request).await.unwrap();
+            assert!(read > 0);
+            time::sleep(Duration::from_secs(2)).await;
+        });
+
+        let mut args = test_fetch_args();
+        args.connect = address;
+        args.requests = 1;
+        args.total_clients = 1;
+        args.setup_timeout_secs = 1;
+        args.drain_timeout_secs = 1;
+        let config = LoadConfig::from_args(args).unwrap();
+        let stats = Arc::new(Stats::new());
+        let started = Instant::now();
+
+        let outcome = LoadSession::new(&config, 0, config.start_id, config.requests)
+            .run(stats, Arc::new(AtomicBool::new(false)))
+            .await
+            .unwrap();
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(outcome.timed_out_connections, 1);
+        assert_eq!(outcome.incomplete_requests, 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn stalled_load_setup_is_bounded_by_setup_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            time::sleep(Duration::from_secs(2)).await;
+        });
+
+        let mut args = test_fetch_args();
+        args.connect = address;
+        args.requests = 1;
+        args.total_clients = 1;
+        args.setup_timeout_secs = 1;
+        args.drain_timeout_secs = 1;
+        let config = LoadConfig::from_args(args).unwrap();
+        let started = Instant::now();
+
+        let outcome = LoadSession::new(&config, 0, config.start_id, config.requests)
+            .run(Arc::new(Stats::new()), Arc::new(AtomicBool::new(false)))
+            .await
+            .unwrap();
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(outcome.timed_out_connections, 1);
+        assert_eq!(outcome.incomplete_requests, 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn orderly_load_drain_reports_completed_in_flight_work() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"200 ready\r\n").await.unwrap();
+            let mut request = [0_u8; 512];
+            let read = stream.read(&mut request).await.unwrap();
+            assert!(read > 0);
+            time::sleep(Duration::from_millis(50)).await;
+            stream
+                .write_all(b"220 1 <article@test> article follows\r\n.\r\n")
+                .await
+                .unwrap();
+        });
+
+        let mut args = test_fetch_args();
+        args.connect = address;
+        args.requests = 1;
+        args.total_clients = 1;
+        args.setup_timeout_secs = 1;
+        args.drain_timeout_secs = 1;
+        let config = LoadConfig::from_args(args).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_for_task = stop.clone();
+        let stopper = tokio::spawn(async move {
+            time::sleep(Duration::from_millis(10)).await;
+            stop_for_task.store(true, Ordering::Release);
+        });
+
+        let outcome = LoadSession::new(&config, 0, config.start_id, config.requests)
+            .run(Arc::new(Stats::new()), stop)
+            .await
+            .unwrap();
+
+        stopper.await.unwrap();
+        server.await.unwrap();
+        assert_eq!(outcome.drained_requests, 1);
+        assert_eq!(outcome.incomplete_requests, 0);
+        assert_eq!(outcome.timed_out_connections, 0);
+    }
+
+    #[tokio::test]
+    async fn server_publishes_session_stats_before_client_closes() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let stats = Arc::new(Stats::new());
+        let server_stats = stats.clone();
+        let server = tokio::spawn(async move {
+            let (stream, peer_addr) = listener.accept().await.unwrap();
+            serve_session(stream, peer_addr, test_config(), server_stats).await
+        });
+
+        let mut client = TcpStream::connect(address).await.unwrap();
+        let mut greeting = vec![0_u8; GREETING.len()];
+        client.read_exact(&mut greeting).await.unwrap();
+        assert_eq!(greeting, GREETING);
+        client.write_all(b"CAPABILITIES\r\n").await.unwrap();
+        let mut response = vec![0_u8; CAPABILITIES_RESPONSE.len()];
+        client.read_exact(&mut response).await.unwrap();
+
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.commands, 1);
+        assert_eq!(
+            snapshot.bytes_sent,
+            (GREETING.len() + response.len()) as u64
+        );
+
+        client.shutdown().await.unwrap();
+        server.await.unwrap().unwrap();
+        let final_snapshot = stats.snapshot();
+        assert_eq!(final_snapshot.commands, 1);
+        assert_eq!(
+            final_snapshot.bytes_sent,
+            (GREETING.len() + response.len()) as u64
+        );
     }
 }

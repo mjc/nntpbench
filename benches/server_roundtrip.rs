@@ -39,6 +39,7 @@ fn server_args(body_bytes: usize, article_bytes: usize) -> ServerArgs {
         stats_interval_secs: 0,
         flush: false,
         pending_write_bytes: 800 * 1024,
+        json: false,
     }
 }
 

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use bytes::{BufMut, Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::sync::{Mutex, OnceCell, mpsc, oneshot};
+use tokio::sync::{Mutex, OwnedMutexGuard, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::protocol::{
@@ -859,6 +859,16 @@ impl Client {
         self.execute_raw_exchange(Request::mode_reader()).await
     }
 
+    /// Send a MODE STREAM request and return the owned raw response frame.
+    pub async fn mode_stream(&self) -> Result<OwnedResponse, ClientError> {
+        self.execute_raw(Request::mode_stream()).await
+    }
+
+    /// Send a MODE STREAM request and return the completed raw request/response pair.
+    pub async fn mode_stream_exchange(&self) -> Result<OwnedExchange, ClientError> {
+        self.execute_raw_exchange(Request::mode_stream()).await
+    }
+
     /// Send a QUIT request and return the owned raw response frame.
     pub async fn quit(&self) -> Result<OwnedResponse, ClientError> {
         self.execute_raw(Request::quit()).await
@@ -928,7 +938,8 @@ impl ClientConnection {
             inner: Arc::new(ConnectionHandle {
                 request_tx,
                 poisoned,
-                capabilities_negotiated: Arc::new(OnceCell::new()),
+                capabilities_negotiated: Arc::new(Mutex::new(false)),
+                send_barrier: Arc::new(Mutex::new(())),
                 writer_task,
                 reader_task,
             }),
@@ -1749,6 +1760,16 @@ impl ClientConnection {
         self.execute_exchange(Request::ModeReader).await
     }
 
+    /// Send a MODE STREAM request and return the owned response frame.
+    pub async fn mode_stream(&self) -> Result<OwnedResponse, ClientError> {
+        self.execute(Request::ModeStream).await
+    }
+
+    /// Send a MODE STREAM request and return the completed request/response pair.
+    pub async fn mode_stream_exchange(&self) -> Result<OwnedExchange, ClientError> {
+        self.execute_exchange(Request::ModeStream).await
+    }
+
     /// Send a QUIT request and return the owned response frame.
     pub async fn quit(&self) -> Result<OwnedResponse, ClientError> {
         self.execute(Request::Quit).await
@@ -1761,6 +1782,8 @@ impl ClientConnection {
 
     /// Execute a client request on this connection.
     pub async fn execute(&self, request: Request<'static>) -> Result<OwnedResponse, ClientError> {
+        #[cfg(feature = "coz")]
+        coz::scope!("client.execute");
         self.queue_request(request).await?.receive().await
     }
 
@@ -1773,15 +1796,26 @@ impl ClientConnection {
             self.ensure_capabilities_negotiated(kind).await?;
         }
 
-        self.queue_request_unchecked(request, kind == RequestKind::Capabilities)
-            .await
+        self.queue_request_unchecked(
+            request,
+            kind == RequestKind::Capabilities,
+            request_kind_invalidates_capabilities(kind),
+        )
+        .await
     }
 
     async fn queue_request_unchecked(
         &self,
         request: Request<'static>,
         mark_capabilities_on_success: bool,
+        invalidate_capabilities_on_success: bool,
     ) -> Result<PendingResponse, ClientError> {
+        let barrier_guard = if request_kind_requires_barrier(request.kind()) {
+            Some(self.inner.send_barrier.clone().lock_owned().await)
+        } else {
+            None
+        };
+
         let (response_tx, response_rx) = oneshot::channel();
         self.inner
             .request_tx
@@ -1796,6 +1830,8 @@ impl ClientConnection {
             inner: self.inner.clone(),
             response_rx,
             mark_capabilities_on_success,
+            invalidate_capabilities_on_success,
+            barrier_guard,
         })
     }
 
@@ -1808,15 +1844,26 @@ impl ClientConnection {
             self.ensure_capabilities_negotiated(kind).await?;
         }
 
-        self.queue_request_exchange_unchecked(request, kind == RequestKind::Capabilities)
-            .await
+        self.queue_request_exchange_unchecked(
+            request,
+            kind == RequestKind::Capabilities,
+            request_kind_invalidates_capabilities(kind),
+        )
+        .await
     }
 
     async fn queue_request_exchange_unchecked(
         &self,
         request: Request<'static>,
         mark_capabilities_on_success: bool,
+        invalidate_capabilities_on_success: bool,
     ) -> Result<PendingExchange, ClientError> {
+        let barrier_guard = if request_kind_requires_barrier(request.kind()) {
+            Some(self.inner.send_barrier.clone().lock_owned().await)
+        } else {
+            None
+        };
+
         let (response_tx, response_rx) = oneshot::channel();
         self.inner
             .request_tx
@@ -1831,6 +1878,8 @@ impl ClientConnection {
             inner: self.inner.clone(),
             response_rx,
             mark_capabilities_on_success,
+            invalidate_capabilities_on_success,
+            barrier_guard,
         })
     }
 
@@ -1839,6 +1888,8 @@ impl ClientConnection {
         &self,
         request: Request<'static>,
     ) -> Result<OwnedExchange, ClientError> {
+        #[cfg(feature = "coz")]
+        coz::scope!("client.execute_exchange");
         self.queue_request_exchange(request).await?.receive().await
     }
 
@@ -1850,21 +1901,20 @@ impl ClientConnection {
             return Ok(());
         }
 
-        let response = self
-            .inner
-            .capabilities_negotiated
-            .get_or_try_init(|| async {
-                let pending = self
-                    .queue_request_unchecked(Request::Capabilities, false)
-                    .await?;
-                let response = pending.receive().await?;
-                if response.status().as_u16() != 101 {
-                    return Err(ClientError::CapabilitiesUnavailable);
-                }
-                Ok::<(), ClientError>(())
-            })
-            .await;
-        response.map(|_| ())
+        if *self.inner.capabilities_negotiated.lock().await {
+            return Ok(());
+        }
+
+        let pending = self
+            .queue_request_unchecked(Request::Capabilities, false, false)
+            .await?;
+        let response = pending.receive().await?;
+        if response.status().as_u16() != 101 {
+            return Err(ClientError::CapabilitiesUnavailable);
+        }
+
+        *self.inner.capabilities_negotiated.lock().await = true;
+        Ok(())
     }
 }
 
@@ -1887,6 +1937,31 @@ fn request_kind_requires_capabilities(kind: RequestKind) -> bool {
     )
 }
 
+fn request_kind_invalidates_capabilities(kind: RequestKind) -> bool {
+    matches!(
+        kind,
+        RequestKind::AuthInfoUser
+            | RequestKind::AuthInfoPass
+            | RequestKind::ModeReader
+            | RequestKind::StartTls
+    )
+}
+
+fn request_kind_requires_barrier(kind: RequestKind) -> bool {
+    matches!(
+        kind,
+        RequestKind::AuthInfoUser
+            | RequestKind::AuthInfoPass
+            | RequestKind::ModeReader
+            | RequestKind::StartTls
+            | RequestKind::Post
+            | RequestKind::Ihave
+            | RequestKind::Check
+            | RequestKind::TakeThis
+            | RequestKind::Quit
+    )
+}
+
 impl Drop for ConnectionHandle {
     fn drop(&mut self) {
         self.writer_task.abort();
@@ -1898,7 +1973,8 @@ impl Drop for ConnectionHandle {
 struct ConnectionHandle {
     request_tx: mpsc::Sender<QueuedRequest>,
     poisoned: Arc<Mutex<Option<SharedEngineError>>>,
-    capabilities_negotiated: Arc<OnceCell<()>>,
+    capabilities_negotiated: Arc<Mutex<bool>>,
+    send_barrier: Arc<Mutex<()>>,
     writer_task: JoinHandle<()>,
     reader_task: JoinHandle<()>,
 }
@@ -2410,6 +2486,8 @@ pub(crate) struct PendingResponse {
     inner: Arc<ConnectionHandle>,
     response_rx: oneshot::Receiver<Result<CompletedRequest, SharedEngineError>>,
     mark_capabilities_on_success: bool,
+    invalidate_capabilities_on_success: bool,
+    barrier_guard: Option<OwnedMutexGuard<()>>,
 }
 
 impl PendingResponse {
@@ -2431,10 +2509,14 @@ impl PendingResponse {
         match response.map_err(ClientError::from)?.response {
             CompletedResponse::Owned(response) => {
                 if self.mark_capabilities_on_success && response.status().as_u16() == 101 {
-                    let _ = self.inner.capabilities_negotiated.set(());
+                    *self.inner.capabilities_negotiated.lock().await = true;
                 } else if self.mark_capabilities_on_success {
                     return Err(ClientError::CapabilitiesUnavailable);
                 }
+                if self.invalidate_capabilities_on_success {
+                    *self.inner.capabilities_negotiated.lock().await = false;
+                }
+                drop(self.barrier_guard);
                 Ok(response)
             }
         }
@@ -2446,6 +2528,8 @@ pub(crate) struct PendingExchange {
     inner: Arc<ConnectionHandle>,
     response_rx: oneshot::Receiver<Result<CompletedRequest, SharedEngineError>>,
     mark_capabilities_on_success: bool,
+    invalidate_capabilities_on_success: bool,
+    barrier_guard: Option<OwnedMutexGuard<()>>,
 }
 
 impl PendingExchange {
@@ -2468,10 +2552,14 @@ impl PendingExchange {
         match completed.response {
             CompletedResponse::Owned(response) => {
                 if self.mark_capabilities_on_success && response.status().as_u16() == 101 {
-                    let _ = self.inner.capabilities_negotiated.set(());
+                    *self.inner.capabilities_negotiated.lock().await = true;
                 } else if self.mark_capabilities_on_success {
                     return Err(ClientError::CapabilitiesUnavailable);
                 }
+                if self.invalidate_capabilities_on_success {
+                    *self.inner.capabilities_negotiated.lock().await = false;
+                }
+                drop(self.barrier_guard);
                 Ok(OwnedExchange {
                     request: completed.request,
                     response,
@@ -2630,6 +2718,7 @@ where
         Request::Capabilities => write_simple_request_wire(writer, b"CAPABILITIES").await,
         Request::Date => write_simple_request_wire(writer, b"DATE").await,
         Request::ModeReader => write_simple_request_wire(writer, b"MODE READER").await,
+        Request::ModeStream => write_simple_request_wire(writer, b"MODE STREAM").await,
         Request::Quit => write_simple_request_wire(writer, b"QUIT").await,
     }
 }
@@ -4441,6 +4530,11 @@ mod tests {
                 .write_all(b"201 posting not permitted\r\n")
                 .await
                 .unwrap();
+            assert_read_request(&mut stream, b"MODE STREAM\r\n").await;
+            stream
+                .write_all(b"203 streaming enabled\r\n")
+                .await
+                .unwrap();
             assert_read_request(&mut stream, b"QUIT\r\n").await;
             stream.write_all(crate::QUIT_RESPONSE).await.unwrap();
         });
@@ -4465,6 +4559,7 @@ mod tests {
         let capabilities = connection.capabilities().await.unwrap();
         let date = connection.date().await.unwrap();
         let mode_reader = connection.mode_reader().await.unwrap();
+        let mode_stream = connection.mode_stream().await.unwrap();
         let quit = connection.quit().await.unwrap();
 
         assert_eq!(list.kind(), RequestKind::List);
@@ -4531,6 +4626,10 @@ mod tests {
         assert_eq!(mode_reader.kind(), RequestKind::ModeReader);
         assert_eq!(mode_reader.status().as_u16(), 201);
         assert_eq!(mode_reader.as_bytes(), b"201 posting not permitted\r\n");
+
+        assert_eq!(mode_stream.kind(), RequestKind::ModeStream);
+        assert_eq!(mode_stream.status().as_u16(), 203);
+        assert_eq!(mode_stream.as_bytes(), b"203 streaming enabled\r\n");
 
         assert_eq!(quit.kind(), RequestKind::Quit);
         assert_eq!(quit.status().as_u16(), 205);
@@ -4682,8 +4781,18 @@ mod tests {
             stream.write_all(crate::TAKETHIS_RESPONSE).await.unwrap();
             assert_read_request(&mut stream, b"AUTHINFO USER bench-user\r\n").await;
             stream.write_all(crate::AUTHINFO_RESPONSE).await.unwrap();
+            assert_read_request(&mut stream, b"CAPABILITIES\r\n").await;
+            stream
+                .write_all(b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nSTARTTLS\r\n.\r\n")
+                .await
+                .unwrap();
             assert_read_request(&mut stream, b"AUTHINFO PASS bench-pass\r\n").await;
             stream.write_all(crate::AUTHINFO_RESPONSE).await.unwrap();
+            assert_read_request(&mut stream, b"CAPABILITIES\r\n").await;
+            stream
+                .write_all(b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nSTARTTLS\r\n.\r\n")
+                .await
+                .unwrap();
             assert_read_request(&mut stream, b"STARTTLS\r\n").await;
             stream.write_all(crate::STARTTLS_RESPONSE).await.unwrap();
         });
@@ -4764,6 +4873,51 @@ mod tests {
             result.is_ok(),
             "RFC 3977 and RFC 4642 require capability negotiation before STARTTLS, but the client did not complete the negotiated path"
         );
+    }
+
+    #[tokio::test]
+    async fn client_connection_blocks_following_requests_behind_starttls_barrier() {
+        use std::time::Duration;
+
+        let listener = crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"201 client ready\r\n").await.unwrap();
+
+            assert_read_request(&mut stream, b"CAPABILITIES\r\n").await;
+            stream
+                .write_all(b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nSTARTTLS\r\n.\r\n")
+                .await
+                .unwrap();
+            assert_read_request(&mut stream, b"STARTTLS\r\n").await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), async {
+                    assert_read_request(&mut stream, b"QUIT\r\n").await;
+                })
+                .await
+                .is_err(),
+                "QUIT should not be pipelined behind STARTTLS before the TLS transition completes"
+            );
+
+            stream.write_all(crate::STARTTLS_RESPONSE).await.unwrap();
+            assert_read_request(&mut stream, b"QUIT\r\n").await;
+            stream.write_all(crate::QUIT_RESPONSE).await.unwrap();
+        });
+
+        let connection = ClientConnection::connect(addr).await.unwrap();
+        let starttls = connection.starttls();
+        let quit = connection.quit();
+
+        let starttls = starttls.await.unwrap();
+        let quit = quit.await.unwrap();
+
+        assert_eq!(starttls.kind(), RequestKind::StartTls);
+        assert_eq!(starttls.status().as_u16(), 382);
+        assert_eq!(quit.kind(), RequestKind::Quit);
+        assert_eq!(quit.status().as_u16(), 205);
+
+        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -5297,8 +5451,18 @@ mod tests {
             stream.write_all(crate::TAKETHIS_RESPONSE).await.unwrap();
             assert_read_request(&mut stream, b"AUTHINFO USER bench-user\r\n").await;
             stream.write_all(crate::AUTHINFO_RESPONSE).await.unwrap();
+            assert_read_request(&mut stream, b"CAPABILITIES\r\n").await;
+            stream
+                .write_all(b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nSTARTTLS\r\n.\r\n")
+                .await
+                .unwrap();
             assert_read_request(&mut stream, b"AUTHINFO PASS bench-pass\r\n").await;
             stream.write_all(crate::AUTHINFO_RESPONSE).await.unwrap();
+            assert_read_request(&mut stream, b"CAPABILITIES\r\n").await;
+            stream
+                .write_all(b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nSTARTTLS\r\n.\r\n")
+                .await
+                .unwrap();
             assert_read_request(&mut stream, b"STARTTLS\r\n").await;
             stream.write_all(crate::STARTTLS_RESPONSE).await.unwrap();
         });
