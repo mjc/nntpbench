@@ -10,10 +10,11 @@ use std::fs;
 use std::future::poll_fn;
 use std::io::{self, IoSlice, Read, Write};
 use std::net::SocketAddr;
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arrayvec::ArrayVec;
@@ -304,7 +305,7 @@ const XHDR_LINES_2_PLUS_RESPONSE: &[u8] = b"221 headers follow\r\n2 8\r\n3 12\r\
 pub const HEAD_RESPONSE: &[u8] = b"221 1 <article.1@nntpbench.local> article retrieved\r\nPath: nntpbench.local!mock\r\nFrom: Bench User <bench@nntpbench.local>\r\nNewsgroups: alt.binaries.bench\r\nSubject: nntpbench synthetic article\r\nMessage-ID: <article.1@nntpbench.local>\r\nDate: Fri, 15 May 2026 00:00:00 +0000\r\n.\r\n";
 pub const STAT_RESPONSE: &[u8] = b"223 1 <article.1@nntpbench.local> article retrieved\r\n";
 pub const HELP_RESPONSE: &[u8] =
-    b"100 help text follows\r\nARTICLE\r\nAUTHINFO\r\nBODY\r\nCAPABILITIES\r\nCHECK\r\nDATE\r\nGROUP\r\nHDR\r\nHEAD\r\nHELP\r\nIHAVE\r\nLAST\r\nLIST\r\nLISTGROUP\r\nMODE READER\r\nNEWGROUPS\r\nNEWNEWS\r\nNEXT\r\nOVER\r\nPOST\r\nQUIT\r\nSTARTTLS\r\nSTAT\r\nTAKETHIS\r\nXHDR\r\nXOVER\r\n.\r\n";
+    b"100 help text follows\r\nARTICLE\r\nBODY\r\nCAPABILITIES\r\nCHECK\r\nDATE\r\nGROUP\r\nHDR\r\nHEAD\r\nHELP\r\nLAST\r\nLIST\r\nLISTGROUP\r\nMODE READER\r\nNEWGROUPS\r\nNEWNEWS\r\nNEXT\r\nOVER\r\nQUIT\r\nSTAT\r\nXHDR\r\nXOVER\r\n.\r\n";
 pub const CAPABILITIES_RESPONSE: &[u8] =
     b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nLIST ACTIVE ACTIVE.TIMES DISTRIB.PATS NEWSGROUPS OVERVIEW.FMT HEADERS\r\nOVER MSGID\r\nHDR\r\nNEWNEWS\r\n.\r\n";
 pub const QUIT_RESPONSE: &[u8] = b"205 closing connection\r\n";
@@ -314,9 +315,15 @@ const ARTICLE_RESPONSE_PREFIX: &[u8] = b"220 1 <article.1@nntpbench.local> artic
 const ARTICLE_RESPONSE_HEADER_EXTRA_CAPACITY: usize = 256;
 const MAX_COMMAND_LINE_BYTES: usize = protocol::MAX_AUTHINFO_SASL_COMMAND_LINE_BYTES;
 const MAX_SERVER_PIPELINE_DEPTH: usize = 1024;
-const SERVER_READER_CAPACITY: usize = 256 * 1024;
+const SERVER_READER_CAPACITY: usize = 8 * 1024;
 const CLIENT_READER_CAPACITY: usize = 256 * 1024;
-const DEFAULT_PENDING_WRITE_BYTES: usize = 800 * 1024;
+const LOAD_STATS_FLUSH_COMMANDS: u64 = 1024;
+const MAX_BATCHED_ARTICLE_RESPONSES: usize = 8;
+const MAX_BATCHED_ARTICLE_RESPONSE_SLICES: usize = MAX_BATCHED_ARTICLE_RESPONSES * 3;
+const MAX_BATCHED_ARTICLE_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const DEFAULT_PENDING_WRITE_BYTES: usize = 64 * 1024;
+const DEFAULT_PENDING_WRITE_POOL_BUFFERS: usize = 4096;
+const GENERATED_RESPONSE_EXTRA_CAPACITY: usize = MAX_COMMAND_LINE_BYTES + 512;
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 const HIGH_THROUGHPUT_SOCKET_BUFFER: usize = 16 * 1024 * 1024;
 #[cfg(target_os = "macos")]
@@ -1020,7 +1027,7 @@ impl LoadSession {
         let mut issued = 0_u64;
         let mut received = 0_u64;
         let mut in_flight = 0_usize;
-
+        let mut session_stats = SessionStats::default();
         loop {
             if in_flight == 0 {
                 in_flight += self
@@ -1051,17 +1058,20 @@ impl LoadSession {
             stats
                 .bytes_sent
                 .fetch_add(response_len as u64, Ordering::Relaxed);
-            stats.commands.fetch_add(1, Ordering::Relaxed);
+            session_stats.commands = session_stats.commands.wrapping_add(1);
             match client_command_kind(command_id, self.command_mix) {
                 ClientCommandMix::Article => {
-                    stats.article_requests.fetch_add(1, Ordering::Relaxed);
+                    session_stats.article_requests = session_stats.article_requests.wrapping_add(1);
                 }
                 ClientCommandMix::Body => {
-                    stats.body_requests.fetch_add(1, Ordering::Relaxed);
+                    session_stats.body_requests = session_stats.body_requests.wrapping_add(1);
                 }
                 ClientCommandMix::Alternate => {
                     unreachable!("client_command_kind should normalize Alternate")
                 }
+            }
+            if session_stats.commands >= LOAD_STATS_FLUSH_COMMANDS {
+                flush_load_session_stats(stats, &mut session_stats);
             }
 
             if self.transfer_bytes != 0
@@ -1086,6 +1096,8 @@ impl LoadSession {
                 in_flight += filled;
             }
         }
+
+        flush_load_session_stats(stats, &mut session_stats);
 
         Ok(())
     }
@@ -1233,7 +1245,9 @@ where
 {
     let len = buffer.len();
     let chunk_len = read_chunk_bytes.max(1);
-    buffer.reserve(chunk_len);
+    if buffer.capacity() - len < chunk_len {
+        buffer.reserve(chunk_len);
+    }
     let read_len = chunk_len.min(buffer.capacity() - len);
     poll_fn(|cx| {
         let mut read_buf = ReadBuf::uninit(&mut buffer.spare_capacity_mut()[..read_len]);
@@ -1890,6 +1904,22 @@ fn transfer_limit_reached(stats: &Stats, transfer_bytes: u64) -> bool {
     transfer_bytes != 0 && stats.bytes_sent.load(Ordering::Relaxed) >= transfer_bytes
 }
 
+fn flush_load_session_stats(stats: &Stats, session_stats: &mut SessionStats) {
+    if session_stats.commands == 0 {
+        return;
+    }
+    stats
+        .commands
+        .fetch_add(session_stats.commands, Ordering::Relaxed);
+    stats
+        .article_requests
+        .fetch_add(session_stats.article_requests, Ordering::Relaxed);
+    stats
+        .body_requests
+        .fetch_add(session_stats.body_requests, Ordering::Relaxed);
+    *session_stats = SessionStats::default();
+}
+
 fn requests_for_connection(total: u64, connections: usize, index: usize) -> u64 {
     if total == 0 {
         return 0;
@@ -1923,14 +1953,14 @@ async fn serve_session_inner(
     let mut reader = BufReader::with_capacity(SERVER_READER_CAPACITY, reader);
     let max_pipeline_depth = config.max_pipeline_depth.min(MAX_SERVER_PIPELINE_DEPTH);
     let mut command_line = [0; MAX_COMMAND_LINE_BYTES];
-    let mut command_lines = Some(CommandLineBatch::default());
+    let mut command_lines = Some(CommandLineBatch::with_capacity(max_pipeline_depth));
     let mut command_batch: Box<CommandBatch> = Box::default();
-    let mut pending_write = PendingWrite::new(config.pending_write_bytes);
-    let mut article_path = PathBuf::with_capacity(1024);
+    let mut pending_write = PendingWrite::from_pool(&config.pending_write_pool);
+    let mut article_path = PathBuf::new();
     let mut session_state = SessionState::default();
     let mut response_buffer =
-        Vec::with_capacity(config.article_bytes.max(config.body_bytes).max(512));
-    let mut aux_response_buffer = Vec::with_capacity(512);
+        GeneratedResponseBuffer::from_pool(&config.generated_response_buffer_pool);
+    let mut aux_response_buffer = Vec::new();
 
     send_greeting(&mut writer, &config, session_stats).await?;
 
@@ -2137,8 +2167,27 @@ where
 {
     session_stats.pipeline_batches += u64::from(command_batch.len() > 1);
 
-    for command in command_batch {
-        if handle_command(
+    let mut command_index = 0;
+    while command_index < command_batch.len() {
+        if let Some(command_lines) = command_lines {
+            let batched = write_batched_message_id_article_responses(
+                &command_batch[command_index..],
+                command_lines,
+                config,
+                session_stats,
+                writer,
+                pending_write,
+                response_buffer,
+            )
+            .await?;
+            if batched != 0 {
+                command_index += batched;
+                continue;
+            }
+        }
+
+        let command = &command_batch[command_index];
+        let should_close = handle_command(
             command,
             command_lines,
             config,
@@ -2150,11 +2199,12 @@ where
             response_buffer,
             aux_response_buffer,
         )
-        .await?
-        {
+        .await?;
+        if should_close {
             flush_session_writer(writer, pending_write, config).await?;
             return Ok(BatchOutcome::Close);
         }
+        command_index += 1;
     }
 
     flush_session_writer(writer, pending_write, config).await?;
@@ -3169,9 +3219,21 @@ where
     }
 }
 
+#[derive(Debug, Clone)]
+struct BufferPool {
+    inner: Arc<Mutex<Vec<Vec<u8>>>>,
+    capacity: usize,
+    max_buffers: usize,
+}
+
 struct PendingWrite {
-    buf: Box<[u8]>,
-    len: usize,
+    buf: Vec<u8>,
+    pool: Option<BufferPool>,
+}
+
+struct GeneratedResponseBuffer {
+    buf: Vec<u8>,
+    pool: Option<BufferPool>,
 }
 
 struct GeneratedResponse<'a> {
@@ -3211,12 +3273,30 @@ fn build_repeated_payload(target_bytes: usize) -> Box<[u8]> {
     buffer.into_boxed_slice()
 }
 
+fn generated_response_buffer_capacity(article_bytes: usize, body_bytes: usize) -> usize {
+    article_bytes
+        .max(body_bytes)
+        .max(512)
+        .saturating_add(GENERATED_RESPONSE_EXTRA_CAPACITY)
+}
+
+fn ensure_vec_capacity(buffer: &mut Vec<u8>, total_capacity: usize) {
+    let additional = total_capacity.saturating_sub(buffer.capacity());
+    if additional != 0 {
+        buffer.reserve(additional);
+    }
+}
+
 fn append_synthetic_article_headers(buffer: &mut Vec<u8>, message_id: &str) {
-    write!(
-        buffer,
-        "Path: nntpbench.local!mock\r\nFrom: Bench User <bench@nntpbench.local>\r\nNewsgroups: alt.binaries.bench\r\nSubject: nntpbench synthetic article\r\nMessage-ID: {message_id}\r\nDate: Fri, 15 May 2026 00:00:00 +0000\r\n"
-    )
-    .expect("write to Vec cannot fail");
+    append_synthetic_article_headers_bytes(buffer, message_id.as_bytes());
+}
+
+fn append_synthetic_article_headers_bytes(buffer: &mut Vec<u8>, message_id: &[u8]) {
+    buffer.extend_from_slice(
+        b"Path: nntpbench.local!mock\r\nFrom: Bench User <bench@nntpbench.local>\r\nNewsgroups: alt.binaries.bench\r\nSubject: nntpbench synthetic article\r\nMessage-ID: ",
+    );
+    buffer.extend_from_slice(message_id);
+    buffer.extend_from_slice(b"\r\nDate: Fri, 15 May 2026 00:00:00 +0000\r\n");
 }
 
 fn build_article_response_header_into<'a>(
@@ -3225,17 +3305,30 @@ fn build_article_response_header_into<'a>(
     message_id: &str,
 ) -> &'a [u8] {
     buffer.clear();
-    buffer.reserve(
+    ensure_vec_capacity(
+        buffer,
         ARTICLE_RESPONSE_PREFIX
             .len()
             .saturating_add(message_id.len())
             .saturating_add(ARTICLE_RESPONSE_HEADER_EXTRA_CAPACITY),
     );
+    append_article_response_header(buffer, article_id, message_id);
+    buffer.as_slice()
+}
+
+fn append_article_response_header(buffer: &mut Vec<u8>, article_id: u64, message_id: &str) {
     write!(buffer, "220 {article_id} {message_id} article follows\r\n")
         .expect("write to Vec cannot fail");
     append_synthetic_article_headers(buffer, message_id);
     buffer.extend_from_slice(CRLF);
-    buffer.as_slice()
+}
+
+fn append_message_id_article_response_header(buffer: &mut Vec<u8>, message_id: &[u8]) {
+    buffer.extend_from_slice(b"220 0 ");
+    buffer.extend_from_slice(message_id);
+    buffer.extend_from_slice(b" article follows\r\n");
+    append_synthetic_article_headers_bytes(buffer, message_id);
+    buffer.extend_from_slice(CRLF);
 }
 
 fn build_selected_article_response_into(
@@ -3247,20 +3340,6 @@ fn build_selected_article_response_into(
     write!(&mut message_id, "<article.{article_id}@nntpbench.local>")
         .expect("write to ArrayString cannot fail");
     build_article_response_into(buffer, article_id, &message_id, target_bytes)
-}
-
-fn build_selected_article_response(article_id: u64, target_bytes: usize) -> Box<[u8]> {
-    let mut buffer = Vec::with_capacity(target_bytes.max(ARTICLE_RESPONSE_PREFIX.len()));
-    build_selected_article_response_into(&mut buffer, article_id, target_bytes)
-        .to_vec()
-        .into_boxed_slice()
-}
-
-fn build_message_id_article_response(message_id: &MessageId<'_>, target_bytes: usize) -> Box<[u8]> {
-    let mut buffer = Vec::with_capacity(target_bytes.max(ARTICLE_RESPONSE_PREFIX.len()));
-    build_message_id_article_response_into(&mut buffer, message_id, target_bytes)
-        .to_vec()
-        .into_boxed_slice()
 }
 
 fn build_message_id_article_response_into<'a>(
@@ -3278,6 +3357,12 @@ fn build_article_response_into<'a>(
     target_bytes: usize,
 ) -> &'a [u8] {
     buffer.clear();
+    ensure_vec_capacity(
+        buffer,
+        target_bytes
+            .max(ARTICLE_RESPONSE_PREFIX.len())
+            .saturating_add(GENERATED_RESPONSE_EXTRA_CAPACITY),
+    );
     build_article_response_header_into(buffer, article_id, message_id);
 
     if buffer.len() < target_bytes {
@@ -3300,20 +3385,6 @@ fn build_selected_body_response_into(
     build_body_response_into(buffer, article_id, &message_id, target_bytes)
 }
 
-fn build_selected_body_response(article_id: u64, target_bytes: usize) -> Box<[u8]> {
-    let mut buffer = Vec::with_capacity(target_bytes.max(BODY_RESPONSE_PREFIX.len()));
-    build_selected_body_response_into(&mut buffer, article_id, target_bytes)
-        .to_vec()
-        .into_boxed_slice()
-}
-
-fn build_message_id_body_response(message_id: &MessageId<'_>, target_bytes: usize) -> Box<[u8]> {
-    let mut buffer = Vec::with_capacity(target_bytes.max(BODY_RESPONSE_PREFIX.len()));
-    build_message_id_body_response_into(&mut buffer, message_id, target_bytes)
-        .to_vec()
-        .into_boxed_slice()
-}
-
 fn build_message_id_body_response_into<'a>(
     buffer: &'a mut Vec<u8>,
     message_id: &MessageId<'_>,
@@ -3329,6 +3400,12 @@ fn build_body_response_into<'a>(
     target_bytes: usize,
 ) -> &'a [u8] {
     buffer.clear();
+    ensure_vec_capacity(
+        buffer,
+        target_bytes
+            .max(BODY_RESPONSE_PREFIX.len())
+            .saturating_add(GENERATED_RESPONSE_EXTRA_CAPACITY),
+    );
     write!(buffer, "222 {article_id} {message_id} body follows\r\n")
         .expect("write to Vec cannot fail");
 
@@ -3346,20 +3423,6 @@ fn build_selected_head_response_into(buffer: &mut Vec<u8>, article_id: u64) -> &
     write!(&mut message_id, "<article.{article_id}@nntpbench.local>")
         .expect("write to ArrayString cannot fail");
     build_head_response_into(buffer, article_id, &message_id)
-}
-
-fn build_selected_head_response(article_id: u64) -> Box<[u8]> {
-    let mut buffer = Vec::new();
-    build_selected_head_response_into(&mut buffer, article_id)
-        .to_vec()
-        .into_boxed_slice()
-}
-
-fn build_message_id_head_response(message_id: &MessageId<'_>) -> Box<[u8]> {
-    let mut buffer = Vec::new();
-    build_message_id_head_response_into(&mut buffer, message_id)
-        .to_vec()
-        .into_boxed_slice()
 }
 
 fn build_message_id_head_response_into<'a>(
@@ -3390,20 +3453,6 @@ fn build_selected_stat_response_into(buffer: &mut Vec<u8>, article_id: u64) -> &
     write!(&mut message_id, "<article.{article_id}@nntpbench.local>")
         .expect("write to ArrayString cannot fail");
     build_stat_response_into(buffer, article_id, &message_id)
-}
-
-fn build_selected_stat_response(article_id: u64) -> Box<[u8]> {
-    let mut buffer = Vec::new();
-    build_selected_stat_response_into(&mut buffer, article_id)
-        .to_vec()
-        .into_boxed_slice()
-}
-
-fn build_message_id_stat_response(message_id: &MessageId<'_>) -> Box<[u8]> {
-    let mut buffer = Vec::new();
-    build_message_id_stat_response_into(&mut buffer, message_id)
-        .to_vec()
-        .into_boxed_slice()
 }
 
 fn build_message_id_stat_response_into<'a>(
@@ -3456,31 +3505,80 @@ impl GeneratedResponse<'_> {
     }
 }
 
+impl BufferPool {
+    fn new(capacity: usize, max_buffers: usize) -> Self {
+        let max_buffers = max_buffers.max(1);
+        Self {
+            inner: Arc::new(Mutex::new(Vec::with_capacity(max_buffers))),
+            capacity: capacity.max(1),
+            max_buffers,
+        }
+    }
+
+    fn acquire(&self) -> Vec<u8> {
+        let buf = self
+            .inner
+            .lock()
+            .ok()
+            .and_then(|mut buffers| buffers.pop())
+            .unwrap_or_else(|| Vec::with_capacity(self.capacity));
+
+        debug_assert_eq!(buf.len(), 0);
+        buf
+    }
+
+    fn release(&self, mut buf: Vec<u8>) {
+        if buf.capacity() != self.capacity {
+            return;
+        }
+        buf.clear();
+        if let Ok(mut buffers) = self.inner.lock()
+            && buffers.len() < self.max_buffers
+        {
+            buffers.push(buf);
+        }
+    }
+
+    #[cfg(test)]
+    fn available_for_test(&self) -> usize {
+        self.inner.lock().map_or(0, |buffers| buffers.len())
+    }
+}
+
 #[cfg_attr(coverage_nightly, coverage(off))]
 impl PendingWrite {
+    fn from_pool(pool: &BufferPool) -> Self {
+        Self {
+            buf: pool.acquire(),
+            pool: Some(pool.clone()),
+        }
+    }
+    #[cfg(test)]
     fn new(capacity: usize) -> Self {
         Self {
-            buf: vec![0; capacity.max(1)].into_boxed_slice(),
-            len: 0,
+            buf: Vec::with_capacity(capacity.max(1)),
+            pool: None,
         }
+    }
+
+    fn capacity(&self) -> usize {
+        self.buf.capacity()
     }
 
     async fn push<W>(&mut self, writer: &mut W, response: &[u8]) -> io::Result<()>
     where
         W: AsyncWrite + Unpin,
     {
-        if response.len() > self.buf.len() {
+        if response.len() > self.capacity() {
             self.write_with_response(writer, response).await?;
             return Ok(());
         }
 
-        if self.len + response.len() > self.buf.len() {
+        if self.buf.len() + response.len() > self.capacity() {
             self.flush(writer).await?;
         }
 
-        let end = self.len + response.len();
-        self.buf[self.len..end].copy_from_slice(response);
-        self.len = end;
+        self.buf.extend_from_slice(response);
         Ok(())
     }
 
@@ -3488,14 +3586,14 @@ impl PendingWrite {
     where
         W: AsyncWrite + Unpin,
     {
-        if self.len == 0 {
+        if self.buf.is_empty() {
             writer.write_all(response).await?;
             return Ok(());
         }
 
-        let mut slices = [IoSlice::new(&self.buf[..self.len]), IoSlice::new(response)];
+        let mut slices = [IoSlice::new(&self.buf), IoSlice::new(response)];
         write_all_vectored(writer, &mut slices).await?;
-        self.len = 0;
+        self.buf.clear();
         Ok(())
     }
 
@@ -3503,13 +3601,76 @@ impl PendingWrite {
     where
         W: AsyncWrite + Unpin,
     {
-        if self.len == 0 {
+        if self.buf.is_empty() {
             return Ok(());
         }
 
-        writer.write_all(&self.buf[..self.len]).await?;
-        self.len = 0;
+        writer.write_all(&self.buf).await?;
+        self.buf.clear();
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.buf.len()
+    }
+
+    #[cfg(test)]
+    fn capacity_for_test(&self) -> usize {
+        self.capacity()
+    }
+
+    #[cfg(test)]
+    fn buffer_ptr_for_test(&self) -> *const u8 {
+        self.buf.as_ptr()
+    }
+}
+
+impl Drop for PendingWrite {
+    fn drop(&mut self) {
+        if let Some(pool) = self.pool.take() {
+            pool.release(std::mem::take(&mut self.buf));
+        }
+    }
+}
+
+impl Deref for GeneratedResponseBuffer {
+    type Target = Vec<u8>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.buf
+    }
+}
+
+impl DerefMut for GeneratedResponseBuffer {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.buf
+    }
+}
+
+impl GeneratedResponseBuffer {
+    fn from_pool(pool: &BufferPool) -> Self {
+        Self {
+            buf: pool.acquire(),
+            pool: Some(pool.clone()),
+        }
+    }
+    #[cfg(test)]
+    fn capacity_for_test(&self) -> usize {
+        self.buf.capacity()
+    }
+
+    #[cfg(test)]
+    fn buffer_ptr_for_test(&self) -> *const u8 {
+        self.buf.as_ptr()
+    }
+}
+
+impl Drop for GeneratedResponseBuffer {
+    fn drop(&mut self) {
+        if let Some(pool) = self.pool.take() {
+            pool.release(std::mem::take(&mut self.buf));
+        }
     }
 }
 
@@ -3587,7 +3748,11 @@ where
                 return false;
             }
             if let Some(message_id) = request.message_id() {
-                let response = build_message_id_article_response(&message_id, config.article_bytes);
+                let response = build_message_id_article_response_into(
+                    response_buffer,
+                    &message_id,
+                    config.article_bytes,
+                );
                 stats
                     .bytes_sent
                     .fetch_add(response.len() as u64, Ordering::Relaxed);
@@ -3595,7 +3760,11 @@ where
                 return false;
             }
             if let Some(article_id) = parse_article_id_arg(request.args()).filter(|id| *id != 1) {
-                let response = build_selected_article_response(article_id, config.article_bytes);
+                let response = build_selected_article_response_into(
+                    response_buffer,
+                    article_id,
+                    config.article_bytes,
+                );
                 stats
                     .bytes_sent
                     .fetch_add(response.len() as u64, Ordering::Relaxed);
@@ -3613,7 +3782,7 @@ where
         RequestKind::Head => {
             stats.article_requests.fetch_add(1, Ordering::Relaxed);
             if let Some(message_id) = request.message_id() {
-                let response = build_message_id_head_response(&message_id);
+                let response = build_message_id_head_response_into(response_buffer, &message_id);
                 stats
                     .bytes_sent
                     .fetch_add(response.len() as u64, Ordering::Relaxed);
@@ -3635,7 +3804,7 @@ where
                 return false;
             }
             if article_id != 1 {
-                let response = build_selected_head_response(article_id);
+                let response = build_selected_head_response_into(response_buffer, article_id);
                 stats
                     .bytes_sent
                     .fetch_add(response.len() as u64, Ordering::Relaxed);
@@ -3653,7 +3822,7 @@ where
         RequestKind::Stat => {
             stats.article_requests.fetch_add(1, Ordering::Relaxed);
             if let Some(message_id) = request.message_id() {
-                let response = build_message_id_stat_response(&message_id);
+                let response = build_message_id_stat_response_into(response_buffer, &message_id);
                 stats
                     .bytes_sent
                     .fetch_add(response.len() as u64, Ordering::Relaxed);
@@ -3675,7 +3844,7 @@ where
                 return false;
             }
             if article_id != 1 {
-                let response = build_selected_stat_response(article_id);
+                let response = build_selected_stat_response_into(response_buffer, article_id);
                 stats
                     .bytes_sent
                     .fetch_add(response.len() as u64, Ordering::Relaxed);
@@ -3693,7 +3862,11 @@ where
         RequestKind::Body => {
             stats.body_requests.fetch_add(1, Ordering::Relaxed);
             if let Some(message_id) = request.message_id() {
-                let response = build_message_id_body_response(&message_id, config.body_bytes);
+                let response = build_message_id_body_response_into(
+                    response_buffer,
+                    &message_id,
+                    config.body_bytes,
+                );
                 stats
                     .bytes_sent
                     .fetch_add(response.len() as u64, Ordering::Relaxed);
@@ -3715,7 +3888,11 @@ where
                 return false;
             }
             if article_id != 1 {
-                let response = build_selected_body_response(article_id, config.body_bytes);
+                let response = build_selected_body_response_into(
+                    response_buffer,
+                    article_id,
+                    config.body_bytes,
+                );
                 stats
                     .bytes_sent
                     .fetch_add(response.len() as u64, Ordering::Relaxed);
@@ -3921,6 +4098,75 @@ where
     write_all_vectored(writer, &mut slices).await
 }
 
+async fn write_batched_message_id_article_responses<W>(
+    commands: &[ParsedCommand],
+    command_lines: &CommandLineBatch,
+    config: &ServerConfig,
+    session_stats: &mut SessionStats,
+    writer: &mut W,
+    pending_write: &mut PendingWrite,
+    response_buffer: &mut Vec<u8>,
+) -> io::Result<usize>
+where
+    W: AsyncWrite + Unpin,
+{
+    if commands.len() < 2 || config.article_dir.is_some() {
+        return Ok(0);
+    }
+
+    response_buffer.clear();
+    let mut ranges = ArrayVec::<(usize, usize, usize), MAX_BATCHED_ARTICLE_RESPONSES>::new();
+    let mut batch_bytes = 0_usize;
+    for command in commands.iter().take(MAX_BATCHED_ARTICLE_RESPONSES) {
+        if !matches!(command.kind, RequestKind::Article) {
+            break;
+        }
+        let Some(message_id) = command_message_id_bytes(command, command_lines) else {
+            break;
+        };
+        let header_start = response_buffer.len();
+        append_message_id_article_response_header(response_buffer, message_id);
+        let header_end = response_buffer.len();
+        let payload_len = repeated_payload_len_at_least(
+            config
+                .article_bytes
+                .saturating_sub(header_end - header_start),
+        );
+        let response_len = (header_end - header_start) + payload_len + DOT_TERMINATOR.len();
+        if !ranges.is_empty()
+            && batch_bytes.saturating_add(response_len) > MAX_BATCHED_ARTICLE_RESPONSE_BYTES
+        {
+            response_buffer.truncate(header_start);
+            break;
+        }
+        batch_bytes += response_len;
+        ranges.push((header_start, header_end, payload_len));
+    }
+
+    if ranges.len() < 2 {
+        return Ok(0);
+    }
+
+    session_stats.commands += ranges.len() as u64;
+    session_stats.article_requests += ranges.len() as u64;
+    session_stats.bytes_sent += ranges
+        .iter()
+        .map(|(start, end, payload_len)| {
+            (end - start) as u64 + *payload_len as u64 + DOT_TERMINATOR.len() as u64
+        })
+        .sum::<u64>();
+
+    pending_write.flush(writer).await?;
+    let mut slices = ArrayVec::<IoSlice<'_>, MAX_BATCHED_ARTICLE_RESPONSE_SLICES>::new();
+    for (start, end, payload_len) in ranges {
+        slices.push(IoSlice::new(&response_buffer[start..end]));
+        slices.push(IoSlice::new(&config.article_payload[..payload_len]));
+        slices.push(IoSlice::new(DOT_TERMINATOR));
+    }
+    write_all_vectored(writer, slices.as_mut_slice()).await?;
+    Ok(slices.len() / 3)
+}
+
 fn open_stored_article_response(
     config: &ServerConfig,
     article_id: Option<u64>,
@@ -3951,7 +4197,7 @@ fn stored_article_message_id_exists(config: &ServerConfig, message_id: &MessageI
         return false;
     }
 
-    let mut article_path = PathBuf::with_capacity(1024);
+    let mut article_path = PathBuf::new();
     matches!(
         open_stored_article_response(config, None, Some(message_id), &mut article_path),
         Ok(Some(_))
@@ -4404,7 +4650,7 @@ fn write_stored_article_response_to<W>(
 where
     W: Write,
 {
-    let mut article_path = PathBuf::with_capacity(1024);
+    let mut article_path = PathBuf::new();
     let Some(file) =
         open_stored_article_response(config, article_id, message_id, &mut article_path)?
     else {
@@ -4490,6 +4736,8 @@ pub struct ServerConfig {
     pub stats_interval: Duration,
     pub flush: bool,
     pub pending_write_bytes: usize,
+    pending_write_pool: BufferPool,
+    generated_response_buffer_pool: BufferPool,
     pub nodelay: bool,
     pub socket_recv_buffer: usize,
     pub socket_send_buffer: usize,
@@ -4522,6 +4770,18 @@ impl ServerConfig {
             stats_interval: Duration::from_secs(args.stats_interval_secs),
             flush: args.flush,
             pending_write_bytes: args.pending_write_bytes.max(1),
+            pending_write_pool: BufferPool::new(
+                args.pending_write_bytes.max(1),
+                args.max_connections
+                    .max(1)
+                    .min(DEFAULT_PENDING_WRITE_POOL_BUFFERS),
+            ),
+            generated_response_buffer_pool: BufferPool::new(
+                generated_response_buffer_capacity(args.article_bytes, args.body_bytes),
+                args.max_connections
+                    .max(1)
+                    .min(DEFAULT_PENDING_WRITE_POOL_BUFFERS),
+            ),
             nodelay: args.nodelay,
             socket_recv_buffer: args.socket_recv_buffer,
             socket_send_buffer: args.socket_send_buffer,
@@ -4800,26 +5060,64 @@ struct ParsedMessageId {
 type CommandBatch = ArrayVec<ParsedCommand, MAX_SERVER_PIPELINE_DEPTH>;
 
 struct CommandLineBatch {
-    lines: Box<[[u8; MAX_COMMAND_LINE_BYTES]]>,
+    bytes: Vec<u8>,
+    lines: Vec<CommandLineSpan>,
+    line_capacity_hint: usize,
+}
+
+#[derive(Clone, Copy)]
+struct CommandLineSpan {
+    start: u32,
+    len: u16,
 }
 
 impl Default for CommandLineBatch {
     fn default() -> Self {
-        let mut lines = Vec::with_capacity(MAX_SERVER_PIPELINE_DEPTH);
-        lines.resize_with(MAX_SERVER_PIPELINE_DEPTH, || [0; MAX_COMMAND_LINE_BYTES]);
-        Self {
-            lines: lines.into_boxed_slice(),
-        }
+        Self::with_capacity(MAX_SERVER_PIPELINE_DEPTH)
     }
 }
 
 impl CommandLineBatch {
+    fn clear(&mut self) {
+        self.bytes.clear();
+        self.lines.clear();
+    }
+
+    fn with_capacity(line_count: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            lines: Vec::new(),
+            line_capacity_hint: line_count.max(1),
+        }
+    }
+
     fn copy_line(&mut self, slot: usize, line: &[u8]) {
-        self.lines[slot][..line.len()].copy_from_slice(line);
+        debug_assert_eq!(slot, self.lines.len());
+        if self.bytes.capacity() == 0 {
+            self.bytes
+                .reserve(self.line_capacity_hint.saturating_mul(64));
+        }
+        if self.lines.capacity() == 0 {
+            self.lines.reserve(self.line_capacity_hint);
+        }
+        let start = self.bytes.len();
+        self.bytes.extend_from_slice(line);
+        self.lines.push(CommandLineSpan {
+            start: start.try_into().unwrap_or(u32::MAX),
+            len: line.len().try_into().unwrap_or(u16::MAX),
+        });
     }
 
     fn line_slice(&self, slot: usize, start: usize, len: usize) -> &[u8] {
-        &self.lines[slot][start..start + len]
+        let line = self.line(slot);
+        &line[start..start + len]
+    }
+
+    fn line(&self, slot: usize) -> &[u8] {
+        let span = self.lines[slot];
+        let start = span.start as usize;
+        let end = start + usize::from(span.len);
+        &self.bytes[start..end]
     }
 }
 
@@ -4835,6 +5133,9 @@ where
     R: tokio::io::AsyncRead + Unpin,
 {
     command_batch.clear();
+    if let Some(command_lines) = command_lines.as_deref_mut() {
+        command_lines.clear();
+    }
     let Some(line_len) = read_crlf_line_into(reader, command_line).await? else {
         return Ok(false);
     };
@@ -4847,11 +5148,7 @@ where
     .await?;
 
     while command_batch.len() < max_pipeline_depth {
-        if find_crlf_line_end(reader.buffer(), 0).is_none() {
-            break;
-        }
-
-        let Some(line_len) = read_crlf_line_into(reader, command_line).await? else {
+        let Some(line_len) = read_buffered_crlf_line_into(reader, command_line) else {
             break;
         };
         push_command(
@@ -4864,6 +5161,26 @@ where
     }
 
     Ok(true)
+}
+
+fn read_buffered_crlf_line_into<R>(
+    reader: &mut BufReader<R>,
+    line: &mut [u8; MAX_COMMAND_LINE_BYTES],
+) -> Option<usize>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let available = reader.buffer();
+    let take = find_crlf_line_end(available, 0)?;
+    if take > line.len() {
+        reader.consume(take);
+        line[..14].copy_from_slice(b"DATE too-long\n");
+        return Some(14);
+    }
+
+    line[..take].copy_from_slice(&available[..take]);
+    reader.consume(take);
+    Some(take)
 }
 
 async fn read_crlf_line_into<R>(reader: &mut R, line: &mut [u8]) -> io::Result<Option<usize>>
@@ -4958,6 +5275,10 @@ fn is_known_transfer_command(line: &[u8], verb: &[u8]) -> bool {
 }
 
 fn parse_command_line(line: &[u8], line_slot: usize) -> ParsedCommand {
+    if let Some(command) = parse_fast_article_message_id_command(line, line_slot) {
+        return command;
+    }
+
     let request = RequestLine::parse(line);
     ParsedCommand {
         kind: request.kind(),
@@ -4974,6 +5295,36 @@ fn parse_command_line(line: &[u8], line_slot: usize) -> ParsedCommand {
         has_transfer_body: false,
         line_too_long: command_line_is_too_long(line),
     }
+}
+
+fn parse_fast_article_message_id_command(line: &[u8], line_slot: usize) -> Option<ParsedCommand> {
+    let line = line.strip_suffix(CRLF)?;
+    let message_id = line.strip_prefix(b"ARTICLE ")?;
+    if !message_id_is_valid_bytes(message_id) {
+        return None;
+    }
+    Some(ParsedCommand {
+        kind: RequestKind::Article,
+        article_id: None,
+        line_slot: line_slot.try_into().ok()?,
+        message_id: Some(ParsedMessageId {
+            start: b"ARTICLE ".len().try_into().ok()?,
+            len: message_id.len().try_into().ok()?,
+        }),
+        syntax_error: false,
+        authinfo_sasl_base64_error: false,
+        has_transfer_body: false,
+        line_too_long: false,
+    })
+}
+
+fn message_id_is_valid_bytes(value: &[u8]) -> bool {
+    (3..=250).contains(&value.len())
+        && value.first() == Some(&b'<')
+        && value.last() == Some(&b'>')
+        && value[1..value.len() - 1]
+            .iter()
+            .all(|byte| matches!(*byte, 0x21..=0x3d | 0x3f..=0x7e))
 }
 
 fn authinfo_sasl_initial_response_base64_error(verb: &[u8], args: &[u8]) -> bool {
@@ -5085,15 +5436,22 @@ fn command_message_id<'a>(
     command: &ParsedCommand,
     command_lines: &'a CommandLineBatch,
 ) -> Option<MessageId<'a>> {
+    let bytes = command_message_id_bytes(command, command_lines)?;
+    let value = std::str::from_utf8(bytes).ok()?;
+    MessageId::from_borrowed(value).ok()
+}
+
+fn command_message_id_bytes<'a>(
+    command: &ParsedCommand,
+    command_lines: &'a CommandLineBatch,
+) -> Option<&'a [u8]> {
     let message_id = command.message_id?;
     let line_slot = usize::from(command.line_slot);
-    let bytes = command_lines.line_slice(
+    Some(command_lines.line_slice(
         line_slot,
         usize::from(message_id.start),
         usize::from(message_id.len),
-    );
-    let value = std::str::from_utf8(bytes).ok()?;
-    MessageId::from_borrowed(value).ok()
+    ))
 }
 
 fn is_command_ws(byte: u8) -> bool {
@@ -5127,12 +5485,8 @@ fn command_args<'a>(
 ) -> Option<&'a [u8]> {
     let command_lines = command_lines?;
     let line_slot = usize::from(command.line_slot);
-    let line = command_lines.line_slice(line_slot, 0, MAX_COMMAND_LINE_BYTES);
-    let end = line
-        .iter()
-        .position(|byte| *byte == 0)
-        .unwrap_or(line.len());
-    let line = strip_complete_crlf_line(&line[..end]).unwrap_or(&line[..end]);
+    let line = command_lines.line(line_slot);
+    let line = strip_complete_crlf_line(line).unwrap_or(line);
     let split = line.iter().position(|byte| is_command_ws(*byte))?;
     Some(skip_command_ws(&line[split..]))
 }
@@ -5565,14 +5919,17 @@ fn article_selector_error(
     {
         return Some(b"423 no article with that number\r\n");
     }
-    if let Some(message_id) = command_lines.and_then(|lines| command_message_id(command, lines)) {
-        if let Some(index) = index
+    if let Some(index) = index {
+        if let Some(message_id) = command_lines.and_then(|lines| command_message_id(command, lines))
             && index.article_entry_for_message_id(&message_id).is_none()
             && !stored_article_message_id_exists(config, &message_id)
         {
             return Some(b"430 no article with that message-id\r\n");
         }
-    } else if command.message_id.is_some() && contains_subslice(args, b"missing") {
+    } else if command.message_id.is_some()
+        && command_lines.is_none()
+        && contains_subslice(args, b"missing")
+    {
         return Some(b"430 no article with that message-id\r\n");
     }
     None
@@ -7131,6 +7488,38 @@ mod tests {
         let guard = AllocationCountGuard::start();
         run();
         guard.finish(label);
+    }
+
+    fn poll_to_completion<F>(future: F) -> F::Output
+    where
+        F: std::future::Future,
+    {
+        use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+        unsafe fn clone(_: *const ()) -> RawWaker {
+            raw_waker()
+        }
+
+        unsafe fn wake(_: *const ()) {}
+
+        unsafe fn wake_by_ref(_: *const ()) {}
+
+        unsafe fn drop(_: *const ()) {}
+
+        fn raw_waker() -> RawWaker {
+            static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
+            RawWaker::new(std::ptr::null(), &VTABLE)
+        }
+
+        let waker = unsafe { Waker::from_raw(raw_waker()) };
+        let mut cx = Context::from_waker(&waker);
+        let mut future = std::pin::pin!(future);
+        loop {
+            match future.as_mut().poll(&mut cx) {
+                Poll::Ready(output) => return output,
+                Poll::Pending => continue,
+            }
+        }
     }
 
     struct FixedWrite<const N: usize> {
@@ -9115,7 +9504,6 @@ mod tests {
             let text = String::from_utf8_lossy(without_greeting(&output));
             for command in [
                 "ARTICLE",
-                "AUTHINFO",
                 "BODY",
                 "CAPABILITIES",
                 "CHECK",
@@ -9124,7 +9512,6 @@ mod tests {
                 "HDR",
                 "HEAD",
                 "HELP",
-                "IHAVE",
                 "LAST",
                 "LIST",
                 "LISTGROUP",
@@ -9133,11 +9520,8 @@ mod tests {
                 "NEWNEWS",
                 "NEXT",
                 "OVER",
-                "POST",
                 "QUIT",
-                "STARTTLS",
                 "STAT",
-                "TAKETHIS",
                 "XHDR",
                 "XOVER",
             ] {
@@ -13812,16 +14196,20 @@ mod tests {
     async fn pending_write_flushes_when_full_and_writes_oversized_directly() {
         let mut sink = tokio::io::sink();
         let mut pending = PendingWrite::new(DEFAULT_PENDING_WRITE_BYTES);
+        assert_eq!(pending.capacity_for_test(), DEFAULT_PENDING_WRITE_BYTES);
         let first = vec![b'a'; DEFAULT_PENDING_WRITE_BYTES - 16];
         let second = vec![b'b'; 32];
         pending.push(&mut sink, &first).await.unwrap();
-        assert_eq!(pending.len, first.len());
+        assert_eq!(pending.len(), first.len());
+        assert_eq!(pending.capacity_for_test(), DEFAULT_PENDING_WRITE_BYTES);
         pending.push(&mut sink, &second).await.unwrap();
-        assert_eq!(pending.len, second.len());
+        assert_eq!(pending.len(), second.len());
+        assert_eq!(pending.capacity_for_test(), DEFAULT_PENDING_WRITE_BYTES);
 
         let huge = vec![b'c'; DEFAULT_PENDING_WRITE_BYTES + 1];
         pending.push(&mut sink, &huge).await.unwrap();
-        assert_eq!(pending.len, 0);
+        assert_eq!(pending.len(), 0);
+        assert_eq!(pending.capacity_for_test(), DEFAULT_PENDING_WRITE_BYTES);
     }
 
     #[tokio::test]
@@ -13837,7 +14225,7 @@ mod tests {
         writer.flush().await.unwrap();
         writer.shutdown().await.unwrap();
 
-        assert_eq!(pending.len, 0);
+        assert_eq!(pending.len(), 0);
         assert_eq!(writer.written, b"CAPABILITIES\r\n".len());
     }
 
@@ -13852,7 +14240,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(pending.len, 0);
+        assert_eq!(pending.len(), 0);
         assert_eq!(writer.vectored_writes, 1);
         assert_eq!(writer.write_calls, 1);
         assert_eq!(
@@ -13890,8 +14278,84 @@ mod tests {
 
         assert_eq!(writer.bytes, expected);
         assert_eq!(stats.bytes_sent, expected.len() as u64);
-        assert_eq!(pending.len, 0);
+        assert_eq!(pending.len(), 0);
         assert_eq!(writer.vectored_writes, 1);
+    }
+
+    #[test]
+    fn pending_write_hot_path_does_not_allocate() {
+        let pool = BufferPool::new(DEFAULT_PENDING_WRITE_BYTES, 1);
+        let oversized = vec![b'x'; DEFAULT_PENDING_WRITE_BYTES + 1];
+        let pending = PendingWrite::from_pool(&pool);
+        let mut sink = tokio::io::sink();
+
+        assert_no_allocations("pending write hot path", move || {
+            let mut pending = pending;
+            poll_to_completion(pending.push(&mut sink, DATE_RESPONSE)).unwrap();
+            poll_to_completion(pending.flush(&mut sink)).unwrap();
+            poll_to_completion(pending.write_with_response(&mut sink, &oversized)).unwrap();
+        });
+    }
+
+    #[tokio::test]
+    async fn pending_write_pool_reuses_returned_buffer() {
+        let pool = BufferPool::new(4096, 1);
+        assert_eq!(pool.available_for_test(), 0);
+
+        let first_ptr = {
+            let mut pending = PendingWrite::from_pool(&pool);
+            let ptr = pending.buffer_ptr_for_test();
+            pending
+                .push(&mut tokio::io::sink(), DATE_RESPONSE)
+                .await
+                .unwrap();
+            assert_eq!(pool.available_for_test(), 0);
+            ptr
+        };
+
+        assert_eq!(pool.available_for_test(), 1);
+
+        let pending = PendingWrite::from_pool(&pool);
+        assert_eq!(pool.available_for_test(), 0);
+        assert_eq!(pending.capacity_for_test(), 4096);
+        assert_eq!(pending.len(), 0);
+        assert_eq!(pending.buffer_ptr_for_test(), first_ptr);
+    }
+
+    #[test]
+    fn generated_response_buffer_pool_reuses_returned_buffer() {
+        let pool = BufferPool::new(4096, 1);
+        assert_eq!(pool.available_for_test(), 0);
+
+        let first_ptr = {
+            let mut response = GeneratedResponseBuffer::from_pool(&pool);
+            let ptr = response.buffer_ptr_for_test();
+            response.extend_from_slice(BODY_RESPONSE_PREFIX);
+            assert_eq!(pool.available_for_test(), 0);
+            ptr
+        };
+
+        assert_eq!(pool.available_for_test(), 1);
+
+        let response = GeneratedResponseBuffer::from_pool(&pool);
+        assert_eq!(pool.available_for_test(), 0);
+        assert_eq!(response.capacity_for_test(), 4096);
+        assert_eq!(response.len(), 0);
+        assert_eq!(response.buffer_ptr_for_test(), first_ptr);
+    }
+
+    #[test]
+    fn generated_response_buffer_pool_drops_mismatched_capacity() {
+        let pool = BufferPool::new(4096, 1);
+        assert_eq!(pool.available_for_test(), 0);
+
+        {
+            let mut response = GeneratedResponseBuffer::from_pool(&pool);
+            response.reserve_exact(4097);
+            assert!(response.capacity_for_test() > 4096);
+        }
+
+        assert_eq!(pool.available_for_test(), 0);
     }
 
     #[tokio::test]
@@ -13918,13 +14382,11 @@ mod tests {
             has_transfer_body: false,
             line_too_long: false,
         };
-        let command_lines = CommandLineBatch::default();
-
         let mut response_buffer = Vec::with_capacity(1024);
         let mut aux_response_buffer = Vec::with_capacity(512);
         let err = handle_command(
             &command,
-            Some(&command_lines),
+            None,
             &config,
             &mut stats,
             &mut writer,
@@ -14712,15 +15174,11 @@ mod tests {
 
         let head_id = MessageId::from_borrowed("<client-head@test>").unwrap();
         let stat_id = MessageId::from_borrowed("<client-stat@test>").unwrap();
-        assert_eq!(
-            output,
-            [
-                GREETING,
-                &build_message_id_head_response(&head_id),
-                &build_message_id_stat_response(&stat_id),
-            ]
-            .concat()
-        );
+        let mut head_response = Vec::new();
+        let mut stat_response = Vec::new();
+        let head_response = build_message_id_head_response_into(&mut head_response, &head_id);
+        let stat_response = build_message_id_stat_response_into(&mut stat_response, &stat_id);
+        assert_eq!(output, [GREETING, head_response, stat_response].concat());
 
         let snapshot = stats.snapshot();
         assert_eq!(snapshot.commands, 2);
@@ -16458,7 +16916,12 @@ mod tests {
     #[tokio::test]
     async fn serve_session_supports_group_navigation_commands() {
         let config = test_config();
-        let article_response = build_selected_article_response(2, config.article_bytes);
+        let mut article_response = Vec::with_capacity(generated_response_buffer_capacity(
+            config.article_bytes,
+            config.body_bytes,
+        ));
+        let article_response =
+            build_selected_article_response_into(&mut article_response, 2, config.article_bytes);
         let (output, stats) = run_session_with_input(
             config,
             b"GROUP alt.test\r\nLISTGROUP\r\nLISTGROUP alt.test\r\nLISTGROUP 1-\r\nLISTGROUP 2-3\r\nLISTGROUP alt.test 1-10\r\nARTICLE 2\r\nLAST\r\nNEXT\r\n",
@@ -16473,7 +16936,7 @@ mod tests {
         expected.extend_from_slice(b"411 no such newsgroup\r\n");
         expected.extend_from_slice(b"411 no such newsgroup\r\n");
         expected.extend_from_slice(LISTGROUP_RESPONSE);
-        expected.extend_from_slice(&article_response);
+        expected.extend_from_slice(article_response);
         expected.extend_from_slice(LAST_RESPONSE);
         expected.extend_from_slice(NEXT_RESPONSE);
         assert_eq!(output, expected);
@@ -17380,6 +17843,14 @@ mod tests {
         assert!(long_command.len() <= MAX_COMMAND_LINE_BYTES);
         let mut command_lines = CommandLineBatch::default();
         let mut response_buffer = Vec::with_capacity(4096);
+        let command = parse_command_line(long_command.as_bytes(), 0);
+        command_lines.copy_line(0, long_command.as_bytes());
+        assert_eq!(
+            command_message_id(&command, &command_lines)
+                .unwrap()
+                .as_str(),
+            long_message
+        );
 
         assert_no_allocations(
             "request parse, scan, serialize, and generated response",
@@ -17412,15 +17883,6 @@ mod tests {
                 assert_eq!(
                     segment_request.message_id().map(MessageId::as_str),
                     Some("<segment@test>")
-                );
-
-                let command = parse_command_line(long_command.as_bytes(), 0);
-                command_lines.copy_line(0, long_command.as_bytes());
-                assert_eq!(
-                    command_message_id(&command, &command_lines)
-                        .unwrap()
-                        .as_str(),
-                    long_message
                 );
 
                 let response = build_selected_article_response_into(&mut response_buffer, 2, 1024);
@@ -17477,6 +17939,16 @@ mod tests {
             .expect("indexed group must exist");
             assert_eq!(complete.as_bytes(), LISTGROUP_2_3_RESPONSE);
             response.clear();
+        });
+    }
+
+    #[test]
+    fn command_line_batch_construction_does_not_allocate() {
+        assert_no_allocations("command line batch construction", || {
+            let batch = CommandLineBatch::default();
+            assert!(batch.bytes.is_empty());
+            assert!(batch.lines.is_empty());
+            assert_eq!(batch.line_capacity_hint, MAX_SERVER_PIPELINE_DEPTH);
         });
     }
 
