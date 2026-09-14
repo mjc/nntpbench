@@ -940,6 +940,7 @@ impl ClientConnection {
                 request_tx,
                 poisoned,
                 capabilities_negotiated: Arc::new(Mutex::new(false)),
+                capabilities_probe: Arc::new(Mutex::new(())),
                 send_barrier: Arc::new(Mutex::new(())),
                 writer_task,
                 reader_task,
@@ -1910,6 +1911,7 @@ impl ClientConnection {
             return Ok(());
         }
 
+        let _probe_guard = self.inner.capabilities_probe.lock().await;
         if *self.inner.capabilities_negotiated.lock().await {
             return Ok(());
         }
@@ -1998,6 +2000,7 @@ struct ConnectionHandle {
     request_tx: mpsc::Sender<QueuedRequest>,
     poisoned: Arc<Mutex<Option<SharedEngineError>>>,
     capabilities_negotiated: Arc<Mutex<bool>>,
+    capabilities_probe: Arc<Mutex<()>>,
     send_barrier: Arc<Mutex<()>>,
     writer_task: JoinHandle<()>,
     reader_task: JoinHandle<()>,
@@ -6043,6 +6046,41 @@ mod tests {
         assert_eq!(first.status().as_u16(), 220);
         assert_eq!(second.status().as_u16(), 222);
 
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn client_connection_single_flights_concurrent_capability_probes() {
+        let listener = crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"201 client ready\r\n").await.unwrap();
+            assert_read_request(&mut stream, b"CAPABILITIES\r\n").await;
+            stream
+                .write_all(b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n")
+                .await
+                .unwrap();
+
+            assert_read_request(&mut stream, b"OVER 1-1\r\n").await;
+            stream
+                .write_all(b"224 Overview information follows\r\n.\r\n")
+                .await
+                .unwrap();
+            assert_read_request(&mut stream, b"OVER 1-1\r\n").await;
+            stream
+                .write_all(b"224 Overview information follows\r\n.\r\n")
+                .await
+                .unwrap();
+        });
+
+        let connection = ClientConnection::connect(addr).await.unwrap();
+        let selector = || ArticleSelector::from_owned("1-1").unwrap();
+        let (first, second) =
+            tokio::join!(connection.over(selector()), connection.over(selector()));
+
+        assert_eq!(first.unwrap().status().as_u16(), 224);
+        assert_eq!(second.unwrap().status().as_u16(), 224);
         server.await.unwrap();
     }
 

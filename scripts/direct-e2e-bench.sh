@@ -63,8 +63,9 @@ Options:
   --churn   run a one-request-per-connection workload and report connections/sec
 
 Environment:
-  SERVER_TASKSET   optional CPU list for the server process, default 0 on Linux with >=2 CPUs
-  CLIENT_TASKSET   optional CPU list for the client process, default 1 on Linux with >=2 CPUs
+  SERVER_TASKSET   optional CPU list for the server process, default to the first CPU in the current affinity mask
+  CLIENT_TASKSET   optional CPU list for the client process, default to the second CPU in the current affinity mask
+                    (with one available CPU, only the server is pinned; with no usable mask, neither is pinned)
 EOF
             exit 0
             ;;
@@ -123,7 +124,9 @@ SUMMARY_HEADER='pending_write_bytes,connections,pipeline_depth,command_mix,verif
 if [[ "$CHURN_MODE" -eq 1 ]]; then
     SUMMARY_HEADER='pending_write_bytes,total_connections,connections,pipeline_depth,command_mix,verification_policy,mode,runs,throughput_gib_s_mean,throughput_gib_s_median,throughput_gib_s_min,throughput_gib_s_max,throughput_gib_s_stddev,throughput_gib_s_cv,connections_per_s_mean,connections_per_s_median,connections_per_s_min,connections_per_s_max,connections_per_s_stddev,connections_per_s_cv,elapsed_s_mean,elapsed_s_median,elapsed_s_min,elapsed_s_max,elapsed_s_stddev,elapsed_s_cv,cpu_s_mean,cpu_s_median,cpu_s_min,cpu_s_max,cpu_s_stddev,cpu_s_cv,rss_kib_mean,rss_kib_median,rss_kib_min,rss_kib_max,rss_kib_stddev,rss_kib_cv'
 fi
-printf '%s\n' "$SUMMARY_HEADER" >"$SUMMARY_CSV"
+if [[ ! -f "$SUMMARY_CSV" || "$(sed -n '1p' "$SUMMARY_CSV" 2>/dev/null)" != "$SUMMARY_HEADER" ]]; then
+    printf '%s\n' "$SUMMARY_HEADER" >"$SUMMARY_CSV"
+fi
 : >"$SUMMARY_JSONL"
 
 json_escape() {

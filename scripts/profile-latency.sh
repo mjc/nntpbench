@@ -14,6 +14,7 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+TARGET_DIR="${CARGO_TARGET_DIR:-$PROJECT_DIR/target}"
 PLATFORM="$(uname -s)"
 case "${1:-}" in
     -h|--help|strace|offcpu|sample|dtrace)
@@ -39,7 +40,7 @@ if [ $# -gt 0 ]; then
 fi
 
 EXTRA_ARGS=("$@")
-OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_DIR/target/profiling/profile-latency}"
+OUTPUT_DIR="${OUTPUT_DIR:-$TARGET_DIR/profiling/profile-latency}"
 case "$OUTPUT_DIR" in
     /*) ;;
     *) OUTPUT_DIR="$PWD/$OUTPUT_DIR" ;;
@@ -78,12 +79,12 @@ fi
 # Resolve binary name
 case "$TARGET" in
     server)
-        BINARY="$PROJECT_DIR/target/profiling/nntpbench"
+        BINARY="$TARGET_DIR/profiling/nntpbench"
         BIN_NAME="nntpbench"
         RUN_ARGS=("server")
         ;;
     nntpbench)
-        BINARY="$PROJECT_DIR/target/profiling/nntpbench"
+        BINARY="$TARGET_DIR/profiling/nntpbench"
         BIN_NAME="nntpbench"
         RUN_ARGS=()
         ;;

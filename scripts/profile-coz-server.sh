@@ -81,7 +81,7 @@ for _ in $(seq 1 100); do
 done
 grep -m1 "server listening" "$server_log"
 
-./target/profiling/nntpbench client \
+"$TARGET_DIR/profiling/nntpbench" client \
     --connect "$LISTEN" \
     --transfer-bytes "$TRANSFER_BYTES" \
     --connections "$CONNECTIONS" \
