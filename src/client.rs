@@ -5080,7 +5080,9 @@ mod tests {
         // RFC 3977 section 3.3 requires clients to discover CAPABILITIES
         // before treating extension commands as negotiated behavior, and RFC
         // 4642 section 2.2 places STARTTLS behind capability advertisement.
-        // This benchmark client still jumps straight to STARTTLS.
+        // This benchmark client discovers the capability before issuing
+        // STARTTLS, but this transport does not perform the subsequent TLS
+        // stream upgrade.
         use std::time::Duration;
 
         let listener = crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
