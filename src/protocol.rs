@@ -3467,10 +3467,6 @@ pub enum Request<'a> {
         kind: AuthInfoKind,
         value: AuthInfoValue<'a>,
     },
-    AuthInfoSasl {
-        mechanism: AuthInfoValue<'a>,
-        initial_response: Option<AuthInfoValue<'a>>,
-    },
     StartTls,
     List,
     Help,
@@ -3516,7 +3512,6 @@ impl<'a> Request<'a> {
                 AuthInfoKind::User => RequestKind::AuthInfoUser,
                 AuthInfoKind::Pass => RequestKind::AuthInfoPass,
             },
-            Self::AuthInfoSasl { .. } => RequestKind::AuthInfo,
             Self::StartTls => RequestKind::StartTls,
             Self::List => RequestKind::List,
             Self::Help => RequestKind::Help,
@@ -3600,10 +3595,6 @@ impl<'a> Request<'a> {
             Self::AuthInfo { kind, value } => {
                 write_authinfo_request_wire(output, *kind, value.as_bytes())
             }
-            Self::AuthInfoSasl {
-                mechanism,
-                initial_response,
-            } => write_authinfo_sasl_request_wire(output, mechanism.as_bytes(), initial_response),
             Self::StartTls => write_simple_request_wire(output, b"STARTTLS"),
             Self::List => write_simple_request_wire(output, b"LIST"),
             Self::Help => write_simple_request_wire(output, b"HELP"),
@@ -3639,7 +3630,6 @@ impl<'a> Request<'a> {
             | Self::NewNews { .. }
             | Self::Post
             | Self::AuthInfo { .. }
-            | Self::AuthInfoSasl { .. }
             | Self::StartTls => None,
             Self::List
             | Self::Help
@@ -3675,7 +3665,6 @@ impl<'a> Request<'a> {
             | Self::Check { .. }
             | Self::TakeThis { .. }
             | Self::AuthInfo { .. }
-            | Self::AuthInfoSasl { .. }
             | Self::StartTls
             | Self::List
             | Self::Help
@@ -3712,7 +3701,6 @@ impl<'a> Request<'a> {
             | Self::Check { .. }
             | Self::TakeThis { .. }
             | Self::AuthInfo { .. }
-            | Self::AuthInfoSasl { .. }
             | Self::StartTls
             | Self::List
             | Self::Help
@@ -3748,7 +3736,6 @@ impl<'a> Request<'a> {
             | Self::Check { .. }
             | Self::TakeThis { .. }
             | Self::AuthInfo { .. }
-            | Self::AuthInfoSasl { .. }
             | Self::StartTls
             | Self::List
             | Self::Help
@@ -3784,7 +3771,6 @@ impl<'a> Request<'a> {
             | Self::Check { .. }
             | Self::TakeThis { .. }
             | Self::AuthInfo { .. }
-            | Self::AuthInfoSasl { .. }
             | Self::StartTls
             | Self::List
             | Self::Help
@@ -3820,7 +3806,6 @@ impl<'a> Request<'a> {
             | Self::Check { .. }
             | Self::TakeThis { .. }
             | Self::AuthInfo { .. }
-            | Self::AuthInfoSasl { .. }
             | Self::StartTls
             | Self::List
             | Self::Help
@@ -3858,7 +3843,6 @@ impl<'a> Request<'a> {
             | Self::Check { .. }
             | Self::TakeThis { .. }
             | Self::AuthInfo { .. }
-            | Self::AuthInfoSasl { .. }
             | Self::StartTls
             | Self::List
             | Self::Help
@@ -3898,7 +3882,6 @@ impl<'a> Request<'a> {
             | Self::Check { .. }
             | Self::TakeThis { .. }
             | Self::AuthInfo { .. }
-            | Self::AuthInfoSasl { .. }
             | Self::StartTls
             | Self::List
             | Self::Help
@@ -3934,7 +3917,6 @@ impl<'a> Request<'a> {
             | Self::Ihave { .. }
             | Self::Check { .. }
             | Self::TakeThis { .. }
-            | Self::AuthInfoSasl { .. }
             | Self::StartTls
             | Self::List
             | Self::Help
@@ -3970,7 +3952,6 @@ impl<'a> Request<'a> {
             | Self::Ihave { .. }
             | Self::Check { .. }
             | Self::AuthInfo { .. }
-            | Self::AuthInfoSasl { .. }
             | Self::StartTls
             | Self::List
             | Self::Help
@@ -4006,7 +3987,6 @@ impl<'a> Request<'a> {
             | Self::Check { .. }
             | Self::TakeThis { .. }
             | Self::AuthInfo { .. }
-            | Self::AuthInfoSasl { .. }
             | Self::StartTls
             | Self::List
             | Self::Help
@@ -4347,30 +4327,6 @@ impl Request<'static> {
         Ok(Self::AuthInfo {
             kind: AuthInfoKind::Pass,
             value: AuthInfoValue::from_owned_bytes(value)?,
-        })
-    }
-
-    /// Build an AUTHINFO SASL request.
-    pub fn authinfo_sasl(
-        mechanism: impl AsRef<str>,
-        initial_response: Option<impl AsRef<str>>,
-    ) -> Result<Self, InvalidAuthInfoValue> {
-        Self::authinfo_sasl_bytes(
-            mechanism.as_ref(),
-            initial_response.map(|value| value.as_ref().as_bytes().to_vec()),
-        )
-    }
-
-    /// Build an AUTHINFO SASL request from byte-oriented RFC 4643 B-CHAR data.
-    pub fn authinfo_sasl_bytes(
-        mechanism: impl AsRef<[u8]>,
-        initial_response: Option<impl AsRef<[u8]>>,
-    ) -> Result<Self, InvalidAuthInfoValue> {
-        Ok(Self::AuthInfoSasl {
-            mechanism: AuthInfoValue::from_owned_bytes(mechanism)?,
-            initial_response: initial_response
-                .map(AuthInfoValue::from_owned_bytes)
-                .transpose()?,
         })
     }
 
@@ -5328,22 +5284,6 @@ where
     write_bytes(output, kind.as_wire());
     write_bytes(output, b" ");
     write_bytes(output, value);
-    write_crlf(output);
-}
-
-fn write_authinfo_sasl_request_wire<W>(
-    output: &mut W,
-    mechanism: &[u8],
-    initial_response: &Option<AuthInfoValue<'_>>,
-) where
-    W: Write,
-{
-    write_bytes(output, b"AUTHINFO SASL ");
-    write_bytes(output, mechanism);
-    if let Some(initial_response) = initial_response {
-        write_bytes(output, b" ");
-        write_bytes(output, initial_response.as_bytes());
-    }
     write_crlf(output);
 }
 

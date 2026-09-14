@@ -553,28 +553,6 @@ impl Client {
         self.execute_raw_exchange(request).await
     }
 
-    /// Send an AUTHINFO SASL request and return the owned raw response frame.
-    pub async fn authinfo_sasl(
-        &self,
-        mechanism: impl AsRef<str>,
-        initial_response: Option<impl AsRef<str>>,
-    ) -> Result<OwnedResponse, ClientError> {
-        let request = Request::authinfo_sasl(mechanism, initial_response)
-            .map_err(|_| ClientError::InvalidAuthInfoValue)?;
-        self.execute_raw(request).await
-    }
-
-    /// Send an AUTHINFO SASL request and return the completed raw request/response pair.
-    pub async fn authinfo_sasl_exchange(
-        &self,
-        mechanism: impl AsRef<str>,
-        initial_response: Option<impl AsRef<str>>,
-    ) -> Result<OwnedExchange, ClientError> {
-        let request = Request::authinfo_sasl(mechanism, initial_response)
-            .map_err(|_| ClientError::InvalidAuthInfoValue)?;
-        self.execute_raw_exchange(request).await
-    }
-
     /// Send a STARTTLS request and return the owned raw response frame.
     pub async fn starttls(&self) -> Result<OwnedResponse, ClientError> {
         self.execute_raw(Request::starttls()).await
@@ -1420,32 +1398,6 @@ impl ClientConnection {
         self.execute_exchange(Request::AuthInfo {
             kind: crate::protocol::AuthInfoKind::Pass,
             value,
-        })
-        .await
-    }
-
-    /// Send an AUTHINFO SASL request and return the owned response frame.
-    pub async fn authinfo_sasl(
-        &self,
-        mechanism: AuthInfoValue<'static>,
-        initial_response: Option<AuthInfoValue<'static>>,
-    ) -> Result<OwnedResponse, ClientError> {
-        self.execute(Request::AuthInfoSasl {
-            mechanism,
-            initial_response,
-        })
-        .await
-    }
-
-    /// Send an AUTHINFO SASL request and return the completed request/response pair.
-    pub async fn authinfo_sasl_exchange(
-        &self,
-        mechanism: AuthInfoValue<'static>,
-        initial_response: Option<AuthInfoValue<'static>>,
-    ) -> Result<OwnedExchange, ClientError> {
-        self.execute_exchange(Request::AuthInfoSasl {
-            mechanism,
-            initial_response,
         })
         .await
     }
@@ -2760,10 +2712,6 @@ where
         Request::AuthInfo { kind, value } => {
             write_authinfo_request_wire(writer, *kind, value.as_bytes()).await
         }
-        Request::AuthInfoSasl {
-            mechanism,
-            initial_response,
-        } => write_authinfo_sasl_request_wire(writer, mechanism.as_bytes(), initial_response).await,
         Request::StartTls => write_simple_request_wire(writer, b"STARTTLS").await,
         Request::List => write_simple_request_wire(writer, b"LIST").await,
         Request::Help => write_simple_request_wire(writer, b"HELP").await,
@@ -3073,39 +3021,6 @@ where
         ],
     )
     .await
-}
-
-async fn write_authinfo_sasl_request_wire<W>(
-    writer: &mut W,
-    mechanism: &[u8],
-    initial_response: &Option<AuthInfoValue<'_>>,
-) -> io::Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
-    if let Some(initial_response) = initial_response {
-        write_slices(
-            writer,
-            &mut [
-                IoSlice::new(b"AUTHINFO SASL "),
-                IoSlice::new(mechanism),
-                IoSlice::new(b" "),
-                IoSlice::new(initial_response.as_bytes()),
-                IoSlice::new(crate::CRLF),
-            ],
-        )
-        .await
-    } else {
-        write_slices(
-            writer,
-            &mut [
-                IoSlice::new(b"AUTHINFO SASL "),
-                IoSlice::new(mechanism),
-                IoSlice::new(crate::CRLF),
-            ],
-        )
-        .await
-    }
 }
 
 async fn write_simple_request_wire<W>(writer: &mut W, verb: &[u8]) -> io::Result<()>
