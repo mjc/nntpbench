@@ -1037,6 +1037,25 @@ impl From<u64> for ArticleNumber {
     }
 }
 
+/// Offsets discovered while validating an article-style response.
+///
+/// The offsets let the consumer perform the transformations that it actually
+/// requested without repeating the allocation-free validation pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ArticleLayout {
+    Article {
+        headers_end: usize,
+        body_start: usize,
+    },
+    Head {
+        headers_end: usize,
+    },
+    Body {
+        body_start: usize,
+    },
+    Stat,
+}
+
 /// Validated header block.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Headers<'a> {
@@ -1047,9 +1066,13 @@ impl<'a> Headers<'a> {
     /// Parse and validate a header block.
     pub fn parse(data: &'a [u8]) -> Result<Self, ArticleParseError> {
         validate_headers(data)?;
-        Ok(Self {
+        Ok(Self::from_validated(data))
+    }
+
+    fn from_validated(data: &'a [u8]) -> Self {
+        Self {
             data: unfold_header_continuations(data),
-        })
+        }
     }
 
     /// Return a header value by case-insensitive name.
@@ -1193,6 +1216,16 @@ impl<'a> Article<'a> {
         content_start: usize,
         content_end: usize,
     ) -> Result<Self, ArticleParseError> {
+        let layout = Self::validate_framed(buf, content_start, content_end)?;
+        Self::parse_framed_with_layout(buf, content_start, content_end, layout)
+    }
+
+    /// Validate a framed article without constructing unfolded or unstuffed data.
+    pub(crate) fn validate_framed(
+        buf: &[u8],
+        content_start: usize,
+        content_end: usize,
+    ) -> Result<ArticleLayout, ArticleParseError> {
         if content_start > content_end || content_end > buf.len() {
             return Err(ArticleParseError::BufferTooShort);
         }
@@ -1205,11 +1238,107 @@ impl<'a> Article<'a> {
 
         let status_code = parse_status_code(buf)?;
         match status_code {
-            220 => Self::parse_article_framed(buf, first_line_end, content_start, content_end),
-            221 => Self::parse_head_framed(buf, first_line_end, content_start, content_end),
-            222 => Self::parse_body_framed(buf, first_line_end, content_start, content_end),
-            223 => Self::parse_stat_framed(buf, first_line_end, content_start, content_end),
+            220 => {
+                parse_first_line(&buf[..first_line_end])?;
+                let separator_pos = find_blank_line(&buf[..content_end], content_start)?;
+                let headers_end = separator_pos + 2;
+                validate_headers(&buf[content_start..headers_end])?;
+                let body_start = separator_pos + 4;
+                if body_start > content_end {
+                    return Err(ArticleParseError::BufferTooShort);
+                }
+                validate_body_content(&buf[body_start..content_end])?;
+                Ok(ArticleLayout::Article {
+                    headers_end,
+                    body_start,
+                })
+            }
+            221 => {
+                parse_first_line(&buf[..first_line_end])?;
+                if find_blank_line(&buf[..content_end], content_start).is_ok() {
+                    return Err(ArticleParseError::UnexpectedBody);
+                }
+                validate_headers(&buf[content_start..content_end])?;
+                Ok(ArticleLayout::Head {
+                    headers_end: content_end,
+                })
+            }
+            222 => {
+                parse_first_line(&buf[..first_line_end])?;
+                validate_body_content(&buf[content_start..content_end])?;
+                Ok(ArticleLayout::Body {
+                    body_start: content_start,
+                })
+            }
+            223 => {
+                parse_first_line(&buf[..first_line_end])?;
+                if content_start != content_end {
+                    return Err(ArticleParseError::UnexpectedBody);
+                }
+                Ok(ArticleLayout::Stat)
+            }
             _ => Err(ArticleParseError::InvalidStatusCode(status_code)),
+        }
+    }
+
+    /// Materialize an article from a layout returned by [`Self::validate_framed`].
+    pub(crate) fn parse_framed_with_layout(
+        buf: &'a [u8],
+        content_start: usize,
+        content_end: usize,
+        layout: ArticleLayout,
+    ) -> Result<Self, ArticleParseError> {
+        let first_line_end = content_start
+            .checked_sub(2)
+            .ok_or(ArticleParseError::BufferTooShort)?;
+        let first_line = buf
+            .get(..first_line_end)
+            .ok_or(ArticleParseError::BufferTooShort)?;
+        let (message_id, article_number) = parse_first_line(first_line)?;
+
+        match layout {
+            ArticleLayout::Article {
+                headers_end,
+                body_start,
+            } => {
+                let headers = Headers::from_validated(
+                    buf.get(content_start..headers_end)
+                        .ok_or(ArticleParseError::BufferTooShort)?,
+                );
+                let body = buf
+                    .get(body_start..content_end)
+                    .ok_or(ArticleParseError::BufferTooShort)?;
+                Ok(Self {
+                    message_id,
+                    article_number,
+                    headers: Some(headers),
+                    body: Some(unstuff_dot_lines(body)),
+                })
+            }
+            ArticleLayout::Head { headers_end } => Ok(Self {
+                message_id,
+                article_number,
+                headers: Some(Headers::from_validated(
+                    buf.get(content_start..headers_end)
+                        .ok_or(ArticleParseError::BufferTooShort)?,
+                )),
+                body: None,
+            }),
+            ArticleLayout::Body { body_start } => Ok(Self {
+                message_id,
+                article_number,
+                headers: None,
+                body: Some(unstuff_dot_lines(
+                    buf.get(body_start..content_end)
+                        .ok_or(ArticleParseError::BufferTooShort)?,
+                )),
+            }),
+            ArticleLayout::Stat => Ok(Self {
+                message_id,
+                article_number,
+                headers: None,
+                body: None,
+            }),
         }
     }
 
@@ -1275,84 +1404,6 @@ impl<'a> Article<'a> {
         let (message_id, article_number) = parse_first_line(&buf[..first_line_end])?;
         let content_start = first_line_end + 2;
         if content_start != buf.len() {
-            return Err(ArticleParseError::UnexpectedBody);
-        }
-
-        Ok(Self {
-            message_id,
-            article_number,
-            headers: None,
-            body: None,
-        })
-    }
-
-    fn parse_article_framed(
-        buf: &'a [u8],
-        first_line_end: usize,
-        content_start: usize,
-        content_end: usize,
-    ) -> Result<Self, ArticleParseError> {
-        let (message_id, article_number) = parse_first_line(&buf[..first_line_end])?;
-        let separator_pos = find_blank_line(&buf[..content_end], content_start)?;
-        let headers = Some(Headers::parse(&buf[content_start..separator_pos + 2])?);
-        let body_start = separator_pos + 4;
-        if body_start > content_end {
-            return Err(ArticleParseError::BufferTooShort);
-        }
-        validate_body_content(&buf[body_start..content_end])?;
-
-        Ok(Self {
-            message_id,
-            article_number,
-            headers,
-            body: Some(unstuff_dot_lines(&buf[body_start..content_end])),
-        })
-    }
-
-    fn parse_head_framed(
-        buf: &'a [u8],
-        first_line_end: usize,
-        content_start: usize,
-        content_end: usize,
-    ) -> Result<Self, ArticleParseError> {
-        let (message_id, article_number) = parse_first_line(&buf[..first_line_end])?;
-        if find_blank_line(&buf[..content_end], content_start).is_ok() {
-            return Err(ArticleParseError::UnexpectedBody);
-        }
-
-        Ok(Self {
-            message_id,
-            article_number,
-            headers: Some(Headers::parse(&buf[content_start..content_end])?),
-            body: None,
-        })
-    }
-
-    fn parse_body_framed(
-        buf: &'a [u8],
-        first_line_end: usize,
-        content_start: usize,
-        content_end: usize,
-    ) -> Result<Self, ArticleParseError> {
-        let (message_id, article_number) = parse_first_line(&buf[..first_line_end])?;
-        validate_body_content(&buf[content_start..content_end])?;
-
-        Ok(Self {
-            message_id,
-            article_number,
-            headers: None,
-            body: Some(unstuff_dot_lines(&buf[content_start..content_end])),
-        })
-    }
-
-    fn parse_stat_framed(
-        buf: &'a [u8],
-        first_line_end: usize,
-        content_start: usize,
-        content_end: usize,
-    ) -> Result<Self, ArticleParseError> {
-        let (message_id, article_number) = parse_first_line(&buf[..first_line_end])?;
-        if content_start != content_end {
             return Err(ArticleParseError::UnexpectedBody);
         }
 
@@ -1684,6 +1735,23 @@ Actual body content\r\n\
         let article = Article::parse(buf).unwrap();
         assert_eq!(article.headers, None);
         assert_eq!(article.body.as_deref(), Some(&b"Body content\r\n"[..]));
+    }
+
+    #[test]
+    fn framed_layout_reuses_validation_for_every_article_shape() {
+        for frame in [VALID_ARTICLE_TEXT, VALID_HEAD, VALID_BODY, VALID_STAT] {
+            let content_start = strict_crlf_line_content_end_from(frame, 0).unwrap() + 2;
+            let content_end = if frame.starts_with(b"223") {
+                content_start
+            } else {
+                find_article_content_end(frame, content_start).unwrap()
+            };
+            let layout = Article::validate_framed(frame, content_start, content_end).unwrap();
+            let reused =
+                Article::parse_framed_with_layout(frame, content_start, content_end, layout)
+                    .unwrap();
+            assert_eq!(reused, Article::parse(frame).unwrap());
+        }
     }
 
     #[test]
