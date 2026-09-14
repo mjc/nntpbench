@@ -544,7 +544,9 @@ mod public_client_experiments {
     }
 
     #[divan::bench(sample_count = 100, sample_size = 20, skip_ext_time)]
-    fn load_read_768k_reused_capacity(bencher: Bencher) {
-        bench_load_read(bencher, BODY_768K, BODY_64K - 256, BODY_768K, 768);
+    fn load_read_reused_capacity(bencher: Bencher) {
+        // Keep the measured read identical to the spare-capacity case; only
+        // the already-grown allocation differs.
+        bench_load_read(bencher, BODY_64K, 32 * 1024, BODY_768K, 768);
     }
 }

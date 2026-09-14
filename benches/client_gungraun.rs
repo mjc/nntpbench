@@ -228,16 +228,16 @@ supported! {
         (runtime(), vec![0_u8; BODY_64K], buffer, 768)
     }
 
-    fn setup_load_read_768k_reused() -> LoadReadSetup {
+    fn setup_load_read_reused() -> LoadReadSetup {
         let mut buffer = Vec::with_capacity(BODY_768K);
-        buffer.resize(BODY_64K - 256, 0);
-        (runtime(), vec![0_u8; BODY_768K], buffer, 768)
+        buffer.resize(32 * 1024, 0);
+        (runtime(), vec![0_u8; BODY_64K], buffer, 768)
     }
 
     #[library_benchmark]
     #[bench::with_spare(setup = setup_load_read_64k_with_spare)]
     #[bench::at_boundary(setup = setup_load_read_64k_boundary)]
-    #[bench::reused_768k(setup = setup_load_read_768k_reused)]
+    #[bench::reused(setup = setup_load_read_reused)]
     fn load_read_capacity(
         (runtime, source, mut buffer, read_chunk_bytes): LoadReadSetup,
     ) -> usize {
