@@ -22,7 +22,7 @@ nix develop -c cargo run -- client --connect 127.0.0.1:2119 --request article --
 nix develop -c cargo run -- fetch --connect 127.0.0.1:2119 --request body --selector 1
 ```
 
-For repeatable client throughput work, use the criterion benchmarks:
+For repeatable client throughput work, use the Divan benchmarks:
 
 ```bash
 nix develop -c cargo bench --bench client_roundtrip
@@ -34,15 +34,6 @@ native build:
 ```bash
 BUILD=0 RUNS=10 ./scripts/direct-e2e-bench.sh
 ```
-
-On this machine, the latest 10-run sweep looked like this:
-
-- 128,509 requests on average, ranging from 128,384 to 128,704
-- 101.06 GB transferred on average, ranging from 100.97 GB to 101.22 GB
-- 4.81 s elapsed on average, ranging from 4.00 s to 5.89 s
-- 9.73 CPU s on average, ranging from 7.27 s to 13.51 s
-- 3,126 KiB RSS on average, ranging from 3,096 KiB to 3,164 KiB
-- about 21.0 GB/s average throughput by bytes over elapsed time
 
 ## Profiling
 
@@ -56,10 +47,11 @@ RUSTFLAGS='-C target-cpu=native -C force-frame-pointers=yes' \
 The profiling scripts choose native tooling by platform:
 
 - `./scripts/profile.sh` uses Linux `perf`/Inferno and writes
-  `flamegraph.svg`; on macOS it uses `sample` and writes `sample.txt`.
+  `target/profiling/profile/flamegraph.svg`; on macOS it uses `sample` and
+  writes `target/profiling/profile/sample.txt`.
 - `./scripts/profile-latency.sh` uses Linux `strace` or `perf` off-CPU mode;
-  on macOS it defaults to `sample` and also has a `dtrace` syscall-latency mode
-  when DTrace is permitted by the host.
+  on macOS it defaults to `sample` and also has a `dtrace` syscall-latency
+  mode when DTrace is permitted by the host.
 - `./scripts/profile-mem.sh` uses Linux `heaptrack` or Valgrind Massif; on
   macOS it runs with `MallocStackLogging` and captures a live `leaks` report.
 
