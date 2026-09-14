@@ -2339,19 +2339,21 @@ impl ResponseDecoder {
 
         match self.streaming.push(chunk)? {
             StreamingDecodeProgress::NeedMore { .. } => Ok(DecodeProgress::NeedMore),
-            StreamingDecodeProgress::Complete {
-                status,
-                frame_consumed,
-                content_end,
-                ..
-            } => {
-                match self.inner.complete(
-                    buffer,
-                    status,
-                    self.streaming.status_line_end(),
-                    content_end,
-                    frame_consumed,
-                ) {
+            StreamingDecodeProgress::Complete { status, bounds, .. } => {
+                let response = match bounds {
+                    Some(bounds) => self.inner.complete_multiline(
+                        buffer,
+                        status,
+                        self.streaming.status_line_end(),
+                        bounds,
+                    ),
+                    None => self.inner.complete_single_line(
+                        buffer,
+                        status,
+                        self.streaming.status_line_end(),
+                    ),
+                };
+                match response {
                     ResponseFrameParse::Complete(response) => Ok(DecodeProgress::Complete {
                         status: response.status(),
                         consumed: response.consumed(),
@@ -2425,8 +2427,7 @@ impl StreamingResponseDecoder {
                                 return Ok(StreamingDecodeProgress::Complete {
                                     status,
                                     consumed,
-                                    frame_consumed: self.status_line_end,
-                                    content_end: self.status_line_end,
+                                    bounds: None,
                                 });
                             }
                             content_start = consumed;
@@ -2456,15 +2457,10 @@ impl StreamingResponseDecoder {
 
         let content_chunk = &chunk[content_start..];
         match self.framer.push(content_chunk) {
-            MultilineFrameProgress::Complete {
-                consumed,
-                chunk_consumed,
-                content_end,
-            } => Ok(StreamingDecodeProgress::Complete {
+            MultilineFrameProgress::Complete(bounds) => Ok(StreamingDecodeProgress::Complete {
                 status,
-                consumed: content_start + chunk_consumed,
-                frame_consumed: self.status_line_end + consumed,
-                content_end: self.status_line_end + content_end,
+                consumed: content_start + bounds.chunk_consumed(),
+                bounds: Some(bounds),
             }),
             MultilineFrameProgress::NeedMore => Ok(StreamingDecodeProgress::NeedMore {
                 consumed: chunk.len(),
@@ -2486,8 +2482,7 @@ enum StreamingDecodeProgress {
     Complete {
         status: StatusCode,
         consumed: usize,
-        frame_consumed: usize,
-        content_end: usize,
+        bounds: Option<crate::terminator::MultilineFrameBounds>,
     },
 }
 
@@ -3594,6 +3589,53 @@ mod tests {
         }
     }
 
+    fn assert_incremental_matches_stateless_for_all_two_push_schedules(
+        kind: RequestKind,
+        frame: &[u8],
+    ) {
+        let expected = ResponseFrameDecoder::new(kind).decode(frame);
+        for first in 0..=frame.len() {
+            for second in first..=frame.len() {
+                let mut decoder = ResponseDecoder::new(kind);
+                let mut progress = DecodeProgress::NeedMore;
+                for prefix_len in [first, second, frame.len()] {
+                    progress = decoder.push(&frame[..prefix_len]).unwrap_or_else(|error| {
+                        panic!(
+                            "incremental decoder errored at prefix {prefix_len} for split ({first}, {second}): {error:?}"
+                        )
+                    });
+                    if matches!(progress, DecodeProgress::Complete { .. }) {
+                        break;
+                    }
+                }
+
+                match (expected, progress) {
+                    (
+                        ResponseFrameParse::Complete(expected),
+                        DecodeProgress::Complete {
+                            status,
+                            consumed,
+                            content_start,
+                            content_end,
+                        },
+                    ) => {
+                        assert_eq!(status, expected.status());
+                        assert_eq!(consumed, expected.consumed());
+                        assert_eq!(content_start, expected.content_start());
+                        assert_eq!(content_end, expected.content_end());
+                    }
+                    (ResponseFrameParse::Complete(expected), progress) => panic!(
+                        "incremental decoder did not match complete stateless frame at split ({first}, {second}): expected {expected:?}, got {progress:?}"
+                    ),
+                    (ResponseFrameParse::NeedMore, DecodeProgress::NeedMore) => {}
+                    (expected, progress) => panic!(
+                        "incremental decoder did not match stateless result at split ({first}, {second}): expected {expected:?}, got {progress:?}"
+                    ),
+                }
+            }
+        }
+    }
+
     async fn assert_read_request(stream: &mut tokio::net::TcpStream, expected: &[u8]) {
         let mut request = vec![0_u8; expected.len()];
         stream.read_exact(&mut request).await.unwrap();
@@ -4346,6 +4388,38 @@ mod tests {
         );
         assert_eq!(second_consumed, chunk.len() - consumed);
         assert_eq!(second_response.status().as_u16(), 220);
+    }
+
+    #[test]
+    fn incremental_decoder_matches_stateless_layout_for_split_valid_and_incomplete_frames() {
+        assert_incremental_matches_stateless_for_all_two_push_schedules(
+            RequestKind::Body,
+            b"222 1 <body@test> body follows\r\nHeader: value\r\n\r\nbody\r\n.\r\ntrailer",
+        );
+        assert_incremental_matches_stateless_for_all_two_push_schedules(
+            RequestKind::Body,
+            b"222 1 <body@test> body follows\r\nHeader: value\r\n\r\nbody\r\n",
+        );
+    }
+
+    #[test]
+    fn incremental_decoder_rejects_malformed_body_like_stateless_parser() {
+        let frame = b"222 1 <body@test> body follows\r\nnot an article\n\r\n.\r\n";
+        assert!(matches!(
+            ResponseFrameDecoder::new(RequestKind::Body).decode(frame),
+            ResponseFrameParse::Invalid
+        ));
+
+        for split in 0..=frame.len() {
+            let mut decoder = ResponseDecoder::new(RequestKind::Body);
+            let first = decoder.push(&frame[..split]);
+            let second = decoder.push(frame);
+            assert!(
+                matches!(first, Err(ClientError::InvalidStatusLine))
+                    || matches!(second, Err(ClientError::InvalidStatusLine)),
+                "malformed frame accepted at split {split}: first={first:?} second={second:?}"
+            );
+        }
     }
 
     #[test]

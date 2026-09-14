@@ -9,7 +9,7 @@ use std::sync::Arc;
 #[cfg(test)]
 use crate::terminator::append_crlf;
 use crate::terminator::{
-    BoundedResponseLineStatus, DOT_TERMINATOR, crlf_normalized_payload_lines,
+    BoundedResponseLineStatus, DOT_TERMINATOR, MultilineFrameBounds, crlf_normalized_payload_lines,
     detect_bounded_response_line_end, find_dot_terminated_block, strict_crlf_line_content_end_from,
     strip_complete_crlf_line,
 };
@@ -246,20 +246,45 @@ impl ResponseFrameDecoder {
         ResponseFrame::parse(self.kind, buffer)
     }
 
-    /// Validate a frame after a streaming caller has already located its end.
+    /// Validate a single-line frame after the status line has been located.
     ///
     /// The streaming detector owns delimiter search. Keeping this completion
     /// step separate avoids searching the accumulated pending buffer a second
     /// time while preserving the full semantic validation performed by
     /// [`ResponseFrame::parse`].
-    pub(crate) fn complete<'a>(
+    pub(crate) fn complete_single_line<'a>(
         self,
         buffer: &'a [u8],
         status: StatusCode,
         status_line_end: usize,
-        content_end: usize,
-        consumed: usize,
     ) -> ResponseFrameParse<'a> {
+        self.complete_with_bounds(buffer, status, status_line_end, None)
+    }
+
+    /// Validate a multiline frame after the shared framer has located its end.
+    pub(crate) fn complete_multiline<'a>(
+        self,
+        buffer: &'a [u8],
+        status: StatusCode,
+        status_line_end: usize,
+        bounds: MultilineFrameBounds,
+    ) -> ResponseFrameParse<'a> {
+        self.complete_with_bounds(buffer, status, status_line_end, Some(bounds))
+    }
+
+    fn complete_with_bounds<'a>(
+        self,
+        buffer: &'a [u8],
+        status: StatusCode,
+        status_line_end: usize,
+        bounds: Option<MultilineFrameBounds>,
+    ) -> ResponseFrameParse<'a> {
+        let (content_end, consumed) = bounds.map_or((status_line_end, status_line_end), |bounds| {
+            (
+                status_line_end + bounds.content_end(),
+                status_line_end + bounds.body_consumed(),
+            )
+        });
         let Some(status_line) = buffer.get(..status_line_end) else {
             return ResponseFrameParse::Invalid;
         };
@@ -275,6 +300,9 @@ impl ResponseFrameDecoder {
         if matches!(descriptor.framing(), ResponseFraming::Unexpected)
             || !validate_response_initial_line(self.kind, status, status_line)
         {
+            return ResponseFrameParse::Invalid;
+        }
+        if descriptor.framing().is_multiline() != bounds.is_some() {
             return ResponseFrameParse::Invalid;
         }
 
@@ -6104,18 +6132,26 @@ mod tests {
     fn response_frame_decoder_accepts_precomputed_boundaries() {
         let wire = b"222 1 <body@test> body follows\r\nbody line\r\n.\r\nNEXT";
         let status_line_end = b"222 1 <body@test> body follows\r\n".len();
-        let content_end = status_line_end + b"body line\r\n".len();
-        let consumed = content_end + b".\r\n".len();
         let status = StatusCode::parse(wire).unwrap();
+        let bounds =
+            match crate::terminator::MultilineFramer::default().push(&wire[status_line_end..]) {
+                crate::terminator::MultilineFrameProgress::Complete(bounds) => bounds,
+                crate::terminator::MultilineFrameProgress::NeedMore => {
+                    panic!("test frame should be complete")
+                }
+            };
 
         let ResponseFrameParse::Complete(response) = ResponseFrameDecoder::new(RequestKind::Body)
-            .complete(wire, status, status_line_end, content_end, consumed)
+            .complete_multiline(wire, status, status_line_end, bounds)
         else {
             panic!("precomputed response frame did not parse");
         };
 
         assert_eq!(response.content(), b"body line\r\n");
-        assert_eq!(response.consumed(), consumed);
+        assert_eq!(
+            response.consumed(),
+            status_line_end + bounds.body_consumed()
+        );
     }
 
     #[test]

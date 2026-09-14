@@ -301,18 +301,46 @@ pub enum EmptyTerminatorStatus {
     NotFound { previous_prefix_len: usize },
 }
 
+/// Offsets produced only after the multiline framer has found a complete frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MultilineFrameBounds {
+    body_consumed: usize,
+    chunk_consumed: usize,
+    content_end: usize,
+}
+
+impl MultilineFrameBounds {
+    const fn new(body_consumed: usize, chunk_consumed: usize, content_end: usize) -> Self {
+        Self {
+            body_consumed,
+            chunk_consumed,
+            content_end,
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn body_consumed(self) -> usize {
+        self.body_consumed
+    }
+
+    #[must_use]
+    pub(crate) const fn chunk_consumed(self) -> usize {
+        self.chunk_consumed
+    }
+
+    #[must_use]
+    pub(crate) const fn content_end(self) -> usize {
+        self.content_end
+    }
+}
+
 /// Progress for an incrementally framed multiline response body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MultilineFrameProgress {
     /// More body bytes are required before the response frame is complete.
     NeedMore,
-    /// The frame ended at `consumed`; `chunk_consumed` is the portion consumed
-    /// from the most recent input chunk, and content ends at `content_end`.
-    Complete {
-        consumed: usize,
-        chunk_consumed: usize,
-        content_end: usize,
-    },
+    /// The frame ended at the offsets produced by the framer.
+    Complete(MultilineFrameBounds),
 }
 
 /// Stateful multiline response framer built from the shared terminator detectors.
@@ -336,11 +364,11 @@ impl MultilineFramer {
         if !self.content_started || self.empty_terminator.is_active() {
             match self.empty_terminator.detect(chunk) {
                 EmptyTerminatorStatus::FoundAt(end) => {
-                    return MultilineFrameProgress::Complete {
-                        consumed: fed + end,
-                        chunk_consumed: end,
-                        content_end: 0,
-                    };
+                    return MultilineFrameProgress::Complete(MultilineFrameBounds::new(
+                        fed + end,
+                        end,
+                        0,
+                    ));
                 }
                 EmptyTerminatorStatus::NeedMore => return MultilineFrameProgress::NeedMore,
                 EmptyTerminatorStatus::NotFound {
@@ -355,11 +383,11 @@ impl MultilineFramer {
         }
 
         match detect_streaming_terminator(&self.tail, chunk) {
-            Some(end) => MultilineFrameProgress::Complete {
-                consumed: fed + end,
-                chunk_consumed: end,
-                content_end: fed + end - DOT_TERMINATOR.len(),
-            },
+            Some(end) => MultilineFrameProgress::Complete(MultilineFrameBounds::new(
+                fed + end,
+                end,
+                fed + end - DOT_TERMINATOR.len(),
+            )),
             None => {
                 self.content_started = true;
                 self.tail.update(chunk);
@@ -1173,22 +1201,14 @@ mod tests {
         assert_eq!(framer.push(b"body\r"), MultilineFrameProgress::NeedMore);
         assert_eq!(
             framer.push(b"\n.\r\n"),
-            MultilineFrameProgress::Complete {
-                consumed: 9,
-                chunk_consumed: 4,
-                content_end: 6,
-            }
+            MultilineFrameProgress::Complete(MultilineFrameBounds::new(9, 4, 6))
         );
 
         let mut empty = MultilineFramer::default();
         assert_eq!(empty.push(b"."), MultilineFrameProgress::NeedMore);
         assert_eq!(
             empty.push(b"\r\n"),
-            MultilineFrameProgress::Complete {
-                consumed: 3,
-                chunk_consumed: 2,
-                content_end: 0,
-            }
+            MultilineFrameProgress::Complete(MultilineFrameBounds::new(3, 2, 0))
         );
     }
 
