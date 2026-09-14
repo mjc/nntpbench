@@ -2572,7 +2572,7 @@ pub fn bench_article_validation_and_two_parses(
 /// Measure frame validation followed by one on-demand article transformation,
 /// reusing the offsets found by validation.
 #[doc(hidden)]
-pub fn bench_article_validation_and_parse(
+pub fn bench_article_validation_and_layout_reuse(
     kind: RequestKind,
     bytes: &[u8],
 ) -> Result<usize, ClientError> {

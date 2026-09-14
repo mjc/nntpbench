@@ -18,7 +18,7 @@ supported! {
         Callgrind, LibraryBenchmarkConfig, library_benchmark, library_benchmark_group, main,
     };
     use nntpbench::client::{
-        bench_article_validation_and_parse, bench_article_validation_and_two_parses,
+        bench_article_validation_and_layout_reuse, bench_article_validation_and_two_parses,
         bench_owned_article_accessor_parse, bench_owned_response_from_bytes,
         bench_public_response_decode_chunks, bench_public_response_decode_chunks_stateless,
     };
@@ -84,7 +84,7 @@ supported! {
     #[bench::dot_stuffed_768k(setup = setup_wire_dot_stuffed_768k)]
     #[bench::folded_headers_768k(setup = setup_wire_folded_headers_768k)]
     fn single_article_parse_path((kind, response): (RequestKind, Vec<u8>)) -> usize {
-        black_box(bench_article_validation_and_parse(
+        black_box(bench_article_validation_and_layout_reuse(
             black_box(kind),
             black_box(&response),
         )
