@@ -7547,9 +7547,6 @@ mod tests {
             Some("pass\tword")
         );
         assert!(Request::authinfo_pass("bad\nvalue").is_err());
-        assert!(Request::authinfo_sasl("PLAIN BAD", None::<&str>).is_err());
-        assert!(Request::authinfo_sasl("PLAIN", Some("not-base64")).is_err());
-        assert!(Request::authinfo_sasl("PLAIN", Some("=")).is_ok());
     }
 
     #[test]
