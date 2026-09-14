@@ -9,7 +9,7 @@ use nntpbench::client::{bench_streaming_decode_response, bench_write_request_wir
 use nntpbench::{
     ClientCommandMix, MessageId, Request, RequestKind, bench_append_load_workload_request,
     bench_client_request_for_command, bench_client_segment_request_for_command,
-    bench_load_response_scan,
+    bench_load_response_scan_in_place, bench_load_response_verify_in_place,
 };
 use std::sync::Arc;
 use tokio::runtime::Builder;
@@ -163,10 +163,10 @@ mod request_wire {
 
 mod streaming_decode {
     use super::{
-        BODY_RESPONSE, Bencher, COMPACT_BODY_RESPONSE, RequestKind, bench_load_response_scan,
+        BODY_RESPONSE, Bencher, COMPACT_BODY_RESPONSE, RequestKind,
+        bench_load_response_scan_in_place, bench_load_response_verify_in_place,
         bench_streaming_decode_response, black_box,
     };
-    use std::sync::Mutex;
 
     #[divan::bench(sample_count = 1000, sample_size = 100)]
     fn compact_body_response(bencher: Bencher) {
@@ -190,14 +190,32 @@ mod streaming_decode {
 
     #[divan::bench(sample_count = 1000, sample_size = 100)]
     fn raw_load_body_response_scan(bencher: Bencher) {
-        let buffer = Mutex::new(BODY_RESPONSE.to_vec());
-        bencher.bench(|| {
-            let mut buffer = buffer.lock().unwrap();
-            buffer.clear();
-            black_box(bench_load_response_scan(
-                black_box(&mut *buffer),
-                black_box(RequestKind::Body),
-            ))
-        });
+        bencher
+            .with_inputs(|| BODY_RESPONSE.to_vec())
+            .bench_local_refs(|buffer| {
+                black_box(
+                    bench_load_response_scan_in_place(
+                        black_box(buffer),
+                        black_box(RequestKind::Body),
+                    )
+                    .unwrap(),
+                )
+            });
+    }
+
+    #[divan::bench(sample_count = 1000, sample_size = 100)]
+    fn full_load_body_response_verify(bencher: Bencher) {
+        bencher
+            .with_inputs(|| BODY_RESPONSE.to_vec())
+            .bench_local_refs(|buffer| {
+                black_box(
+                    bench_load_response_verify_in_place(
+                        black_box(buffer),
+                        black_box(RequestKind::Body),
+                        black_box("<bench@example.com>"),
+                    )
+                    .unwrap(),
+                )
+            });
     }
 }
