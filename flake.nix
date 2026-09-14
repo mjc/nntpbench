@@ -44,6 +44,21 @@
       package = pkgs.callPackage ./nix/package.nix {
         inherit cargoToml rustPlatform;
       };
+
+      gungraunRunner = rustPlatform.buildRustPackage rec {
+        pname = "gungraun-runner";
+        version = "0.19.4";
+        src = pkgs.fetchFromGitHub {
+          owner = "gungraun";
+          repo = "gungraun";
+          rev = "v${version}";
+          hash = "sha256-KWQ4wMNIdKY9FTmPd9ZdlSuCpQQBFhIKD2Ereo3JQaI=";
+        };
+        cargoHash = "sha256-+3toaUDLCmExC3EvNv1GEdUbHSBeShurp2Y+zvE/t0k=";
+        cargoBuildFlags = ["-p" pname];
+        cargoInstallFlags = ["-p" pname];
+        doCheck = false;
+      };
     in {
       apps.default = {
         type = "app";
@@ -59,6 +74,7 @@
             rustToolchain
             pkgs.cargo-llvm-cov
             pkgs.coz
+            gungraunRunner
           ]
           ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
             pkgs.heaptrack
@@ -82,7 +98,7 @@
           echo "  cargo clippy --all-targets -- -D warnings"
           echo "  cargo llvm-cov --fail-under-lines 100 --summary-only"
           echo "  cargo bench --bench server_roundtrip"
-          echo "  cargo bench --bench server_callgrind"
+          echo "  cargo bench --bench server_gungraun"
           echo "  ./scripts/profile-coz.sh"
           echo "  ./scripts/profile.sh"
           echo "  ./scripts/profile-mem.sh"

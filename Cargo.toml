@@ -21,9 +21,10 @@ coz = ["dep:coz"]
 [dev-dependencies]
 divan = "0.1.21"
 proptest = "1.9.0"
+serde_json = "1.0.149"
 
 [target.'cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))'.dev-dependencies]
-iai-callgrind = "0.16.1"
+gungraun = "0.19.4"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage_nightly)"] }
@@ -33,7 +34,7 @@ name = "server_roundtrip"
 harness = false
 
 [[bench]]
-name = "server_callgrind"
+name = "server_gungraun"
 harness = false
 
 [[bench]]
