@@ -14,6 +14,10 @@ PLATFORM="$(uname -s)"
 FIRST_ARG="${1:-}"
 TARGET="server"
 OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_DIR/target/profiling/profile-mem}"
+case "$OUTPUT_DIR" in
+    /*) ;;
+    *) OUTPUT_DIR="$PWD/$OUTPUT_DIR" ;;
+esac
 if [ $# -gt 0 ]; then
     case "$1" in
         server|nntpbench|/*|./*|../*)
@@ -64,7 +68,10 @@ case "$TARGET" in
         RUN_ARGS=()
         ;;
     *)
-        BINARY="$TARGET"
+        case "$TARGET" in
+            /*) BINARY="$TARGET" ;;
+            *) BINARY="$PROJECT_DIR/$TARGET" ;;
+        esac
         BIN_NAME=""  # Custom path, skip build
         RUN_ARGS=()
         ;;

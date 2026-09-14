@@ -15,6 +15,10 @@ ATTACH_PID=""
 TARGET="server"
 EXTRA_ARGS=()
 OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_DIR/target/profiling/profile}"
+case "$OUTPUT_DIR" in
+    /*) ;;
+    *) OUTPUT_DIR="$PWD/$OUTPUT_DIR" ;;
+esac
 mkdir -p "$OUTPUT_DIR"
 
 # Parse arguments

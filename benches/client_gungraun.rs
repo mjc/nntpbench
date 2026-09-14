@@ -190,7 +190,9 @@ supported! {
     }
 
     fn setup_decode_64k_whole() -> (Vec<u8>, usize) {
-        (setup_body_response(BODY_64K), BODY_64K)
+        let response = setup_body_response(BODY_64K);
+        let chunk_bytes = response.len();
+        (response, chunk_bytes)
     }
 
     fn setup_decode_768k_1k() -> (Vec<u8>, usize) {
@@ -202,7 +204,9 @@ supported! {
     }
 
     fn setup_decode_768k_whole() -> (Vec<u8>, usize) {
-        (setup_body_response(BODY_768K), BODY_768K)
+        let response = setup_body_response(BODY_768K);
+        let chunk_bytes = response.len();
+        (response, chunk_bytes)
     }
 
     library_benchmark_group!(name = public_client; benchmarks =

@@ -59,7 +59,7 @@ if [[ -n "$FIXED_SPEEDUP" ]]; then
 fi
 
 coz "${coz_args[@]}" \
-    --- ./target/profiling/nntpbench server \
+    --- "$TARGET_DIR/profiling/nntpbench" server \
     --listen "$LISTEN" \
     --threads 4 \
     --max-connections 4096 \

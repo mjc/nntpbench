@@ -1811,28 +1811,32 @@ impl ClientConnection {
         mark_capabilities_on_success: bool,
         invalidate_capabilities_on_success: bool,
     ) -> Result<PendingResponse, ClientError> {
-        let barrier_guard = if request_kind_requires_barrier(request.kind()) {
-            Some(self.inner.send_barrier.clone().lock_owned().await)
-        } else {
-            None
-        };
+        let barrier_guard = self.inner.send_barrier.clone().lock_owned().await;
+        let (retained_barrier_guard, enqueue_barrier_guard) =
+            if request_kind_requires_barrier(request.kind()) {
+                (Some(barrier_guard), None)
+            } else {
+                (None, Some(barrier_guard))
+            };
 
         let (response_tx, response_rx) = oneshot::channel();
-        self.inner
+        let send_result = self
+            .inner
             .request_tx
             .send(QueuedRequest {
                 request,
                 response_tx,
+                barrier_guard: retained_barrier_guard,
             })
-            .await
-            .map_err(|_| ClientError::ConnectionClosed)?;
+            .await;
+        drop(enqueue_barrier_guard);
+        send_result.map_err(|_| ClientError::ConnectionClosed)?;
 
         Ok(PendingResponse {
             inner: self.inner.clone(),
             response_rx,
             mark_capabilities_on_success,
             invalidate_capabilities_on_success,
-            barrier_guard,
         })
     }
 
@@ -1859,28 +1863,32 @@ impl ClientConnection {
         mark_capabilities_on_success: bool,
         invalidate_capabilities_on_success: bool,
     ) -> Result<PendingExchange, ClientError> {
-        let barrier_guard = if request_kind_requires_barrier(request.kind()) {
-            Some(self.inner.send_barrier.clone().lock_owned().await)
-        } else {
-            None
-        };
+        let barrier_guard = self.inner.send_barrier.clone().lock_owned().await;
+        let (retained_barrier_guard, enqueue_barrier_guard) =
+            if request_kind_requires_barrier(request.kind()) {
+                (Some(barrier_guard), None)
+            } else {
+                (None, Some(barrier_guard))
+            };
 
         let (response_tx, response_rx) = oneshot::channel();
-        self.inner
+        let send_result = self
+            .inner
             .request_tx
             .send(QueuedRequest {
                 request,
                 response_tx,
+                barrier_guard: retained_barrier_guard,
             })
-            .await
-            .map_err(|_| ClientError::ConnectionClosed)?;
+            .await;
+        drop(enqueue_barrier_guard);
+        send_result.map_err(|_| ClientError::ConnectionClosed)?;
 
         Ok(PendingExchange {
             inner: self.inner.clone(),
             response_rx,
             mark_capabilities_on_success,
             invalidate_capabilities_on_success,
-            barrier_guard,
         })
     }
 
@@ -1943,6 +1951,7 @@ fn request_kind_invalidates_capabilities(kind: RequestKind) -> bool {
         kind,
         RequestKind::AuthInfoUser
             | RequestKind::AuthInfoPass
+            | RequestKind::AuthInfo
             | RequestKind::ModeReader
             | RequestKind::StartTls
     )
@@ -1953,6 +1962,7 @@ fn request_kind_requires_barrier(kind: RequestKind) -> bool {
         kind,
         RequestKind::AuthInfoUser
             | RequestKind::AuthInfoPass
+            | RequestKind::AuthInfo
             | RequestKind::ModeReader
             | RequestKind::StartTls
             | RequestKind::Post
@@ -1961,6 +1971,19 @@ fn request_kind_requires_barrier(kind: RequestKind) -> bool {
             | RequestKind::TakeThis
             | RequestKind::Quit
     )
+}
+
+fn response_invalidates_capabilities(kind: RequestKind, status: StatusCode) -> bool {
+    if !request_kind_invalidates_capabilities(kind) {
+        return false;
+    }
+
+    match kind {
+        RequestKind::AuthInfoUser | RequestKind::AuthInfoPass | RequestKind::AuthInfo => {
+            matches!(status.as_u16(), 281 | 283)
+        }
+        _ => true,
+    }
 }
 
 impl Drop for ConnectionHandle {
@@ -2653,6 +2676,7 @@ pub async fn bench_pending_read_capacity(
 struct QueuedRequest {
     request: Request<'static>,
     response_tx: oneshot::Sender<Result<CompletedRequest, SharedEngineError>>,
+    barrier_guard: Option<OwnedMutexGuard<()>>,
 }
 
 #[derive(Debug)]
@@ -2661,7 +2685,6 @@ pub(crate) struct PendingResponse {
     response_rx: oneshot::Receiver<Result<CompletedRequest, SharedEngineError>>,
     mark_capabilities_on_success: bool,
     invalidate_capabilities_on_success: bool,
-    barrier_guard: Option<OwnedMutexGuard<()>>,
 }
 
 impl PendingResponse {
@@ -2680,17 +2703,20 @@ impl PendingResponse {
             }
         };
 
-        match response.map_err(ClientError::from)?.response {
+        let completed = response.map_err(ClientError::from)?;
+        let request_kind = completed.request.kind();
+        match completed.response {
             CompletedResponse::Owned(response) => {
                 if self.mark_capabilities_on_success && response.status().as_u16() == 101 {
                     *self.inner.capabilities_negotiated.lock().await = true;
                 } else if self.mark_capabilities_on_success {
                     return Err(ClientError::CapabilitiesUnavailable);
                 }
-                if self.invalidate_capabilities_on_success {
+                if self.invalidate_capabilities_on_success
+                    && response_invalidates_capabilities(request_kind, response.status())
+                {
                     *self.inner.capabilities_negotiated.lock().await = false;
                 }
-                drop(self.barrier_guard);
                 Ok(response)
             }
         }
@@ -2703,7 +2729,6 @@ pub(crate) struct PendingExchange {
     response_rx: oneshot::Receiver<Result<CompletedRequest, SharedEngineError>>,
     mark_capabilities_on_success: bool,
     invalidate_capabilities_on_success: bool,
-    barrier_guard: Option<OwnedMutexGuard<()>>,
 }
 
 impl PendingExchange {
@@ -2723,6 +2748,7 @@ impl PendingExchange {
         };
 
         let completed = response.map_err(ClientError::from)?;
+        let request_kind = completed.request.kind();
         match completed.response {
             CompletedResponse::Owned(response) => {
                 if self.mark_capabilities_on_success && response.status().as_u16() == 101 {
@@ -2730,10 +2756,11 @@ impl PendingExchange {
                 } else if self.mark_capabilities_on_success {
                     return Err(ClientError::CapabilitiesUnavailable);
                 }
-                if self.invalidate_capabilities_on_success {
+                if self.invalidate_capabilities_on_success
+                    && response_invalidates_capabilities(request_kind, response.status())
+                {
                     *self.inner.capabilities_negotiated.lock().await = false;
                 }
-                drop(self.barrier_guard);
                 Ok(OwnedExchange {
                     request: completed.request,
                     response,
@@ -2759,6 +2786,7 @@ struct InFlightRequest {
     request: Request<'static>,
     kind: RequestKind,
     response_tx: oneshot::Sender<Result<CompletedRequest, SharedEngineError>>,
+    barrier_guard: Option<OwnedMutexGuard<()>>,
 }
 
 #[derive(Debug, Clone)]
@@ -2794,6 +2822,7 @@ async fn run_writer_task(
             request: queued.request,
             kind,
             response_tx: queued.response_tx,
+            barrier_guard: queued.barrier_guard,
         };
         if let Err(err) = inflight_tx.send(inflight).await {
             let error = SharedEngineError::ConnectionClosed;
@@ -3281,6 +3310,7 @@ async fn run_reader_task(
             request,
             kind,
             response_tx,
+            barrier_guard,
         } = inflight_request;
         let mut decoder = ResponseDecoder::new(kind);
 
@@ -3303,6 +3333,7 @@ async fn run_reader_task(
                             bytes,
                         });
                         let _ = response_tx.send(Ok(CompletedRequest { request, response }));
+                        drop(barrier_guard);
                         break;
                     }
                     Err(ClientError::InvalidStatusLine) => {

@@ -40,6 +40,10 @@ fi
 
 EXTRA_ARGS=("$@")
 OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_DIR/target/profiling/profile-latency}"
+case "$OUTPUT_DIR" in
+    /*) ;;
+    *) OUTPUT_DIR="$PWD/$OUTPUT_DIR" ;;
+esac
 mkdir -p "$OUTPUT_DIR"
 
 if [ "$MODE" = "-h" ] || [ "$MODE" = "--help" ]; then
@@ -84,7 +88,10 @@ case "$TARGET" in
         RUN_ARGS=()
         ;;
     *)
-        BINARY="$TARGET"
+        case "$TARGET" in
+            /*) BINARY="$TARGET" ;;
+            *) BINARY="$PROJECT_DIR/$TARGET" ;;
+        esac
         BIN_NAME=""  # Custom path, skip build
         RUN_ARGS=()
         ;;

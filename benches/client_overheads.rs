@@ -374,8 +374,7 @@ mod public_client_experiments {
         bench_article_parse_passes(bencher, BODY_768K, ArticleVariant::FoldedHeaders);
     }
 
-    fn bench_fragmented_decode(bencher: Bencher, size: usize, chunk_bytes: usize) {
-        let response = fixtures::body_response(size, false);
+    fn bench_fragmented_decode_response(bencher: Bencher, response: Vec<u8>, chunk_bytes: usize) {
         bencher.bench(|| {
             black_box(bench_public_response_decode_chunks(
                 black_box(RequestKind::Body),
@@ -385,8 +384,21 @@ mod public_client_experiments {
         });
     }
 
-    fn bench_stateless_decode(bencher: Bencher, size: usize, chunk_bytes: usize) {
+    fn bench_fragmented_decode(bencher: Bencher, size: usize, chunk_bytes: usize) {
+        bench_fragmented_decode_response(
+            bencher,
+            fixtures::body_response(size, false),
+            chunk_bytes,
+        );
+    }
+
+    fn bench_fragmented_decode_whole_read(bencher: Bencher, size: usize) {
         let response = fixtures::body_response(size, false);
+        let chunk_bytes = response.len();
+        bench_fragmented_decode_response(bencher, response, chunk_bytes);
+    }
+
+    fn bench_stateless_decode_response(bencher: Bencher, response: Vec<u8>, chunk_bytes: usize) {
         bencher.bench(|| {
             black_box(bench_public_response_decode_chunks_stateless(
                 black_box(RequestKind::Body),
@@ -394,6 +406,16 @@ mod public_client_experiments {
                 black_box(chunk_bytes),
             ))
         });
+    }
+
+    fn bench_stateless_decode(bencher: Bencher, size: usize, chunk_bytes: usize) {
+        bench_stateless_decode_response(bencher, fixtures::body_response(size, false), chunk_bytes);
+    }
+
+    fn bench_stateless_decode_whole_read(bencher: Bencher, size: usize) {
+        let response = fixtures::body_response(size, false);
+        let chunk_bytes = response.len();
+        bench_stateless_decode_response(bencher, response, chunk_bytes);
     }
 
     #[divan::bench(sample_count = 50, sample_size = 10)]
@@ -408,7 +430,7 @@ mod public_client_experiments {
 
     #[divan::bench(sample_count = 50, sample_size = 10)]
     fn fragmented_decode_64k_whole_read(bencher: Bencher) {
-        bench_fragmented_decode(bencher, BODY_64K, BODY_64K);
+        bench_fragmented_decode_whole_read(bencher, BODY_64K);
     }
 
     #[divan::bench(sample_count = 20, sample_size = 5)]
@@ -424,7 +446,12 @@ mod public_client_experiments {
 
     #[divan::bench(sample_count = 20, sample_size = 5)]
     fn fragmented_decode_768k_whole_read(bencher: Bencher) {
-        bench_fragmented_decode(bencher, BODY_768K, BODY_768K);
+        bench_fragmented_decode_whole_read(bencher, BODY_768K);
+    }
+
+    #[divan::bench(sample_count = 50, sample_size = 10)]
+    fn stateless_decode_control_64k_1_byte(bencher: Bencher) {
+        bench_stateless_decode(bencher, BODY_64K, 1);
     }
 
     #[divan::bench(sample_count = 50, sample_size = 10)]
@@ -434,7 +461,7 @@ mod public_client_experiments {
 
     #[divan::bench(sample_count = 50, sample_size = 10)]
     fn stateless_decode_control_64k_whole_read(bencher: Bencher) {
-        bench_stateless_decode(bencher, BODY_64K, BODY_64K);
+        bench_stateless_decode_whole_read(bencher, BODY_64K);
     }
 
     #[divan::bench(sample_count = 20, sample_size = 5)]
@@ -444,7 +471,7 @@ mod public_client_experiments {
 
     #[divan::bench(sample_count = 20, sample_size = 5)]
     fn stateless_decode_control_768k_whole_read(bencher: Bencher) {
-        bench_stateless_decode(bencher, BODY_768K, BODY_768K);
+        bench_stateless_decode_whole_read(bencher, BODY_768K);
     }
 
     fn bench_read_capacity(
