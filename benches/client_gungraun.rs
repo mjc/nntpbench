@@ -22,8 +22,11 @@ supported! {
         bench_owned_article_accessor_parse, bench_owned_response_from_bytes,
         bench_public_response_decode_chunks, bench_public_response_decode_chunks_stateless,
     };
-    use nntpbench::{OwnedResponse, RequestKind};
+    use nntpbench::{
+        OwnedResponse, RequestKind, bench_load_read_capacity,
+    };
     use std::hint::black_box;
+    use tokio::runtime::{Builder, Runtime};
 
     mod fixtures;
     use fixtures::ArticleVariant;
@@ -43,6 +46,10 @@ supported! {
 
     fn setup_body_response(size: usize) -> Vec<u8> {
         fixtures::body_response(size, false)
+    }
+
+    fn runtime() -> Runtime {
+        Builder::new_current_thread().enable_all().build().unwrap()
     }
 
     #[library_benchmark]
@@ -209,12 +216,57 @@ supported! {
         (response, chunk_bytes)
     }
 
+    type LoadReadSetup = (Runtime, Vec<u8>, usize, usize, usize);
+
+    fn setup_load_read_64k_with_spare() -> LoadReadSetup {
+        (runtime(), vec![0_u8; BODY_64K], 32 * 1024, BODY_64K, 768)
+    }
+
+    fn setup_load_read_64k_boundary() -> LoadReadSetup {
+        (
+            runtime(),
+            vec![0_u8; BODY_64K],
+            BODY_64K - 256,
+            BODY_64K,
+            768,
+        )
+    }
+
+    fn setup_load_read_768k_reused() -> LoadReadSetup {
+        (
+            runtime(),
+            vec![0_u8; BODY_768K],
+            BODY_64K - 256,
+            BODY_768K,
+            768,
+        )
+    }
+
+    #[library_benchmark]
+    #[bench::with_spare(setup = setup_load_read_64k_with_spare)]
+    #[bench::at_boundary(setup = setup_load_read_64k_boundary)]
+    #[bench::reused_768k(setup = setup_load_read_768k_reused)]
+    fn load_read_capacity(
+        (runtime, source, initial_len, initial_capacity, read_chunk_bytes): LoadReadSetup,
+    ) -> usize {
+        let (read, capacity) = runtime
+            .block_on(bench_load_read_capacity(
+                black_box(&source),
+                black_box(initial_len),
+                black_box(initial_capacity),
+                black_box(read_chunk_bytes),
+            ))
+            .unwrap();
+        black_box(read.saturating_add(capacity))
+    }
+
     library_benchmark_group!(name = public_client; benchmarks =
         repeated_owned_article_parse,
         full_article_parse_path,
         single_article_parse_path,
         fragmented_public_decode,
-        stateless_public_decode_control
+        stateless_public_decode_control,
+        load_read_capacity
     );
 
     main!(config = LibraryBenchmarkConfig::default()
