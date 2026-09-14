@@ -9,7 +9,7 @@ use nntpbench::client::{bench_streaming_decode_response, bench_write_request_wir
 use nntpbench::{
     ClientCommandMix, MessageId, Request, RequestKind, bench_append_load_workload_request,
     bench_client_request_for_command, bench_client_segment_request_for_command,
-    bench_load_response_scan,
+    bench_load_response_scan_in_place,
 };
 use std::sync::Arc;
 use tokio::runtime::Builder;
@@ -166,6 +166,7 @@ mod streaming_decode {
         BODY_RESPONSE, Bencher, COMPACT_BODY_RESPONSE, RequestKind,
         bench_load_response_scan_in_place, bench_streaming_decode_response, black_box,
     };
+    use std::cell::RefCell;
 
     #[divan::bench(sample_count = 1000, sample_size = 100)]
     fn compact_body_response(bencher: Bencher) {
@@ -189,8 +190,9 @@ mod streaming_decode {
 
     #[divan::bench(sample_count = 1000, sample_size = 100)]
     fn raw_load_body_response_scan(bencher: Bencher) {
-        let mut buffer = BODY_RESPONSE.to_vec();
-        bencher.bench(|| {
+        let buffer = RefCell::new(BODY_RESPONSE.to_vec());
+        bencher.bench_local(|| {
+            let mut buffer = buffer.borrow_mut();
             black_box(bench_load_response_scan_in_place(
                 black_box(&mut buffer),
                 black_box(RequestKind::Body),

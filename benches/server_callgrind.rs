@@ -53,6 +53,7 @@ supported! {
     struct ProcessHarness {
         config: Arc<ServerConfig>,
         stats: Stats,
+        response_buffer: Vec<u8>,
         output: Vec<u8>,
     }
 
@@ -60,6 +61,7 @@ supported! {
         ProcessHarness {
             config: Arc::new(ServerConfig::from_args(server_args(BODY_64K, ARTICLE_64K))),
             stats: Stats::new(),
+            response_buffer: Vec::with_capacity(BODY_64K + ARTICLE_64K + 1024),
             output: Vec::with_capacity(BODY_64K + ARTICLE_64K + 1024),
         }
     }
@@ -68,6 +70,7 @@ supported! {
         ProcessHarness {
             config: Arc::new(ServerConfig::from_args(server_args(BODY_768K, ARTICLE_768K))),
             stats: Stats::new(),
+            response_buffer: Vec::with_capacity(BODY_768K + ARTICLE_768K + 1024),
             output: Vec::with_capacity(BODY_768K + ARTICLE_768K + 1024),
         }
     }
@@ -75,6 +78,7 @@ supported! {
     struct PipelineHarness {
         config: Arc<ServerConfig>,
         stats: Stats,
+        response_buffer: Vec<u8>,
         commands: Vec<RequestKind>,
         output: Vec<u8>,
     }
@@ -83,6 +87,7 @@ supported! {
         PipelineHarness {
             config: Arc::new(ServerConfig::from_args(server_args(BODY_64K, ARTICLE_64K))),
             stats: Stats::new(),
+            response_buffer: Vec::with_capacity(BODY_64K + ARTICLE_64K + 2048),
             commands: Vec::with_capacity(8),
             output: Vec::with_capacity(BODY_64K + ARTICLE_64K + 2048),
         }
@@ -104,10 +109,13 @@ supported! {
     #[bench::article_64k(setup = setup_64k)]
     #[bench::article_768k(setup = setup_768k)]
     fn process_article(mut harness: ProcessHarness) -> usize {
+        harness.response_buffer.clear();
+        harness.output.clear();
         process_request_to_buffer(
             RequestLine::parse(b"ARTICLE <bench@nntpbench.local>\r\n"),
             &harness.config,
             &harness.stats,
+            &mut harness.response_buffer,
             &mut harness.output,
         );
         black_box(harness.output.len())
@@ -117,10 +125,13 @@ supported! {
     #[bench::body_64k(setup = setup_64k)]
     #[bench::body_768k(setup = setup_768k)]
     fn process_body(mut harness: ProcessHarness) -> usize {
+        harness.response_buffer.clear();
+        harness.output.clear();
         process_request_to_buffer(
             RequestLine::parse(b"BODY <bench@nntpbench.local>\r\n"),
             &harness.config,
             &harness.stats,
+            &mut harness.response_buffer,
             &mut harness.output,
         );
         black_box(harness.output.len())
@@ -129,10 +140,13 @@ supported! {
     #[library_benchmark]
     #[bench::capabilities(setup = setup_64k)]
     fn process_capabilities(mut harness: ProcessHarness) -> usize {
+        harness.response_buffer.clear();
+        harness.output.clear();
         process_request_to_buffer(
             RequestLine::parse(b"CAPABILITIES\r\n"),
             &harness.config,
             &harness.stats,
+            &mut harness.response_buffer,
             &mut harness.output,
         );
         black_box(harness.output.len())
@@ -141,10 +155,13 @@ supported! {
     #[library_benchmark]
     #[bench::unknown(setup = setup_64k)]
     fn process_unknown(mut harness: ProcessHarness) -> usize {
+        harness.response_buffer.clear();
+        harness.output.clear();
         process_request_to_buffer(
             RequestLine::parse(b"XYZZY 1\r\n"),
             &harness.config,
             &harness.stats,
+            &mut harness.response_buffer,
             &mut harness.output,
         );
         black_box(harness.output.len())
@@ -153,10 +170,13 @@ supported! {
     #[library_benchmark]
     #[bench::date(setup = setup_64k)]
     fn process_date(mut harness: ProcessHarness) -> usize {
+        harness.response_buffer.clear();
+        harness.output.clear();
         process_request_to_buffer(
             RequestLine::parse(b"DATE\r\n"),
             &harness.config,
             &harness.stats,
+            &mut harness.response_buffer,
             &mut harness.output,
         );
         black_box(harness.output.len())
@@ -165,10 +185,13 @@ supported! {
     #[library_benchmark]
     #[bench::mode_reader(setup = setup_64k)]
     fn process_mode_reader(mut harness: ProcessHarness) -> usize {
+        harness.response_buffer.clear();
+        harness.output.clear();
         process_request_to_buffer(
             RequestLine::parse(b"MODE READER\r\n"),
             &harness.config,
             &harness.stats,
+            &mut harness.response_buffer,
             &mut harness.output,
         );
         black_box(harness.output.len())
@@ -177,10 +200,13 @@ supported! {
     #[library_benchmark]
     #[bench::quit(setup = setup_64k)]
     fn process_quit(mut harness: ProcessHarness) -> bool {
+        harness.response_buffer.clear();
+        harness.output.clear();
         black_box(process_request_to_buffer(
             RequestLine::parse(b"QUIT\r\n"),
             &harness.config,
             &harness.stats,
+            &mut harness.response_buffer,
             &mut harness.output,
         ))
     }
@@ -199,10 +225,13 @@ QUIT\r\n",
         );
         let consumed = for_each_request_line_in_batch(request, 64, |request| {
             harness.commands.push(request.kind());
+            harness.response_buffer.clear();
+            harness.output.clear();
             let _ = process_request_to_buffer(
                 request,
                 &harness.config,
                 &harness.stats,
+                &mut harness.response_buffer,
                 &mut harness.output,
             );
         });
