@@ -320,6 +320,7 @@ const MAX_SERVER_PIPELINE_DEPTH: usize = 1024;
 const SERVER_READER_CAPACITY: usize = 8 * 1024;
 const CLIENT_READER_CAPACITY: usize = 256 * 1024;
 const DEFAULT_MAX_LOAD_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+const MIN_LOAD_READ_SPARE_BYTES: usize = 256;
 const LOAD_STATS_FLUSH_COMMANDS: u64 = 1024;
 const MAX_BATCHED_ARTICLE_RESPONSES: usize = 8;
 const MAX_BATCHED_ARTICLE_RESPONSE_SLICES: usize = MAX_BATCHED_ARTICLE_RESPONSES * 3;
@@ -2334,10 +2335,11 @@ where
 {
     let len = buffer.len();
     let chunk_len = read_chunk_bytes.max(1);
-    if buffer.capacity() - len < chunk_len {
+    let spare_capacity = buffer.capacity().saturating_sub(len);
+    if spare_capacity < chunk_len && spare_capacity < MIN_LOAD_READ_SPARE_BYTES {
         buffer.reserve(chunk_len);
     }
-    let read_len = chunk_len.min(buffer.capacity() - len);
+    let read_len = chunk_len.min(buffer.capacity().saturating_sub(len).max(1));
     poll_fn(|cx| {
         let mut read_buf = ReadBuf::uninit(&mut buffer.spare_capacity_mut()[..read_len]);
         match Pin::new(&mut *reader).poll_read(cx, &mut read_buf) {
@@ -2713,6 +2715,18 @@ pub fn bench_load_response_verify_in_place(
     expected: &str,
 ) -> io::Result<usize> {
     bench_load_response_verify_inner(buffer, kind, Some(expected))
+}
+
+/// Measure one direct-load receive using an already allocated buffer.
+#[doc(hidden)]
+pub async fn bench_load_read_capacity_in_place(
+    source: &[u8],
+    buffer: &mut Vec<u8>,
+    read_chunk_bytes: usize,
+) -> io::Result<(usize, usize)> {
+    let mut reader = io::Cursor::new(source);
+    let read = read_into_load_buffer(&mut reader, buffer, read_chunk_bytes).await?;
+    Ok((read, buffer.capacity()))
 }
 
 fn bench_load_response_verify_inner(
@@ -8834,6 +8848,40 @@ mod tests {
             nodelay: true,
             socket_recv_buffer: HIGH_THROUGHPUT_SOCKET_BUFFER,
             socket_send_buffer: HIGH_THROUGHPUT_SOCKET_BUFFER,
+        }
+    }
+
+    struct LoadProbeReader {
+        data: Vec<u8>,
+        offset: usize,
+        max_requested: usize,
+    }
+
+    impl LoadProbeReader {
+        fn new(data: &[u8]) -> Self {
+            Self {
+                data: data.to_vec(),
+                offset: 0,
+                max_requested: 0,
+            }
+        }
+    }
+
+    impl AsyncRead for LoadProbeReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buffer: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            self.max_requested = self.max_requested.max(buffer.remaining());
+            let available = self.data.len() - self.offset;
+            let copied = available.min(buffer.remaining());
+            if copied != 0 {
+                let end = self.offset + copied;
+                buffer.put_slice(&self.data[self.offset..end]);
+                self.offset = end;
+            }
+            Poll::Ready(Ok(()))
         }
     }
 
@@ -19625,6 +19673,22 @@ mod tests {
         assert!(measurements[0].0 <= 16);
         assert!(measurements[1].0 <= 16);
         assert!(measurements[1].1 <= measurements[0].1 + 8);
+    }
+
+    #[tokio::test]
+    async fn load_read_uses_existing_spare_capacity_before_growth() {
+        let mut reader = LoadProbeReader::new(&[b'x'; 512]);
+        let mut buffer = Vec::with_capacity(1024);
+        buffer.resize(768, b'p');
+
+        let read = read_into_load_buffer(&mut reader, &mut buffer, 512)
+            .await
+            .unwrap();
+
+        assert_eq!(read, 256);
+        assert_eq!(reader.max_requested, 256);
+        assert_eq!(buffer.capacity(), 1024);
+        assert_eq!(buffer.len(), 1024);
     }
 
     #[test]

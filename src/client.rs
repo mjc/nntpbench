@@ -28,6 +28,7 @@ use crate::{
 
 const OWNED_RESPONSE_PREALLOC_BYTES: usize = 8 * 1024 * 1024;
 const STREAMING_STATUS_LINE_BYTES: usize = crate::protocol::MAX_AUTHINFO_SASL_RESPONSE_LINE_BYTES;
+const MIN_PENDING_READ_SPARE_BYTES: usize = 256;
 
 /// Options for the client one-connection client prototype.
 #[derive(Debug, Clone, Copy)]
@@ -939,6 +940,7 @@ impl ClientConnection {
                 request_tx,
                 poisoned,
                 capabilities_negotiated: Arc::new(Mutex::new(false)),
+                capabilities_probe: Arc::new(Mutex::new(())),
                 send_barrier: Arc::new(Mutex::new(())),
                 writer_task,
                 reader_task,
@@ -1810,28 +1812,32 @@ impl ClientConnection {
         mark_capabilities_on_success: bool,
         invalidate_capabilities_on_success: bool,
     ) -> Result<PendingResponse, ClientError> {
-        let barrier_guard = if request_kind_requires_barrier(request.kind()) {
-            Some(self.inner.send_barrier.clone().lock_owned().await)
-        } else {
-            None
-        };
+        let barrier_guard = self.inner.send_barrier.clone().lock_owned().await;
+        let (retained_barrier_guard, enqueue_barrier_guard) =
+            if request_kind_requires_barrier(request.kind()) {
+                (Some(barrier_guard), None)
+            } else {
+                (None, Some(barrier_guard))
+            };
 
         let (response_tx, response_rx) = oneshot::channel();
-        self.inner
+        let send_result = self
+            .inner
             .request_tx
             .send(QueuedRequest {
                 request,
                 response_tx,
+                barrier_guard: retained_barrier_guard,
             })
-            .await
-            .map_err(|_| ClientError::ConnectionClosed)?;
+            .await;
+        drop(enqueue_barrier_guard);
+        send_result.map_err(|_| ClientError::ConnectionClosed)?;
 
         Ok(PendingResponse {
             inner: self.inner.clone(),
             response_rx,
             mark_capabilities_on_success,
             invalidate_capabilities_on_success,
-            barrier_guard,
         })
     }
 
@@ -1858,28 +1864,32 @@ impl ClientConnection {
         mark_capabilities_on_success: bool,
         invalidate_capabilities_on_success: bool,
     ) -> Result<PendingExchange, ClientError> {
-        let barrier_guard = if request_kind_requires_barrier(request.kind()) {
-            Some(self.inner.send_barrier.clone().lock_owned().await)
-        } else {
-            None
-        };
+        let barrier_guard = self.inner.send_barrier.clone().lock_owned().await;
+        let (retained_barrier_guard, enqueue_barrier_guard) =
+            if request_kind_requires_barrier(request.kind()) {
+                (Some(barrier_guard), None)
+            } else {
+                (None, Some(barrier_guard))
+            };
 
         let (response_tx, response_rx) = oneshot::channel();
-        self.inner
+        let send_result = self
+            .inner
             .request_tx
             .send(QueuedRequest {
                 request,
                 response_tx,
+                barrier_guard: retained_barrier_guard,
             })
-            .await
-            .map_err(|_| ClientError::ConnectionClosed)?;
+            .await;
+        drop(enqueue_barrier_guard);
+        send_result.map_err(|_| ClientError::ConnectionClosed)?;
 
         Ok(PendingExchange {
             inner: self.inner.clone(),
             response_rx,
             mark_capabilities_on_success,
             invalidate_capabilities_on_success,
-            barrier_guard,
         })
     }
 
@@ -1901,6 +1911,7 @@ impl ClientConnection {
             return Ok(());
         }
 
+        let _probe_guard = self.inner.capabilities_probe.lock().await;
         if *self.inner.capabilities_negotiated.lock().await {
             return Ok(());
         }
@@ -1942,6 +1953,7 @@ fn request_kind_invalidates_capabilities(kind: RequestKind) -> bool {
         kind,
         RequestKind::AuthInfoUser
             | RequestKind::AuthInfoPass
+            | RequestKind::AuthInfo
             | RequestKind::ModeReader
             | RequestKind::StartTls
     )
@@ -1952,6 +1964,7 @@ fn request_kind_requires_barrier(kind: RequestKind) -> bool {
         kind,
         RequestKind::AuthInfoUser
             | RequestKind::AuthInfoPass
+            | RequestKind::AuthInfo
             | RequestKind::ModeReader
             | RequestKind::StartTls
             | RequestKind::Post
@@ -1960,6 +1973,19 @@ fn request_kind_requires_barrier(kind: RequestKind) -> bool {
             | RequestKind::TakeThis
             | RequestKind::Quit
     )
+}
+
+fn response_invalidates_capabilities(kind: RequestKind, status: StatusCode) -> bool {
+    if !request_kind_invalidates_capabilities(kind) {
+        return false;
+    }
+
+    match kind {
+        RequestKind::AuthInfoUser | RequestKind::AuthInfoPass | RequestKind::AuthInfo => {
+            matches!(status.as_u16(), 281 | 283)
+        }
+        _ => true,
+    }
 }
 
 impl Drop for ConnectionHandle {
@@ -1974,6 +2000,7 @@ struct ConnectionHandle {
     request_tx: mpsc::Sender<QueuedRequest>,
     poisoned: Arc<Mutex<Option<SharedEngineError>>>,
     capabilities_negotiated: Arc<Mutex<bool>>,
+    capabilities_probe: Arc<Mutex<()>>,
     send_barrier: Arc<Mutex<()>>,
     writer_task: JoinHandle<()>,
     reader_task: JoinHandle<()>,
@@ -2133,10 +2160,25 @@ impl TryFrom<OwnedResponse> for OwnedArticle {
     type Error = ClientError;
 
     fn try_from(response: OwnedResponse) -> Result<Self, Self::Error> {
-        if let Err(source) = response.parse_article() {
-            return Err(ClientError::UnexpectedArticleResponse { response, source });
+        let expected_status = match response.kind {
+            RequestKind::Article => 220,
+            RequestKind::Head => 221,
+            RequestKind::Body => 222,
+            RequestKind::Stat => 223,
+            _ => 0,
+        };
+        if response.status.as_u16() != expected_status {
+            let status = response.status.as_u16();
+            return Err(ClientError::UnexpectedArticleResponse {
+                response,
+                source: ArticleParseError::InvalidStatusCode(status),
+            });
         }
 
+        // `ResponseFrame::parse` has already validated the complete frame and
+        // performed its semantic parse. Avoid performing that allocation-producing
+        // parse a second time while converting the response wrapper; the typed
+        // accessor remains the explicit parse requested by the caller.
         Ok(Self { response })
     }
 }
@@ -2278,25 +2320,36 @@ impl From<crate::protocol::InvalidListGroupRangeOrGroupName> for ClientError {
 #[derive(Debug)]
 struct ResponseDecoder {
     inner: ResponseFrameDecoder,
+    streaming: StreamingResponseDecoder,
+    scanned: usize,
 }
 
 impl ResponseDecoder {
     fn new(kind: RequestKind) -> Self {
         Self {
             inner: ResponseFrameDecoder::new(kind),
+            streaming: StreamingResponseDecoder::new(kind),
+            scanned: 0,
         }
     }
 
     fn push(&mut self, buffer: &[u8]) -> Result<DecodeProgress, ClientError> {
-        match self.inner.decode(buffer) {
-            ResponseFrameParse::Complete(response) => Ok(DecodeProgress::Complete {
-                status: response.status(),
-                consumed: response.consumed(),
-                content_start: response.content_start(),
-                content_end: response.content_end(),
-            }),
-            ResponseFrameParse::NeedMore => Ok(DecodeProgress::NeedMore),
-            ResponseFrameParse::Invalid => Err(ClientError::InvalidStatusLine),
+        let start = self.scanned.min(buffer.len());
+        let chunk = &buffer[start..];
+        self.scanned = buffer.len();
+
+        match self.streaming.push(chunk)? {
+            StreamingDecodeProgress::NeedMore { .. } => Ok(DecodeProgress::NeedMore),
+            StreamingDecodeProgress::Complete { .. } => match self.inner.decode(buffer) {
+                ResponseFrameParse::Complete(response) => Ok(DecodeProgress::Complete {
+                    status: response.status(),
+                    consumed: response.consumed(),
+                    content_start: response.content_start(),
+                    content_end: response.content_end(),
+                }),
+                ResponseFrameParse::NeedMore => Ok(DecodeProgress::NeedMore),
+                ResponseFrameParse::Invalid => Err(ClientError::InvalidStatusLine),
+            },
         }
     }
 }
@@ -2475,10 +2528,158 @@ pub fn bench_streaming_decode_response(
     }
 }
 
+/// Construct the owned response representation used by the benchmark-only
+/// public-client probes.
+#[doc(hidden)]
+pub fn bench_owned_response_from_bytes(
+    kind: RequestKind,
+    bytes: &[u8],
+) -> Result<OwnedResponse, ClientError> {
+    let ResponseFrameParse::Complete(frame) = ResponseFrameDecoder::new(kind).decode(bytes) else {
+        return Err(ClientError::UnexpectedEof);
+    };
+
+    Ok(OwnedResponse {
+        kind,
+        status: frame.status(),
+        content_start: frame.content_start(),
+        content_end: frame.content_end(),
+        bytes: Bytes::copy_from_slice(&bytes[..frame.consumed()]),
+    })
+}
+
+/// Measure the article transformation performed by the typed accessor after
+/// response-frame validation has already completed.
+#[doc(hidden)]
+pub fn bench_owned_article_accessor_parse(response: &OwnedResponse) -> Result<usize, ClientError> {
+    let parsed = response
+        .parse_article()
+        .map_err(|_| ClientError::UnexpectedEof)?;
+    Ok(parsed
+        .body
+        .as_ref()
+        .map_or(0, |body| body.len())
+        .saturating_add(parsed.message_id.as_str().len()))
+}
+
+/// Measure frame validation plus the two later article parses without copying
+/// the input into an owned response. This is the allocation-producing baseline
+/// for the full public-client parse sequence.
+#[doc(hidden)]
+pub fn bench_article_validation_and_two_parses(
+    kind: RequestKind,
+    bytes: &[u8],
+) -> Result<usize, ClientError> {
+    let ResponseFrameParse::Complete(frame) = ResponseFrameDecoder::new(kind).decode(bytes) else {
+        return Err(ClientError::UnexpectedEof);
+    };
+    let first = Article::parse_framed(bytes, frame.content_start(), frame.content_end())
+        .map_err(|_| ClientError::UnexpectedEof)?;
+    let second = Article::parse_framed(bytes, frame.content_start(), frame.content_end())
+        .map_err(|_| ClientError::UnexpectedEof)?;
+    Ok(first
+        .body
+        .as_ref()
+        .map_or(0, |body| body.len())
+        .saturating_add(second.message_id.as_str().len()))
+}
+
+/// Measure frame validation followed by one on-demand article transformation.
+#[doc(hidden)]
+pub fn bench_article_validation_and_parse(
+    kind: RequestKind,
+    bytes: &[u8],
+) -> Result<usize, ClientError> {
+    let ResponseFrameParse::Complete(frame) = ResponseFrameDecoder::new(kind).decode(bytes) else {
+        return Err(ClientError::UnexpectedEof);
+    };
+    let parsed = Article::parse_framed(bytes, frame.content_start(), frame.content_end())
+        .map_err(|_| ClientError::UnexpectedEof)?;
+    Ok(parsed
+        .body
+        .as_ref()
+        .map_or(0, |body| body.len())
+        .saturating_add(parsed.message_id.as_str().len()))
+}
+
+/// Run the current incremental public response decoder against a fragmented
+/// response.
+#[doc(hidden)]
+pub fn bench_public_response_decode_chunks(
+    kind: RequestKind,
+    response: &[u8],
+    chunk_bytes: usize,
+) -> Result<(StatusCode, usize), ClientError> {
+    let chunk_bytes = chunk_bytes.max(1);
+    let mut decoder = ResponseDecoder::new(kind);
+    let mut pending = BytesMut::with_capacity(response.len());
+    let mut offset = 0;
+
+    while offset < response.len() {
+        let end = (offset + chunk_bytes).min(response.len());
+        pending.extend_from_slice(&response[offset..end]);
+        offset = end;
+
+        if let DecodeProgress::Complete {
+            status, consumed, ..
+        } = decoder.push(&pending)?
+        {
+            return Ok((status, consumed));
+        }
+    }
+
+    Err(ClientError::UnexpectedEof)
+}
+
+/// Run the pre-incremental whole-pending-buffer decoder as a benchmark control.
+#[doc(hidden)]
+pub fn bench_public_response_decode_chunks_stateless(
+    kind: RequestKind,
+    response: &[u8],
+    chunk_bytes: usize,
+) -> Result<(StatusCode, usize), ClientError> {
+    let chunk_bytes = chunk_bytes.max(1);
+    let decoder = ResponseFrameDecoder::new(kind);
+    let mut pending = BytesMut::with_capacity(response.len());
+    let mut offset = 0;
+
+    while offset < response.len() {
+        let end = (offset + chunk_bytes).min(response.len());
+        pending.extend_from_slice(&response[offset..end]);
+        offset = end;
+
+        match decoder.decode(&pending) {
+            ResponseFrameParse::Complete(frame) => {
+                return Ok((frame.status(), frame.consumed()));
+            }
+            ResponseFrameParse::NeedMore => {}
+            ResponseFrameParse::Invalid => return Err(ClientError::InvalidStatusLine),
+        }
+    }
+
+    Err(ClientError::UnexpectedEof)
+}
+
+/// Measure one owned-client receive into a caller-controlled buffer state.
+#[doc(hidden)]
+pub async fn bench_pending_read_capacity(
+    source: &[u8],
+    initial_len: usize,
+    initial_capacity: usize,
+    read_chunk_bytes: usize,
+) -> io::Result<(usize, usize)> {
+    let mut reader = io::Cursor::new(source);
+    let mut pending = BytesMut::with_capacity(initial_capacity);
+    pending.resize(initial_len, 0);
+    let read = read_into_pending_bytes(&mut reader, &mut pending, read_chunk_bytes).await?;
+    Ok((read, pending.capacity()))
+}
+
 #[derive(Debug)]
 struct QueuedRequest {
     request: Request<'static>,
     response_tx: oneshot::Sender<Result<CompletedRequest, SharedEngineError>>,
+    barrier_guard: Option<OwnedMutexGuard<()>>,
 }
 
 #[derive(Debug)]
@@ -2487,7 +2688,6 @@ pub(crate) struct PendingResponse {
     response_rx: oneshot::Receiver<Result<CompletedRequest, SharedEngineError>>,
     mark_capabilities_on_success: bool,
     invalidate_capabilities_on_success: bool,
-    barrier_guard: Option<OwnedMutexGuard<()>>,
 }
 
 impl PendingResponse {
@@ -2506,17 +2706,20 @@ impl PendingResponse {
             }
         };
 
-        match response.map_err(ClientError::from)?.response {
+        let completed = response.map_err(ClientError::from)?;
+        let request_kind = completed.request.kind();
+        match completed.response {
             CompletedResponse::Owned(response) => {
                 if self.mark_capabilities_on_success && response.status().as_u16() == 101 {
                     *self.inner.capabilities_negotiated.lock().await = true;
                 } else if self.mark_capabilities_on_success {
                     return Err(ClientError::CapabilitiesUnavailable);
                 }
-                if self.invalidate_capabilities_on_success {
+                if self.invalidate_capabilities_on_success
+                    && response_invalidates_capabilities(request_kind, response.status())
+                {
                     *self.inner.capabilities_negotiated.lock().await = false;
                 }
-                drop(self.barrier_guard);
                 Ok(response)
             }
         }
@@ -2529,7 +2732,6 @@ pub(crate) struct PendingExchange {
     response_rx: oneshot::Receiver<Result<CompletedRequest, SharedEngineError>>,
     mark_capabilities_on_success: bool,
     invalidate_capabilities_on_success: bool,
-    barrier_guard: Option<OwnedMutexGuard<()>>,
 }
 
 impl PendingExchange {
@@ -2549,6 +2751,7 @@ impl PendingExchange {
         };
 
         let completed = response.map_err(ClientError::from)?;
+        let request_kind = completed.request.kind();
         match completed.response {
             CompletedResponse::Owned(response) => {
                 if self.mark_capabilities_on_success && response.status().as_u16() == 101 {
@@ -2556,10 +2759,11 @@ impl PendingExchange {
                 } else if self.mark_capabilities_on_success {
                     return Err(ClientError::CapabilitiesUnavailable);
                 }
-                if self.invalidate_capabilities_on_success {
+                if self.invalidate_capabilities_on_success
+                    && response_invalidates_capabilities(request_kind, response.status())
+                {
                     *self.inner.capabilities_negotiated.lock().await = false;
                 }
-                drop(self.barrier_guard);
                 Ok(OwnedExchange {
                     request: completed.request,
                     response,
@@ -2585,6 +2789,7 @@ struct InFlightRequest {
     request: Request<'static>,
     kind: RequestKind,
     response_tx: oneshot::Sender<Result<CompletedRequest, SharedEngineError>>,
+    barrier_guard: Option<OwnedMutexGuard<()>>,
 }
 
 #[derive(Debug, Clone)]
@@ -2620,6 +2825,7 @@ async fn run_writer_task(
             request: queued.request,
             kind,
             response_tx: queued.response_tx,
+            barrier_guard: queued.barrier_guard,
         };
         if let Err(err) = inflight_tx.send(inflight).await {
             let error = SharedEngineError::ConnectionClosed;
@@ -3107,6 +3313,7 @@ async fn run_reader_task(
             request,
             kind,
             response_tx,
+            barrier_guard,
         } = inflight_request;
         let mut decoder = ResponseDecoder::new(kind);
 
@@ -3129,6 +3336,7 @@ async fn run_reader_task(
                             bytes,
                         });
                         let _ = response_tx.send(Ok(CompletedRequest { request, response }));
+                        drop(barrier_guard);
                         break;
                     }
                     Err(ClientError::InvalidStatusLine) => {
@@ -3185,7 +3393,16 @@ where
     R: AsyncRead + Unpin,
 {
     let read_len = read_chunk_bytes.max(1);
-    pending_read.reserve(read_len);
+    let spare_capacity = pending_read.capacity().saturating_sub(pending_read.len());
+    if spare_capacity < read_len && spare_capacity < MIN_PENDING_READ_SPARE_BYTES {
+        pending_read.reserve(read_len);
+    }
+    let read_len = read_len.min(
+        pending_read
+            .capacity()
+            .saturating_sub(pending_read.len())
+            .max(1),
+    );
     poll_fn(|cx| {
         let spare = pending_read.spare_capacity_mut();
         let mut read_buf = ReadBuf::uninit(&mut spare[..read_len]);
@@ -4243,6 +4460,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn owned_pending_read_uses_sufficient_spare_capacity_without_growth() {
+        let mut reader = ProbeReader::new(&[b'x'; 512]);
+        let mut pending_read = BytesMut::with_capacity(1024);
+        pending_read.resize(768, b'p');
+
+        let read = read_into_pending_bytes(&mut reader, &mut pending_read, 512)
+            .await
+            .unwrap();
+
+        assert_eq!(read, 256);
+        assert_eq!(reader.max_requested, 256);
+        assert_eq!(pending_read.capacity(), 1024);
+        assert_eq!(pending_read.len(), 1024);
+    }
+
+    #[tokio::test]
     async fn client_connection_fetches_article_and_parses_zero_copy_view() {
         let listener = crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
         let addr = listener.local_addr().unwrap();
@@ -4847,7 +5080,9 @@ mod tests {
         // RFC 3977 section 3.3 requires clients to discover CAPABILITIES
         // before treating extension commands as negotiated behavior, and RFC
         // 4642 section 2.2 places STARTTLS behind capability advertisement.
-        // This benchmark client still jumps straight to STARTTLS.
+        // This benchmark client discovers the capability before issuing
+        // STARTTLS, but this transport does not perform the subsequent TLS
+        // stream upgrade.
         use std::time::Duration;
 
         let listener = crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
@@ -4916,6 +5151,69 @@ mod tests {
         assert_eq!(starttls.status().as_u16(), 382);
         assert_eq!(quit.kind(), RequestKind::Quit);
         assert_eq!(quit.status().as_u16(), 205);
+
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn authinfo_state_coordination_waits_for_terminal_statuses() {
+        assert!(request_kind_requires_barrier(RequestKind::AuthInfo));
+        assert!(request_kind_invalidates_capabilities(RequestKind::AuthInfo));
+        assert!(!response_invalidates_capabilities(
+            RequestKind::AuthInfo,
+            StatusCode::parse(b"383").unwrap()
+        ));
+        assert!(response_invalidates_capabilities(
+            RequestKind::AuthInfo,
+            StatusCode::parse(b"281").unwrap()
+        ));
+        assert!(response_invalidates_capabilities(
+            RequestKind::AuthInfo,
+            StatusCode::parse(b"283").unwrap()
+        ));
+    }
+
+    #[tokio::test]
+    async fn client_connection_does_not_probe_capabilities_between_authinfo_steps() {
+        let listener = crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"201 client ready\r\n").await.unwrap();
+            assert_read_request(&mut stream, b"CAPABILITIES\r\n").await;
+            stream
+                .write_all(b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n")
+                .await
+                .unwrap();
+            assert_read_request(&mut stream, b"AUTHINFO USER bench-user\r\n").await;
+            stream
+                .write_all(b"381 password required\r\n")
+                .await
+                .unwrap();
+            assert_read_request(&mut stream, b"AUTHINFO PASS bench-pass\r\n").await;
+            stream.write_all(crate::AUTHINFO_RESPONSE).await.unwrap();
+        });
+
+        let connection = ClientConnection::connect(addr).await.unwrap();
+        connection.capabilities().await.unwrap();
+        assert_eq!(
+            connection
+                .authinfo_user(AuthInfoValue::from_owned("bench-user").unwrap())
+                .await
+                .unwrap()
+                .status()
+                .as_u16(),
+            381
+        );
+        assert_eq!(
+            connection
+                .authinfo_pass(AuthInfoValue::from_owned("bench-pass").unwrap())
+                .await
+                .unwrap()
+                .status()
+                .as_u16(),
+            281
+        );
 
         server.await.unwrap();
     }
@@ -5750,6 +6048,41 @@ mod tests {
         assert_eq!(first.status().as_u16(), 220);
         assert_eq!(second.status().as_u16(), 222);
 
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn client_connection_single_flights_concurrent_capability_probes() {
+        let listener = crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"201 client ready\r\n").await.unwrap();
+            assert_read_request(&mut stream, b"CAPABILITIES\r\n").await;
+            stream
+                .write_all(b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n")
+                .await
+                .unwrap();
+
+            assert_read_request(&mut stream, b"OVER 1-1\r\n").await;
+            stream
+                .write_all(b"224 Overview information follows\r\n.\r\n")
+                .await
+                .unwrap();
+            assert_read_request(&mut stream, b"OVER 1-1\r\n").await;
+            stream
+                .write_all(b"224 Overview information follows\r\n.\r\n")
+                .await
+                .unwrap();
+        });
+
+        let connection = ClientConnection::connect(addr).await.unwrap();
+        let selector = || ArticleSelector::from_owned("1-1").unwrap();
+        let (first, second) =
+            tokio::join!(connection.over(selector()), connection.over(selector()));
+
+        assert_eq!(first.unwrap().status().as_u16(), 224);
+        assert_eq!(second.unwrap().status().as_u16(), 224);
         server.await.unwrap();
     }
 

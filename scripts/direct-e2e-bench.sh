@@ -15,12 +15,23 @@ fi
 DEFAULT_SERVER_TASKSET=""
 DEFAULT_CLIENT_TASKSET=""
 if [[ "$PINNING_SUPPORTED" -eq 1 ]]; then
-    AVAILABLE_CPUS="$(nproc 2>/dev/null || echo 1)"
-    if [[ "$AVAILABLE_CPUS" -ge 2 ]]; then
-        DEFAULT_SERVER_TASKSET="0"
-        DEFAULT_CLIENT_TASKSET="1"
-    elif [[ "$AVAILABLE_CPUS" -eq 1 ]]; then
-        DEFAULT_SERVER_TASKSET="0"
+    AFFINITY_CPUS=()
+    IFS=, read -r -a affinity_ranges <<< "$(taskset -pc $$ 2>/dev/null | sed 's/.*: //')"
+    for affinity_range in "${affinity_ranges[@]}"; do
+        if [[ "$affinity_range" == *-* ]]; then
+            IFS=- read -r range_start range_end <<< "$affinity_range"
+            for ((cpu = range_start; cpu <= range_end && ${#AFFINITY_CPUS[@]} < 2; cpu++)); do
+                AFFINITY_CPUS+=("$cpu")
+            done
+        elif [[ -n "$affinity_range" ]]; then
+            AFFINITY_CPUS+=("$affinity_range")
+        fi
+    done
+    if [[ "${#AFFINITY_CPUS[@]}" -ge 2 ]]; then
+        DEFAULT_SERVER_TASKSET="${AFFINITY_CPUS[0]}"
+        DEFAULT_CLIENT_TASKSET="${AFFINITY_CPUS[1]}"
+    elif [[ "${#AFFINITY_CPUS[@]}" -eq 1 ]]; then
+        DEFAULT_SERVER_TASKSET="${AFFINITY_CPUS[0]}"
     fi
 fi
 
@@ -52,8 +63,9 @@ Options:
   --churn   run a one-request-per-connection workload and report connections/sec
 
 Environment:
-  SERVER_TASKSET   optional CPU list for the server process, default 0 on Linux with >=2 CPUs
-  CLIENT_TASKSET   optional CPU list for the client process, default 1 on Linux with >=2 CPUs
+  SERVER_TASKSET   optional CPU list for the server process, default to the first CPU in the current affinity mask
+  CLIENT_TASKSET   optional CPU list for the client process, default to the second CPU in the current affinity mask
+                    (with one available CPU, only the server is pinned; with no usable mask, neither is pinned)
 EOF
             exit 0
             ;;
@@ -137,7 +149,7 @@ series_stats() {
 
     count=$(wc -l <"$values_file" | tr -d ' ')
     if [[ "$count" -eq 0 ]]; then
-        printf '0 0 0 0 0\n'
+        printf '0 0 0 0 0 0\n'
         return
     fi
 

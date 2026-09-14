@@ -10,10 +10,15 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+TARGET_DIR="${CARGO_TARGET_DIR:-$PROJECT_DIR/target}"
 PLATFORM="$(uname -s)"
 FIRST_ARG="${1:-}"
 TARGET="server"
-OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_DIR/target/profiling/profile-mem}"
+OUTPUT_DIR="${OUTPUT_DIR:-$TARGET_DIR/profiling/profile-mem}"
+case "$OUTPUT_DIR" in
+    /*) ;;
+    *) OUTPUT_DIR="$PWD/$OUTPUT_DIR" ;;
+esac
 if [ $# -gt 0 ]; then
     case "$1" in
         server|nntpbench|/*|./*|../*)
@@ -54,17 +59,20 @@ fi
 # Resolve binary name
 case "$TARGET" in
     server)
-        BINARY="$PROJECT_DIR/target/profiling/nntpbench"
+        BINARY="$TARGET_DIR/profiling/nntpbench"
         BIN_NAME="nntpbench"
         RUN_ARGS=("server")
         ;;
     nntpbench)
-        BINARY="$PROJECT_DIR/target/profiling/nntpbench"
+        BINARY="$TARGET_DIR/profiling/nntpbench"
         BIN_NAME="nntpbench"
         RUN_ARGS=()
         ;;
     *)
-        BINARY="$TARGET"
+        case "$TARGET" in
+            /*) BINARY="$TARGET" ;;
+            *) BINARY="$PROJECT_DIR/$TARGET" ;;
+        esac
         BIN_NAME=""  # Custom path, skip build
         RUN_ARGS=()
         ;;

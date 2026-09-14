@@ -73,7 +73,6 @@
           [
             rustToolchain
             pkgs.cargo-llvm-cov
-            gungraunRunner
             pkgs.coz
             gungraunRunner
           ]
