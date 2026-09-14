@@ -10,11 +10,10 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-cd "$PROJECT_DIR"
-
 PLATFORM="$(uname -s)"
 FIRST_ARG="${1:-}"
 TARGET="server"
+OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_DIR/target/profiling/profile-mem}"
 if [ $# -gt 0 ]; then
     case "$1" in
         server|nntpbench|/*|./*|../*)
@@ -39,6 +38,7 @@ if [ "$FIRST_ARG" = "-h" ] || [ "$FIRST_ARG" = "--help" ]; then
     echo "  macOS: MallocStackLogging + leaks"
     echo ""
     echo "Environment:"
+    echo "  OUTPUT_DIR         artifact directory, default target/profiling/profile-mem"
     echo "  PROFILE_SECONDS    macOS live snapshot delay, default 10"
     echo ""
     echo "Examples:"
@@ -79,6 +79,7 @@ build_profile_binary() {
 
 echo "=== Heap Profiling ==="
 echo ""
+mkdir -p "$OUTPUT_DIR"
 
 case "$PLATFORM" in
   Darwin)
@@ -87,10 +88,12 @@ case "$PLATFORM" in
         exit 1
     fi
 
+    cd "$PROJECT_DIR"
     build_profile_binary
+    cd "$OUTPUT_DIR"
     SECONDS_TO_RUN="${PROFILE_SECONDS:-10}"
-    LEAKS_OUTPUT="leaks.txt"
-    MEMGRAPH_DIR="$PROJECT_DIR/target/profiling"
+    LEAKS_OUTPUT="$OUTPUT_DIR/leaks.txt"
+    MEMGRAPH_DIR="$OUTPUT_DIR/leaks-graphs"
     mkdir -p "$MEMGRAPH_DIR"
 
     echo "Using MallocStackLogging + leaks..."
@@ -116,7 +119,9 @@ case "$PLATFORM" in
     ;;
 
   Linux)
+    cd "$PROJECT_DIR"
     build_profile_binary
+    cd "$OUTPUT_DIR"
 
     if command -v heaptrack &> /dev/null; then
         echo "Using heaptrack..."
@@ -137,8 +142,8 @@ case "$PLATFORM" in
             if command -v heaptrack_print &> /dev/null; then
                 echo "Generating text summary..."
                 heaptrack_print "$HEAPTRACK_FILE" -F stacks.txt > heaptrack-summary.txt 2>&1 || true
-                echo "Summary: heaptrack-summary.txt"
-                echo "Stacks:  stacks.txt"
+                echo "Summary: $OUTPUT_DIR/heaptrack-summary.txt"
+                echo "Stacks:  $OUTPUT_DIR/stacks.txt"
             fi
 
             if command -v heaptrack_gui &> /dev/null; then

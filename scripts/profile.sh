@@ -10,12 +10,12 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-cd "$PROJECT_DIR"
-
 PLATFORM="$(uname -s)"
 ATTACH_PID=""
 TARGET="server"
 EXTRA_ARGS=()
+OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_DIR/target/profiling/profile}"
+mkdir -p "$OUTPUT_DIR"
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -29,6 +29,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --pid PID   Attach to an already-running process instead of launching one"
             echo ""
             echo "Environment:"
+            echo "  OUTPUT_DIR            artifact directory, default target/profiling/profile"
             echo "  PROFILE_SECONDS       macOS sample duration, default 10"
             echo "  SAMPLE_INTERVAL_MS    macOS sample interval, default 1"
             echo ""
@@ -115,16 +116,18 @@ run_macos_sample() {
 case "$PLATFORM" in
   Darwin)
     printf '\033]0;sample: nntpbench CPU\007'
+    cd "$PROJECT_DIR"
     build_profile_binary
+    cd "$OUTPUT_DIR"
 
     if [ -n "$ATTACH_PID" ]; then
-        run_macos_sample "$ATTACH_PID" sample.txt
+        run_macos_sample "$ATTACH_PID" "$OUTPUT_DIR/sample.txt"
     else
         echo "Profiling: $BINARY ${RUN_ARGS[*]} ${EXTRA_ARGS[*]}"
         "$BINARY" "${RUN_ARGS[@]}" "${EXTRA_ARGS[@]}" &
         APP_PID=$!
         set +e
-        run_macos_sample "$APP_PID" sample.txt
+        run_macos_sample "$APP_PID" "$OUTPUT_DIR/sample.txt"
         SAMPLE_STATUS=$?
         if kill -0 "$APP_PID" 2>/dev/null; then
             kill -INT "$APP_PID" 2>/dev/null || true
@@ -145,7 +148,9 @@ case "$PLATFORM" in
     echo -1 | sudo tee /proc/sys/kernel/perf_event_paranoid > /dev/null
 
     printf '\033]0;perf: nntpbench CPU\007'
+    cd "$PROJECT_DIR"
     build_profile_binary
+    cd "$OUTPUT_DIR"
 
     set +e
     if [ -n "$ATTACH_PID" ]; then
