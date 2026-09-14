@@ -28,6 +28,7 @@ use crate::{
 
 const OWNED_RESPONSE_PREALLOC_BYTES: usize = 8 * 1024 * 1024;
 const STREAMING_STATUS_LINE_BYTES: usize = crate::protocol::MAX_AUTHINFO_SASL_RESPONSE_LINE_BYTES;
+const MIN_PENDING_READ_SPARE_BYTES: usize = 256;
 
 /// Options for the client one-connection client prototype.
 #[derive(Debug, Clone, Copy)]
@@ -2181,10 +2182,25 @@ impl TryFrom<OwnedResponse> for OwnedArticle {
     type Error = ClientError;
 
     fn try_from(response: OwnedResponse) -> Result<Self, Self::Error> {
-        if let Err(source) = response.parse_article() {
-            return Err(ClientError::UnexpectedArticleResponse { response, source });
+        let expected_status = match response.kind {
+            RequestKind::Article => 220,
+            RequestKind::Head => 221,
+            RequestKind::Body => 222,
+            RequestKind::Stat => 223,
+            _ => 0,
+        };
+        if response.status.as_u16() != expected_status {
+            let status = response.status.as_u16();
+            return Err(ClientError::UnexpectedArticleResponse {
+                response,
+                source: ArticleParseError::InvalidStatusCode(status),
+            });
         }
 
+        // `ResponseFrame::parse` has already validated the complete frame and
+        // performed its semantic parse. Avoid performing that allocation-producing
+        // parse a second time while converting the response wrapper; the typed
+        // accessor remains the explicit parse requested by the caller.
         Ok(Self { response })
     }
 }
@@ -2326,25 +2342,36 @@ impl From<crate::protocol::InvalidListGroupRangeOrGroupName> for ClientError {
 #[derive(Debug)]
 struct ResponseDecoder {
     inner: ResponseFrameDecoder,
+    streaming: StreamingResponseDecoder,
+    scanned: usize,
 }
 
 impl ResponseDecoder {
     fn new(kind: RequestKind) -> Self {
         Self {
             inner: ResponseFrameDecoder::new(kind),
+            streaming: StreamingResponseDecoder::new(kind),
+            scanned: 0,
         }
     }
 
     fn push(&mut self, buffer: &[u8]) -> Result<DecodeProgress, ClientError> {
-        match self.inner.decode(buffer) {
-            ResponseFrameParse::Complete(response) => Ok(DecodeProgress::Complete {
-                status: response.status(),
-                consumed: response.consumed(),
-                content_start: response.content_start(),
-                content_end: response.content_end(),
-            }),
-            ResponseFrameParse::NeedMore => Ok(DecodeProgress::NeedMore),
-            ResponseFrameParse::Invalid => Err(ClientError::InvalidStatusLine),
+        let start = self.scanned.min(buffer.len());
+        let chunk = &buffer[start..];
+        self.scanned = buffer.len();
+
+        match self.streaming.push(chunk)? {
+            StreamingDecodeProgress::NeedMore { .. } => Ok(DecodeProgress::NeedMore),
+            StreamingDecodeProgress::Complete { .. } => match self.inner.decode(buffer) {
+                ResponseFrameParse::Complete(response) => Ok(DecodeProgress::Complete {
+                    status: response.status(),
+                    consumed: response.consumed(),
+                    content_start: response.content_start(),
+                    content_end: response.content_end(),
+                }),
+                ResponseFrameParse::NeedMore => Ok(DecodeProgress::NeedMore),
+                ResponseFrameParse::Invalid => Err(ClientError::InvalidStatusLine),
+            },
         }
     }
 }
@@ -2543,12 +2570,13 @@ pub fn bench_owned_response_from_bytes(
     })
 }
 
-/// Measure the two post-frame article parses performed by the current owned
-/// article path: conversion to `OwnedArticle` and the typed accessor.
+/// Measure the article transformation performed by the typed accessor after
+/// response-frame validation has already completed.
 #[doc(hidden)]
-pub fn bench_owned_article_parse_passes(response: &OwnedResponse) -> Result<usize, ClientError> {
-    let article = OwnedArticle::try_from(response.clone())?;
-    let parsed = article.article().map_err(|_| ClientError::UnexpectedEof)?;
+pub fn bench_owned_article_accessor_parse(response: &OwnedResponse) -> Result<usize, ClientError> {
+    let parsed = response
+        .parse_article()
+        .map_err(|_| ClientError::UnexpectedEof)?;
     Ok(parsed
         .body
         .as_ref()
@@ -2578,9 +2606,26 @@ pub fn bench_article_validation_and_two_parses(
         .saturating_add(second.message_id.as_str().len()))
 }
 
-/// Run the current stateless public response decoder against a fragmented
-/// response. This intentionally preserves the existing whole-pending-buffer
-/// decode behavior so an incremental decoder can be compared against it.
+/// Measure frame validation followed by one on-demand article transformation.
+#[doc(hidden)]
+pub fn bench_article_validation_and_parse(
+    kind: RequestKind,
+    bytes: &[u8],
+) -> Result<usize, ClientError> {
+    let ResponseFrameParse::Complete(frame) = ResponseFrameDecoder::new(kind).decode(bytes) else {
+        return Err(ClientError::UnexpectedEof);
+    };
+    let parsed = Article::parse_framed(bytes, frame.content_start(), frame.content_end())
+        .map_err(|_| ClientError::UnexpectedEof)?;
+    Ok(parsed
+        .body
+        .as_ref()
+        .map_or(0, |body| body.len())
+        .saturating_add(parsed.message_id.as_str().len()))
+}
+
+/// Run the current incremental public response decoder against a fragmented
+/// response.
 #[doc(hidden)]
 pub fn bench_public_response_decode_chunks(
     kind: RequestKind,
@@ -2602,6 +2647,35 @@ pub fn bench_public_response_decode_chunks(
         } = decoder.push(&pending)?
         {
             return Ok((status, consumed));
+        }
+    }
+
+    Err(ClientError::UnexpectedEof)
+}
+
+/// Run the pre-incremental whole-pending-buffer decoder as a benchmark control.
+#[doc(hidden)]
+pub fn bench_public_response_decode_chunks_stateless(
+    kind: RequestKind,
+    response: &[u8],
+    chunk_bytes: usize,
+) -> Result<(StatusCode, usize), ClientError> {
+    let chunk_bytes = chunk_bytes.max(1);
+    let decoder = ResponseFrameDecoder::new(kind);
+    let mut pending = BytesMut::with_capacity(response.len());
+    let mut offset = 0;
+
+    while offset < response.len() {
+        let end = (offset + chunk_bytes).min(response.len());
+        pending.extend_from_slice(&response[offset..end]);
+        offset = end;
+
+        match decoder.decode(&pending) {
+            ResponseFrameParse::Complete(frame) => {
+                return Ok((frame.status(), frame.consumed()));
+            }
+            ResponseFrameParse::NeedMore => {}
+            ResponseFrameParse::Invalid => return Err(ClientError::InvalidStatusLine),
         }
     }
 
@@ -3370,7 +3444,16 @@ where
     R: AsyncRead + Unpin,
 {
     let read_len = read_chunk_bytes.max(1);
-    pending_read.reserve(read_len);
+    let spare_capacity = pending_read.capacity().saturating_sub(pending_read.len());
+    if spare_capacity < read_len && spare_capacity < MIN_PENDING_READ_SPARE_BYTES {
+        pending_read.reserve(read_len);
+    }
+    let read_len = read_len.min(
+        pending_read
+            .capacity()
+            .saturating_sub(pending_read.len())
+            .max(1),
+    );
     poll_fn(|cx| {
         let spare = pending_read.spare_capacity_mut();
         let mut read_buf = ReadBuf::uninit(&mut spare[..read_len]);
@@ -4425,6 +4508,22 @@ mod tests {
         assert_eq!(read, 1);
         assert_eq!(pending_read.len(), OWNED_RESPONSE_PREALLOC_BYTES + 1);
         assert_eq!(pending_read[OWNED_RESPONSE_PREALLOC_BYTES], b'z');
+    }
+
+    #[tokio::test]
+    async fn owned_pending_read_uses_sufficient_spare_capacity_without_growth() {
+        let mut reader = ProbeReader::new(&[b'x'; 512]);
+        let mut pending_read = BytesMut::with_capacity(1024);
+        pending_read.resize(768, b'p');
+
+        let read = read_into_pending_bytes(&mut reader, &mut pending_read, 512)
+            .await
+            .unwrap();
+
+        assert_eq!(read, 256);
+        assert_eq!(reader.max_requested, 256);
+        assert_eq!(pending_read.capacity(), 1024);
+        assert_eq!(pending_read.len(), 1024);
     }
 
     #[tokio::test]
