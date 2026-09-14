@@ -17,8 +17,7 @@ use crate::protocol::{
     ArticleRef, Request, ResponseFrameDecoder, ResponseFrameParse, ResponseInitialParse,
 };
 use crate::terminator::{
-    DOT_TERMINATOR, EmptyMultilineTerminator, EmptyTerminatorStatus, MultilineTerminatorDetector,
-    crlf_normalized_payload_lines,
+    DOT_TERMINATOR, MultilineFrameProgress, MultilineFramer, crlf_normalized_payload_lines,
 };
 use crate::{
     Article, ArticleParseError, ArticleSelector, ArticleTransfer, AuthInfoKind, AuthInfoValue,
@@ -2340,16 +2339,29 @@ impl ResponseDecoder {
 
         match self.streaming.push(chunk)? {
             StreamingDecodeProgress::NeedMore { .. } => Ok(DecodeProgress::NeedMore),
-            StreamingDecodeProgress::Complete { .. } => match self.inner.decode(buffer) {
-                ResponseFrameParse::Complete(response) => Ok(DecodeProgress::Complete {
-                    status: response.status(),
-                    consumed: response.consumed(),
-                    content_start: response.content_start(),
-                    content_end: response.content_end(),
-                }),
-                ResponseFrameParse::NeedMore => Ok(DecodeProgress::NeedMore),
-                ResponseFrameParse::Invalid => Err(ClientError::InvalidStatusLine),
-            },
+            StreamingDecodeProgress::Complete {
+                status,
+                frame_consumed,
+                content_end,
+                ..
+            } => {
+                match self.inner.complete(
+                    buffer,
+                    status,
+                    self.streaming.status_line_end(),
+                    content_end,
+                    frame_consumed,
+                ) {
+                    ResponseFrameParse::Complete(response) => Ok(DecodeProgress::Complete {
+                        status: response.status(),
+                        consumed: response.consumed(),
+                        content_start: response.content_start(),
+                        content_end: response.content_end(),
+                    }),
+                    ResponseFrameParse::NeedMore => Ok(DecodeProgress::NeedMore),
+                    ResponseFrameParse::Invalid => Err(ClientError::InvalidStatusLine),
+                }
+            }
         }
     }
 }
@@ -2369,11 +2381,10 @@ enum DecodeProgress {
 struct StreamingResponseDecoder {
     kind: RequestKind,
     status: Option<StatusCode>,
+    status_line_end: usize,
+    framer: MultilineFramer,
     status_buf: [u8; STREAMING_STATUS_LINE_BYTES],
     status_len: usize,
-    content_started: bool,
-    empty_terminator: EmptyMultilineTerminator,
-    tail: MultilineTerminatorDetector,
 }
 
 impl StreamingResponseDecoder {
@@ -2381,11 +2392,10 @@ impl StreamingResponseDecoder {
         Self {
             kind,
             status: None,
+            status_line_end: 0,
+            framer: MultilineFramer::default(),
             status_buf: [0; STREAMING_STATUS_LINE_BYTES],
             status_len: 0,
-            content_started: false,
-            empty_terminator: EmptyMultilineTerminator::default(),
-            tail: MultilineTerminatorDetector::default(),
         }
     }
 
@@ -2410,8 +2420,14 @@ impl StreamingResponseDecoder {
                         ResponseInitialParse::Complete(initial) => {
                             let status = initial.status();
                             self.status = Some(status);
+                            self.status_line_end = self.status_len;
                             if !initial.descriptor().framing().is_multiline() {
-                                return Ok(StreamingDecodeProgress::Complete { status, consumed });
+                                return Ok(StreamingDecodeProgress::Complete {
+                                    status,
+                                    consumed,
+                                    frame_consumed: self.status_line_end,
+                                    content_end: self.status_line_end,
+                                });
                             }
                             content_start = consumed;
                             break;
@@ -2439,79 +2455,40 @@ impl StreamingResponseDecoder {
         }
 
         let content_chunk = &chunk[content_start..];
-        if !self.content_started || self.empty_terminator.is_active() {
-            match self.empty_terminator.detect(content_chunk) {
-                EmptyTerminatorStatus::FoundAt(end) => {
-                    return Ok(StreamingDecodeProgress::Complete {
-                        status,
-                        consumed: content_start + end,
-                    });
-                }
-                EmptyTerminatorStatus::NeedMore => {
-                    return Ok(StreamingDecodeProgress::NeedMore {
-                        consumed: chunk.len(),
-                    });
-                }
-                EmptyTerminatorStatus::NotFound {
-                    previous_prefix_len,
-                } => {
-                    self.content_started = true;
-                    if previous_prefix_len != 0 {
-                        self.tail.update(&DOT_TERMINATOR[..previous_prefix_len]);
-                    }
-                }
-            }
-        }
-
-        match detect_streaming_terminator(&self.tail, content_chunk) {
-            Some(end) => Ok(StreamingDecodeProgress::Complete {
+        match self.framer.push(content_chunk) {
+            MultilineFrameProgress::Complete {
+                consumed,
+                chunk_consumed,
+                content_end,
+            } => Ok(StreamingDecodeProgress::Complete {
                 status,
-                consumed: content_start + end,
+                consumed: content_start + chunk_consumed,
+                frame_consumed: self.status_line_end + consumed,
+                content_end: self.status_line_end + content_end,
             }),
-            None => {
-                self.content_started = true;
-                self.tail.update(content_chunk);
-                Ok(StreamingDecodeProgress::NeedMore {
-                    consumed: chunk.len(),
-                })
-            }
+            MultilineFrameProgress::NeedMore => Ok(StreamingDecodeProgress::NeedMore {
+                consumed: chunk.len(),
+            }),
         }
     }
-}
 
-fn detect_streaming_terminator(tail: &MultilineTerminatorDetector, chunk: &[u8]) -> Option<usize> {
-    match (
-        tail.find_spanning_terminator(chunk),
-        find_in_chunk_terminator(chunk),
-    ) {
-        (Some(spanning), Some(in_chunk)) => Some(spanning.min(in_chunk)),
-        (Some(spanning), None) => Some(spanning),
-        (None, Some(in_chunk)) => Some(in_chunk),
-        (None, None) => None,
+    fn status_line_end(&self) -> usize {
+        self.status_line_end
     }
-}
-
-fn find_in_chunk_terminator(chunk: &[u8]) -> Option<usize> {
-    memchr::memchr_iter(b'.', chunk).find_map(|dot| {
-        if dot >= crate::CRLF.len()
-            && dot + crate::CRLF.len() < chunk.len()
-            && chunk[dot - 2] == b'\r'
-            && chunk[dot - 1] == b'\n'
-            && chunk[dot + 1] == b'\r'
-            && chunk[dot + 2] == b'\n'
-        {
-            Some(dot + DOT_TERMINATOR.len())
-        } else {
-            None
-        }
-    })
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug)]
 enum StreamingDecodeProgress {
-    NeedMore { consumed: usize },
-    Complete { status: StatusCode, consumed: usize },
+    NeedMore {
+        consumed: usize,
+    },
+    Complete {
+        status: StatusCode,
+        consumed: usize,
+        frame_consumed: usize,
+        content_end: usize,
+    },
 }
 
 #[doc(hidden)]

@@ -245,6 +245,79 @@ impl ResponseFrameDecoder {
     pub(crate) fn decode<'a>(self, buffer: &'a [u8]) -> ResponseFrameParse<'a> {
         ResponseFrame::parse(self.kind, buffer)
     }
+
+    /// Validate a frame after a streaming caller has already located its end.
+    ///
+    /// The streaming detector owns delimiter search. Keeping this completion
+    /// step separate avoids searching the accumulated pending buffer a second
+    /// time while preserving the full semantic validation performed by
+    /// [`ResponseFrame::parse`].
+    pub(crate) fn complete<'a>(
+        self,
+        buffer: &'a [u8],
+        status: StatusCode,
+        status_line_end: usize,
+        content_end: usize,
+        consumed: usize,
+    ) -> ResponseFrameParse<'a> {
+        let Some(status_line) = buffer.get(..status_line_end) else {
+            return ResponseFrameParse::Invalid;
+        };
+        if status_line_end < 5
+            || content_end < status_line_end
+            || consumed < content_end
+            || consumed > buffer.len()
+        {
+            return ResponseFrameParse::Invalid;
+        }
+
+        let descriptor = ResponseDescriptor::for_request_status(self.kind, status);
+        if matches!(descriptor.framing(), ResponseFraming::Unexpected)
+            || !validate_response_initial_line(self.kind, status, status_line)
+        {
+            return ResponseFrameParse::Invalid;
+        }
+
+        let (content, terminator) = if descriptor.framing().is_multiline() {
+            let Some(content) = buffer.get(status_line_end..content_end) else {
+                return ResponseFrameParse::Invalid;
+            };
+            if !validate_multiline_response_content(
+                self.kind,
+                buffer,
+                status_line,
+                status_line_end,
+                content_end,
+            ) {
+                return ResponseFrameParse::Invalid;
+            }
+            let Some(terminator) = buffer.get(content_end..consumed) else {
+                return ResponseFrameParse::Invalid;
+            };
+            (content, terminator)
+        } else {
+            if content_end != status_line_end || consumed != status_line_end {
+                return ResponseFrameParse::Invalid;
+            }
+            (
+                &buffer[status_line_end..status_line_end],
+                &buffer[status_line_end..status_line_end],
+            )
+        };
+
+        ResponseFrameParse::Complete(ResponseFrame {
+            kind: self.kind,
+            descriptor,
+            bytes: &buffer[..consumed],
+            status_line,
+            content,
+            terminator,
+            content_start: status_line_end,
+            content_end,
+            status,
+            consumed,
+        })
+    }
 }
 
 /// Protocol status-line result for streaming callers that cannot retain a full frame.
@@ -6025,6 +6098,24 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn response_frame_decoder_accepts_precomputed_boundaries() {
+        let wire = b"222 1 <body@test> body follows\r\nbody line\r\n.\r\nNEXT";
+        let status_line_end = b"222 1 <body@test> body follows\r\n".len();
+        let content_end = status_line_end + b"body line\r\n".len();
+        let consumed = content_end + b".\r\n".len();
+        let status = StatusCode::parse(wire).unwrap();
+
+        let ResponseFrameParse::Complete(response) = ResponseFrameDecoder::new(RequestKind::Body)
+            .complete(wire, status, status_line_end, content_end, consumed)
+        else {
+            panic!("precomputed response frame did not parse");
+        };
+
+        assert_eq!(response.content(), b"body line\r\n");
+        assert_eq!(response.consumed(), consumed);
     }
 
     #[test]
