@@ -75,6 +75,7 @@
             pkgs.cargo-llvm-cov
             gungraunRunner
             pkgs.coz
+            gungraunRunner
           ]
           ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
             pkgs.heaptrack
@@ -98,7 +99,7 @@
           echo "  cargo clippy --all-targets -- -D warnings"
           echo "  cargo llvm-cov --fail-under-lines 100 --summary-only"
           echo "  cargo bench --bench server_roundtrip"
-          echo "  cargo bench --bench server_callgrind"
+          echo "  cargo bench --bench server_gungraun"
           echo "  ./scripts/profile-coz.sh"
           echo "  ./scripts/profile.sh"
           echo "  ./scripts/profile-mem.sh"

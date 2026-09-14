@@ -3,7 +3,7 @@
 //! These benches avoid live TCP so instruction counts focus on command parsing,
 //! response selection, stats accounting, and buffer writes.
 //!
-//! Run with: `cargo bench --bench server_callgrind`
+//! Run with: `cargo bench --bench server_gungraun`
 
 macro_rules! supported {
     ($($item:item)*) => {
@@ -22,6 +22,7 @@ supported! {
         RequestKind, RequestLine, ServerArgs, ServerConfig, Stats,
         bench_format_indexed_group_response, bench_format_indexed_listgroup_range_response,
         bench_format_indexed_listgroup_response,
+        bench_load_response_scan_in_place, bench_load_response_verify_in_place,
         for_each_request_line_in_batch, process_request_to_buffer,
     };
     use std::hint::black_box;
@@ -31,6 +32,10 @@ supported! {
     const ARTICLE_768K: usize = 768 * 1024;
     const BODY_64K: usize = 64 * 1024;
     const BODY_768K: usize = 768 * 1024;
+    const BODY_RESPONSE: &[u8] = b"222 42 <bench@example.com> body follows\r\n\
+This is the benchmark body.\r\n\
+It has multiple lines.\r\n\
+.\r\n";
 
     fn server_args(body_bytes: usize, article_bytes: usize) -> ServerArgs {
         ServerArgs {
@@ -49,6 +54,7 @@ supported! {
             stats_interval_secs: 0,
             flush: false,
             pending_write_bytes: 800 * 1024,
+            json: false,
         }
     }
 
@@ -114,6 +120,31 @@ supported! {
             commands: Vec::with_capacity(8),
             output: Vec::with_capacity(BODY_64K + ARTICLE_64K + 2048),
         }
+    }
+
+    fn setup_body_response() -> Vec<u8> {
+        BODY_RESPONSE.to_vec()
+    }
+
+    #[library_benchmark]
+    #[bench::framing_only(setup = setup_body_response)]
+    fn consume_body_response(mut response: Vec<u8>) -> usize {
+        let consumed = bench_load_response_scan_in_place(&mut response, RequestKind::Body).unwrap();
+        assert_eq!(consumed, BODY_RESPONSE.len());
+        black_box(consumed)
+    }
+
+    #[library_benchmark]
+    #[bench::full_identity_verification(setup = setup_body_response)]
+    fn verify_body_response(mut response: Vec<u8>) -> usize {
+        let consumed = bench_load_response_verify_in_place(
+            &mut response,
+            RequestKind::Body,
+            "<bench@example.com>",
+        )
+        .unwrap();
+        assert_eq!(consumed, BODY_RESPONSE.len());
+        black_box(consumed)
     }
 
     #[library_benchmark]
@@ -296,7 +327,9 @@ QUIT\r\n",
             format_indexed_listgroup_response,
             format_indexed_listgroup_range_response,
             process_quit,
-            process_pipelined_batch
+            process_pipelined_batch,
+            consume_body_response,
+            verify_body_response
     );
 
     main!(
@@ -315,5 +348,5 @@ QUIT\r\n",
     any(target_arch = "x86_64", target_arch = "aarch64")
 )))]
 fn main() {
-    eprintln!("server_callgrind is disabled on this target");
+    eprintln!("server_gungraun is disabled on this target");
 }

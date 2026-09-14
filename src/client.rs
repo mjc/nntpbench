@@ -2763,9 +2763,7 @@ where
         Request::AuthInfoSasl {
             mechanism,
             initial_response,
-        } => {
-            write_authinfo_sasl_request_wire(writer, mechanism.as_bytes(), initial_response).await
-        }
+        } => write_authinfo_sasl_request_wire(writer, mechanism.as_bytes(), initial_response).await,
         Request::StartTls => write_simple_request_wire(writer, b"STARTTLS").await,
         Request::List => write_simple_request_wire(writer, b"LIST").await,
         Request::Help => write_simple_request_wire(writer, b"HELP").await,
@@ -4618,7 +4616,10 @@ mod tests {
                 .await
                 .unwrap();
             assert_read_request(&mut stream, b"MODE STREAM\r\n").await;
-            stream.write_all(b"203 streaming enabled\r\n").await.unwrap();
+            stream
+                .write_all(b"203 streaming enabled\r\n")
+                .await
+                .unwrap();
             assert_read_request(&mut stream, b"QUIT\r\n").await;
             stream.write_all(crate::QUIT_RESPONSE).await.unwrap();
         });
@@ -4882,32 +4883,32 @@ mod tests {
         });
 
         let connection = ClientConnection::connect(addr).await.unwrap();
-                let post = connection.post().await.unwrap();
-                let ihave = connection
+        let post = connection.post().await.unwrap();
+        let ihave = connection
             .ihave(MessageId::from_str_or_wrap("ihave@test").unwrap())
             .await
             .unwrap();
-                let check = connection
+        let check = connection
             .check(MessageId::from_str_or_wrap("check@test").unwrap())
             .await
             .unwrap();
-                let takethis = connection
+        let takethis = connection
             .takethis(
                 MessageId::from_str_or_wrap("take@test").unwrap(),
                 ArticleTransfer::from_owned(b"Subject: Take\r\n\r\n.line\r\nbody"),
             )
             .await
             .unwrap();
-                let auth_user = connection
+        let auth_user = connection
             .authinfo_user(AuthInfoValue::from_owned("bench-user").unwrap())
             .await
             .unwrap();
-                let auth_pass = connection
+        let auth_pass = connection
             .authinfo_pass(AuthInfoValue::from_owned("bench-pass").unwrap())
             .await
             .unwrap();
-                let starttls = connection.starttls().await.unwrap();
-        
+        let starttls = connection.starttls().await.unwrap();
+
         assert_eq!(post.kind(), RequestKind::Post);
         assert_eq!(post.status().as_u16(), 340);
         assert_eq!(ihave.kind(), RequestKind::Ihave);

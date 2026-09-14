@@ -1212,7 +1212,6 @@ pub async fn run_load(args: FetchArgs) -> io::Result<()> {
         }
     }
 
-
     if config.csv {
         let snapshot = stats.snapshot();
         println!(
@@ -1522,7 +1521,9 @@ fn render_server_manifest(
             "\"results\":{{\"accepted_connections\":{},\"refused_connections\":{},",
             "\"active_connections\":{},\"commands\":{},\"pipeline_batches\":{},",
             "\"article_responses\":{},\"body_responses\":{},",
-            "\"response_wire_bytes\":{},\"errors\":{}}},",
+            "\"wire_bytes_sent\":{},",
+            "\"wire_bytes_includes\":\"greeting, status line, headers, body, and terminator\",",
+            "\"errors\":{}}},",
             "\"process\":{{\"role\":\"server\",\"elapsed_seconds\":{:.9},",
             "\"cpu_seconds\":{:.9},\"rss_kib\":{}}}}}"
         ),
@@ -1814,7 +1815,6 @@ impl LoadSession {
         .map(Some)
     }
 
-
     async fn run(self, stats: Arc<Stats>, stop: Arc<AtomicBool>) -> io::Result<LoadSessionOutcome> {
         stats.accepted_connections.fetch_add(1, Ordering::Relaxed);
         stats.active_connections.fetch_add(1, Ordering::Relaxed);
@@ -1910,11 +1910,7 @@ impl LoadSession {
                 in_flight += match batch {
                     Ok(result) => result?,
                     Err(_) => {
-                        return Ok(self.timeout_outcome(
-                            outcome,
-                            measurement_started,
-                            in_flight,
-                        ));
+                        return Ok(self.timeout_outcome(outcome, measurement_started, in_flight));
                     }
                 };
                 issued = issued.wrapping_add(in_flight as u64);
@@ -1939,11 +1935,7 @@ impl LoadSession {
             let response_len = match response {
                 Ok(result) => result?,
                 Err(_) => {
-                    return Ok(self.timeout_outcome(
-                        outcome,
-                        measurement_started,
-                        in_flight,
-                    ));
+                    return Ok(self.timeout_outcome(outcome, measurement_started, in_flight));
                 }
             };
             let was_draining = stop.load(Ordering::Acquire);
@@ -1969,8 +1961,7 @@ impl LoadSession {
             coz::progress!("client.response");
             match client_command_kind(command_id, self.command_mix) {
                 ClientCommandMix::Article => {
-                    session_stats.article_requests =
-                        session_stats.article_requests.wrapping_add(1);
+                    session_stats.article_requests = session_stats.article_requests.wrapping_add(1);
                 }
                 ClientCommandMix::Body => {
                     session_stats.body_requests = session_stats.body_requests.wrapping_add(1);
@@ -2008,11 +1999,7 @@ impl LoadSession {
                 let filled = match batch {
                     Ok(result) => result?,
                     Err(_) => {
-                        return Ok(self.timeout_outcome(
-                            outcome,
-                            measurement_started,
-                            in_flight,
-                        ));
+                        return Ok(self.timeout_outcome(outcome, measurement_started, in_flight));
                     }
                 };
                 issued = issued.wrapping_add(filled as u64);
@@ -2025,7 +2012,6 @@ impl LoadSession {
 
         Ok(outcome)
     }
-
 
     #[allow(clippy::too_many_arguments)]
     async fn issue_load_batch(
@@ -2089,7 +2075,9 @@ impl LoadSession {
         let mut filled = 0;
         while filled < capacity
             && !stop.load(Ordering::Acquire)
-            && self.requests.is_none_or(|requests| issued + (filled as u64) < requests)
+            && self
+                .requests
+                .is_none_or(|requests| issued + (filled as u64) < requests)
             && !transfer_limit_reached(stats, self.transfer_bytes)
         {
             let request_index = issued + filled as u64;
@@ -2198,14 +2186,20 @@ impl LoadResponseReader {
                 if !content_started {
                     match empty_detector.detect(data) {
                         EmptyTerminatorStatus::FoundAt(consumed) => {
-                            let frame_len =
-                                bounded_response_len(response_len, consumed, self.max_response_bytes)?;
+                            let frame_len = bounded_response_len(
+                                response_len,
+                                consumed,
+                                self.max_response_bytes,
+                            )?;
                             self.start += consumed;
                             return Ok(frame_len);
                         }
                         EmptyTerminatorStatus::NeedMore => {
-                            response_len =
-                                bounded_response_len(response_len, data.len(), self.max_response_bytes)?;
+                            response_len = bounded_response_len(
+                                response_len,
+                                data.len(),
+                                self.max_response_bytes,
+                            )?;
                             self.start = self.buffer.len();
                         }
                         EmptyTerminatorStatus::NotFound { .. } => {
@@ -2217,14 +2211,20 @@ impl LoadResponseReader {
                 if content_started {
                     match detector.detect_terminator(data) {
                         TerminatorStatus::FoundAt(consumed) => {
-                            let frame_len =
-                                bounded_response_len(response_len, consumed, self.max_response_bytes)?;
+                            let frame_len = bounded_response_len(
+                                response_len,
+                                consumed,
+                                self.max_response_bytes,
+                            )?;
                             self.start += consumed;
                             return Ok(frame_len);
                         }
                         TerminatorStatus::NotFound => {
-                            response_len =
-                                bounded_response_len(response_len, data.len(), self.max_response_bytes)?;
+                            response_len = bounded_response_len(
+                                response_len,
+                                data.len(),
+                                self.max_response_bytes,
+                            )?;
                             detector.update(data);
                             self.start = self.buffer.len();
                         }
@@ -2353,7 +2353,6 @@ where
     })
     .await
 }
-
 
 fn fetch_request(args: &FetchArgs) -> Result<Request<'static>, ClientError> {
     let request = args.request.ok_or(ClientError::MissingArticleSelector)?;
@@ -2664,7 +2663,16 @@ pub fn bench_append_load_workload_request(
     request_index: u64,
     mix: ClientCommandMix,
 ) -> io::Result<()> {
-    append_load_workload_request(buffer, command_id, command_id, request_index, mix, None, 0, 1)
+    append_load_workload_request(
+        buffer,
+        command_id,
+        command_id,
+        request_index,
+        mix,
+        None,
+        0,
+        1,
+    )
 }
 
 #[doc(hidden)]
@@ -4332,7 +4340,13 @@ where
             Ok(false)
         }
         RequestKind::ModeStream => {
-            write_response(writer, pending_write, b"203 streaming enabled\r\n", session_stats).await?;
+            write_response(
+                writer,
+                pending_write,
+                b"203 streaming enabled\r\n",
+                session_stats,
+            )
+            .await?;
             Ok(false)
         }
         RequestKind::Quit => {
@@ -5314,7 +5328,9 @@ where
         append_message_id_article_response_header(response_buffer, message_id);
         let header_end = response_buffer.len();
         let payload_len = repeated_payload_len_at_least(
-            config.article_bytes.saturating_sub(header_end - header_start),
+            config
+                .article_bytes
+                .saturating_sub(header_end - header_start),
         );
         let response_len = (header_end - header_start) + payload_len + DOT_TERMINATOR.len();
         if !ranges.is_empty()
@@ -6101,7 +6117,6 @@ impl Stats {
         self.add_session(session);
         *session = SessionStats::default();
     }
-
 }
 
 impl Default for Stats {
@@ -8853,7 +8868,10 @@ mod tests {
         assert!(manifest.contains("\"accepted_connections\":3"));
         assert!(manifest.contains("\"refused_connections\":2"));
         assert!(manifest.contains("\"commands\":11"));
-        assert!(manifest.contains("\"response_wire_bytes\":4096"));
+        assert!(manifest.contains("\"wire_bytes_sent\":4096"));
+        assert!(manifest.contains(
+            "\"wire_bytes_includes\":\"greeting, status line, headers, body, and terminator\""
+        ));
         assert!(manifest.contains("\"cpu_seconds\":0.500000000"));
         assert!(manifest.contains("\"rss_kib\":2048"));
         serde_json::from_str::<serde_json::Value>(&manifest)
@@ -8898,10 +8916,8 @@ mod tests {
 
     #[test]
     fn workload_identity_covers_segment_sizes_and_message_ids_but_not_endpoint() {
-        let segments = write_temp_segments(
-            "workload-identity",
-            "1024\tfirst@test\n2048\tsecond@test\n",
-        );
+        let segments =
+            write_temp_segments("workload-identity", "1024\tfirst@test\n2048\tsecond@test\n");
         let mut direct_args = test_fetch_args();
         direct_args.segments = Some(segments.clone());
         let direct = LoadConfig::from_args(direct_args.clone()).unwrap();
@@ -8909,8 +8925,10 @@ mod tests {
         let proxy = LoadConfig::from_args(direct_args).unwrap();
         fs::remove_file(segments).unwrap();
 
-        let changed_segments =
-            write_temp_segments("workload-identity-changed", "1024\tfirst@test\n4096\tsecond@test\n");
+        let changed_segments = write_temp_segments(
+            "workload-identity-changed",
+            "1024\tfirst@test\n4096\tsecond@test\n",
+        );
         let mut changed_args = test_fetch_args();
         changed_args.segments = Some(changed_segments.clone());
         let changed = LoadConfig::from_args(changed_args).unwrap();
@@ -16076,7 +16094,6 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
-
     #[test]
     fn client_request_for_command_uses_message_ids_without_selected_group() {
         let article =
@@ -16661,10 +16678,7 @@ mod tests {
             sixth.write_all(b"201 fetch ready\r\n").await.unwrap();
             let read = sixth.read(&mut request).await.unwrap();
             assert_eq!(&request[..read], b"MODE STREAM\r\n");
-            sixth
-                .write_all(b"203 streaming enabled\r\n")
-                .await
-                .unwrap();
+            sixth.write_all(b"203 streaming enabled\r\n").await.unwrap();
 
             let (mut seventh, _) = listener.accept().await.unwrap();
             seventh.write_all(b"201 fetch ready\r\n").await.unwrap();
@@ -19378,13 +19392,9 @@ mod tests {
             response.len()
         );
         assert_eq!(
-            bench_load_response_verify_in_place(
-                &mut response.to_vec(),
-                RequestKind::Body,
-                wrong,
-            )
-            .unwrap_err()
-            .kind(),
+            bench_load_response_verify_in_place(&mut response.to_vec(), RequestKind::Body, wrong,)
+                .unwrap_err()
+                .kind(),
             io::ErrorKind::InvalidData
         );
     }
@@ -19807,7 +19817,10 @@ mod tests {
 
         let snapshot = stats.snapshot();
         assert_eq!(snapshot.commands, 1);
-        assert_eq!(snapshot.bytes_sent, (GREETING.len() + response.len()) as u64);
+        assert_eq!(
+            snapshot.bytes_sent,
+            (GREETING.len() + response.len()) as u64
+        );
 
         client.shutdown().await.unwrap();
         server.await.unwrap().unwrap();
@@ -19818,5 +19831,4 @@ mod tests {
             (GREETING.len() + response.len()) as u64
         );
     }
-
 }
