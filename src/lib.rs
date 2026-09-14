@@ -2717,18 +2717,15 @@ pub fn bench_load_response_verify_in_place(
     bench_load_response_verify_inner(buffer, kind, Some(expected))
 }
 
-/// Measure one direct-load receive into a caller-controlled buffer state.
+/// Measure one direct-load receive using an already allocated buffer.
 #[doc(hidden)]
-pub async fn bench_load_read_capacity(
+pub async fn bench_load_read_capacity_in_place(
     source: &[u8],
-    initial_len: usize,
-    initial_capacity: usize,
+    buffer: &mut Vec<u8>,
     read_chunk_bytes: usize,
 ) -> io::Result<(usize, usize)> {
     let mut reader = io::Cursor::new(source);
-    let mut buffer = Vec::with_capacity(initial_capacity);
-    buffer.resize(initial_len, 0);
-    let read = read_into_load_buffer(&mut reader, &mut buffer, read_chunk_bytes).await?;
+    let read = read_into_load_buffer(&mut reader, buffer, read_chunk_bytes).await?;
     Ok((read, buffer.capacity()))
 }
 
