@@ -19,8 +19,10 @@ supported! {
         Callgrind, LibraryBenchmarkConfig, library_benchmark, library_benchmark_group, main,
     };
     use nntpbench::{
-        RequestKind, RequestLine, ServerArgs, ServerConfig, Stats, for_each_request_line_in_batch,
-        process_request_to_buffer,
+        RequestKind, RequestLine, ServerArgs, ServerConfig, Stats,
+        bench_format_indexed_group_response, bench_format_indexed_listgroup_range_response,
+        bench_format_indexed_listgroup_response,
+        for_each_request_line_in_batch, process_request_to_buffer,
     };
     use std::hint::black_box;
     use std::sync::Arc;
@@ -73,6 +75,27 @@ supported! {
             response_buffer: Vec::with_capacity(BODY_768K + ARTICLE_768K + 1024),
             output: Vec::with_capacity(BODY_768K + ARTICLE_768K + 1024),
         }
+    }
+
+    fn setup_indexed_group_response() -> Vec<u8> {
+        let mut response = Vec::with_capacity(256);
+        bench_format_indexed_group_response(&mut response);
+        response.clear();
+        response
+    }
+
+    fn setup_indexed_listgroup_response() -> Vec<u8> {
+        let mut response = Vec::with_capacity(256);
+        bench_format_indexed_listgroup_response(&mut response);
+        response.clear();
+        response
+    }
+
+    fn setup_indexed_listgroup_range_response() -> Vec<u8> {
+        let mut response = Vec::with_capacity(256);
+        bench_format_indexed_listgroup_range_response(&mut response);
+        response.clear();
+        response
     }
 
     struct PipelineHarness {
@@ -198,6 +221,27 @@ supported! {
     }
 
     #[library_benchmark]
+    #[bench::indexed(setup = setup_indexed_group_response)]
+    fn format_indexed_group_response(mut response: Vec<u8>) -> usize {
+        response.clear();
+        black_box(bench_format_indexed_group_response(&mut response))
+    }
+
+    #[library_benchmark]
+    #[bench::indexed(setup = setup_indexed_listgroup_response)]
+    fn format_indexed_listgroup_response(mut response: Vec<u8>) -> usize {
+        response.clear();
+        black_box(bench_format_indexed_listgroup_response(&mut response))
+    }
+
+    #[library_benchmark]
+    #[bench::indexed(setup = setup_indexed_listgroup_range_response)]
+    fn format_indexed_listgroup_range_response(mut response: Vec<u8>) -> usize {
+        response.clear();
+        black_box(bench_format_indexed_listgroup_range_response(&mut response))
+    }
+
+    #[library_benchmark]
     #[bench::quit(setup = setup_64k)]
     fn process_quit(mut harness: ProcessHarness) -> bool {
         harness.response_buffer.clear();
@@ -248,6 +292,9 @@ QUIT\r\n",
             process_unknown,
             process_date,
             process_mode_reader,
+            format_indexed_group_response,
+            format_indexed_listgroup_response,
+            format_indexed_listgroup_range_response,
             process_quit,
             process_pipelined_batch
     );
