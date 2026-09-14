@@ -150,9 +150,15 @@ supported! {
 
     #[library_benchmark]
     #[bench::one_byte_64k(setup = setup_decode_64k_one)]
+    #[bench::two_bytes_64k(setup = setup_decode_64k_2)]
+    #[bench::four_bytes_64k(setup = setup_decode_64k_4)]
+    #[bench::thirty_one_bytes_64k(setup = setup_decode_64k_31)]
     #[bench::chunk_256_64k(setup = setup_decode_64k_256)]
     #[bench::whole_read_64k(setup = setup_decode_64k_whole)]
     #[bench::chunk_1k_768k(setup = setup_decode_768k_1k)]
+    #[bench::two_bytes_768k(setup = setup_decode_768k_2)]
+    #[bench::four_bytes_768k(setup = setup_decode_768k_4)]
+    #[bench::thirty_one_bytes_768k(setup = setup_decode_768k_31)]
     #[bench::chunk_256k_768k(setup = setup_decode_768k_256k)]
     #[bench::whole_read_768k(setup = setup_decode_768k_whole)]
     fn fragmented_public_decode((response, chunk_bytes): (Vec<u8>, usize)) -> usize {
@@ -169,9 +175,15 @@ supported! {
 
     #[library_benchmark]
     #[bench::one_byte_64k(setup = setup_decode_64k_one)]
+    #[bench::two_bytes_64k(setup = setup_decode_64k_2)]
+    #[bench::four_bytes_64k(setup = setup_decode_64k_4)]
+    #[bench::thirty_one_bytes_64k(setup = setup_decode_64k_31)]
     #[bench::chunk_256_64k(setup = setup_decode_64k_256)]
     #[bench::whole_read_64k(setup = setup_decode_64k_whole)]
     #[bench::chunk_1k_768k(setup = setup_decode_768k_1k)]
+    #[bench::two_bytes_768k(setup = setup_decode_768k_2)]
+    #[bench::four_bytes_768k(setup = setup_decode_768k_4)]
+    #[bench::thirty_one_bytes_768k(setup = setup_decode_768k_31)]
     #[bench::chunk_256k_768k(setup = setup_decode_768k_256k)]
     #[bench::whole_read_768k(setup = setup_decode_768k_whole)]
     fn stateless_public_decode_control((response, chunk_bytes): (Vec<u8>, usize)) -> usize {
@@ -190,6 +202,18 @@ supported! {
         (setup_body_response(BODY_64K), 1)
     }
 
+    fn setup_decode_64k_2() -> (Vec<u8>, usize) {
+        (setup_body_response(BODY_64K), 2)
+    }
+
+    fn setup_decode_64k_4() -> (Vec<u8>, usize) {
+        (setup_body_response(BODY_64K), 4)
+    }
+
+    fn setup_decode_64k_31() -> (Vec<u8>, usize) {
+        (setup_body_response(BODY_64K), 31)
+    }
+
     fn setup_decode_64k_256() -> (Vec<u8>, usize) {
         (setup_body_response(BODY_64K), 256)
     }
@@ -202,6 +226,18 @@ supported! {
 
     fn setup_decode_768k_1k() -> (Vec<u8>, usize) {
         (setup_body_response(BODY_768K), 1024)
+    }
+
+    fn setup_decode_768k_2() -> (Vec<u8>, usize) {
+        (setup_body_response(BODY_768K), 2)
+    }
+
+    fn setup_decode_768k_4() -> (Vec<u8>, usize) {
+        (setup_body_response(BODY_768K), 4)
+    }
+
+    fn setup_decode_768k_31() -> (Vec<u8>, usize) {
+        (setup_body_response(BODY_768K), 31)
     }
 
     fn setup_decode_768k_256k() -> (Vec<u8>, usize) {
