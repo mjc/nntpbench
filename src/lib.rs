@@ -19,6 +19,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arrayvec::ArrayVec;
 use clap::{ArgAction, Parser, ValueEnum};
+use md5::{Digest, Md5};
 use socket2::{Domain, Protocol, SockRef, Socket, Type};
 use tokio::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
@@ -617,6 +618,10 @@ pub struct ServerArgs {
     /// Per-session pending write buffer used to coalesce small generated response chunks.
     #[arg(long, default_value_t = DEFAULT_PENDING_WRITE_BYTES)]
     pub pending_write_bytes: usize,
+
+    /// Print one machine-readable server manifest on graceful shutdown.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
 }
 
 #[cfg(test)]
@@ -756,9 +761,12 @@ mod proptests {
 
 #[cfg_attr(coverage_nightly, coverage(off))]
 pub async fn run_server(args: ServerArgs) -> io::Result<()> {
+    let started = Instant::now();
+    let start_cpu_ticks = process_cpu_ticks();
+    let json = args.json;
     let listener = bind_listener(args.listen, args.backlog, args.reuse_port)?;
     let local_addr = listener.local_addr()?;
-    let config = Arc::new(ServerConfig::from_args(args));
+    let config = Arc::new(ServerConfig::from_bound_args(args, local_addr));
     let stats = Arc::new(Stats::new());
     let limiter = Arc::new(Semaphore::new(config.max_connections));
 
@@ -799,7 +807,20 @@ pub async fn run_server(args: ServerArgs) -> io::Result<()> {
             shutdown = tokio::signal::ctrl_c() => {
                 shutdown?;
                 eprintln!("shutdown requested");
-                stats.print_snapshot("final");
+                if json {
+                    println!(
+                        "{}",
+                        render_server_manifest(
+                            &config,
+                            stats.snapshot(),
+                            started.elapsed(),
+                            cpu_seconds_since(start_cpu_ticks),
+                            process_rss_kib(),
+                        )
+                    );
+                } else {
+                    stats.print_snapshot("final");
+                }
                 return Ok(());
             }
         }
@@ -1299,6 +1320,75 @@ fn cpu_model() -> Option<String> {
         })
 }
 
+fn update_workload_identity(hasher: &mut Md5, tag: u8, value: &[u8]) {
+    hasher.update([tag]);
+    hasher.update((value.len() as u64).to_le_bytes());
+    hasher.update(value);
+}
+
+fn workload_identity(config: &LoadConfig) -> String {
+    let mut hasher = Md5::new();
+    hasher.update(b"nntpbench-workload-v1");
+    update_workload_identity(
+        &mut hasher,
+        0,
+        &config.requests.unwrap_or_default().to_le_bytes(),
+    );
+    update_workload_identity(&mut hasher, 1, &config.transfer_bytes.to_le_bytes());
+    update_workload_identity(&mut hasher, 2, &config.duration.as_nanos().to_le_bytes());
+    match config.offered_rate {
+        Some(rate) => {
+            update_workload_identity(&mut hasher, 3, &[1]);
+            update_workload_identity(&mut hasher, 4, &rate.to_bits().to_le_bytes());
+        }
+        None => update_workload_identity(&mut hasher, 3, &[0]),
+    }
+    update_workload_identity(&mut hasher, 5, &(config.connections as u64).to_le_bytes());
+    update_workload_identity(&mut hasher, 6, &(config.client_offset as u64).to_le_bytes());
+    update_workload_identity(&mut hasher, 7, &(config.total_clients as u64).to_le_bytes());
+    update_workload_identity(
+        &mut hasher,
+        8,
+        &(config.pipeline_depth as u64).to_le_bytes(),
+    );
+    update_workload_identity(
+        &mut hasher,
+        9,
+        &[match config.command_mix {
+            ClientCommandMix::Article => 0,
+            ClientCommandMix::Body => 1,
+            ClientCommandMix::Alternate => 2,
+        }],
+    );
+    update_workload_identity(&mut hasher, 10, &config.start_id.to_le_bytes());
+    update_workload_identity(
+        &mut hasher,
+        11,
+        &[match config.workload_policy {
+            LoadWorkloadPolicy::Disjoint => 0,
+            LoadWorkloadPolicy::Shared => 1,
+            LoadWorkloadPolicy::Repeat => 2,
+        }],
+    );
+    if let Some(segments) = &config.segments {
+        for (index, message_id) in segments.ids.iter().enumerate() {
+            update_workload_identity(
+                &mut hasher,
+                12,
+                &segments.declared_size(index).to_le_bytes(),
+            );
+            update_workload_identity(&mut hasher, 13, message_id.as_str().as_bytes());
+        }
+    }
+    let digest = hasher.finalize();
+    let mut identity = String::with_capacity(36);
+    identity.push_str("md5:");
+    for byte in digest {
+        write!(&mut identity, "{byte:02x}").expect("writing to a string cannot fail");
+    }
+    identity
+}
+
 fn render_load_manifest(
     config: &LoadConfig,
     snapshot: Snapshot,
@@ -1326,6 +1416,7 @@ fn render_load_manifest(
     format!(
         concat!(
             "{{\"schema_version\":1,\"tool\":\"nntpbench\",\"version\":{},\"mode\":\"load\",",
+            "\"workload_identity\":{},",
             "\"host\":{{\"os\":{},\"arch\":{},\"cpu_model\":{},\"loopback\":{}}},",
             "\"byte_counter\":\"client response wire-frame bytes\",\"byte_counter_includes\":\"status line, headers, body, and terminator\",",
             "\"config\":{{",
@@ -1352,6 +1443,7 @@ fn render_load_manifest(
             "\"process\":{{\"role\":\"client\",\"cpu_seconds\":{:.9},\"rss_kib\":{}}}}}"
         ),
         json_string(env!("CARGO_PKG_VERSION")),
+        json_string(&workload_identity(config)),
         json_string(std::env::consts::OS),
         json_string(std::env::consts::ARCH),
         json_option_string(cpu_model()),
@@ -1407,6 +1499,65 @@ fn render_load_manifest(
         histogram_percentile_us(lifecycle.latency_histogram.as_ref(), 0.95),
         histogram_percentile_us(lifecycle.schedule_delay_histogram.as_ref(), 0.50),
         histogram_percentile_us(lifecycle.schedule_delay_histogram.as_ref(), 0.95),
+        cpu_seconds,
+        rss_kib,
+    )
+}
+
+fn render_server_manifest(
+    config: &ServerConfig,
+    snapshot: Snapshot,
+    elapsed: Duration,
+    cpu_seconds: f64,
+    rss_kib: u64,
+) -> String {
+    format!(
+        concat!(
+            "{{\"schema_version\":1,\"tool\":\"nntpbench\",\"version\":{},\"mode\":\"server\",",
+            "\"host\":{{\"os\":{},\"arch\":{},\"cpu_model\":{},\"loopback\":{}}},",
+            "\"config\":{{\"listen\":{},\"body_bytes\":{},\"article_bytes\":{},",
+            "\"article_dir\":{},\"max_connections\":{},\"max_pipeline_depth\":{},",
+            "\"stats_interval_secs\":{},\"flush\":{},\"pending_write_bytes\":{},",
+            "\"nodelay\":{},\"socket_recv_buffer\":{},\"socket_send_buffer\":{}}},",
+            "\"results\":{{\"accepted_connections\":{},\"refused_connections\":{},",
+            "\"active_connections\":{},\"commands\":{},\"pipeline_batches\":{},",
+            "\"article_responses\":{},\"body_responses\":{},",
+            "\"response_wire_bytes\":{},\"errors\":{}}},",
+            "\"process\":{{\"role\":\"server\",\"elapsed_seconds\":{:.9},",
+            "\"cpu_seconds\":{:.9},\"rss_kib\":{}}}}}"
+        ),
+        json_string(env!("CARGO_PKG_VERSION")),
+        json_string(std::env::consts::OS),
+        json_string(std::env::consts::ARCH),
+        json_option_string(cpu_model()),
+        config.listen.ip().is_loopback(),
+        json_string(&config.listen.to_string()),
+        config.body_bytes,
+        config.article_bytes,
+        json_option_string(
+            config
+                .article_dir
+                .as_deref()
+                .map(|path| path.display().to_string())
+        ),
+        config.max_connections,
+        config.max_pipeline_depth,
+        config.stats_interval.as_secs(),
+        config.flush,
+        config.pending_write_bytes,
+        config.nodelay,
+        config.socket_recv_buffer,
+        config.socket_send_buffer,
+        snapshot.accepted_connections,
+        snapshot.refused_connections,
+        snapshot.active_connections,
+        snapshot.commands,
+        snapshot.pipeline_batches,
+        snapshot.article_requests,
+        snapshot.body_requests,
+        snapshot.bytes_sent,
+        snapshot.errors,
+        elapsed.as_secs_f64(),
         cpu_seconds,
         rss_kib,
     )
@@ -1645,9 +1796,16 @@ impl LoadSession {
         if !self.verification_policy.verifies(request_index) {
             return Ok(None);
         }
+        let synthetic_id = synthetic_request_id(
+            self.next_id,
+            self.client_index,
+            request_index,
+            self.total_clients,
+            self.workload_policy,
+        );
         request_message_id_for_command(
             client_command_kind(command_id, self.command_mix),
-            command_id,
+            synthetic_id,
             request_index,
             self.segments.as_deref(),
             self.client_index,
@@ -2520,6 +2678,23 @@ pub fn bench_load_response_scan_in_place(
     buffer: &mut Vec<u8>,
     kind: RequestKind,
 ) -> io::Result<usize> {
+    bench_load_response_verify_inner(buffer, kind, None)
+}
+
+#[doc(hidden)]
+pub fn bench_load_response_verify_in_place(
+    buffer: &mut Vec<u8>,
+    kind: RequestKind,
+    expected: &str,
+) -> io::Result<usize> {
+    bench_load_response_verify_inner(buffer, kind, Some(expected))
+}
+
+fn bench_load_response_verify_inner(
+    buffer: &mut Vec<u8>,
+    kind: RequestKind,
+    expected: Option<&str>,
+) -> io::Result<usize> {
     let read_buffer_bytes = buffer.capacity().max(1);
     let mut reader = LoadResponseReader {
         buffer: std::mem::take(buffer),
@@ -2528,7 +2703,7 @@ pub fn bench_load_response_scan_in_place(
         max_response_bytes: usize::MAX,
     };
     let result = reader
-        .try_consume_response(kind, None)?
+        .try_consume_response(kind, expected)?
         .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "incomplete response"));
     *buffer = reader.buffer;
     result
@@ -5733,6 +5908,7 @@ where
 
 #[derive(Debug)]
 pub struct ServerConfig {
+    pub listen: SocketAddr,
     pub body_bytes: usize,
     pub article_bytes: usize,
     body_response: Box<[u8]>,
@@ -5755,6 +5931,11 @@ pub struct ServerConfig {
 
 impl ServerConfig {
     pub fn from_args(args: ServerArgs) -> Self {
+        let listen = args.listen;
+        Self::from_bound_args(args, listen)
+    }
+
+    fn from_bound_args(args: ServerArgs, listen: SocketAddr) -> Self {
         let body_response = build_generated_response(BODY_RESPONSE_PREFIX, args.body_bytes);
         let article_response =
             build_generated_response(ARTICLE_RESPONSE_PREFIX, args.article_bytes);
@@ -5767,6 +5948,7 @@ impl ServerConfig {
             None => (None, None),
         };
         Self {
+            listen,
             body_bytes: args.body_bytes,
             article_bytes: args.article_bytes,
             body_response,
@@ -8451,6 +8633,7 @@ mod tests {
             stats_interval_secs: 0,
             flush: false,
             pending_write_bytes: DEFAULT_PENDING_WRITE_BYTES,
+            json: false,
         }
     }
 
@@ -8640,9 +8823,101 @@ mod tests {
         assert!(manifest.contains("\"response_wire_bytes\":0"));
         assert!(manifest.contains("\"connections\":1"));
         assert!(manifest.contains("\"pipeline_depth\":64"));
+        assert!(manifest.contains("\"workload_identity\":\"md5:"));
         assert!(manifest.contains("\"measurement_secs\":0.000"));
         assert!(manifest.contains("\"cpu_seconds\":0.250000000"));
         assert!(manifest.contains("\"rss_kib\":1234"));
+        let parsed: serde_json::Value =
+            serde_json::from_str(&manifest).expect("load manifest must be valid JSON");
+        assert_eq!(parsed["workload_identity"], workload_identity(&config));
+    }
+
+    #[test]
+    fn server_manifest_records_limits_results_and_process_cost() {
+        let config = ServerConfig::from_args(test_args());
+        let stats = Stats::new();
+        stats.accepted_connections.store(3, Ordering::Relaxed);
+        stats.refused_connections.store(2, Ordering::Relaxed);
+        stats.commands.store(11, Ordering::Relaxed);
+        stats.bytes_sent.store(4096, Ordering::Relaxed);
+
+        let manifest =
+            render_server_manifest(&config, stats.snapshot(), Duration::from_secs(7), 0.5, 2048);
+
+        assert!(manifest.starts_with("{\"schema_version\":1"));
+        assert!(manifest.contains("\"mode\":\"server\""));
+        assert!(manifest.contains("\"listen\":\"127.0.0.1:0\""));
+        assert!(manifest.contains("\"article_bytes\":2048"));
+        assert!(manifest.contains("\"max_connections\":16"));
+        assert!(manifest.contains("\"max_pipeline_depth\":8"));
+        assert!(manifest.contains("\"accepted_connections\":3"));
+        assert!(manifest.contains("\"refused_connections\":2"));
+        assert!(manifest.contains("\"commands\":11"));
+        assert!(manifest.contains("\"response_wire_bytes\":4096"));
+        assert!(manifest.contains("\"cpu_seconds\":0.500000000"));
+        assert!(manifest.contains("\"rss_kib\":2048"));
+        serde_json::from_str::<serde_json::Value>(&manifest)
+            .expect("server manifest must be valid JSON");
+    }
+
+    #[test]
+    fn server_config_records_the_bound_listener_address() {
+        let bound = "127.0.0.1:18119".parse().unwrap();
+        let config = ServerConfig::from_bound_args(test_args(), bound);
+
+        assert_eq!(config.listen, bound);
+    }
+
+    #[test]
+    fn server_json_flag_is_explicit_and_defaults_off() {
+        let default = ServerArgs::try_parse_from(["nntpbench"]).unwrap();
+        let enabled = ServerArgs::try_parse_from(["nntpbench", "--json"]).unwrap();
+
+        assert!(!default.json);
+        assert!(enabled.json);
+    }
+
+    #[test]
+    fn workload_identity_matches_direct_and_proxy_endpoints_but_changes_with_input() {
+        let direct = LoadConfig::from_args(test_fetch_args()).unwrap();
+        let mut proxy_args = test_fetch_args();
+        proxy_args.connect = "127.0.0.1:8119".parse().unwrap();
+        let proxy = LoadConfig::from_args(proxy_args.clone()).unwrap();
+
+        assert_eq!(workload_identity(&direct), workload_identity(&proxy));
+
+        proxy_args.pipeline_depth += 1;
+        let changed = LoadConfig::from_args(proxy_args).unwrap();
+        assert_ne!(workload_identity(&direct), workload_identity(&changed));
+
+        let mut scheduled_args = test_fetch_args();
+        scheduled_args.offered_rate = Some(0.0);
+        let scheduled = LoadConfig::from_args(scheduled_args).unwrap();
+        assert_ne!(workload_identity(&direct), workload_identity(&scheduled));
+    }
+
+    #[test]
+    fn workload_identity_covers_segment_sizes_and_message_ids_but_not_endpoint() {
+        let segments = write_temp_segments(
+            "workload-identity",
+            "1024\tfirst@test\n2048\tsecond@test\n",
+        );
+        let mut direct_args = test_fetch_args();
+        direct_args.segments = Some(segments.clone());
+        let direct = LoadConfig::from_args(direct_args.clone()).unwrap();
+        direct_args.connect = "127.0.0.1:8119".parse().unwrap();
+        let proxy = LoadConfig::from_args(direct_args).unwrap();
+        fs::remove_file(segments).unwrap();
+
+        let changed_segments =
+            write_temp_segments("workload-identity-changed", "1024\tfirst@test\n4096\tsecond@test\n");
+        let mut changed_args = test_fetch_args();
+        changed_args.segments = Some(changed_segments.clone());
+        let changed = LoadConfig::from_args(changed_args).unwrap();
+        fs::remove_file(changed_segments).unwrap();
+
+        assert_eq!(workload_identity(&direct), workload_identity(&proxy));
+        assert_ne!(workload_identity(&direct), workload_identity(&changed));
     }
 
     #[test]
@@ -19085,6 +19360,50 @@ mod tests {
             bench_load_response_scan_in_place(&mut buffer, RequestKind::Article).unwrap();
         assert_eq!(consumed, first.len());
         assert_eq!(&buffer[consumed..], second);
+    }
+
+    #[test]
+    fn benchmark_load_response_verifier_checks_message_identity() {
+        let response = b"222 1 <article@test> body follows\r\nbody\r\n.\r\n";
+        let expected = "<article@test>";
+        let wrong = "<other@test>";
+
+        assert_eq!(
+            bench_load_response_verify_in_place(
+                &mut response.to_vec(),
+                RequestKind::Body,
+                expected,
+            )
+            .unwrap(),
+            response.len()
+        );
+        assert_eq!(
+            bench_load_response_verify_in_place(
+                &mut response.to_vec(),
+                RequestKind::Body,
+                wrong,
+            )
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn disjoint_load_session_verifies_the_message_id_it_puts_on_the_wire() {
+        let mut args = test_fetch_args();
+        args.connections = 2;
+        args.total_clients = 2;
+        args.verification_policy = LoadVerificationPolicy::Full;
+        let config = LoadConfig::from_args(args).unwrap();
+        let session = LoadSession::new(&config, 1, config.start_id, None);
+
+        let expected = session.expected_message_id(config.start_id, 0).unwrap();
+
+        assert_eq!(
+            expected.as_ref().map(MessageId::as_str),
+            Some("<bench.2@nntpbench.local>")
+        );
     }
 
     #[test]

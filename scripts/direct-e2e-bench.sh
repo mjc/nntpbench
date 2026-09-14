@@ -87,6 +87,7 @@ CHURN_TOTAL_CONNECTIONS="${CHURN_TOTAL_CONNECTIONS:-$CONNECTIONS}"
 CLIENT_THREADS="${CLIENT_THREADS:-8}"
 PIPELINE_DEPTH="${PIPELINE_DEPTH:-128}"
 COMMAND_MIX="${COMMAND_MIX:-article}"
+VERIFICATION_POLICY="${VERIFICATION_POLICY:-full}"
 RUNS="${RUNS:-10}"
 CLIENT_READ_BUFFER_BYTES="${CLIENT_READ_BUFFER_BYTES:-262144}"
 CLIENT_SOCKET_RECV_BUFFER="${CLIENT_SOCKET_RECV_BUFFER:-${SOCKET_RECV_BUFFER:-$DEFAULT_SOCKET_RECV_BUFFER}}"
@@ -107,9 +108,9 @@ mkdir -p "$RESULTS_DIR"
 SUMMARY_CSV="$RESULTS_DIR/summary.csv"
 SUMMARY_JSONL="$RESULTS_DIR/summary.jsonl"
 SUMMARY_JSON="$RESULTS_DIR/summary.json"
-SUMMARY_HEADER='pending_write_bytes,connections,pipeline_depth,command_mix,mode,runs,throughput_gib_s_mean,throughput_gib_s_median,throughput_gib_s_min,throughput_gib_s_max,throughput_gib_s_stddev,throughput_gib_s_cv,elapsed_s_mean,elapsed_s_median,elapsed_s_min,elapsed_s_max,elapsed_s_stddev,elapsed_s_cv,cpu_s_mean,cpu_s_median,cpu_s_min,cpu_s_max,cpu_s_stddev,cpu_s_cv,rss_kib_mean,rss_kib_median,rss_kib_min,rss_kib_max,rss_kib_stddev,rss_kib_cv'
+SUMMARY_HEADER='pending_write_bytes,connections,pipeline_depth,command_mix,verification_policy,mode,runs,throughput_gib_s_mean,throughput_gib_s_median,throughput_gib_s_min,throughput_gib_s_max,throughput_gib_s_stddev,throughput_gib_s_cv,elapsed_s_mean,elapsed_s_median,elapsed_s_min,elapsed_s_max,elapsed_s_stddev,elapsed_s_cv,cpu_s_mean,cpu_s_median,cpu_s_min,cpu_s_max,cpu_s_stddev,cpu_s_cv,rss_kib_mean,rss_kib_median,rss_kib_min,rss_kib_max,rss_kib_stddev,rss_kib_cv'
 if [[ "$CHURN_MODE" -eq 1 ]]; then
-    SUMMARY_HEADER='pending_write_bytes,total_connections,connections,pipeline_depth,command_mix,mode,runs,throughput_gib_s_mean,throughput_gib_s_median,throughput_gib_s_min,throughput_gib_s_max,throughput_gib_s_stddev,throughput_gib_s_cv,connections_per_s_mean,connections_per_s_median,connections_per_s_min,connections_per_s_max,connections_per_s_stddev,connections_per_s_cv,elapsed_s_mean,elapsed_s_median,elapsed_s_min,elapsed_s_max,elapsed_s_stddev,elapsed_s_cv,cpu_s_mean,cpu_s_median,cpu_s_min,cpu_s_max,cpu_s_stddev,cpu_s_cv,rss_kib_mean,rss_kib_median,rss_kib_min,rss_kib_max,rss_kib_stddev,rss_kib_cv'
+    SUMMARY_HEADER='pending_write_bytes,total_connections,connections,pipeline_depth,command_mix,verification_policy,mode,runs,throughput_gib_s_mean,throughput_gib_s_median,throughput_gib_s_min,throughput_gib_s_max,throughput_gib_s_stddev,throughput_gib_s_cv,connections_per_s_mean,connections_per_s_median,connections_per_s_min,connections_per_s_max,connections_per_s_stddev,connections_per_s_cv,elapsed_s_mean,elapsed_s_median,elapsed_s_min,elapsed_s_max,elapsed_s_stddev,elapsed_s_cv,cpu_s_mean,cpu_s_median,cpu_s_min,cpu_s_max,cpu_s_stddev,cpu_s_cv,rss_kib_mean,rss_kib_median,rss_kib_min,rss_kib_max,rss_kib_stddev,rss_kib_cv'
 fi
 if [[ ! -f "$SUMMARY_CSV" || "$(sed -n '1p' "$SUMMARY_CSV" 2>/dev/null)" != "$SUMMARY_HEADER" ]]; then
     printf '%s\n' "$SUMMARY_HEADER" >"$SUMMARY_CSV"
@@ -199,11 +200,11 @@ summarize_case() {
     read -r rss_mean rss_median rss_min rss_max rss_stdev rss_cv < <(series_stats "$rss_file")
 
     if [[ "$churn_mode" -eq 1 ]]; then
-        printf '\ncase=%s pending_write_bytes=%s total_connections=%s connections=%s pipeline_depth=%s command_mix=%s mode=%s runs=%s\n' \
-            "$case_name" "$pending_write_bytes" "$total_connections" "$connections" "$pipeline_depth" "$command_mix" "$mode" "$RUNS"
+        printf '\ncase=%s pending_write_bytes=%s total_connections=%s connections=%s pipeline_depth=%s command_mix=%s verification_policy=%s mode=%s runs=%s\n' \
+            "$case_name" "$pending_write_bytes" "$total_connections" "$connections" "$pipeline_depth" "$command_mix" "$VERIFICATION_POLICY" "$mode" "$RUNS"
     else
-        printf '\ncase=%s pending_write_bytes=%s connections=%s pipeline_depth=%s command_mix=%s mode=%s runs=%s\n' \
-            "$case_name" "$pending_write_bytes" "$connections" "$pipeline_depth" "$command_mix" "$mode" "$RUNS"
+        printf '\ncase=%s pending_write_bytes=%s connections=%s pipeline_depth=%s command_mix=%s verification_policy=%s mode=%s runs=%s\n' \
+            "$case_name" "$pending_write_bytes" "$connections" "$pipeline_depth" "$command_mix" "$VERIFICATION_POLICY" "$mode" "$RUNS"
     fi
     printf '  throughput_gib_s: mean=%s median=%s min=%s max=%s stdev=%s\n' \
         "$throughput_mean" "$throughput_median" "$throughput_min" "$throughput_max" "$throughput_stdev"
@@ -229,32 +230,32 @@ summarize_case() {
     printf '  rss_kib:          cv=%s\n' "$rss_cv"
 
     if [[ "$churn_mode" -eq 1 ]]; then
-        printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
-            "$pending_write_bytes" "$total_connections" "$connections" "$pipeline_depth" "$command_mix" "$mode" "$RUNS" \
+        printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+            "$pending_write_bytes" "$total_connections" "$connections" "$pipeline_depth" "$command_mix" "$VERIFICATION_POLICY" "$mode" "$RUNS" \
             "$throughput_mean" "$throughput_median" "$throughput_min" "$throughput_max" "$throughput_stdev" "$throughput_cv" \
             "$connections_per_s_mean" "$connections_per_s_median" "$connections_per_s_min" "$connections_per_s_max" "$connections_per_s_stdev" "$connections_per_s_cv" \
             "$elapsed_mean" "$elapsed_median" "$elapsed_min" "$elapsed_max" "$elapsed_stdev" "$elapsed_cv" \
             "$cpu_mean" "$cpu_median" "$cpu_min" "$cpu_max" "$cpu_stdev" "$cpu_cv" \
             "$rss_mean" "$rss_median" "$rss_min" "$rss_max" "$rss_stdev" "$rss_cv" >>"$SUMMARY_CSV"
     else
-        printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
-            "$pending_write_bytes" "$connections" "$pipeline_depth" "$command_mix" "$mode" "$RUNS" \
+        printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+            "$pending_write_bytes" "$connections" "$pipeline_depth" "$command_mix" "$VERIFICATION_POLICY" "$mode" "$RUNS" \
             "$throughput_mean" "$throughput_median" "$throughput_min" "$throughput_max" "$throughput_stdev" "$throughput_cv" \
             "$elapsed_mean" "$elapsed_median" "$elapsed_min" "$elapsed_max" "$elapsed_stdev" "$elapsed_cv" \
             "$cpu_mean" "$cpu_median" "$cpu_min" "$cpu_max" "$cpu_stdev" "$cpu_cv" \
             "$rss_mean" "$rss_median" "$rss_min" "$rss_max" "$rss_stdev" "$rss_cv" >>"$SUMMARY_CSV"
     fi
     if [[ "$churn_mode" -eq 1 ]]; then
-        printf '{"case_name":"%s","pending_write_bytes":%s,"total_connections":%s,"connections":%s,"pipeline_depth":%s,"command_mix":"%s","mode":"%s","runs":%s,"throughput_gib_s":{"mean":%s,"median":%s,"best":%s,"worst":%s,"stddev":%s,"cv":%s},"connections_per_s":{"mean":%s,"median":%s,"best":%s,"worst":%s,"stddev":%s,"cv":%s},"elapsed_s":{"mean":%s,"median":%s,"best":%s,"worst":%s,"stddev":%s,"cv":%s},"cpu_s":{"mean":%s,"median":%s,"best":%s,"worst":%s,"stddev":%s,"cv":%s},"rss_kib":{"mean":%s,"median":%s,"best":%s,"worst":%s,"stddev":%s,"cv":%s}}\n' \
-            "$(json_escape "$case_name")" "$pending_write_bytes" "$total_connections" "$connections" "$pipeline_depth" "$(json_escape "$command_mix")" "$(json_escape "$mode")" "$RUNS" \
+        printf '{"case_name":"%s","pending_write_bytes":%s,"total_connections":%s,"connections":%s,"pipeline_depth":%s,"command_mix":"%s","verification_policy":"%s","mode":"%s","runs":%s,"throughput_gib_s":{"mean":%s,"median":%s,"best":%s,"worst":%s,"stddev":%s,"cv":%s},"connections_per_s":{"mean":%s,"median":%s,"best":%s,"worst":%s,"stddev":%s,"cv":%s},"elapsed_s":{"mean":%s,"median":%s,"best":%s,"worst":%s,"stddev":%s,"cv":%s},"cpu_s":{"mean":%s,"median":%s,"best":%s,"worst":%s,"stddev":%s,"cv":%s},"rss_kib":{"mean":%s,"median":%s,"best":%s,"worst":%s,"stddev":%s,"cv":%s}}\n' \
+            "$(json_escape "$case_name")" "$pending_write_bytes" "$total_connections" "$connections" "$pipeline_depth" "$(json_escape "$command_mix")" "$(json_escape "$VERIFICATION_POLICY")" "$(json_escape "$mode")" "$RUNS" \
             "$throughput_mean" "$throughput_median" "$throughput_max" "$throughput_min" "$throughput_stdev" "$throughput_cv" \
             "$connections_per_s_mean" "$connections_per_s_median" "$connections_per_s_max" "$connections_per_s_min" "$connections_per_s_stdev" "$connections_per_s_cv" \
             "$elapsed_mean" "$elapsed_median" "$elapsed_min" "$elapsed_max" "$elapsed_stdev" "$elapsed_cv" \
             "$cpu_mean" "$cpu_median" "$cpu_min" "$cpu_max" "$cpu_stdev" "$cpu_cv" \
             "$rss_mean" "$rss_median" "$rss_min" "$rss_max" "$rss_stdev" "$rss_cv" >>"$SUMMARY_JSONL"
     else
-        printf '{"case_name":"%s","pending_write_bytes":%s,"connections":%s,"pipeline_depth":%s,"command_mix":"%s","mode":"%s","runs":%s,"throughput_gib_s":{"mean":%s,"median":%s,"best":%s,"worst":%s,"stddev":%s,"cv":%s},"elapsed_s":{"mean":%s,"median":%s,"best":%s,"worst":%s,"stddev":%s,"cv":%s},"cpu_s":{"mean":%s,"median":%s,"best":%s,"worst":%s,"stddev":%s,"cv":%s},"rss_kib":{"mean":%s,"median":%s,"best":%s,"worst":%s,"stddev":%s,"cv":%s}}\n' \
-            "$(json_escape "$case_name")" "$pending_write_bytes" "$connections" "$pipeline_depth" "$(json_escape "$command_mix")" "$(json_escape "$mode")" "$RUNS" \
+        printf '{"case_name":"%s","pending_write_bytes":%s,"connections":%s,"pipeline_depth":%s,"command_mix":"%s","verification_policy":"%s","mode":"%s","runs":%s,"throughput_gib_s":{"mean":%s,"median":%s,"best":%s,"worst":%s,"stddev":%s,"cv":%s},"elapsed_s":{"mean":%s,"median":%s,"best":%s,"worst":%s,"stddev":%s,"cv":%s},"cpu_s":{"mean":%s,"median":%s,"best":%s,"worst":%s,"stddev":%s,"cv":%s},"rss_kib":{"mean":%s,"median":%s,"best":%s,"worst":%s,"stddev":%s,"cv":%s}}\n' \
+            "$(json_escape "$case_name")" "$pending_write_bytes" "$connections" "$pipeline_depth" "$(json_escape "$command_mix")" "$(json_escape "$VERIFICATION_POLICY")" "$(json_escape "$mode")" "$RUNS" \
             "$throughput_mean" "$throughput_median" "$throughput_max" "$throughput_min" "$throughput_stdev" "$throughput_cv" \
             "$elapsed_mean" "$elapsed_median" "$elapsed_min" "$elapsed_max" "$elapsed_stdev" "$elapsed_cv" \
             "$cpu_mean" "$cpu_median" "$cpu_min" "$cpu_max" "$cpu_stdev" "$cpu_cv" \
@@ -298,11 +299,13 @@ for pending_write_bytes in "${PENDING_WRITE_BYTES_SET[@]}"; do
                 fi
                 case_dir="$RESULTS_DIR/$case_name"
                 raw_csv="$case_dir/raw.csv"
+                server_manifest="$case_dir/server.json"
                 mkdir -p "$case_dir"
                 : >"$raw_csv"
+                : >"$server_manifest"
 
                 SERVER_LOG="$(mktemp "$TARGET_DIR/direct-e2e-server.XXXXXX.log")"
-                run_with_optional_taskset "$SERVER_TASKSET" "$TARGET_DIR/profiling/nntpbench" server \
+                server_command=("$TARGET_DIR/profiling/nntpbench" server \
                     --listen "$LISTEN" \
                     --body-bytes "$BODY_BYTES" \
                     --article-bytes "$ARTICLE_BYTES" \
@@ -311,7 +314,12 @@ for pending_write_bytes in "${PENDING_WRITE_BYTES_SET[@]}"; do
                     --pending-write-bytes "$pending_write_bytes" \
                     --socket-recv-buffer "$SERVER_SOCKET_RECV_BUFFER" \
                     --socket-send-buffer "$SERVER_SOCKET_SEND_BUFFER" \
-                    --stats-interval-secs 0 >"$SERVER_LOG" 2>&1 &
+                    --stats-interval-secs 0 \
+                    --json)
+                if [[ -n "$SERVER_TASKSET" && "$PINNING_SUPPORTED" -eq 1 ]]; then
+                    server_command=(taskset -c "$SERVER_TASKSET" "${server_command[@]}")
+                fi
+                "${server_command[@]}" >"$server_manifest" 2>"$SERVER_LOG" &
                 SERVER_PID="$!"
 
                 while ! grep -q "server listening" "$SERVER_LOG"; do
@@ -324,8 +332,8 @@ for pending_write_bytes in "${PENDING_WRITE_BYTES_SET[@]}"; do
                 grep -m1 "server listening" "$SERVER_LOG"
 
                 for run in $(seq 1 "$RUNS"); do
-                    printf 'run=%s body_bytes=%s article_bytes=%s pending_write_bytes=%s total_connections=%s connections=%s pipeline_depth=%s command_mix=%s mode=%s\n' \
-                        "$run" "$BODY_BYTES" "$ARTICLE_BYTES" "$pending_write_bytes" "$total_connections" "$connections" "$pipeline_depth" "$command_mix" "$mode"
+                    printf 'run=%s body_bytes=%s article_bytes=%s pending_write_bytes=%s total_connections=%s connections=%s pipeline_depth=%s command_mix=%s verification_policy=%s mode=%s\n' \
+                        "$run" "$BODY_BYTES" "$ARTICLE_BYTES" "$pending_write_bytes" "$total_connections" "$connections" "$pipeline_depth" "$command_mix" "$VERIFICATION_POLICY" "$mode"
                     if [[ "$CHURN_MODE" -eq 1 ]]; then
                         remaining_connections="$total_connections"
                         total_commands=0
@@ -347,6 +355,7 @@ for pending_write_bytes in "${PENDING_WRITE_BYTES_SET[@]}"; do
                                 --threads "$CLIENT_THREADS" \
                                 --pipeline-depth "$pipeline_depth" \
                                 --command-mix "$command_mix" \
+                                --verification-policy "$VERIFICATION_POLICY" \
                                 --read-buffer-bytes "$CLIENT_READ_BUFFER_BYTES" \
                                 --socket-recv-buffer "$CLIENT_SOCKET_RECV_BUFFER" \
                                 --socket-send-buffer "$CLIENT_SOCKET_SEND_BUFFER" \
@@ -371,6 +380,7 @@ for pending_write_bytes in "${PENDING_WRITE_BYTES_SET[@]}"; do
                             --threads "$CLIENT_THREADS" \
                             --pipeline-depth "$pipeline_depth" \
                             --command-mix "$command_mix" \
+                            --verification-policy "$VERIFICATION_POLICY" \
                             --read-buffer-bytes "$CLIENT_READ_BUFFER_BYTES" \
                             --socket-recv-buffer "$CLIENT_SOCKET_RECV_BUFFER" \
                             --socket-send-buffer "$CLIENT_SOCKET_SEND_BUFFER" \
@@ -385,6 +395,7 @@ for pending_write_bytes in "${PENDING_WRITE_BYTES_SET[@]}"; do
                 wait "$SERVER_PID" || true
                 SERVER_PID=""
                 rm -f "$SERVER_LOG"
+                python3 -c 'import json, sys; json.load(open(sys.argv[1], encoding="utf-8"))' "$server_manifest"
 
                 summarize_case "$raw_csv" "$pending_write_bytes" "$total_connections" "$connections" "$pipeline_depth" "$command_mix" "$case_name" "$mode" "$CHURN_MODE"
             done
