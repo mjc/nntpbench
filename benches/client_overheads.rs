@@ -167,6 +167,7 @@ mod streaming_decode {
         bench_load_response_scan_in_place, bench_load_response_verify_in_place,
         bench_streaming_decode_response, black_box,
     };
+    use std::cell::RefCell;
 
     #[divan::bench(sample_count = 1000, sample_size = 100)]
     fn compact_body_response(bencher: Bencher) {

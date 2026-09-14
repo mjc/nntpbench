@@ -81,6 +81,27 @@ It has multiple lines.\r\n\
         }
     }
 
+    fn setup_indexed_group_response() -> Vec<u8> {
+        let mut response = Vec::with_capacity(256);
+        bench_format_indexed_group_response(&mut response);
+        response.clear();
+        response
+    }
+
+    fn setup_indexed_listgroup_response() -> Vec<u8> {
+        let mut response = Vec::with_capacity(256);
+        bench_format_indexed_listgroup_response(&mut response);
+        response.clear();
+        response
+    }
+
+    fn setup_indexed_listgroup_range_response() -> Vec<u8> {
+        let mut response = Vec::with_capacity(256);
+        bench_format_indexed_listgroup_range_response(&mut response);
+        response.clear();
+        response
+    }
+
     struct PipelineHarness {
         config: Arc<ServerConfig>,
         stats: Stats,
@@ -229,6 +250,27 @@ It has multiple lines.\r\n\
     }
 
     #[library_benchmark]
+    #[bench::indexed(setup = setup_indexed_group_response)]
+    fn format_indexed_group_response(mut response: Vec<u8>) -> usize {
+        response.clear();
+        black_box(bench_format_indexed_group_response(&mut response))
+    }
+
+    #[library_benchmark]
+    #[bench::indexed(setup = setup_indexed_listgroup_response)]
+    fn format_indexed_listgroup_response(mut response: Vec<u8>) -> usize {
+        response.clear();
+        black_box(bench_format_indexed_listgroup_response(&mut response))
+    }
+
+    #[library_benchmark]
+    #[bench::indexed(setup = setup_indexed_listgroup_range_response)]
+    fn format_indexed_listgroup_range_response(mut response: Vec<u8>) -> usize {
+        response.clear();
+        black_box(bench_format_indexed_listgroup_range_response(&mut response))
+    }
+
+    #[library_benchmark]
     #[bench::quit(setup = setup_64k)]
     fn process_quit(mut harness: ProcessHarness) -> bool {
         harness.response_buffer.clear();
@@ -279,6 +321,9 @@ QUIT\r\n",
             process_unknown,
             process_date,
             process_mode_reader,
+            format_indexed_group_response,
+            format_indexed_listgroup_response,
+            format_indexed_listgroup_range_response,
             process_quit,
             process_pipelined_batch,
             consume_body_response,

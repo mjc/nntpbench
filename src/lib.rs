@@ -3398,9 +3398,11 @@ where
                     writer,
                     pending_write,
                     config,
-                    RequestKind::Article,
-                    article_id,
-                    message_id.as_ref(),
+                    StoredArticleResponseRequest {
+                        kind: RequestKind::Article,
+                        article_id,
+                        message_id: message_id.as_ref(),
+                    },
                     session_stats,
                     article_path,
                 )
@@ -3473,9 +3475,11 @@ where
                         writer,
                         pending_write,
                         config,
-                        RequestKind::Head,
-                        None,
-                        Some(&message_id),
+                        StoredArticleResponseRequest {
+                            kind: RequestKind::Head,
+                            article_id: None,
+                            message_id: Some(&message_id),
+                        },
                         session_stats,
                         article_path,
                     )
@@ -3518,9 +3522,11 @@ where
                         writer,
                         pending_write,
                         config,
-                        RequestKind::Head,
-                        Some(article_id),
-                        None,
+                        StoredArticleResponseRequest {
+                            kind: RequestKind::Head,
+                            article_id: Some(article_id),
+                            message_id: None,
+                        },
                         session_stats,
                         article_path,
                     )
@@ -3537,9 +3543,11 @@ where
                         writer,
                         pending_write,
                         config,
-                        RequestKind::Head,
-                        Some(article_id),
-                        None,
+                        StoredArticleResponseRequest {
+                            kind: RequestKind::Head,
+                            article_id: Some(article_id),
+                            message_id: None,
+                        },
                         session_stats,
                         article_path,
                     )
@@ -3570,9 +3578,11 @@ where
                         writer,
                         pending_write,
                         config,
-                        RequestKind::Stat,
-                        None,
-                        Some(&message_id),
+                        StoredArticleResponseRequest {
+                            kind: RequestKind::Stat,
+                            article_id: None,
+                            message_id: Some(&message_id),
+                        },
                         session_stats,
                         article_path,
                     )
@@ -3615,9 +3625,11 @@ where
                         writer,
                         pending_write,
                         config,
-                        RequestKind::Stat,
-                        Some(article_id),
-                        None,
+                        StoredArticleResponseRequest {
+                            kind: RequestKind::Stat,
+                            article_id: Some(article_id),
+                            message_id: None,
+                        },
                         session_stats,
                         article_path,
                     )
@@ -3634,9 +3646,11 @@ where
                         writer,
                         pending_write,
                         config,
-                        RequestKind::Stat,
-                        Some(article_id),
-                        None,
+                        StoredArticleResponseRequest {
+                            kind: RequestKind::Stat,
+                            article_id: Some(article_id),
+                            message_id: None,
+                        },
                         session_stats,
                         article_path,
                     )
@@ -3667,9 +3681,11 @@ where
                         writer,
                         pending_write,
                         config,
-                        RequestKind::Body,
-                        None,
-                        Some(&message_id),
+                        StoredArticleResponseRequest {
+                            kind: RequestKind::Body,
+                            article_id: None,
+                            message_id: Some(&message_id),
+                        },
                         session_stats,
                         article_path,
                     )
@@ -3716,9 +3732,11 @@ where
                         writer,
                         pending_write,
                         config,
-                        RequestKind::Body,
-                        Some(article_id),
-                        None,
+                        StoredArticleResponseRequest {
+                            kind: RequestKind::Body,
+                            article_id: Some(article_id),
+                            message_id: None,
+                        },
                         session_stats,
                         article_path,
                     )
@@ -3735,9 +3753,11 @@ where
                         writer,
                         pending_write,
                         config,
-                        RequestKind::Body,
-                        Some(article_id),
-                        None,
+                        StoredArticleResponseRequest {
+                            kind: RequestKind::Body,
+                            article_id: Some(article_id),
+                            message_id: None,
+                        },
                         session_stats,
                         article_path,
                     )
@@ -3869,7 +3889,7 @@ where
                     session_state.selected_group = Some(SelectedGroup::Fixture(group));
                     session_state.current_article = group.first_article();
                 }
-                response
+                response.as_bytes()
             } else {
                 let Some(group) = fixture_group_from_name(args) else {
                     write_response(
@@ -3930,7 +3950,7 @@ where
                     session_state.selected_group = Some(SelectedGroup::Fixture(group));
                     session_state.current_article = group.first_article();
                 }
-                write_response(writer, pending_write, response, session_stats).await?;
+                write_response(writer, pending_write, response.as_bytes(), session_stats).await?;
             } else {
                 let current_group = match session_state.selected_group.as_ref() {
                     Some(SelectedGroup::Fixture(group)) => Some(*group),
@@ -4290,7 +4310,7 @@ where
                     index,
                 )
             {
-                write_response(writer, pending_write, &response, session_stats).await?;
+                write_response(writer, pending_write, response, session_stats).await?;
             } else {
                 write_response(
                     writer,
@@ -4476,11 +4496,11 @@ fn append_message_id_article_response_header(buffer: &mut Vec<u8>, message_id: &
     buffer.extend_from_slice(CRLF);
 }
 
-fn build_selected_article_response_into<'a>(
-    buffer: &'a mut Vec<u8>,
+fn build_selected_article_response_into(
+    buffer: &mut Vec<u8>,
     article_id: u64,
     target_bytes: usize,
-) -> &'a [u8] {
+) -> &[u8] {
     let mut message_id = arrayvec::ArrayString::<64>::new();
     write!(&mut message_id, "<article.{article_id}@nntpbench.local>")
         .expect("write to ArrayString cannot fail");
@@ -4519,11 +4539,11 @@ fn build_article_response_into<'a>(
     buffer.as_slice()
 }
 
-fn build_selected_body_response_into<'a>(
-    buffer: &'a mut Vec<u8>,
+fn build_selected_body_response_into(
+    buffer: &mut Vec<u8>,
     article_id: u64,
     target_bytes: usize,
-) -> &'a [u8] {
+) -> &[u8] {
     let mut message_id = arrayvec::ArrayString::<64>::new();
     write!(&mut message_id, "<article.{article_id}@nntpbench.local>")
         .expect("write to ArrayString cannot fail");
@@ -4563,7 +4583,7 @@ fn build_body_response_into<'a>(
     buffer.as_slice()
 }
 
-fn build_selected_head_response_into<'a>(buffer: &'a mut Vec<u8>, article_id: u64) -> &'a [u8] {
+fn build_selected_head_response_into(buffer: &mut Vec<u8>, article_id: u64) -> &[u8] {
     let mut message_id = arrayvec::ArrayString::<64>::new();
     write!(&mut message_id, "<article.{article_id}@nntpbench.local>")
         .expect("write to ArrayString cannot fail");
@@ -4593,7 +4613,7 @@ fn build_head_response_into<'a>(
     buffer.as_slice()
 }
 
-fn build_selected_stat_response_into<'a>(buffer: &'a mut Vec<u8>, article_id: u64) -> &'a [u8] {
+fn build_selected_stat_response_into(buffer: &mut Vec<u8>, article_id: u64) -> &[u8] {
     let mut message_id = arrayvec::ArrayString::<64>::new();
     write!(&mut message_id, "<article.{article_id}@nntpbench.local>")
         .expect("write to ArrayString cannot fail");
@@ -5519,14 +5539,13 @@ fn collect_article_paths(root: &Path, output: &mut Vec<PathBuf>) -> io::Result<(
                     continue;
                 }
                 recurse(&entry_path, output)?;
-            } else if file_type.is_file() {
-                if entry_path
+            } else if file_type.is_file()
+                && entry_path
                     .file_name()
                     .and_then(|name| name.to_str())
                     .is_some_and(|name| name.chars().all(|ch| ch.is_ascii_digit()))
-                {
-                    output.push(entry_path);
-                }
+            {
+                output.push(entry_path);
             }
         }
         Ok(())
@@ -5764,29 +5783,34 @@ fn append_dot_stuffed_body(output: &mut Vec<u8>, body: &[u8]) {
     }
 }
 
+struct StoredArticleResponseRequest<'message_id, 'article> {
+    kind: RequestKind,
+    article_id: Option<u64>,
+    message_id: Option<&'message_id MessageId<'article>>,
+}
+
 async fn write_stored_article_response<W>(
     writer: &mut W,
     pending_write: &mut PendingWrite,
     config: &ServerConfig,
-    kind: RequestKind,
-    article_id: Option<u64>,
-    message_id: Option<&MessageId<'_>>,
+    request: StoredArticleResponseRequest<'_, '_>,
     session_stats: &mut SessionStats,
     article_path: &mut PathBuf,
 ) -> io::Result<bool>
 where
     W: AsyncWrite + Unpin,
 {
-    let Some(file) = open_stored_article_response(config, article_id, message_id, article_path)?
+    let Some(file) =
+        open_stored_article_response(config, request.article_id, request.message_id, article_path)?
     else {
         return Ok(false);
     };
 
-    if kind != RequestKind::Article {
+    if request.kind != RequestKind::Article {
         let mut bytes = Vec::new();
         let mut file = file;
         file.read_to_end(&mut bytes)?;
-        let response = build_stored_article_response(kind, &bytes)?;
+        let response = build_stored_article_response(request.kind, &bytes)?;
         pending_write.flush(writer).await?;
         write_response(writer, pending_write, &response, session_stats).await?;
         return Ok(true);
@@ -7027,11 +7051,11 @@ fn nntp_datetime_timestamp(date: &[u8], time: &[u8], current_year: u16) -> Optio
         return None;
     }
     let year = i32::try_from(date_key / 10_000).ok()?;
-    let month = ((date_key / 100) % 100) as u32;
+    let month = (date_key / 100) % 100;
     let day = (date_key % 100) as i32;
-    let hour = u32::from(parse_ascii_decimal_u32(&time[..2])?);
-    let minute = u32::from(parse_ascii_decimal_u32(&time[2..4])?);
-    let second = u32::from(parse_ascii_decimal_u32(&time[4..6])?);
+    let hour = parse_ascii_decimal_u32(&time[..2])?;
+    let minute = parse_ascii_decimal_u32(&time[2..4])?;
+    let second = parse_ascii_decimal_u32(&time[4..6])?;
     let days = days_from_civil(year, month, day)?;
     days.checked_mul(86_400)?
         .checked_add(i64::from(hour * 3600 + minute * 60 + second))
@@ -7399,13 +7423,39 @@ fn group_response_for_args_with_index_into<'a>(
     response: &'a mut Vec<u8>,
     args: &[u8],
     index: &ArticleStoreIndex,
-) -> Option<&'a [u8]> {
+) -> Option<group_response_framing::CompleteGroupResponse<'a>> {
     let group_name = std::str::from_utf8(args).ok()?.trim();
     if let Some(articles) = index.article_numbers_for_group(group_name) {
         return Some(format_group_response_into(response, group_name, articles));
     }
     fixture_group_from_name(args)
         .map(|group| format_group_response_into(response, group.name(), group.article_numbers()))
+}
+
+fn benchmark_article_store_index() -> &'static ArticleStoreIndex {
+    static INDEX: std::sync::OnceLock<ArticleStoreIndex> = std::sync::OnceLock::new();
+    INDEX.get_or_init(|| ArticleStoreIndex {
+        groups: BTreeMap::from([(
+            Arc::<str>::from("alt.test"),
+            ArticleStoreGroup {
+                article_numbers: Box::new([1, 2, 3]),
+                active_time: 0,
+            },
+        )]),
+        articles_by_number: BTreeMap::new(),
+        articles_by_message_id: HashMap::new(),
+    })
+}
+
+#[doc(hidden)]
+pub fn bench_format_indexed_group_response(response: &mut Vec<u8>) -> usize {
+    let complete = group_response_for_args_with_index_into(
+        response,
+        b"alt.test",
+        benchmark_article_store_index(),
+    )
+    .expect("indexed group must exist");
+    complete.as_bytes().len()
 }
 
 fn last_response_for_article(article_id: u64) -> &'static [u8] {
@@ -7478,7 +7528,7 @@ fn listgroup_response_for_args_with_index_into<'a>(
     args: &[u8],
     current_group: Option<&str>,
     index: &ArticleStoreIndex,
-) -> Option<&'a [u8]> {
+) -> Option<group_response_framing::CompleteListGroupResponse<'a>> {
     let group_name = listgroup_explicit_group_arg(args)
         .and_then(|group| std::str::from_utf8(group).ok())
         .map(str::trim)
@@ -7487,27 +7537,16 @@ fn listgroup_response_for_args_with_index_into<'a>(
         .unwrap_or("alt.test");
     if let Some(articles) = index.article_numbers_for_group(group_name) {
         let range = listgroup_range_arg(args).and_then(listgroup_range_bounds);
-        let filtered: Vec<u64> = match range {
-            Some((start, end)) => articles
-                .iter()
-                .copied()
-                .filter(|article| {
-                    let end = end.unwrap_or(u64::MAX);
-                    *article >= start && *article <= end
-                })
-                .collect(),
-            None => articles.to_vec(),
-        };
-        return Some(format_listgroup_response_into(
-            response, group_name, articles, &filtered,
+        return Some(group_response_framing::write_listgroup_response(
+            response, group_name, articles, range,
         ));
     }
     fixture_group_from_name(group_name.as_bytes()).map(|group| {
-        format_listgroup_response_into(
+        group_response_framing::write_listgroup_response(
             response,
             group_name,
             group.article_numbers(),
-            group.article_numbers(),
+            None,
         )
     })
 }
@@ -7536,11 +7575,9 @@ fn format_group_response_into<'a>(
     response.clear();
     write!(
         response,
-        "211 {} {} {} {}\r\n",
-        articles.len(),
-        low,
-        high,
-        group_name
+        b"alt.test",
+        None,
+        benchmark_article_store_index(),
     )
     .expect("write to Vec cannot fail");
     response.as_slice()
