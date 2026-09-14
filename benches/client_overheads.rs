@@ -425,6 +425,21 @@ mod public_client_experiments {
     }
 
     #[divan::bench(sample_count = 50, sample_size = 10)]
+    fn fragmented_decode_64k_2_bytes(bencher: Bencher) {
+        bench_fragmented_decode(bencher, BODY_64K, 2);
+    }
+
+    #[divan::bench(sample_count = 50, sample_size = 10)]
+    fn fragmented_decode_64k_4_bytes(bencher: Bencher) {
+        bench_fragmented_decode(bencher, BODY_64K, 4);
+    }
+
+    #[divan::bench(sample_count = 50, sample_size = 10)]
+    fn fragmented_decode_64k_31_bytes(bencher: Bencher) {
+        bench_fragmented_decode(bencher, BODY_64K, 31);
+    }
+
+    #[divan::bench(sample_count = 50, sample_size = 10)]
     fn fragmented_decode_64k_256_bytes(bencher: Bencher) {
         bench_fragmented_decode(bencher, BODY_64K, 256);
     }
@@ -438,6 +453,21 @@ mod public_client_experiments {
     #[ignore]
     fn fragmented_decode_768k_1_byte(bencher: Bencher) {
         bench_fragmented_decode(bencher, BODY_768K, 1);
+    }
+
+    #[divan::bench(sample_count = 20, sample_size = 5)]
+    fn fragmented_decode_768k_2_bytes(bencher: Bencher) {
+        bench_fragmented_decode(bencher, BODY_768K, 2);
+    }
+
+    #[divan::bench(sample_count = 20, sample_size = 5)]
+    fn fragmented_decode_768k_4_bytes(bencher: Bencher) {
+        bench_fragmented_decode(bencher, BODY_768K, 4);
+    }
+
+    #[divan::bench(sample_count = 20, sample_size = 5)]
+    fn fragmented_decode_768k_31_bytes(bencher: Bencher) {
+        bench_fragmented_decode(bencher, BODY_768K, 31);
     }
 
     #[divan::bench(sample_count = 20, sample_size = 5)]
@@ -456,6 +486,21 @@ mod public_client_experiments {
     }
 
     #[divan::bench(sample_count = 50, sample_size = 10)]
+    fn stateless_decode_control_64k_2_bytes(bencher: Bencher) {
+        bench_stateless_decode(bencher, BODY_64K, 2);
+    }
+
+    #[divan::bench(sample_count = 50, sample_size = 10)]
+    fn stateless_decode_control_64k_4_bytes(bencher: Bencher) {
+        bench_stateless_decode(bencher, BODY_64K, 4);
+    }
+
+    #[divan::bench(sample_count = 50, sample_size = 10)]
+    fn stateless_decode_control_64k_31_bytes(bencher: Bencher) {
+        bench_stateless_decode(bencher, BODY_64K, 31);
+    }
+
+    #[divan::bench(sample_count = 50, sample_size = 10)]
     fn stateless_decode_control_64k_256_bytes(bencher: Bencher) {
         bench_stateless_decode(bencher, BODY_64K, 256);
     }
@@ -468,6 +513,27 @@ mod public_client_experiments {
     #[divan::bench(sample_count = 20, sample_size = 5)]
     fn stateless_decode_control_768k_256k(bencher: Bencher) {
         bench_stateless_decode(bencher, BODY_768K, 256 * 1024);
+    }
+
+    #[divan::bench(sample_count = 20, sample_size = 5)]
+    #[ignore]
+    fn stateless_decode_control_768k_1_byte(bencher: Bencher) {
+        bench_stateless_decode(bencher, BODY_768K, 1);
+    }
+
+    #[divan::bench(sample_count = 20, sample_size = 5)]
+    fn stateless_decode_control_768k_2_bytes(bencher: Bencher) {
+        bench_stateless_decode(bencher, BODY_768K, 2);
+    }
+
+    #[divan::bench(sample_count = 20, sample_size = 5)]
+    fn stateless_decode_control_768k_4_bytes(bencher: Bencher) {
+        bench_stateless_decode(bencher, BODY_768K, 4);
+    }
+
+    #[divan::bench(sample_count = 20, sample_size = 5)]
+    fn stateless_decode_control_768k_31_bytes(bencher: Bencher) {
+        bench_stateless_decode(bencher, BODY_768K, 31);
     }
 
     #[divan::bench(sample_count = 20, sample_size = 5)]
