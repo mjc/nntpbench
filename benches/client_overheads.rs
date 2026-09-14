@@ -15,9 +15,7 @@ use nntpbench::client::{
 use nntpbench::{
     ClientCommandMix, MessageId, Request, RequestKind, bench_append_load_workload_request,
     bench_client_request_for_command, bench_client_segment_request_for_command,
-    bench_load_response_scan_in_place,
-    bench_load_read_capacity,
-    bench_load_read_capacity_in_place,
+    bench_load_read_capacity_in_place, bench_load_response_scan_in_place,
     bench_load_response_verify_in_place,
 };
 use std::sync::Arc;
@@ -206,10 +204,10 @@ mod streaming_decode {
                     bench_load_response_scan_in_place(
                         black_box(buffer),
                         black_box(RequestKind::Body),
-                     )
-                     .unwrap(),
-                 )
-             });
+                    )
+                    .unwrap(),
+                )
+            });
     }
 
     #[divan::bench(sample_count = 1000, sample_size = 100)]
@@ -222,10 +220,10 @@ mod streaming_decode {
                         black_box(buffer),
                         black_box(RequestKind::Body),
                         black_box("<bench@example.com>"),
-                     )
-                     .unwrap(),
-                 )
-             });
+                    )
+                    .unwrap(),
+                )
+            });
     }
 }
 
