@@ -2091,13 +2091,15 @@ impl LoadSession {
             );
             append_load_workload_request(
                 buffer,
-                command_id,
-                synthetic_id,
-                request_index,
-                self.command_mix,
-                self.segments.as_deref(),
-                self.client_index,
-                self.total_clients,
+                LoadWorkloadRequest {
+                    command_id,
+                    synthetic_id,
+                    request_index,
+                    mix: self.command_mix,
+                    segments: self.segments.as_deref(),
+                    client_index: self.client_index,
+                    total_clients: self.total_clients,
+                },
             )?;
             filled += 1;
         }
@@ -2627,16 +2629,29 @@ fn client_request_for_command(
     }
 }
 
-fn append_load_workload_request(
-    buffer: &mut Vec<u8>,
+struct LoadWorkloadRequest<'a> {
     command_id: u64,
     synthetic_id: u64,
     request_index: u64,
     mix: ClientCommandMix,
-    segments: Option<&SegmentSet>,
+    segments: Option<&'a SegmentSet>,
     client_index: usize,
     total_clients: usize,
+}
+
+fn append_load_workload_request(
+    buffer: &mut Vec<u8>,
+    workload: LoadWorkloadRequest<'_>,
 ) -> io::Result<()> {
+    let LoadWorkloadRequest {
+        command_id,
+        synthetic_id,
+        request_index,
+        mix,
+        segments,
+        client_index,
+        total_clients,
+    } = workload;
     let kind = client_command_kind(command_id, mix);
     match kind {
         ClientCommandMix::Article => buffer.extend_from_slice(b"ARTICLE "),
@@ -2665,13 +2680,15 @@ pub fn bench_append_load_workload_request(
 ) -> io::Result<()> {
     append_load_workload_request(
         buffer,
-        command_id,
-        command_id,
-        request_index,
-        mix,
-        None,
-        0,
-        1,
+        LoadWorkloadRequest {
+            command_id,
+            synthetic_id: command_id,
+            request_index,
+            mix,
+            segments: None,
+            client_index: 0,
+            total_clients: 1,
+        },
     )
 }
 
@@ -4955,7 +4972,7 @@ where
                 stats
                     .bytes_sent
                     .fetch_add(response.len() as u64, Ordering::Relaxed);
-                output.write_all(&response).expect("response write failed");
+                output.write_all(response).expect("response write failed");
                 return false;
             }
             if let Some(article_id) = parse_article_id_arg(request.args()).filter(|id| *id != 1) {
@@ -4967,7 +4984,7 @@ where
                 stats
                     .bytes_sent
                     .fetch_add(response.len() as u64, Ordering::Relaxed);
-                output.write_all(&response).expect("response write failed");
+                output.write_all(response).expect("response write failed");
                 return false;
             }
             stats
@@ -4985,7 +5002,7 @@ where
                 stats
                     .bytes_sent
                     .fetch_add(response.len() as u64, Ordering::Relaxed);
-                output.write_all(&response).expect("response write failed");
+                output.write_all(response).expect("response write failed");
                 return false;
             }
             let article_id = parse_article_id_arg(request.args()).unwrap_or(1);
@@ -5007,7 +5024,7 @@ where
                 stats
                     .bytes_sent
                     .fetch_add(response.len() as u64, Ordering::Relaxed);
-                output.write_all(&response).expect("response write failed");
+                output.write_all(response).expect("response write failed");
                 return false;
             }
             stats
@@ -5025,7 +5042,7 @@ where
                 stats
                     .bytes_sent
                     .fetch_add(response.len() as u64, Ordering::Relaxed);
-                output.write_all(&response).expect("response write failed");
+                output.write_all(response).expect("response write failed");
                 return false;
             }
             let article_id = parse_article_id_arg(request.args()).unwrap_or(1);
@@ -5047,7 +5064,7 @@ where
                 stats
                     .bytes_sent
                     .fetch_add(response.len() as u64, Ordering::Relaxed);
-                output.write_all(&response).expect("response write failed");
+                output.write_all(response).expect("response write failed");
                 return false;
             }
             stats
@@ -5069,7 +5086,7 @@ where
                 stats
                     .bytes_sent
                     .fetch_add(response.len() as u64, Ordering::Relaxed);
-                output.write_all(&response).expect("response write failed");
+                output.write_all(response).expect("response write failed");
                 return false;
             }
             let article_id = parse_article_id_arg(request.args()).unwrap_or(1);
@@ -5095,7 +5112,7 @@ where
                 stats
                     .bytes_sent
                     .fetch_add(response.len() as u64, Ordering::Relaxed);
-                output.write_all(&response).expect("response write failed");
+                output.write_all(response).expect("response write failed");
                 return false;
             }
             stats
@@ -5982,13 +5999,13 @@ impl ServerConfig {
                 args.pending_write_bytes.max(1),
                 args.max_connections
                     .max(1)
-                    .min(DEFAULT_PENDING_WRITE_POOL_BUFFERS),
+                    .clamp(1, DEFAULT_PENDING_WRITE_POOL_BUFFERS),
             ),
             generated_response_buffer_pool: GeneratedResponseBufferPool::new(
                 generated_response_buffer_capacity(args.article_bytes, args.body_bytes),
                 args.max_connections
                     .max(1)
-                    .min(DEFAULT_PENDING_WRITE_POOL_BUFFERS),
+                    .clamp(1, DEFAULT_PENDING_WRITE_POOL_BUFFERS),
             ),
             nodelay: args.nodelay,
             socket_recv_buffer: args.socket_recv_buffer,
@@ -19700,7 +19717,8 @@ mod tests {
             let (mut stream, _) = listener.accept().await.unwrap();
             stream.write_all(b"200 ready\r\n").await.unwrap();
             let mut request = [0_u8; 512];
-            stream.read(&mut request).await.unwrap();
+            let read = stream.read(&mut request).await.unwrap();
+            assert!(read > 0);
             time::sleep(Duration::from_secs(2)).await;
         });
 
@@ -19762,7 +19780,8 @@ mod tests {
             let (mut stream, _) = listener.accept().await.unwrap();
             stream.write_all(b"200 ready\r\n").await.unwrap();
             let mut request = [0_u8; 512];
-            stream.read(&mut request).await.unwrap();
+            let read = stream.read(&mut request).await.unwrap();
+            assert!(read > 0);
             time::sleep(Duration::from_millis(50)).await;
             stream
                 .write_all(b"220 1 <article@test> article follows\r\n.\r\n")
