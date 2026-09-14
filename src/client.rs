@@ -5150,6 +5150,69 @@ mod tests {
         server.await.unwrap();
     }
 
+    #[test]
+    fn authinfo_state_coordination_waits_for_terminal_statuses() {
+        assert!(request_kind_requires_barrier(RequestKind::AuthInfo));
+        assert!(request_kind_invalidates_capabilities(RequestKind::AuthInfo));
+        assert!(!response_invalidates_capabilities(
+            RequestKind::AuthInfo,
+            StatusCode::parse(b"383").unwrap()
+        ));
+        assert!(response_invalidates_capabilities(
+            RequestKind::AuthInfo,
+            StatusCode::parse(b"281").unwrap()
+        ));
+        assert!(response_invalidates_capabilities(
+            RequestKind::AuthInfo,
+            StatusCode::parse(b"283").unwrap()
+        ));
+    }
+
+    #[tokio::test]
+    async fn client_connection_does_not_probe_capabilities_between_authinfo_steps() {
+        let listener = crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"201 client ready\r\n").await.unwrap();
+            assert_read_request(&mut stream, b"CAPABILITIES\r\n").await;
+            stream
+                .write_all(b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n")
+                .await
+                .unwrap();
+            assert_read_request(&mut stream, b"AUTHINFO USER bench-user\r\n").await;
+            stream
+                .write_all(b"381 password required\r\n")
+                .await
+                .unwrap();
+            assert_read_request(&mut stream, b"AUTHINFO PASS bench-pass\r\n").await;
+            stream.write_all(crate::AUTHINFO_RESPONSE).await.unwrap();
+        });
+
+        let connection = ClientConnection::connect(addr).await.unwrap();
+        connection.capabilities().await.unwrap();
+        assert_eq!(
+            connection
+                .authinfo_user(AuthInfoValue::from_owned("bench-user").unwrap())
+                .await
+                .unwrap()
+                .status()
+                .as_u16(),
+            381
+        );
+        assert_eq!(
+            connection
+                .authinfo_pass(AuthInfoValue::from_owned("bench-pass").unwrap())
+                .await
+                .unwrap()
+                .status()
+                .as_u16(),
+            281
+        );
+
+        server.await.unwrap();
+    }
+
     #[tokio::test]
     async fn client_connection_retries_capability_preflight_after_non_list_response() {
         let listener = crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
