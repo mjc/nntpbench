@@ -1155,11 +1155,6 @@ impl ValidatedArticle {
             },
         }
     }
-
-    pub(crate) fn content_slice(self, buffer: &[u8]) -> Result<&[u8], ArticleParseError> {
-        self.bind(buffer)?;
-        self.content_range().slice(buffer)
-    }
 }
 
 /// An article validation proof bound to the immutable bytes it describes.
@@ -1169,6 +1164,13 @@ pub(crate) struct ValidatedArticleView<'a> {
 }
 
 impl<'a> ValidatedArticleView<'a> {
+    pub(crate) fn content(self) -> &'a [u8] {
+        self.validated
+            .content_range()
+            .slice(self.buffer)
+            .expect("validated article view preserves its content range")
+    }
+
     pub(crate) fn materialize(self) -> Article<'a> {
         Article::materialize_validated_article(self.buffer, self.validated)
             .expect("validated article view preserves its validated bytes")
@@ -1487,7 +1489,7 @@ impl<'a> Article<'a> {
     }
 
     /// Materialize an article from proof returned by [`Self::validate_article_frame`].
-    pub(crate) fn materialize_validated_article(
+    fn materialize_validated_article(
         buf: &'a [u8],
         validated: ValidatedArticle,
     ) -> Result<Self, ArticleParseError> {

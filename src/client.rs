@@ -2040,8 +2040,9 @@ impl OwnedResponseContent {
         match self {
             Self::Generic { start, end } => &bytes[*start..*end],
             Self::Article(validated) => validated
-                .content_slice(bytes)
-                .expect("OwnedResponse preserves the immutable buffer validated by its decoder"),
+                .bind(bytes)
+                .expect("OwnedResponse preserves the immutable buffer validated by its decoder")
+                .content(),
         }
     }
 }
