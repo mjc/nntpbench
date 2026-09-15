@@ -2387,11 +2387,11 @@ impl ResponseDecoder {
             StreamingDecodeProgress::NeedMore { .. } => Ok(FramingDecodeProgress::NeedMore),
             StreamingDecodeProgress::Complete {
                 status,
-                consumed,
+                consumed: chunk_consumed,
                 bounds,
             } => Ok(FramingDecodeProgress::Complete {
                 status,
-                consumed,
+                buffer_consumed: start + chunk_consumed,
                 bounds,
             }),
         }
@@ -2417,6 +2417,7 @@ impl ResponseDecoder {
         }
     }
 
+    #[cfg(test)]
     fn push<'a>(&mut self, buffer: &'a [u8]) -> Result<DecodeProgress<'a>, ClientError> {
         match self.push_framing(buffer)? {
             FramingDecodeProgress::NeedMore => Ok(DecodeProgress::NeedMore),
@@ -2442,12 +2443,12 @@ enum FramingDecodeProgress {
     NeedMore,
     Complete {
         status: StatusCode,
-        consumed: usize,
+        buffer_consumed: usize,
         bounds: Option<crate::terminator::MultilineFrameBounds>,
     },
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 #[derive(Debug)]
 enum DecodeProgress<'a> {
     NeedMore,
@@ -2659,8 +2660,8 @@ pub fn bench_article_validation_and_materialization(
         .saturating_add(parsed.message_id.as_str().len()))
 }
 
-/// Run the current incremental public response decoder against a fragmented
-/// response.
+/// Run the production framing, freeze, and validation sequence against a
+/// fragmented response.
 #[doc(hidden)]
 pub fn bench_public_response_decode_chunks(
     kind: RequestKind,
@@ -2677,11 +2678,20 @@ pub fn bench_public_response_decode_chunks(
         pending.extend_from_slice(&response[offset..end]);
         offset = end;
 
-        if let DecodeProgress::Complete {
-            status, consumed, ..
-        } = decoder.push(&pending)?
-        {
-            return Ok((status, consumed));
+        match decoder.push_framing(&pending)? {
+            FramingDecodeProgress::NeedMore => {}
+            FramingDecodeProgress::Complete {
+                status,
+                buffer_consumed,
+                bounds,
+            } => {
+                let bytes = pending.split_to(buffer_consumed).freeze();
+                return match decoder.complete_frame(&bytes, status, bounds) {
+                    ResponseFrameParse::Complete(frame) => Ok((frame.status(), frame.consumed())),
+                    ResponseFrameParse::NeedMore => Err(ClientError::UnexpectedEof),
+                    ResponseFrameParse::Invalid => Err(ClientError::InvalidStatusLine),
+                };
+            }
         }
     }
 
@@ -3380,10 +3390,10 @@ async fn run_reader_task(
                     Ok(FramingDecodeProgress::NeedMore) => {}
                     Ok(FramingDecodeProgress::Complete {
                         status,
-                        consumed,
+                        buffer_consumed,
                         bounds,
                     }) => {
-                        let bytes = pending_read.split_to(consumed).freeze();
+                        let bytes = pending_read.split_to(buffer_consumed).freeze();
                         let ResponseFrameParse::Complete(frame) =
                             decoder.complete_frame(&bytes, status, bounds)
                         else {
@@ -3647,6 +3657,34 @@ mod tests {
                 DecodeProgress::NeedMore => panic!("decoder did not complete at split {split}"),
             },
         }
+    }
+
+    fn assert_framing_completion_reports_buffer_offset(
+        kind: RequestKind,
+        buffer: &[u8],
+        split: usize,
+        expected_frame_end: usize,
+    ) {
+        let mut decoder = ResponseDecoder::new(kind);
+        match decoder
+            .push_framing(&buffer[..split])
+            .expect("first framing push should succeed")
+        {
+            FramingDecodeProgress::NeedMore => {}
+            FramingDecodeProgress::Complete { .. } => {
+                panic!("framing completed before the final chunk")
+            }
+        }
+
+        let FramingDecodeProgress::Complete {
+            buffer_consumed, ..
+        } = decoder
+            .push_framing(buffer)
+            .expect("second framing push should succeed")
+        else {
+            panic!("the final chunk should complete the response")
+        };
+        assert_eq!(buffer_consumed, expected_frame_end);
     }
 
     fn assert_decoder_completes_on_all_three_push_schedules(
@@ -4025,6 +4063,42 @@ mod tests {
             decoder.push(&too_long),
             Err(ClientError::InvalidStatusLine)
         ));
+    }
+
+    #[test]
+    fn framing_completion_reports_accumulated_single_line_offset() {
+        let response = b"223 1 <stat@test> article exists\r\n";
+        assert_framing_completion_reports_buffer_offset(
+            RequestKind::Stat,
+            response,
+            response.len() - 1,
+            response.len(),
+        );
+    }
+
+    #[test]
+    fn framing_completion_reports_accumulated_multiline_offset() {
+        let response = b"222 1 <body@test> body follows\r\nbody\r\n.\r\n";
+        assert_framing_completion_reports_buffer_offset(
+            RequestKind::Body,
+            response,
+            response.len() - 1,
+            response.len(),
+        );
+    }
+
+    #[test]
+    fn framing_completion_excludes_a_packed_following_response() {
+        let first = b"223 1 <stat@test> article exists\r\n";
+        let mut packed = first.to_vec();
+        packed.extend_from_slice(b"205 closing connection\r\n");
+
+        assert_framing_completion_reports_buffer_offset(
+            RequestKind::Stat,
+            &packed,
+            first.len() - 1,
+            first.len(),
+        );
     }
 
     #[test]
