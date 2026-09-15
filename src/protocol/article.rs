@@ -1086,30 +1086,9 @@ struct ValidatedFirstLine {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ValidatedHeaders {
-    Plain(ArticleFrameRange),
-    Folded(ArticleFrameRange),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HeaderTransformation {
     None,
     Unfold,
-}
-
-impl HeaderTransformation {
-    fn with_range(self, range: ArticleFrameRange) -> ValidatedHeaders {
-        match self {
-            Self::None => ValidatedHeaders::Plain(range),
-            Self::Unfold => ValidatedHeaders::Folded(range),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ValidatedBody {
-    Plain(ArticleFrameRange),
-    DotStuffed(ArticleFrameRange),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1118,28 +1097,25 @@ enum BodyTransformation {
     Unstuff,
 }
 
-impl BodyTransformation {
-    fn with_range(self, range: ArticleFrameRange) -> ValidatedBody {
-        match self {
-            Self::None => ValidatedBody::Plain(range),
-            Self::Unstuff => ValidatedBody::DotStuffed(range),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ValidatedArticleContent {
     Article {
-        headers: ValidatedHeaders,
-        body: ValidatedBody,
+        headers: ArticleFrameRange,
+        header_transformation: HeaderTransformation,
+        body: ArticleFrameRange,
+        body_transformation: BodyTransformation,
     },
     Head {
-        headers: ValidatedHeaders,
+        headers: ArticleFrameRange,
+        header_transformation: HeaderTransformation,
     },
     Body {
-        body: ValidatedBody,
+        body: ArticleFrameRange,
+        body_transformation: BodyTransformation,
     },
-    Stat,
+    Stat {
+        content_start: usize,
+    },
 }
 
 /// Opaque proof that an immutable response buffer is an article-family response.
@@ -1157,6 +1133,26 @@ impl ValidatedArticle {
         } else {
             Err(ArticleParseError::BufferTooShort)
         }
+    }
+
+    fn content_range(self) -> ArticleFrameRange {
+        match self.content {
+            ValidatedArticleContent::Article { headers, body, .. } => ArticleFrameRange {
+                start: headers.start,
+                end: body.end,
+            },
+            ValidatedArticleContent::Head { headers, .. } => headers,
+            ValidatedArticleContent::Body { body, .. } => body,
+            ValidatedArticleContent::Stat { content_start } => ArticleFrameRange {
+                start: content_start,
+                end: content_start,
+            },
+        }
+    }
+
+    pub(crate) fn content_slice(self, buffer: &[u8]) -> Result<&[u8], ArticleParseError> {
+        self.require_buffer(buffer)?;
+        self.content_range().slice(buffer)
     }
 }
 
@@ -1208,7 +1204,7 @@ impl FramedArticle {
             .checked_add(crate::CRLF.len())
             .ok_or(ArticleParseError::BufferTooShort)?;
         let headers = ArticleFrameRange::new(self.content.start, headers_end)?;
-        let headers = validate_headers(headers.slice(buffer)?)?.with_range(headers);
+        let header_transformation = validate_headers(headers.slice(buffer)?)?;
 
         let body_start = headers_end
             .checked_add(crate::CRLF.len())
@@ -1217,9 +1213,14 @@ impl FramedArticle {
             return Err(ArticleParseError::BufferTooShort);
         }
         let body = ArticleFrameRange::new(body_start, self.content.end)?;
-        let body = validate_body_content(body.slice(buffer)?)?.with_range(body);
+        let body_transformation = validate_body_content(body.slice(buffer)?)?;
 
-        Ok(ValidatedArticleContent::Article { headers, body })
+        Ok(ValidatedArticleContent::Article {
+            headers,
+            header_transformation,
+            body,
+            body_transformation,
+        })
     }
 
     fn validate_head_content(
@@ -1229,18 +1230,24 @@ impl FramedArticle {
         if find_blank_line(self.content_prefix(buffer)?, self.content.start).is_ok() {
             return Err(ArticleParseError::UnexpectedBody);
         }
-        let headers = validate_headers(self.content.slice(buffer)?)?.with_range(self.content);
+        let header_transformation = validate_headers(self.content.slice(buffer)?)?;
 
-        Ok(ValidatedArticleContent::Head { headers })
+        Ok(ValidatedArticleContent::Head {
+            headers: self.content,
+            header_transformation,
+        })
     }
 
     fn validate_body_content(
         self,
         buffer: &[u8],
     ) -> Result<ValidatedArticleContent, ArticleParseError> {
-        let body = validate_body_content(self.content.slice(buffer)?)?.with_range(self.content);
+        let body_transformation = validate_body_content(self.content.slice(buffer)?)?;
 
-        Ok(ValidatedArticleContent::Body { body })
+        Ok(ValidatedArticleContent::Body {
+            body: self.content,
+            body_transformation,
+        })
     }
 
     fn validate_stat_content(self) -> Result<ValidatedArticleContent, ArticleParseError> {
@@ -1248,7 +1255,9 @@ impl FramedArticle {
             return Err(ArticleParseError::UnexpectedBody);
         }
 
-        Ok(ValidatedArticleContent::Stat)
+        Ok(ValidatedArticleContent::Stat {
+            content_start: self.content.start,
+        })
     }
 }
 
@@ -1276,14 +1285,15 @@ impl<'a> Headers<'a> {
 
     fn from_validated(
         buffer: &'a [u8],
-        headers: ValidatedHeaders,
+        headers: ArticleFrameRange,
+        transformation: HeaderTransformation,
     ) -> Result<Self, ArticleParseError> {
-        match headers {
-            ValidatedHeaders::Plain(range) => Ok(Self {
-                data: Cow::Borrowed(range.slice(buffer)?),
+        match transformation {
+            HeaderTransformation::None => Ok(Self {
+                data: Cow::Borrowed(headers.slice(buffer)?),
             }),
-            ValidatedHeaders::Folded(range) => Ok(Self {
-                data: unfold_header_continuations(range.slice(buffer)?),
+            HeaderTransformation::Unfold => Ok(Self {
+                data: unfold_header_continuations(headers.slice(buffer)?),
             }),
         }
     }
@@ -1467,28 +1477,43 @@ impl<'a> Article<'a> {
         let article_number = Some(validated.first_line.article_number);
 
         match validated.content {
-            ValidatedArticleContent::Article { headers, body } => {
-                let headers = Headers::from_validated(buf, headers)?;
+            ValidatedArticleContent::Article {
+                headers,
+                header_transformation,
+                body,
+                body_transformation,
+            } => {
+                let headers = Headers::from_validated(buf, headers, header_transformation)?;
                 Ok(Self {
                     message_id,
                     article_number,
                     headers: Some(headers),
-                    body: Some(materialize_validated_body(buf, body)?),
+                    body: Some(materialize_validated_body(buf, body, body_transformation)?),
                 })
             }
-            ValidatedArticleContent::Head { headers } => Ok(Self {
+            ValidatedArticleContent::Head {
+                headers,
+                header_transformation,
+            } => Ok(Self {
                 message_id,
                 article_number,
-                headers: Some(Headers::from_validated(buf, headers)?),
+                headers: Some(Headers::from_validated(
+                    buf,
+                    headers,
+                    header_transformation,
+                )?),
                 body: None,
             }),
-            ValidatedArticleContent::Body { body } => Ok(Self {
+            ValidatedArticleContent::Body {
+                body,
+                body_transformation,
+            } => Ok(Self {
                 message_id,
                 article_number,
                 headers: None,
-                body: Some(materialize_validated_body(buf, body)?),
+                body: Some(materialize_validated_body(buf, body, body_transformation)?),
             }),
-            ValidatedArticleContent::Stat => Ok(Self {
+            ValidatedArticleContent::Stat { .. } => Ok(Self {
                 message_id,
                 article_number,
                 headers: None,
@@ -1650,11 +1675,12 @@ fn unstuff_known_dot_lines(buf: &[u8]) -> Cow<'_, [u8]> {
 
 fn materialize_validated_body(
     buffer: &[u8],
-    body: ValidatedBody,
+    body: ArticleFrameRange,
+    transformation: BodyTransformation,
 ) -> Result<Cow<'_, [u8]>, ArticleParseError> {
-    match body {
-        ValidatedBody::Plain(range) => Ok(Cow::Borrowed(range.slice(buffer)?)),
-        ValidatedBody::DotStuffed(range) => Ok(unstuff_known_dot_lines(range.slice(buffer)?)),
+    match transformation {
+        BodyTransformation::None => Ok(Cow::Borrowed(body.slice(buffer)?)),
+        BodyTransformation::Unstuff => Ok(unstuff_known_dot_lines(body.slice(buffer)?)),
     }
 }
 
@@ -1959,6 +1985,12 @@ Actual body content\r\n\
         let content_end = find_article_content_end(&original, content_start).unwrap();
         let validated =
             Article::validate_article_frame(&original, content_start, content_end).unwrap();
+
+        assert_eq!(
+            Article::materialize_validated_article(&original[..content_end], validated),
+            Err(ArticleParseError::BufferTooShort)
+        );
+
         let mut replacement = original.clone();
         *replacement
             .get_mut(content_start)

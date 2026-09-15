@@ -15,7 +15,7 @@ use tokio::task::JoinHandle;
 
 use crate::protocol::{
     ArticleRef, Request, ResponseFrameDecoder, ResponseFrameParse, ResponseInitialParse,
-    ValidatedResponseContent,
+    ValidatedArticle, ValidatedResponseContent,
 };
 use crate::terminator::{
     DOT_TERMINATOR, MultilineFrameProgress, MultilineFramer, crlf_normalized_payload_lines,
@@ -2011,10 +2011,39 @@ struct ConnectionHandle {
 pub struct OwnedResponse {
     kind: RequestKind,
     status: StatusCode,
-    content_start: usize,
-    content_end: usize,
-    content_validation: ValidatedResponseContent,
+    content: OwnedResponseContent,
     bytes: Bytes,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OwnedResponseContent {
+    Generic { start: usize, end: usize },
+    Article(ValidatedArticle),
+}
+
+impl OwnedResponseContent {
+    fn from_frame(
+        content_start: usize,
+        content_end: usize,
+        validation: ValidatedResponseContent,
+    ) -> Self {
+        match validation {
+            ValidatedResponseContent::Generic => Self::Generic {
+                start: content_start,
+                end: content_end,
+            },
+            ValidatedResponseContent::Article(validated) => Self::Article(validated),
+        }
+    }
+
+    fn content<'a>(&self, bytes: &'a [u8]) -> &'a [u8] {
+        match self {
+            Self::Generic { start, end } => &bytes[*start..*end],
+            Self::Article(validated) => validated
+                .content_slice(bytes)
+                .expect("OwnedResponse preserves the immutable buffer validated by its decoder"),
+        }
+    }
 }
 
 impl OwnedResponse {
@@ -2039,17 +2068,17 @@ impl OwnedResponse {
     /// Borrowed response payload bytes, excluding the initial line and any dot terminator.
     #[must_use]
     pub fn content(&self) -> &[u8] {
-        &self.bytes[self.content_start..self.content_end]
+        self.content.content(&self.bytes)
     }
 
     /// Parse the response as an ARTICLE/HEAD/BODY/STAT article-style frame.
     pub fn parse_article(&self) -> Result<Article<'_>, ArticleParseError> {
-        match self.content_validation {
-            ValidatedResponseContent::Article(validated) => {
+        match self.content {
+            OwnedResponseContent::Article(validated) => {
                 Article::materialize_validated_article(&self.bytes, validated)
             }
-            ValidatedResponseContent::Generic => {
-                Article::parse_article_frame(&self.bytes, self.content_start, self.content_end)
+            OwnedResponseContent::Generic { start, end } => {
+                Article::parse_article_frame(&self.bytes, start, end)
             }
         }
     }
@@ -2109,7 +2138,7 @@ impl OwnedArticle {
 
     /// Borrow the parsed article/body view from the owned wire bytes.
     pub fn article(&self) -> Article<'_> {
-        let ValidatedResponseContent::Article(validated) = self.response.content_validation else {
+        let OwnedResponseContent::Article(validated) = self.response.content else {
             unreachable!("OwnedArticle is constructed only from article validation");
         };
         Article::materialize_validated_article(&self.response.bytes, validated)
@@ -2180,20 +2209,13 @@ impl TryFrom<OwnedResponse> for OwnedArticle {
             _ => 0,
         };
         if response.status.as_u16() != expected_status {
-            let status = response.status.as_u16();
-            return Err(ClientError::UnexpectedArticleResponse {
-                response: Box::new(response),
-                source: ArticleParseError::InvalidStatusCode(status),
-            });
+            return Err(ClientError::UnexpectedArticleResponse { response });
         }
 
-        match response.content_validation {
-            ValidatedResponseContent::Article(_) => {}
-            ValidatedResponseContent::Generic => {
-                return Err(ClientError::UnexpectedArticleResponse {
-                    source: ArticleParseError::InvalidStatusCode(response.status.as_u16()),
-                    response: Box::new(response),
-                });
+        match response.content {
+            OwnedResponseContent::Article(_) => {}
+            OwnedResponseContent::Generic { .. } => {
+                return Err(ClientError::UnexpectedArticleResponse { response });
             }
         }
         Ok(Self { response })
@@ -2226,10 +2248,7 @@ pub enum ClientError {
     InvalidListGroupRange,
     CapabilitiesUnavailable,
     ConnectionClosed,
-    UnexpectedArticleResponse {
-        response: Box<OwnedResponse>,
-        source: ArticleParseError,
-    },
+    UnexpectedArticleResponse { response: OwnedResponse },
 }
 
 impl fmt::Display for ClientError {
@@ -2262,9 +2281,9 @@ impl fmt::Display for ClientError {
                 write!(f, "CAPABILITIES did not return a capability list")
             }
             Self::ConnectionClosed => write!(f, "connection engine closed"),
-            Self::UnexpectedArticleResponse { response, source } => write!(
+            Self::UnexpectedArticleResponse { response } => write!(
                 f,
-                "unexpected article response status {}: {source}",
+                "unexpected article response status {}",
                 response.status().as_u16()
             ),
         }
@@ -2535,9 +2554,11 @@ pub fn bench_owned_response_from_bytes(
     Ok(OwnedResponse {
         kind,
         status: frame.status(),
-        content_start: frame.content_start(),
-        content_end: frame.content_end(),
-        content_validation: frame.content_validation(),
+        content: OwnedResponseContent::from_frame(
+            frame.content_start(),
+            frame.content_end(),
+            frame.content_validation(),
+        ),
         bytes: bytes.slice(..frame.consumed()),
     })
 }
@@ -3327,9 +3348,11 @@ async fn run_reader_task(
                         let response = CompletedResponse::Owned(OwnedResponse {
                             kind,
                             status,
-                            content_start,
-                            content_end,
-                            content_validation,
+                            content: OwnedResponseContent::from_frame(
+                                content_start,
+                                content_end,
+                                content_validation,
+                            ),
                             bytes,
                         });
                         let _ = response_tx.send(Ok(CompletedRequest { request, response }));
@@ -3679,9 +3702,11 @@ mod tests {
         OwnedResponse {
             kind,
             status,
-            content_start: frame.content_start(),
-            content_end: frame.content_end(),
-            content_validation: frame.content_validation(),
+            content: OwnedResponseContent::from_frame(
+                frame.content_start(),
+                frame.content_end(),
+                frame.content_validation(),
+            ),
             bytes,
         }
     }
@@ -3693,7 +3718,7 @@ mod tests {
             StatusCode::parse(b"222").unwrap(),
             b"222 1 <body@test> body follows\r\nbody\r\n.\r\n",
         );
-        response.content_validation = ValidatedResponseContent::Generic;
+        response.content = OwnedResponseContent::Generic { start: 0, end: 0 };
 
         let Err(ClientError::UnexpectedArticleResponse { .. }) = OwnedArticle::try_from(response)
         else {
