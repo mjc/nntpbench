@@ -136,35 +136,31 @@ impl<'a> ResponseFrame<'a> {
             return ResponseFrameParse::Invalid;
         }
 
-        let (consumed, content, terminator, content_validation) =
-            if descriptor.framing().is_multiline() {
-                let Some(block) = find_dot_terminated_block(buffer, status_line_end) else {
-                    return ResponseFrameParse::NeedMore;
-                };
-                let content_validation = match validate_multiline_response_content(
-                    kind,
-                    buffer,
-                    &buffer[..status_line_end],
-                    status_line_end,
-                    block.content_end(),
-                ) {
-                    None => return ResponseFrameParse::Invalid,
-                    Some(validation) => validation,
-                };
-                (
-                    block.block_end(),
-                    block.content(),
-                    block.terminator(),
-                    content_validation,
-                )
-            } else {
-                (
-                    status_line_end,
-                    &buffer[status_line_end..status_line_end],
-                    &buffer[status_line_end..status_line_end],
-                    ValidatedResponseContent::Generic,
-                )
+        let (consumed, content, terminator) = if descriptor.framing().is_multiline() {
+            let Some(block) = find_dot_terminated_block(buffer, status_line_end) else {
+                return ResponseFrameParse::NeedMore;
             };
+            (block.block_end(), block.content(), block.terminator())
+        } else {
+            (
+                status_line_end,
+                &buffer[status_line_end..status_line_end],
+                &buffer[status_line_end..status_line_end],
+            )
+        };
+        let content_end = status_line_end + content.len();
+        let content_validation = match validate_response_content(
+            kind,
+            status,
+            descriptor.framing(),
+            buffer,
+            &buffer[..status_line_end],
+            status_line_end,
+            content_end,
+        ) {
+            Some(validation) => validation,
+            None => return ResponseFrameParse::Invalid,
+        };
 
         ResponseFrameParse::Complete(Self {
             kind,
@@ -174,7 +170,7 @@ impl<'a> ResponseFrame<'a> {
             content,
             terminator,
             content_start: status_line_end,
-            content_end: status_line_end + content.len(),
+            content_end,
             content_validation,
             status,
             consumed,
@@ -322,24 +318,14 @@ impl ResponseFrameDecoder {
             return ResponseFrameParse::Invalid;
         }
 
-        let (content, terminator, content_validation) = if descriptor.framing().is_multiline() {
+        let (content, terminator) = if descriptor.framing().is_multiline() {
             let Some(content) = buffer.get(status_line_end..content_end) else {
                 return ResponseFrameParse::Invalid;
-            };
-            let content_validation = match validate_multiline_response_content(
-                self.kind,
-                buffer,
-                status_line,
-                status_line_end,
-                content_end,
-            ) {
-                None => return ResponseFrameParse::Invalid,
-                Some(validation) => validation,
             };
             let Some(terminator) = buffer.get(content_end..consumed) else {
                 return ResponseFrameParse::Invalid;
             };
-            (content, terminator, content_validation)
+            (content, terminator)
         } else {
             if content_end != status_line_end || consumed != status_line_end {
                 return ResponseFrameParse::Invalid;
@@ -347,8 +333,19 @@ impl ResponseFrameDecoder {
             (
                 &buffer[status_line_end..status_line_end],
                 &buffer[status_line_end..status_line_end],
-                ValidatedResponseContent::Generic,
             )
+        };
+        let content_validation = match validate_response_content(
+            self.kind,
+            status,
+            descriptor.framing(),
+            buffer,
+            status_line,
+            status_line_end,
+            content_end,
+        ) {
+            Some(validation) => validation,
+            None => return ResponseFrameParse::Invalid,
         };
 
         ResponseFrameParse::Complete(ResponseFrame {
@@ -2797,8 +2794,10 @@ pub(crate) enum ValidatedResponseContent {
     Article(ValidatedArticleLayout),
 }
 
-fn validate_multiline_response_content(
+fn validate_response_content(
     kind: RequestKind,
+    status: StatusCode,
+    framing: ResponseFraming,
     frame: &[u8],
     status_line: &[u8],
     content_start: usize,
@@ -2806,13 +2805,14 @@ fn validate_multiline_response_content(
 ) -> Option<ValidatedResponseContent> {
     let content = frame.get(content_start..content_end)?;
 
-    if matches!(
-        kind,
-        RequestKind::Article | RequestKind::Head | RequestKind::Body
-    ) {
+    if response_has_article_layout(kind, status) {
         return Article::validate_article_frame(frame, content_start, content_end)
             .map(ValidatedResponseContent::Article)
             .ok();
+    }
+
+    if !framing.is_multiline() {
+        return Some(ValidatedResponseContent::Generic);
     }
 
     let valid = match kind {
@@ -2850,6 +2850,16 @@ fn validate_multiline_response_content(
     } else {
         None
     }
+}
+
+const fn response_has_article_layout(kind: RequestKind, status: StatusCode) -> bool {
+    matches!(
+        (kind, status.as_u16()),
+        (RequestKind::Article, 220)
+            | (RequestKind::Head, 221)
+            | (RequestKind::Body, 222)
+            | (RequestKind::Stat, 223)
+    )
 }
 
 fn validate_generic_multiline_response_content(content: &[u8]) -> bool {
@@ -6212,6 +6222,20 @@ mod tests {
             b"222 1 <body@test> body follows\r\nbody line\r\n.\r\n"
         );
         assert_eq!(response.consumed(), response.bytes().len());
+    }
+
+    #[test]
+    fn stat_response_frame_retains_article_validation() {
+        let wire = b"223 1 <stat@test> article exists\r\n";
+        let ResponseFrameParse::Complete(response) = ResponseFrame::parse(RequestKind::Stat, wire)
+        else {
+            panic!("STAT response should parse");
+        };
+
+        assert!(matches!(
+            response.content_validation(),
+            ValidatedResponseContent::Article(_)
+        ));
     }
 
     #[test]
