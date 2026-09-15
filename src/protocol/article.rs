@@ -1127,9 +1127,15 @@ pub(crate) struct ValidatedArticle {
 }
 
 impl ValidatedArticle {
-    fn require_buffer(self, buffer: &[u8]) -> Result<(), ArticleParseError> {
+    pub(crate) fn bind<'a>(
+        self,
+        buffer: &'a [u8],
+    ) -> Result<ValidatedArticleView<'a>, ArticleParseError> {
         if self.buffer.contains(buffer) {
-            Ok(())
+            Ok(ValidatedArticleView {
+                buffer,
+                validated: self,
+            })
         } else {
             Err(ArticleParseError::BufferTooShort)
         }
@@ -1151,8 +1157,21 @@ impl ValidatedArticle {
     }
 
     pub(crate) fn content_slice(self, buffer: &[u8]) -> Result<&[u8], ArticleParseError> {
-        self.require_buffer(buffer)?;
+        self.bind(buffer)?;
         self.content_range().slice(buffer)
+    }
+}
+
+/// An article validation proof bound to the immutable bytes it describes.
+pub(crate) struct ValidatedArticleView<'a> {
+    buffer: &'a [u8],
+    validated: ValidatedArticle,
+}
+
+impl<'a> ValidatedArticleView<'a> {
+    pub(crate) fn materialize(self) -> Article<'a> {
+        Article::materialize_validated_article(self.buffer, self.validated)
+            .expect("validated article view preserves its validated bytes")
     }
 }
 
@@ -1472,7 +1491,7 @@ impl<'a> Article<'a> {
         buf: &'a [u8],
         validated: ValidatedArticle,
     ) -> Result<Self, ArticleParseError> {
-        validated.require_buffer(buf)?;
+        validated.bind(buf)?;
         let message_id = materialize_validated_message_id(buf, validated.first_line.message_id)?;
         let article_number = Some(validated.first_line.article_number);
 

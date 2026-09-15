@@ -2075,7 +2075,7 @@ impl OwnedResponse {
     pub fn parse_article(&self) -> Result<Article<'_>, ArticleParseError> {
         match self.content {
             OwnedResponseContent::Article(validated) => {
-                Article::materialize_validated_article(&self.bytes, validated)
+                validated.bind(&self.bytes).map(|bound| bound.materialize())
             }
             OwnedResponseContent::Generic { start, end } => {
                 Article::parse_article_frame(&self.bytes, start, end)
@@ -2141,8 +2141,10 @@ impl OwnedArticle {
         let OwnedResponseContent::Article(validated) = self.response.content else {
             unreachable!("OwnedArticle is constructed only from article validation");
         };
-        Article::materialize_validated_article(&self.response.bytes, validated)
+        validated
+            .bind(&self.response.bytes)
             .expect("OwnedArticle preserves the immutable buffer validated by its decoder")
+            .materialize()
     }
 
     /// Borrow the underlying raw response wrapper.
@@ -2609,8 +2611,10 @@ pub fn bench_article_validation_and_materialization(
     let ValidatedResponseContent::Article(validated) = frame.content_validation() else {
         return Err(ClientError::UnexpectedEof);
     };
-    let parsed = Article::materialize_validated_article(bytes, validated)
-        .map_err(|_| ClientError::UnexpectedEof)?;
+    let parsed = validated
+        .bind(bytes)
+        .map_err(|_| ClientError::UnexpectedEof)?
+        .materialize();
     Ok(parsed
         .body
         .as_ref()
