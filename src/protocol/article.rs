@@ -2,6 +2,8 @@
 
 use std::{borrow::Cow, fmt};
 
+use bytes::Bytes;
+
 use super::{
     InvalidMessageId, MAX_ARTICLE_NUMBER, MessageId, StatusCode, validate_optional_trailing_comment,
 };
@@ -1061,25 +1063,6 @@ impl ArticleFrameRange {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ValidatedBuffer {
-    start: usize,
-    len: usize,
-}
-
-impl ValidatedBuffer {
-    fn new(buffer: &[u8]) -> Self {
-        Self {
-            start: buffer.as_ptr() as usize,
-            len: buffer.len(),
-        }
-    }
-
-    fn contains(self, buffer: &[u8]) -> bool {
-        self.start == buffer.as_ptr() as usize && self.len == buffer.len()
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ValidatedFirstLine {
     message_id: ArticleFrameRange,
     article_number: ArticleNumber,
@@ -1118,29 +1101,13 @@ enum ValidatedArticleContent {
     },
 }
 
-/// Opaque proof that an immutable response buffer is an article-family response.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ValidatedArticle {
-    buffer: ValidatedBuffer,
+struct ArticleLayout {
     first_line: ValidatedFirstLine,
     content: ValidatedArticleContent,
 }
 
-impl ValidatedArticle {
-    pub(crate) fn bind<'a>(
-        self,
-        buffer: &'a [u8],
-    ) -> Result<ValidatedArticleView<'a>, ArticleParseError> {
-        if self.buffer.contains(buffer) {
-            Ok(ValidatedArticleView {
-                buffer,
-                validated: self,
-            })
-        } else {
-            Err(ArticleParseError::BufferTooShort)
-        }
-    }
-
+impl ArticleLayout {
     fn content_range(self) -> ArticleFrameRange {
         match self.content {
             ValidatedArticleContent::Article { headers, body, .. } => ArticleFrameRange {
@@ -1157,23 +1124,54 @@ impl ValidatedArticle {
     }
 }
 
-/// An article validation proof bound to the immutable bytes it describes.
+/// An article layout bound to the immutable bytes it validates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ValidatedArticleView<'a> {
     buffer: &'a [u8],
-    validated: ValidatedArticle,
+    layout: ArticleLayout,
+}
+
+/// Immutable owned article bytes and the layout validated for those bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ValidatedOwnedArticle {
+    bytes: Bytes,
+    layout: ArticleLayout,
 }
 
 impl<'a> ValidatedArticleView<'a> {
-    pub(crate) fn content(self) -> &'a [u8] {
-        self.validated
-            .content_range()
-            .slice(self.buffer)
-            .expect("validated article view preserves its content range")
+    pub(crate) fn materialize(self) -> Article<'a> {
+        Article::materialize_validated_article(self.buffer, self.layout)
+            .expect("validated article view preserves its validated bytes")
     }
 
-    pub(crate) fn materialize(self) -> Article<'a> {
-        Article::materialize_validated_article(self.buffer, self.validated)
-            .expect("validated article view preserves its validated bytes")
+    pub(crate) fn into_owned(self, bytes: Bytes) -> ValidatedOwnedArticle {
+        assert_eq!(self.buffer.as_ptr(), bytes.as_ptr());
+        assert_eq!(self.buffer.len(), bytes.len());
+        ValidatedOwnedArticle {
+            bytes,
+            layout: self.layout,
+        }
+    }
+}
+
+impl ValidatedOwnedArticle {
+    #[must_use]
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    #[must_use]
+    pub(crate) fn content(&self) -> &[u8] {
+        self.layout
+            .content_range()
+            .slice(&self.bytes)
+            .expect("owned article preserves its validated content range")
+    }
+
+    #[must_use]
+    pub(crate) fn materialize(&self) -> Article<'_> {
+        Article::materialize_validated_article(&self.bytes, self.layout)
+            .expect("owned article preserves its validated bytes")
     }
 }
 
@@ -1461,15 +1459,15 @@ impl<'a> Article<'a> {
         content_end: usize,
     ) -> Result<Self, ArticleParseError> {
         let validated = Self::validate_article_frame(buf, content_start, content_end)?;
-        Self::materialize_validated_article(buf, validated)
+        Ok(validated.materialize())
     }
 
     /// Validate a framed article without constructing unfolded or unstuffed data.
     pub(crate) fn validate_article_frame(
-        buf: &[u8],
+        buf: &'a [u8],
         content_start: usize,
         content_end: usize,
-    ) -> Result<ValidatedArticle, ArticleParseError> {
+    ) -> Result<ValidatedArticleView<'a>, ArticleParseError> {
         let frame = FramedArticle::from_content_bounds(buf, content_start, content_end)?;
         let first_line = validate_first_line(buf, frame.first_line)?;
 
@@ -1481,23 +1479,24 @@ impl<'a> Article<'a> {
             status_code => Err(ArticleParseError::InvalidStatusCode(status_code)),
         }?;
 
-        Ok(ValidatedArticle {
-            buffer: ValidatedBuffer::new(buf),
-            first_line,
-            content,
+        Ok(ValidatedArticleView {
+            buffer: buf,
+            layout: ArticleLayout {
+                first_line,
+                content,
+            },
         })
     }
 
     /// Materialize an article from proof returned by [`Self::validate_article_frame`].
     fn materialize_validated_article(
         buf: &'a [u8],
-        validated: ValidatedArticle,
+        layout: ArticleLayout,
     ) -> Result<Self, ArticleParseError> {
-        validated.bind(buf)?;
-        let message_id = materialize_validated_message_id(buf, validated.first_line.message_id)?;
-        let article_number = Some(validated.first_line.article_number);
+        let message_id = materialize_validated_message_id(buf, layout.first_line.message_id)?;
+        let article_number = Some(layout.first_line.article_number);
 
-        match validated.content {
+        match layout.content {
             ValidatedArticleContent::Article {
                 headers,
                 header_transformation,
@@ -1994,33 +1993,22 @@ Actual body content\r\n\
             };
             let validated =
                 Article::validate_article_frame(frame, content_start, content_end).unwrap();
-            let reused = Article::materialize_validated_article(frame, validated).unwrap();
+            let reused = validated.materialize();
             assert_eq!(reused, Article::parse(frame).unwrap());
         }
     }
 
     #[test]
-    fn validated_article_rejects_a_different_buffer() {
-        let original = VALID_BODY.to_vec();
-        let content_start = strict_crlf_line_content_end_from(&original, 0).unwrap() + 2;
-        let content_end = find_article_content_end(&original, content_start).unwrap();
+    fn owned_article_validation_preserves_the_bound_bytes_and_layout() {
+        let bytes = Bytes::from_static(VALID_BODY);
+        let content_start = strict_crlf_line_content_end_from(&bytes, 0).unwrap() + 2;
+        let content_end = find_article_content_end(&bytes, content_start).unwrap();
         let validated =
-            Article::validate_article_frame(&original, content_start, content_end).unwrap();
+            Article::validate_article_frame(&bytes, content_start, content_end).unwrap();
+        let owned = validated.into_owned(bytes.clone());
 
-        assert_eq!(
-            Article::materialize_validated_article(&original[..content_end], validated),
-            Err(ArticleParseError::BufferTooShort)
-        );
-
-        let mut replacement = original.clone();
-        *replacement
-            .get_mut(content_start)
-            .expect("the BODY fixture has content") = b'\0';
-
-        assert_eq!(
-            Article::materialize_validated_article(&replacement, validated),
-            Err(ArticleParseError::BufferTooShort)
-        );
+        assert_eq!(owned.bytes(), VALID_BODY);
+        assert_eq!(owned.materialize(), Article::parse(VALID_BODY).unwrap());
     }
 
     #[test]

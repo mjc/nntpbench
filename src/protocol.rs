@@ -16,8 +16,8 @@ use crate::terminator::{
 
 pub mod article;
 
-pub(crate) use article::ValidatedArticle;
 pub use article::{Article, ArticleNumber, ArticleParseError, HeaderIter, Headers};
+pub(crate) use article::{ValidatedArticleView, ValidatedOwnedArticle};
 
 pub const MAX_ARTICLE_NUMBER: u64 = 2_147_483_647;
 /// RFC 3977 section 3.1 command lines and response initial lines are limited
@@ -89,6 +89,18 @@ impl StatusCode {
 }
 
 /// Borrowed whole NNTP response frame parsed from bytes received from the wire.
+///
+/// A parsed frame retains the immutable borrow that validated its article layout,
+/// so the source cannot be mutated while that validation remains usable.
+///
+/// ```compile_fail
+/// use nntpbench::{RequestKind, ResponseFrame};
+///
+/// let mut wire = b"222 1 <body@test> body follows\r\nbody\r\n.\r\n".to_vec();
+/// let parsed = ResponseFrame::parse(RequestKind::Body, &wire);
+/// wire[32] = b'\0';
+/// let _still_validated = parsed;
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResponseFrame<'a> {
     kind: RequestKind,
@@ -99,7 +111,7 @@ pub struct ResponseFrame<'a> {
     terminator: &'a [u8],
     content_start: usize,
     content_end: usize,
-    content_validation: ValidatedResponseContent,
+    content_validation: ValidatedResponseContent<'a>,
     status: StatusCode,
     consumed: usize,
 }
@@ -228,7 +240,7 @@ impl<'a> ResponseFrame<'a> {
     }
 
     #[must_use]
-    pub(crate) const fn content_validation(self) -> ValidatedResponseContent {
+    pub(crate) const fn content_validation(self) -> ValidatedResponseContent<'a> {
         self.content_validation
     }
 }
@@ -2789,20 +2801,20 @@ fn validate_optional_trailing_comment(value: &[u8]) -> bool {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ValidatedResponseContent {
+pub(crate) enum ValidatedResponseContent<'a> {
     Generic,
-    Article(ValidatedArticle),
+    Article(ValidatedArticleView<'a>),
 }
 
-fn validate_response_content(
+fn validate_response_content<'a>(
     kind: RequestKind,
     status: StatusCode,
     framing: ResponseFraming,
-    frame: &[u8],
+    frame: &'a [u8],
     status_line: &[u8],
     content_start: usize,
     content_end: usize,
-) -> Option<ValidatedResponseContent> {
+) -> Option<ValidatedResponseContent<'a>> {
     let content = frame.get(content_start..content_end)?;
 
     match (kind, status.as_u16()) {
@@ -6228,6 +6240,18 @@ mod tests {
         let ValidatedResponseContent::Article(_) = response.content_validation() else {
             panic!("STAT response should retain article validation");
         };
+    }
+
+    #[test]
+    fn equivalent_article_frames_from_distinct_allocations_compare_equal() {
+        let first = b"222 1 <body@test> body follows\r\nbody\r\n.\r\n".to_vec();
+        let second = first.clone();
+
+        assert_ne!(first.as_ptr(), second.as_ptr());
+        assert_eq!(
+            ResponseFrame::parse(RequestKind::Body, &first),
+            ResponseFrame::parse(RequestKind::Body, &second),
+        );
     }
 
     #[test]

@@ -15,7 +15,7 @@ use tokio::task::JoinHandle;
 
 use crate::protocol::{
     ArticleRef, Request, ResponseFrameDecoder, ResponseFrameParse, ResponseInitialParse,
-    ValidatedArticle, ValidatedResponseContent,
+    ValidatedOwnedArticle, ValidatedResponseContent,
 };
 use crate::terminator::{
     DOT_TERMINATOR, MultilineFrameProgress, MultilineFramer, crlf_normalized_payload_lines,
@@ -2012,37 +2012,48 @@ pub struct OwnedResponse {
     kind: RequestKind,
     status: StatusCode,
     content: OwnedResponseContent,
-    bytes: Bytes,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum OwnedResponseContent {
-    Generic { start: usize, end: usize },
-    Article(ValidatedArticle),
+    Generic {
+        bytes: Bytes,
+        start: usize,
+        end: usize,
+    },
+    Article(ValidatedOwnedArticle),
 }
 
 impl OwnedResponseContent {
     fn from_frame(
+        bytes: Bytes,
         content_start: usize,
         content_end: usize,
-        validation: ValidatedResponseContent,
+        validation: ValidatedResponseContent<'_>,
     ) -> Self {
         match validation {
             ValidatedResponseContent::Generic => Self::Generic {
+                bytes,
                 start: content_start,
                 end: content_end,
             },
-            ValidatedResponseContent::Article(validated) => Self::Article(validated),
+            ValidatedResponseContent::Article(validated) => {
+                Self::Article(validated.into_owned(bytes))
+            }
         }
     }
 
-    fn content<'a>(&self, bytes: &'a [u8]) -> &'a [u8] {
+    fn bytes(&self) -> &[u8] {
         match self {
-            Self::Generic { start, end } => &bytes[*start..*end],
-            Self::Article(validated) => validated
-                .bind(bytes)
-                .expect("OwnedResponse preserves the immutable buffer validated by its decoder")
-                .content(),
+            Self::Generic { bytes, .. } => bytes,
+            Self::Article(article) => article.bytes(),
+        }
+    }
+
+    fn content(&self) -> &[u8] {
+        match self {
+            Self::Generic { bytes, start, end } => &bytes[*start..*end],
+            Self::Article(article) => article.content(),
         }
     }
 }
@@ -2063,23 +2074,21 @@ impl OwnedResponse {
     /// Raw response bytes.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
-        &self.bytes
+        self.content.bytes()
     }
 
     /// Borrowed response payload bytes, excluding the initial line and any dot terminator.
     #[must_use]
     pub fn content(&self) -> &[u8] {
-        self.content.content(&self.bytes)
+        self.content.content()
     }
 
     /// Parse the response as an ARTICLE/HEAD/BODY/STAT article-style frame.
     pub fn parse_article(&self) -> Result<Article<'_>, ArticleParseError> {
-        match self.content {
-            OwnedResponseContent::Article(validated) => {
-                validated.bind(&self.bytes).map(|bound| bound.materialize())
-            }
-            OwnedResponseContent::Generic { start, end } => {
-                Article::parse_article_frame(&self.bytes, start, end)
+        match &self.content {
+            OwnedResponseContent::Article(article) => Ok(article.materialize()),
+            OwnedResponseContent::Generic { bytes, start, end } => {
+                Article::parse_article_frame(bytes, *start, *end)
             }
         }
     }
@@ -2139,13 +2148,10 @@ impl OwnedArticle {
 
     /// Borrow the parsed article/body view from the owned wire bytes.
     pub fn article(&self) -> Article<'_> {
-        let OwnedResponseContent::Article(validated) = self.response.content else {
+        let OwnedResponseContent::Article(ref article) = self.response.content else {
             unreachable!("OwnedArticle is constructed only from article validation");
         };
-        validated
-            .bind(&self.response.bytes)
-            .expect("OwnedArticle preserves the immutable buffer validated by its decoder")
-            .materialize()
+        article.materialize()
     }
 
     /// Borrow the underlying raw response wrapper.
@@ -2372,28 +2378,50 @@ impl ResponseDecoder {
         }
     }
 
-    fn push(&mut self, buffer: &[u8]) -> Result<DecodeProgress, ClientError> {
+    fn push_framing(&mut self, buffer: &[u8]) -> Result<FramingDecodeProgress, ClientError> {
         let start = self.scanned.min(buffer.len());
         let chunk = &buffer[start..];
         self.scanned = buffer.len();
 
         match self.streaming.push(chunk)? {
-            StreamingDecodeProgress::NeedMore { .. } => Ok(DecodeProgress::NeedMore),
-            StreamingDecodeProgress::Complete { status, bounds, .. } => {
-                let response = match bounds {
-                    Some(bounds) => self.inner.complete_multiline(
-                        buffer,
-                        status,
-                        self.streaming.status_line_end(),
-                        bounds,
-                    ),
-                    None => self.inner.complete_single_line(
-                        buffer,
-                        status,
-                        self.streaming.status_line_end(),
-                    ),
-                };
-                match response {
+            StreamingDecodeProgress::NeedMore { .. } => Ok(FramingDecodeProgress::NeedMore),
+            StreamingDecodeProgress::Complete {
+                status,
+                consumed,
+                bounds,
+            } => Ok(FramingDecodeProgress::Complete {
+                status,
+                consumed,
+                bounds,
+            }),
+        }
+    }
+
+    fn complete_frame<'a>(
+        &self,
+        buffer: &'a [u8],
+        status: StatusCode,
+        bounds: Option<crate::terminator::MultilineFrameBounds>,
+    ) -> ResponseFrameParse<'a> {
+        match bounds {
+            Some(bounds) => self.inner.complete_multiline(
+                buffer,
+                status,
+                self.streaming.status_line_end(),
+                bounds,
+            ),
+            None => {
+                self.inner
+                    .complete_single_line(buffer, status, self.streaming.status_line_end())
+            }
+        }
+    }
+
+    fn push<'a>(&mut self, buffer: &'a [u8]) -> Result<DecodeProgress<'a>, ClientError> {
+        match self.push_framing(buffer)? {
+            FramingDecodeProgress::NeedMore => Ok(DecodeProgress::NeedMore),
+            FramingDecodeProgress::Complete { status, bounds, .. } => {
+                match self.complete_frame(buffer, status, bounds) {
                     ResponseFrameParse::Complete(response) => Ok(DecodeProgress::Complete {
                         status: response.status(),
                         consumed: response.consumed(),
@@ -2410,14 +2438,25 @@ impl ResponseDecoder {
 }
 
 #[derive(Debug)]
-enum DecodeProgress {
+enum FramingDecodeProgress {
+    NeedMore,
+    Complete {
+        status: StatusCode,
+        consumed: usize,
+        bounds: Option<crate::terminator::MultilineFrameBounds>,
+    },
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug)]
+enum DecodeProgress<'a> {
     NeedMore,
     Complete {
         status: StatusCode,
         consumed: usize,
         content_start: usize,
         content_end: usize,
-        content_validation: ValidatedResponseContent,
+        content_validation: ValidatedResponseContent<'a>,
     },
 }
 
@@ -2558,11 +2597,11 @@ pub fn bench_owned_response_from_bytes(
         kind,
         status: frame.status(),
         content: OwnedResponseContent::from_frame(
+            bytes.slice(..frame.consumed()),
             frame.content_start(),
             frame.content_end(),
             frame.content_validation(),
         ),
-        bytes: bytes.slice(..frame.consumed()),
     })
 }
 
@@ -2612,10 +2651,7 @@ pub fn bench_article_validation_and_materialization(
     let ValidatedResponseContent::Article(validated) = frame.content_validation() else {
         return Err(ClientError::UnexpectedEof);
     };
-    let parsed = validated
-        .bind(bytes)
-        .map_err(|_| ClientError::UnexpectedEof)?
-        .materialize();
+    let parsed = validated.materialize();
     Ok(parsed
         .body
         .as_ref()
@@ -3340,25 +3376,32 @@ async fn run_reader_task(
 
         loop {
             if !pending_read.is_empty() {
-                match decoder.push(&pending_read) {
-                    Ok(DecodeProgress::NeedMore) => {}
-                    Ok(DecodeProgress::Complete {
+                match decoder.push_framing(&pending_read) {
+                    Ok(FramingDecodeProgress::NeedMore) => {}
+                    Ok(FramingDecodeProgress::Complete {
                         status,
                         consumed,
-                        content_start,
-                        content_end,
-                        content_validation,
+                        bounds,
                     }) => {
                         let bytes = pending_read.split_to(consumed).freeze();
+                        let ResponseFrameParse::Complete(frame) =
+                            decoder.complete_frame(&bytes, status, bounds)
+                        else {
+                            let error = SharedEngineError::InvalidStatusLine;
+                            let _ = response_tx.send(Err(error.clone()));
+                            writer_abort.abort();
+                            poison_reader_engine(&poisoned, &mut inflight_rx, error).await;
+                            return;
+                        };
                         let response = CompletedResponse::Owned(OwnedResponse {
                             kind,
-                            status,
+                            status: frame.status(),
                             content: OwnedResponseContent::from_frame(
-                                content_start,
-                                content_end,
-                                content_validation,
+                                bytes.clone(),
+                                frame.content_start(),
+                                frame.content_end(),
+                                frame.content_validation(),
                             ),
-                            bytes,
                         });
                         let _ = response_tx.send(Ok(CompletedRequest { request, response }));
                         drop(barrier_guard);
@@ -3708,11 +3751,11 @@ mod tests {
             kind,
             status,
             content: OwnedResponseContent::from_frame(
+                bytes.slice(..frame.consumed()),
                 frame.content_start(),
                 frame.content_end(),
                 frame.content_validation(),
             ),
-            bytes,
         }
     }
 
@@ -3723,7 +3766,11 @@ mod tests {
             StatusCode::parse(b"222").unwrap(),
             b"222 1 <body@test> body follows\r\nbody\r\n.\r\n",
         );
-        response.content = OwnedResponseContent::Generic { start: 0, end: 0 };
+        response.content = OwnedResponseContent::Generic {
+            bytes: response.content.bytes().to_vec().into(),
+            start: 0,
+            end: 0,
+        };
 
         let Err(ClientError::UnexpectedArticleResponse { .. }) = OwnedArticle::try_from(response)
         else {
@@ -3742,6 +3789,23 @@ mod tests {
 
         let parsed: Article<'_> = article.article();
         assert_eq!(parsed.body.as_deref(), Some(&b"body\r\n"[..]));
+    }
+
+    #[test]
+    fn equivalent_owned_article_responses_compare_equal_across_allocations() {
+        let first = response_from_bytes(
+            RequestKind::Body,
+            StatusCode::parse(b"222").unwrap(),
+            b"222 1 <body@test> body follows\r\nbody\r\n.\r\n",
+        );
+        let second = response_from_bytes(
+            RequestKind::Body,
+            StatusCode::parse(b"222").unwrap(),
+            b"222 1 <body@test> body follows\r\nbody\r\n.\r\n",
+        );
+
+        assert_ne!(first.as_bytes().as_ptr(), second.as_bytes().as_ptr());
+        assert_eq!(first, second);
     }
 
     #[test]
