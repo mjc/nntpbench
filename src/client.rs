@@ -15,7 +15,7 @@ use tokio::task::JoinHandle;
 
 use crate::protocol::{
     ArticleRef, Request, ResponseFrameDecoder, ResponseFrameParse, ResponseInitialParse,
-    ValidatedResponseContent,
+    ValidatedArticleLayout, ValidatedResponseContent,
 };
 use crate::terminator::{
     DOT_TERMINATOR, MultilineFrameProgress, MultilineFramer, crlf_normalized_payload_lines,
@@ -2086,6 +2086,7 @@ impl OwnedExchange {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnedArticle {
     response: OwnedResponse,
+    layout: ValidatedArticleLayout,
 }
 
 impl OwnedArticle {
@@ -2109,7 +2110,7 @@ impl OwnedArticle {
 
     /// Borrow the parsed article/body view from the owned wire bytes.
     pub fn article(&self) -> Result<Article<'_>, ArticleParseError> {
-        self.response.parse_article()
+        Article::materialize_validated_article(&self.response.bytes, self.layout)
     }
 
     /// Borrow the underlying raw response wrapper.
@@ -2183,11 +2184,16 @@ impl TryFrom<OwnedResponse> for OwnedArticle {
             });
         }
 
-        // `ResponseFrame::parse` has already validated the complete frame and
-        // performed its semantic parse. Avoid performing that allocation-producing
-        // parse a second time while converting the response wrapper; the typed
-        // accessor remains the explicit parse requested by the caller.
-        Ok(Self { response })
+        let layout = match response.content_validation {
+            ValidatedResponseContent::Article(layout) => layout,
+            ValidatedResponseContent::Generic => {
+                return Err(ClientError::UnexpectedArticleResponse {
+                    source: ArticleParseError::InvalidStatusCode(response.status.as_u16()),
+                    response,
+                });
+            }
+        };
+        Ok(Self { response, layout })
     }
 }
 
@@ -2535,10 +2541,8 @@ pub fn bench_owned_response_from_bytes(
 /// Measure the article transformation performed by the typed accessor after
 /// response-frame validation has already completed.
 #[doc(hidden)]
-pub fn bench_owned_article_accessor_parse(response: &OwnedResponse) -> Result<usize, ClientError> {
-    let parsed = response
-        .parse_article()
-        .map_err(|_| ClientError::UnexpectedEof)?;
+pub fn bench_owned_article_accessor_parse(article: &OwnedArticle) -> Result<usize, ClientError> {
+    let parsed = article.article().map_err(|_| ClientError::UnexpectedEof)?;
     Ok(parsed
         .body
         .as_ref()
@@ -3676,6 +3680,21 @@ mod tests {
             content_validation: frame.content_validation(),
             bytes: Bytes::copy_from_slice(bytes),
         }
+    }
+
+    #[test]
+    fn owned_article_requires_decoder_article_proof() {
+        let mut response = response_from_bytes(
+            RequestKind::Body,
+            StatusCode::parse(b"222").unwrap(),
+            b"222 1 <body@test> body follows\r\nbody\r\n.\r\n",
+        );
+        response.content_validation = ValidatedResponseContent::Generic;
+
+        assert!(matches!(
+            OwnedArticle::try_from(response),
+            Err(ClientError::UnexpectedArticleResponse { .. })
+        ));
     }
 
     #[test]
