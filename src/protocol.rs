@@ -2805,14 +2805,17 @@ fn validate_response_content(
 ) -> Option<ValidatedResponseContent> {
     let content = frame.get(content_start..content_end)?;
 
-    if response_has_article_layout(kind, status) {
-        return Article::validate_article_frame(frame, content_start, content_end)
-            .map(ValidatedResponseContent::Article)
-            .ok();
-    }
-
-    if !framing.is_multiline() {
-        return Some(ValidatedResponseContent::Generic);
+    match (kind, status.as_u16()) {
+        (RequestKind::Article, 220)
+        | (RequestKind::Head, 221)
+        | (RequestKind::Body, 222)
+        | (RequestKind::Stat, 223) => {
+            return Article::validate_article_frame(frame, content_start, content_end)
+                .map(ValidatedResponseContent::Article)
+                .ok();
+        }
+        _ if !framing.is_multiline() => return Some(ValidatedResponseContent::Generic),
+        _ => {}
     }
 
     let valid = match kind {
@@ -2850,16 +2853,6 @@ fn validate_response_content(
     } else {
         None
     }
-}
-
-const fn response_has_article_layout(kind: RequestKind, status: StatusCode) -> bool {
-    matches!(
-        (kind, status.as_u16()),
-        (RequestKind::Article, 220)
-            | (RequestKind::Head, 221)
-            | (RequestKind::Body, 222)
-            | (RequestKind::Stat, 223)
-    )
 }
 
 fn validate_generic_multiline_response_content(content: &[u8]) -> bool {
@@ -6232,10 +6225,9 @@ mod tests {
             panic!("STAT response should parse");
         };
 
-        assert!(matches!(
-            response.content_validation(),
-            ValidatedResponseContent::Article(_)
-        ));
+        let ValidatedResponseContent::Article(_) = response.content_validation() else {
+            panic!("STAT response should retain article validation");
+        };
     }
 
     #[test]

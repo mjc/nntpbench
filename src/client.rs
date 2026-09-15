@@ -3691,10 +3691,10 @@ mod tests {
         );
         response.content_validation = ValidatedResponseContent::Generic;
 
-        assert!(matches!(
-            OwnedArticle::try_from(response),
-            Err(ClientError::UnexpectedArticleResponse { .. })
-        ));
+        let Err(ClientError::UnexpectedArticleResponse { .. }) = OwnedArticle::try_from(response)
+        else {
+            panic!("article promotion should require decoder proof");
+        };
     }
 
     #[test]
