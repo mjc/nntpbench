@@ -15,7 +15,7 @@ use tokio::task::JoinHandle;
 
 use crate::protocol::{
     ArticleRef, Request, ResponseFrameDecoder, ResponseFrameParse, ResponseInitialParse,
-    ValidatedArticleLayout, ValidatedResponseContent,
+    ValidatedArticle, ValidatedResponseContent,
 };
 use crate::terminator::{
     DOT_TERMINATOR, MultilineFrameProgress, MultilineFramer, crlf_normalized_payload_lines,
@@ -2045,8 +2045,8 @@ impl OwnedResponse {
     /// Parse the response as an ARTICLE/HEAD/BODY/STAT article-style frame.
     pub fn parse_article(&self) -> Result<Article<'_>, ArticleParseError> {
         match self.content_validation {
-            ValidatedResponseContent::Article(layout) => {
-                Article::materialize_validated_article(&self.bytes, layout)
+            ValidatedResponseContent::Article(validated) => {
+                Article::materialize_validated_article(&self.bytes, validated)
             }
             ValidatedResponseContent::Generic => {
                 Article::parse_article_frame(&self.bytes, self.content_start, self.content_end)
@@ -2086,7 +2086,7 @@ impl OwnedExchange {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnedArticle {
     response: OwnedResponse,
-    layout: ValidatedArticleLayout,
+    validated: ValidatedArticle,
 }
 
 impl OwnedArticle {
@@ -2110,7 +2110,7 @@ impl OwnedArticle {
 
     /// Borrow the parsed article/body view from the owned wire bytes.
     pub fn article(&self) -> Result<Article<'_>, ArticleParseError> {
-        Article::materialize_validated_article(&self.response.bytes, self.layout)
+        Article::materialize_validated_article(&self.response.bytes, self.validated)
     }
 
     /// Borrow the underlying raw response wrapper.
@@ -2184,8 +2184,8 @@ impl TryFrom<OwnedResponse> for OwnedArticle {
             });
         }
 
-        let layout = match response.content_validation {
-            ValidatedResponseContent::Article(layout) => layout,
+        let validated = match response.content_validation {
+            ValidatedResponseContent::Article(validated) => validated,
             ValidatedResponseContent::Generic => {
                 return Err(ClientError::UnexpectedArticleResponse {
                     source: ArticleParseError::InvalidStatusCode(response.status.as_u16()),
@@ -2193,7 +2193,10 @@ impl TryFrom<OwnedResponse> for OwnedArticle {
                 });
             }
         };
-        Ok(Self { response, layout })
+        Ok(Self {
+            response,
+            validated,
+        })
     }
 }
 
@@ -2572,20 +2575,19 @@ pub fn bench_article_validation_and_two_parses(
         .saturating_add(second.message_id.as_str().len()))
 }
 
-/// Measure frame validation followed by one on-demand article transformation,
-/// reusing the offsets found by validation.
+/// Measure frame validation followed by one on-demand article transformation.
 #[doc(hidden)]
-pub fn bench_article_validation_and_layout_reuse(
+pub fn bench_article_validation_and_materialization(
     kind: RequestKind,
     bytes: &[u8],
 ) -> Result<usize, ClientError> {
     let ResponseFrameParse::Complete(frame) = ResponseFrameDecoder::new(kind).decode(bytes) else {
         return Err(ClientError::UnexpectedEof);
     };
-    let ValidatedResponseContent::Article(layout) = frame.content_validation() else {
+    let ValidatedResponseContent::Article(validated) = frame.content_validation() else {
         return Err(ClientError::UnexpectedEof);
     };
-    let parsed = Article::materialize_validated_article(bytes, layout)
+    let parsed = Article::materialize_validated_article(bytes, validated)
         .map_err(|_| ClientError::UnexpectedEof)?;
     Ok(parsed
         .body

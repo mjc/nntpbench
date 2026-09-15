@@ -16,7 +16,7 @@ use crate::terminator::{
 
 pub mod article;
 
-pub(crate) use article::ValidatedArticleLayout;
+pub(crate) use article::ValidatedArticle;
 pub use article::{Article, ArticleNumber, ArticleParseError, HeaderIter, Headers};
 
 pub const MAX_ARTICLE_NUMBER: u64 = 2_147_483_647;
@@ -2791,7 +2791,7 @@ fn validate_optional_trailing_comment(value: &[u8]) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ValidatedResponseContent {
     Generic,
-    Article(ValidatedArticleLayout),
+    Article(ValidatedArticle),
 }
 
 fn validate_response_content(

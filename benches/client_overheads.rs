@@ -6,7 +6,7 @@
 
 use divan::{Bencher, black_box};
 use nntpbench::client::{
-    bench_article_validation_and_layout_reuse, bench_article_validation_and_two_parses,
+    bench_article_validation_and_materialization, bench_article_validation_and_two_parses,
     bench_owned_article_accessor_parse, bench_owned_response_from_bytes,
     bench_pending_read_capacity, bench_public_response_decode_chunks,
     bench_public_response_decode_chunks_stateless, bench_streaming_decode_response,
@@ -229,7 +229,7 @@ mod streaming_decode {
 
 mod public_client_experiments {
     use super::{
-        Bencher, RequestKind, bench_article_validation_and_layout_reuse,
+        Bencher, RequestKind, bench_article_validation_and_materialization,
         bench_article_validation_and_two_parses, bench_load_read_capacity_in_place,
         bench_owned_article_accessor_parse, bench_owned_response_from_bytes,
         bench_pending_read_capacity, bench_public_response_decode_chunks,
@@ -279,7 +279,7 @@ mod public_client_experiments {
         };
         let response = fixtures::article_response(size, variant);
         bencher.bench(|| {
-            black_box(bench_article_validation_and_layout_reuse(
+            black_box(bench_article_validation_and_materialization(
                 black_box(kind),
                 black_box(&response),
             ))
