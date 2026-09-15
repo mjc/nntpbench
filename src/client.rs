@@ -15,7 +15,7 @@ use tokio::task::JoinHandle;
 
 use crate::protocol::{
     ArticleRef, Request, ResponseFrameDecoder, ResponseFrameParse, ResponseInitialParse,
-    ValidatedArticle, ValidatedResponseContent,
+    ValidatedResponseContent,
 };
 use crate::terminator::{
     DOT_TERMINATOR, MultilineFrameProgress, MultilineFramer, crlf_normalized_payload_lines,
@@ -2086,7 +2086,6 @@ impl OwnedExchange {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnedArticle {
     response: OwnedResponse,
-    validated: ValidatedArticle,
 }
 
 impl OwnedArticle {
@@ -2109,8 +2108,12 @@ impl OwnedArticle {
     }
 
     /// Borrow the parsed article/body view from the owned wire bytes.
-    pub fn article(&self) -> Result<Article<'_>, ArticleParseError> {
-        Article::materialize_validated_article(&self.response.bytes, self.validated)
+    pub fn article(&self) -> Article<'_> {
+        let ValidatedResponseContent::Article(validated) = self.response.content_validation else {
+            unreachable!("OwnedArticle is constructed only from article validation");
+        };
+        Article::materialize_validated_article(&self.response.bytes, validated)
+            .expect("OwnedArticle preserves the immutable buffer validated by its decoder")
     }
 
     /// Borrow the underlying raw response wrapper.
@@ -2179,24 +2182,21 @@ impl TryFrom<OwnedResponse> for OwnedArticle {
         if response.status.as_u16() != expected_status {
             let status = response.status.as_u16();
             return Err(ClientError::UnexpectedArticleResponse {
-                response,
+                response: Box::new(response),
                 source: ArticleParseError::InvalidStatusCode(status),
             });
         }
 
-        let validated = match response.content_validation {
-            ValidatedResponseContent::Article(validated) => validated,
+        match response.content_validation {
+            ValidatedResponseContent::Article(_) => {}
             ValidatedResponseContent::Generic => {
                 return Err(ClientError::UnexpectedArticleResponse {
                     source: ArticleParseError::InvalidStatusCode(response.status.as_u16()),
-                    response,
+                    response: Box::new(response),
                 });
             }
-        };
-        Ok(Self {
-            response,
-            validated,
-        })
+        }
+        Ok(Self { response })
     }
 }
 
@@ -2227,7 +2227,7 @@ pub enum ClientError {
     CapabilitiesUnavailable,
     ConnectionClosed,
     UnexpectedArticleResponse {
-        response: OwnedResponse,
+        response: Box<OwnedResponse>,
         source: ArticleParseError,
     },
 }
@@ -2527,7 +2527,8 @@ pub fn bench_owned_response_from_bytes(
     kind: RequestKind,
     bytes: &[u8],
 ) -> Result<OwnedResponse, ClientError> {
-    let ResponseFrameParse::Complete(frame) = ResponseFrameDecoder::new(kind).decode(bytes) else {
+    let bytes = Bytes::copy_from_slice(bytes);
+    let ResponseFrameParse::Complete(frame) = ResponseFrameDecoder::new(kind).decode(&bytes) else {
         return Err(ClientError::UnexpectedEof);
     };
 
@@ -2537,7 +2538,7 @@ pub fn bench_owned_response_from_bytes(
         content_start: frame.content_start(),
         content_end: frame.content_end(),
         content_validation: frame.content_validation(),
-        bytes: Bytes::copy_from_slice(&bytes[..frame.consumed()]),
+        bytes: bytes.slice(..frame.consumed()),
     })
 }
 
@@ -2545,7 +2546,7 @@ pub fn bench_owned_response_from_bytes(
 /// response-frame validation has already completed.
 #[doc(hidden)]
 pub fn bench_owned_article_accessor_parse(article: &OwnedArticle) -> Result<usize, ClientError> {
-    let parsed = article.article().map_err(|_| ClientError::UnexpectedEof)?;
+    let parsed = article.article();
     Ok(parsed
         .body
         .as_ref()
@@ -3669,7 +3670,8 @@ mod tests {
     }
 
     fn response_from_bytes(kind: RequestKind, status: StatusCode, bytes: &[u8]) -> OwnedResponse {
-        let ResponseFrameParse::Complete(frame) = ResponseFrameDecoder::new(kind).decode(bytes)
+        let bytes = Bytes::copy_from_slice(bytes);
+        let ResponseFrameParse::Complete(frame) = ResponseFrameDecoder::new(kind).decode(&bytes)
         else {
             panic!("test response frame should parse");
         };
@@ -3680,7 +3682,7 @@ mod tests {
             content_start: frame.content_start(),
             content_end: frame.content_end(),
             content_validation: frame.content_validation(),
-            bytes: Bytes::copy_from_slice(bytes),
+            bytes,
         }
     }
 
@@ -3697,6 +3699,19 @@ mod tests {
         else {
             panic!("article promotion should require decoder proof");
         };
+    }
+
+    #[test]
+    fn owned_article_access_is_infallible_after_promotion() {
+        let response = response_from_bytes(
+            RequestKind::Body,
+            StatusCode::parse(b"222").unwrap(),
+            b"222 1 <body@test> body follows\r\nbody\r\n.\r\n",
+        );
+        let article = OwnedArticle::try_from(response).unwrap();
+
+        let parsed: Article<'_> = article.article();
+        assert_eq!(parsed.body.as_deref(), Some(&b"body\r\n"[..]));
     }
 
     #[test]
@@ -5486,7 +5501,7 @@ mod tests {
 
         let client = Client::connect(addr).await.unwrap();
         let article = client.article("surface@test").await.unwrap();
-        let parsed = article.article().unwrap();
+        let parsed = article.article();
 
         assert_eq!(article.kind(), RequestKind::Article);
         assert_eq!(article.status().as_u16(), 220);
@@ -5519,7 +5534,7 @@ mod tests {
 
         let client = Client::connect(addr).await.unwrap();
         let exchange = client.article_exchange("exchange@test").await.unwrap();
-        let parsed = exchange.article().article().unwrap();
+        let parsed = exchange.article().article();
 
         assert_eq!(
             exchange.request(),
@@ -5567,10 +5582,7 @@ mod tests {
         );
         assert_eq!(article.status().as_u16(), 220);
         assert_eq!(raw.kind(), RequestKind::Article);
-        assert_eq!(
-            article.article().unwrap().message_id.as_str(),
-            "<pair-surface@test>"
-        );
+        assert_eq!(article.article().message_id.as_str(), "<pair-surface@test>");
 
         server.await.unwrap();
     }
@@ -5603,15 +5615,12 @@ mod tests {
         assert_eq!(current.kind(), RequestKind::Article);
         assert_eq!(current.status().as_u16(), 220);
         assert_eq!(
-            current.article().unwrap().message_id.as_str(),
+            current.article().message_id.as_str(),
             "<surface-current@test>"
         );
         assert_eq!(stat.kind(), RequestKind::Stat);
         assert_eq!(stat.status().as_u16(), 223);
-        assert_eq!(
-            stat.article().unwrap().message_id.as_str(),
-            "<surface-42@test>"
-        );
+        assert_eq!(stat.article().message_id.as_str(), "<surface-42@test>");
 
         server.await.unwrap();
     }
@@ -6031,16 +6040,13 @@ mod tests {
         assert_eq!(head.kind(), RequestKind::Head);
         assert_eq!(head.status().as_u16(), 221);
         assert_eq!(
-            head.article().unwrap().headers.unwrap().get("Subject"),
+            head.article().headers.unwrap().get("Subject"),
             Some(&b"Surface Head"[..])
         );
 
         assert_eq!(stat.kind(), RequestKind::Stat);
         assert_eq!(stat.status().as_u16(), 223);
-        assert_eq!(
-            stat.article().unwrap().message_id.as_str(),
-            "<stat-surface@test>"
-        );
+        assert_eq!(stat.article().message_id.as_str(), "<stat-surface@test>");
 
         server.await.unwrap();
     }
@@ -6069,7 +6075,7 @@ mod tests {
         assert_eq!(exchange.request(), &request);
         assert_eq!(exchange.article().status().as_u16(), 222);
         assert_eq!(
-            exchange.article().article().unwrap().body.as_deref(),
+            exchange.article().article().body.as_deref(),
             Some(&b"direct body\r\n"[..])
         );
 
