@@ -15,6 +15,7 @@ use crate::terminator::{
 };
 
 pub mod article;
+pub(crate) mod response_receiver;
 
 pub use article::{Article, ArticleNumber, ArticleParseError, HeaderIter, Headers};
 pub(crate) use article::{ValidatedArticleView, ValidatedOwnedArticle};
@@ -268,32 +269,6 @@ impl ResponseFrameDecoder {
     #[must_use]
     pub(crate) fn decode<'a>(self, buffer: &'a [u8]) -> ResponseFrameParse<'a> {
         ResponseFrame::parse(self.kind, buffer)
-    }
-
-    /// Validate a single-line frame after the status line has been located.
-    ///
-    /// The streaming detector owns delimiter search. Keeping this completion
-    /// step separate avoids searching the accumulated pending buffer a second
-    /// time while preserving the full semantic validation performed by
-    /// [`ResponseFrame::parse`].
-    pub(crate) fn complete_single_line<'a>(
-        self,
-        buffer: &'a [u8],
-        status: StatusCode,
-        status_line_end: usize,
-    ) -> ResponseFrameParse<'a> {
-        self.complete_with_bounds(buffer, status, status_line_end, None)
-    }
-
-    /// Validate a multiline frame after the shared framer has located its end.
-    pub(crate) fn complete_multiline<'a>(
-        self,
-        buffer: &'a [u8],
-        status: StatusCode,
-        status_line_end: usize,
-        bounds: MultilineFrameBounds,
-    ) -> ResponseFrameParse<'a> {
-        self.complete_with_bounds(buffer, status, status_line_end, Some(bounds))
     }
 
     fn complete_with_bounds<'a>(
@@ -6191,7 +6166,7 @@ mod tests {
             };
 
         let ResponseFrameParse::Complete(response) = ResponseFrameDecoder::new(RequestKind::Body)
-            .complete_multiline(wire, status, status_line_end, bounds)
+            .complete_with_bounds(wire, status, status_line_end, Some(bounds))
         else {
             panic!("precomputed response frame did not parse");
         };

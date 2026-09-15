@@ -1,0 +1,881 @@
+//! Accumulated input and its request decoder have one owner. Only append reads
+//! may change input while decoding; completed prefixes leave as immutable bytes.
+
+use bytes::{Bytes, BytesMut};
+use tokio::io::AsyncRead;
+
+use super::{
+    Article, ArticleParseError, RequestKind, ResponseFrameDecoder, ResponseFrameParse,
+    ResponseInitialParse, StatusCode, ValidatedOwnedArticle, ValidatedResponseContent,
+};
+use crate::client::{ClientError, OWNED_RESPONSE_PREALLOC_BYTES, read_into_pending_bytes};
+use crate::terminator::{MultilineFrameProgress, MultilineFramer};
+
+const STREAMING_STATUS_LINE_BYTES: usize = super::MAX_AUTHINFO_SASL_RESPONSE_LINE_BYTES;
+
+pub(crate) struct BufferedResponseReceiver<R> {
+    reader: R,
+    pending: BytesMut,
+    state: ReceiverState,
+}
+
+enum ReceiverState {
+    Ready,
+    Unavailable,
+}
+
+impl<R: AsyncRead + Unpin> BufferedResponseReceiver<R> {
+    pub(crate) fn new(reader: R) -> Self {
+        Self {
+            reader,
+            pending: BytesMut::with_capacity(OWNED_RESPONSE_PREALLOC_BYTES),
+            state: ReceiverState::Ready,
+        }
+    }
+
+    pub(crate) async fn receive(
+        &mut self,
+        kind: RequestKind,
+        read_chunk_bytes: usize,
+    ) -> Result<OwnedResponse, ClientError> {
+        self.start_response()?;
+        let mut response = PendingResponse {
+            receiver: self,
+            decoder: ResponseDecoder::new(kind),
+        };
+        loop {
+            if let Some(completed) = response.extract()? {
+                return Ok(completed);
+            }
+            if read_into_pending_bytes(
+                &mut response.receiver.reader,
+                &mut response.receiver.pending,
+                read_chunk_bytes,
+            )
+            .await?
+                == 0
+            {
+                return Err(ClientError::UnexpectedEof);
+            }
+        }
+    }
+
+    fn start_response(&mut self) -> Result<(), ClientError> {
+        match self.state {
+            ReceiverState::Ready => self.state = ReceiverState::Unavailable,
+            ReceiverState::Unavailable => return Err(ClientError::ConnectionClosed),
+        }
+        Ok(())
+    }
+}
+
+/// Exclusive access keeps accumulated scanner state attached to its input.
+struct PendingResponse<'a, R> {
+    receiver: &'a mut BufferedResponseReceiver<R>,
+    decoder: ResponseDecoder,
+}
+
+impl<R: AsyncRead + Unpin> PendingResponse<'_, R> {
+    fn extract(&mut self) -> Result<Option<OwnedResponse>, ClientError> {
+        match self.decoder.push_framing(&self.receiver.pending)? {
+            FramingDecodeProgress::NeedMore => Ok(None),
+            FramingDecodeProgress::Complete {
+                status,
+                frame_end,
+                bounds,
+            } => {
+                let framed = FramedResponse {
+                    bytes: frame_end.extract(&mut self.receiver.pending),
+                    decoder: &self.decoder,
+                    status,
+                    bounds,
+                };
+                let response = framed.validate()?;
+                self.receiver.state = ReceiverState::Ready;
+                Ok(Some(response))
+            }
+        }
+    }
+}
+
+pub(crate) fn benchmark_receive(
+    kind: RequestKind,
+    response: &[u8],
+    chunk_bytes: usize,
+) -> Result<(StatusCode, usize), ClientError> {
+    receive_fragments(kind, response, chunk_bytes)
+        .map(|response| (response.status(), response.as_bytes().len()))
+}
+
+pub(crate) fn owned_from_bytes(
+    kind: RequestKind,
+    bytes: &[u8],
+) -> Result<OwnedResponse, ClientError> {
+    receive_fragments(kind, bytes, bytes.len())
+}
+
+fn receive_fragments(
+    kind: RequestKind,
+    response: &[u8],
+    chunk_bytes: usize,
+) -> Result<OwnedResponse, ClientError> {
+    let mut receiver = BufferedResponseReceiver {
+        reader: tokio::io::empty(),
+        pending: BytesMut::with_capacity(response.len()),
+        state: ReceiverState::Ready,
+    };
+    receiver.start_response()?;
+    let mut pending = PendingResponse {
+        receiver: &mut receiver,
+        decoder: ResponseDecoder::new(kind),
+    };
+    for chunk in response.chunks(chunk_bytes.max(1)) {
+        pending.receiver.pending.extend_from_slice(chunk);
+        if let Some(response) = pending.extract()? {
+            return Ok(response);
+        }
+    }
+    Err(ClientError::UnexpectedEof)
+}
+
+/// Framing authorizes extraction only. Semantic validation consumes the owned
+/// wire frame before an article layout can be exposed.
+struct FramedResponse<'a> {
+    bytes: Bytes,
+    decoder: &'a ResponseDecoder,
+    status: StatusCode,
+    bounds: Option<crate::terminator::MultilineFrameBounds>,
+}
+
+impl FramedResponse<'_> {
+    fn validate(self) -> Result<OwnedResponse, ClientError> {
+        let ResponseFrameParse::Complete(frame) =
+            self.decoder
+                .validate_frame(&self.bytes, self.status, self.bounds)
+        else {
+            return Err(ClientError::InvalidStatusLine);
+        };
+        Ok(OwnedResponse {
+            kind: self.decoder.streaming.kind,
+            status: frame.status(),
+            content: OwnedResponseContent::from_frame(
+                self.bytes.clone(),
+                frame.content_start(),
+                frame.content_end(),
+                frame.content_validation(),
+            ),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::future::Future;
+    use std::io;
+    use std::pin::Pin;
+    use std::task::{Context, Poll, Waker};
+    use tokio::io::{AsyncWriteExt, ReadBuf};
+
+    struct FragmentedInput<'a>(VecDeque<&'a [u8]>);
+
+    impl AsyncRead for FragmentedInput<'_> {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            destination: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if let Some(fragment) = self.0.pop_front() {
+                let count = fragment.len().min(destination.remaining());
+                destination.put_slice(&fragment[..count]);
+                if count < fragment.len() {
+                    self.0.push_front(&fragment[count..]);
+                }
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn receives_exact_frames_at_every_split() {
+        let frames: &[(RequestKind, &[u8])] = &[
+            (RequestKind::Stat, b"223 1 <stat@test> article exists\r\n"),
+            (RequestKind::Body, b"430 no article\r\n"),
+            (
+                RequestKind::Body,
+                b"222 1 <body@test> body follows\r\n.\r\n",
+            ),
+            (
+                RequestKind::Body,
+                b"222 1 <body@test> body follows\r\n..stuffed\r\n.\r\n",
+            ),
+            (
+                RequestKind::Head,
+                b"221 1 <head@test> headers follow\r\nSubject: folded\r\n continuation\r\n.\r\n",
+            ),
+            (
+                RequestKind::Article,
+                b"220 1 <article@test> article follows\r\nSubject: article\r\n\r\nbody\r\n.\r\n",
+            ),
+        ];
+        for &(kind, wire) in frames {
+            for split in 1..wire.len() {
+                let input = FragmentedInput([&wire[..split], &wire[split..]].into());
+                let mut receiver = BufferedResponseReceiver::new(input);
+                let response = receiver.receive(kind, wire.len()).await.unwrap();
+                assert_eq!(response.as_bytes(), wire, "{kind:?}, split {split}");
+                assert!(receiver.pending.is_empty());
+            }
+            let input = FragmentedInput(wire.chunks(1).collect());
+            let mut receiver = BufferedResponseReceiver::new(input);
+            assert_eq!(
+                receiver.receive(kind, wire.len()).await.unwrap().as_bytes(),
+                wire
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn three_fragment_extraction_preserves_the_packed_next_response() {
+        let frames: &[(RequestKind, &[u8])] = &[
+            (RequestKind::Stat, b"223 1 <stat@test> exists\r\n"),
+            (RequestKind::Body, b"430 missing\r\n"),
+            (RequestKind::Body, b"222 1 <body@test> follows\r\n.\r\n"),
+            (
+                RequestKind::Body,
+                b"222 1 <body@test> follows\r\n..dot\r\n.\r\n",
+            ),
+            (
+                RequestKind::Head,
+                b"221 1 <head@test> follows\r\nH: a\r\n b\r\n.\r\n",
+            ),
+            (
+                RequestKind::Article,
+                b"220 1 <article@test> follows\r\nH: a\r\n\r\nx\r\n.\r\n",
+            ),
+        ];
+        let next = b"223 2 <next@test> exists\r\n";
+        for &(kind, frame) in frames {
+            let packed = [frame, next].concat();
+            for first in 1..frame.len() - 1 {
+                for second in first + 1..frame.len() {
+                    let input = FragmentedInput(VecDeque::from([
+                        &packed[..first],
+                        &packed[first..second],
+                        &packed[second..],
+                    ]));
+                    let mut receiver = BufferedResponseReceiver::new(input);
+                    let response = receiver.receive(kind, packed.len()).await.unwrap();
+                    assert_eq!(response.as_bytes(), frame, "{kind:?} {first}/{second}");
+                    assert_eq!(receiver.pending.as_ref(), next);
+                    let following = receiver
+                        .receive(RequestKind::Stat, packed.len())
+                        .await
+                        .unwrap();
+                    assert_eq!(following.as_bytes(), next);
+                    assert!(receiver.pending.is_empty());
+                    assert_eq!(response.as_bytes(), frame);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn received_plain_article_access_borrows_without_allocating() {
+        use std::borrow::Cow;
+        use std::sync::atomic::Ordering;
+
+        for body_len in [64 * 1024, 768 * 1024] {
+            let mut wire = b"222 1 <plain@test> follows\r\n".to_vec();
+            for _ in 0..body_len / 64 {
+                wire.extend_from_slice(&[b'x'; 62]);
+                wire.extend_from_slice(b"\r\n");
+            }
+            wire.extend_from_slice(b".\r\n");
+            let input = FragmentedInput(VecDeque::from([wire.as_slice()]));
+            let mut receiver = BufferedResponseReceiver::new(input);
+            let article = OwnedArticle::try_from(
+                receiver
+                    .receive(RequestKind::Body, 16 * 1024)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            crate::TEST_ALLOCATIONS.store(0, Ordering::Relaxed);
+            crate::COUNT_TEST_ALLOCATIONS.with(|enabled| enabled.set(true));
+            for _ in 0..16 {
+                let parsed = article.article();
+                match parsed.body {
+                    Some(Cow::Borrowed(body)) => {
+                        assert_eq!(body.len(), body_len);
+                        std::hint::black_box(body);
+                    }
+                    Some(Cow::Owned(_)) | None => panic!("plain body must be borrowed"),
+                }
+            }
+            crate::COUNT_TEST_ALLOCATIONS.with(|enabled| enabled.set(false));
+            assert_eq!(crate::TEST_ALLOCATIONS.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn packed_prefix_is_frozen_without_the_next_responses_bytes() {
+        let first = b"222 1 <body@test> body follows\r\nbody\r\n.\r\n";
+        let second = b"223 2 <stat@test> article exists\r\n";
+        let third = b"430 no article\r\n";
+        let packed = [first.as_slice(), second.as_slice(), &third[..5]].concat();
+        let input = FragmentedInput([packed.as_slice(), &third[5..]].into());
+        let mut receiver = BufferedResponseReceiver::new(input);
+        let response = receiver.receive(RequestKind::Body, 4096).await.unwrap();
+        assert_eq!(response.as_bytes(), first);
+        assert_eq!(
+            receiver.pending.as_ref(),
+            [second.as_slice(), &third[..5]].concat()
+        );
+        let article = OwnedArticle::try_from(response).unwrap();
+        assert_eq!(
+            article.article().body.as_deref(),
+            Some(b"body\r\n".as_slice())
+        );
+        assert_eq!(article.clone(), article);
+        assert_eq!(
+            receiver
+                .receive(RequestKind::Stat, 4096)
+                .await
+                .unwrap()
+                .as_bytes(),
+            second
+        );
+        assert_eq!(receiver.pending.as_ref(), &third[..5]);
+        assert_eq!(
+            receiver
+                .receive(RequestKind::Body, 4096)
+                .await
+                .unwrap()
+                .as_bytes(),
+            third
+        );
+        assert!(receiver.pending.is_empty());
+        assert_eq!(
+            article.article().body.as_deref(),
+            Some(b"body\r\n".as_slice())
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_partial_receive_prevents_reclassification_as_a_new_response() {
+        let (mut peer, input) = tokio::io::duplex(128);
+        peer.write_all(b"223 1 <stat@test> article exists\r")
+            .await
+            .unwrap();
+        let mut receiver = BufferedResponseReceiver::new(input);
+        {
+            let mut receive = std::pin::pin!(receiver.receive(RequestKind::Stat, 128));
+            assert!(
+                receive
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+        }
+        peer.write_all(b"\n").await.unwrap();
+        assert!(matches!(
+            receiver.receive(RequestKind::Body, 128).await,
+            Err(ClientError::ConnectionClosed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn same_status_has_request_scoped_shape_in_packed_input() {
+        let group = b"211 2 1 2 alt.test\r\n";
+        let listgroup = b"211 2 1 2 alt.test\r\n1\r\n2\r\n.\r\n";
+        let packed = [group.as_slice(), listgroup.as_slice()].concat();
+        let mut receiver = BufferedResponseReceiver::new(packed.as_slice());
+        assert_eq!(
+            receiver
+                .receive(RequestKind::Group, 4096)
+                .await
+                .unwrap()
+                .as_bytes(),
+            group
+        );
+        assert_eq!(receiver.pending.as_ref(), listgroup);
+        assert_eq!(
+            receiver
+                .receive(RequestKind::ListGroup, 4096)
+                .await
+                .unwrap()
+                .as_bytes(),
+            listgroup
+        );
+        assert!(receiver.pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn malformed_article_never_becomes_a_validated_owned_response() {
+        let wire = b"222 1 <body@test> body follows\r\nbo\0dy\r\n.\r\n";
+        for split in 1..wire.len() {
+            let input = FragmentedInput([&wire[..split], &wire[split..]].into());
+            let mut receiver = BufferedResponseReceiver::new(input);
+            assert!(
+                matches!(
+                    receiver.receive(RequestKind::Body, 4096).await,
+                    Err(ClientError::InvalidStatusLine)
+                ),
+                "split={split}"
+            );
+            assert!(matches!(
+                receiver.receive(RequestKind::Body, 4096).await,
+                Err(ClientError::ConnectionClosed)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_an_unpolled_receive_does_not_abandon_a_response() {
+        let wire = b"223 1 <stat@test> article exists\r\n";
+        let mut receiver = BufferedResponseReceiver::new(wire.as_slice());
+        drop(receiver.receive(RequestKind::Body, 4096));
+        assert_eq!(
+            receiver
+                .receive(RequestKind::Stat, 4096)
+                .await
+                .unwrap()
+                .as_bytes(),
+            wire
+        );
+    }
+}
+
+/// Owned response bytes for the client path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedResponse {
+    kind: RequestKind,
+    status: StatusCode,
+    content: OwnedResponseContent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OwnedResponseContent {
+    Generic {
+        bytes: Bytes,
+        start: usize,
+        end: usize,
+    },
+    Article(ValidatedOwnedArticle),
+}
+
+impl OwnedResponseContent {
+    fn from_frame(
+        bytes: Bytes,
+        content_start: usize,
+        content_end: usize,
+        validation: ValidatedResponseContent<'_>,
+    ) -> Self {
+        match validation {
+            ValidatedResponseContent::Generic => Self::Generic {
+                bytes,
+                start: content_start,
+                end: content_end,
+            },
+            ValidatedResponseContent::Article(validated) => {
+                Self::Article(validated.into_owned(bytes))
+            }
+        }
+    }
+
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Generic { bytes, .. } => bytes,
+            Self::Article(article) => article.bytes(),
+        }
+    }
+
+    fn content(&self) -> &[u8] {
+        match self {
+            Self::Generic { bytes, start, end } => &bytes[*start..*end],
+            Self::Article(article) => article.content(),
+        }
+    }
+}
+
+impl OwnedResponse {
+    /// Request kind that produced this response.
+    #[must_use]
+    pub const fn kind(&self) -> RequestKind {
+        self.kind
+    }
+
+    /// Parsed status code from the response status line.
+    #[must_use]
+    pub const fn status(&self) -> StatusCode {
+        self.status
+    }
+
+    /// Raw response bytes.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        self.content.bytes()
+    }
+
+    /// Borrowed response payload bytes, excluding the initial line and any dot terminator.
+    #[must_use]
+    pub fn content(&self) -> &[u8] {
+        self.content.content()
+    }
+
+    /// Parse the response as an ARTICLE/HEAD/BODY/STAT article-style frame.
+    pub fn parse_article(&self) -> Result<Article<'_>, ArticleParseError> {
+        match &self.content {
+            OwnedResponseContent::Article(article) => Ok(article.materialize()),
+            OwnedResponseContent::Generic { bytes, start, end } => {
+                Article::parse_article_frame(bytes, *start, *end)
+            }
+        }
+    }
+}
+
+/// Owned client article-style response that materializes its retained validated layout on demand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedArticle {
+    response: OwnedResponse,
+}
+
+impl OwnedArticle {
+    /// Request kind that produced this article-style response.
+    #[must_use]
+    pub const fn kind(&self) -> RequestKind {
+        self.response.kind()
+    }
+
+    /// Parsed status code from the response status line.
+    #[must_use]
+    pub const fn status(&self) -> StatusCode {
+        self.response.status()
+    }
+
+    /// Raw response bytes.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        self.response.as_bytes()
+    }
+
+    /// Borrow the parsed article/body view from the owned wire bytes.
+    pub fn article(&self) -> Article<'_> {
+        let OwnedResponseContent::Article(ref article) = self.response.content else {
+            unreachable!("OwnedArticle is constructed only from article validation");
+        };
+        article.materialize()
+    }
+
+    /// Borrow the underlying raw response wrapper.
+    #[must_use]
+    pub const fn response(&self) -> &OwnedResponse {
+        &self.response
+    }
+
+    /// Consume the client article-style wrapper and return the raw response.
+    #[must_use]
+    pub fn into_response(self) -> OwnedResponse {
+        self.response
+    }
+}
+
+impl TryFrom<OwnedResponse> for OwnedArticle {
+    type Error = ClientError;
+
+    fn try_from(response: OwnedResponse) -> Result<Self, Self::Error> {
+        let expected_status = match response.kind {
+            RequestKind::Article => 220,
+            RequestKind::Head => 221,
+            RequestKind::Body => 222,
+            RequestKind::Stat => 223,
+            _ => 0,
+        };
+        if response.status.as_u16() != expected_status {
+            return Err(ClientError::UnexpectedArticleResponse { response });
+        }
+
+        match response.content {
+            OwnedResponseContent::Article(_) => {}
+            OwnedResponseContent::Generic { .. } => {
+                return Err(ClientError::UnexpectedArticleResponse { response });
+            }
+        }
+        Ok(Self { response })
+    }
+}
+
+#[derive(Debug)]
+struct ResponseDecoder {
+    streaming: StreamingResponseDecoder,
+    scanned: FrameEnd,
+}
+
+impl ResponseDecoder {
+    fn new(kind: RequestKind) -> Self {
+        Self {
+            streaming: StreamingResponseDecoder::new(kind),
+            scanned: FrameEnd(0),
+        }
+    }
+
+    fn push_framing(&mut self, buffer: &[u8]) -> Result<FramingDecodeProgress, ClientError> {
+        let start = self.scanned;
+        let chunk = &buffer[start.0..];
+        self.scanned = FrameEnd(buffer.len());
+
+        match self.streaming.push(chunk)? {
+            StreamingDecodeProgress::NeedMore { .. } => Ok(FramingDecodeProgress::NeedMore),
+            StreamingDecodeProgress::Complete {
+                status,
+                consumed: chunk_consumed,
+                bounds,
+            } => Ok(FramingDecodeProgress::Complete {
+                status,
+                frame_end: start.after_chunk(chunk_consumed),
+                bounds,
+            }),
+        }
+    }
+
+    fn validate_frame<'a>(
+        &self,
+        buffer: &'a [u8],
+        status: StatusCode,
+        bounds: Option<crate::terminator::MultilineFrameBounds>,
+    ) -> ResponseFrameParse<'a> {
+        ResponseFrameDecoder::new(self.streaming.kind).complete_with_bounds(
+            buffer,
+            status,
+            self.streaming.status_line_end(),
+            bounds,
+        )
+    }
+
+    #[cfg(test)]
+    fn push<'a>(&mut self, buffer: &'a [u8]) -> Result<DecodeProgress<'a>, ClientError> {
+        match self.push_framing(buffer)? {
+            FramingDecodeProgress::NeedMore => Ok(DecodeProgress::NeedMore),
+            FramingDecodeProgress::Complete {
+                status,
+                bounds,
+                frame_end,
+            } => match self.validate_frame(&buffer[..frame_end.0], status, bounds) {
+                ResponseFrameParse::Complete(response) => Ok(DecodeProgress::Complete {
+                    status: response.status(),
+                    consumed: response.consumed(),
+                    content_start: response.content_start(),
+                    content_end: response.content_end(),
+                    content_validation: response.content_validation(),
+                }),
+                ResponseFrameParse::NeedMore => Ok(DecodeProgress::NeedMore),
+                ResponseFrameParse::Invalid => Err(ClientError::InvalidStatusLine),
+            },
+        }
+    }
+}
+
+#[derive(Debug)]
+enum FramingDecodeProgress {
+    NeedMore,
+    Complete {
+        status: StatusCode,
+        frame_end: FrameEnd,
+        bounds: Option<crate::terminator::MultilineFrameBounds>,
+    },
+}
+
+/// Exclusive position relative to the first byte of the accumulated response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FrameEnd(usize);
+
+impl FrameEnd {
+    fn after_chunk(self, consumed: ChunkConsumed) -> Self {
+        Self(self.0 + consumed.0)
+    }
+
+    fn extract(self, pending: &mut BytesMut) -> Bytes {
+        pending.split_to(self.0).freeze()
+    }
+}
+
+/// Count consumed from this push's chunk, not the accumulated response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ChunkConsumed(usize);
+
+#[cfg(test)]
+#[derive(Debug)]
+enum DecodeProgress<'a> {
+    NeedMore,
+    Complete {
+        status: StatusCode,
+        consumed: usize,
+        content_start: usize,
+        content_end: usize,
+        content_validation: ValidatedResponseContent<'a>,
+    },
+}
+
+#[derive(Debug)]
+struct StreamingResponseDecoder {
+    kind: RequestKind,
+    status: Option<StatusCode>,
+    status_line_end: usize,
+    framer: MultilineFramer,
+    status_buf: [u8; STREAMING_STATUS_LINE_BYTES],
+    status_len: usize,
+}
+
+impl StreamingResponseDecoder {
+    fn new(kind: RequestKind) -> Self {
+        Self {
+            kind,
+            status: None,
+            status_line_end: 0,
+            framer: MultilineFramer::default(),
+            status_buf: [0; STREAMING_STATUS_LINE_BYTES],
+            status_len: 0,
+        }
+    }
+
+    fn push(&mut self, chunk: &[u8]) -> Result<StreamingDecodeProgress, ClientError> {
+        let mut content_start = 0;
+        let status = match self.status {
+            Some(status) => status,
+            None => {
+                let mut consumed = 0;
+                while consumed < chunk.len() {
+                    if self.status_len == self.status_buf.len() {
+                        return Err(ClientError::InvalidStatusLine);
+                    }
+                    self.status_buf[self.status_len] = chunk[consumed];
+                    self.status_len += 1;
+                    consumed += 1;
+
+                    match crate::protocol::ResponseInitial::parse(
+                        self.kind,
+                        &self.status_buf[..self.status_len],
+                    ) {
+                        ResponseInitialParse::Complete(initial) => {
+                            let status = initial.status();
+                            self.status = Some(status);
+                            self.status_line_end = self.status_len;
+                            if !initial.descriptor().framing().is_multiline() {
+                                return Ok(StreamingDecodeProgress::Complete {
+                                    status,
+                                    consumed: ChunkConsumed(consumed),
+                                    bounds: None,
+                                });
+                            }
+                            content_start = consumed;
+                            break;
+                        }
+                        ResponseInitialParse::NeedMore => {}
+                        ResponseInitialParse::Invalid => {
+                            return Err(ClientError::InvalidStatusLine);
+                        }
+                    }
+                }
+
+                let Some(status) = self.status else {
+                    return Ok(StreamingDecodeProgress::NeedMore {
+                        consumed: ChunkConsumed(chunk.len()),
+                    });
+                };
+                status
+            }
+        };
+
+        if content_start >= chunk.len() {
+            return Ok(StreamingDecodeProgress::NeedMore {
+                consumed: ChunkConsumed(chunk.len()),
+            });
+        }
+
+        let content_chunk = &chunk[content_start..];
+        match self.framer.push(content_chunk) {
+            MultilineFrameProgress::Complete(bounds) => Ok(StreamingDecodeProgress::Complete {
+                status,
+                consumed: ChunkConsumed(content_start + bounds.chunk_consumed()),
+                bounds: Some(bounds),
+            }),
+            MultilineFrameProgress::NeedMore => Ok(StreamingDecodeProgress::NeedMore {
+                consumed: ChunkConsumed(chunk.len()),
+            }),
+        }
+    }
+
+    fn status_line_end(&self) -> usize {
+        self.status_line_end
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug)]
+enum StreamingDecodeProgress {
+    NeedMore {
+        consumed: ChunkConsumed,
+    },
+    Complete {
+        status: StatusCode,
+        consumed: ChunkConsumed,
+        bounds: Option<crate::terminator::MultilineFrameBounds>,
+    },
+}
+
+#[doc(hidden)]
+pub fn bench_streaming_decode_response(
+    kind: RequestKind,
+    response: &[u8],
+) -> Result<(StatusCode, usize), ClientError> {
+    let mut decoder = StreamingResponseDecoder::new(kind);
+    match decoder.push(response)? {
+        StreamingDecodeProgress::Complete {
+            status, consumed, ..
+        } => Ok((status, consumed.0)),
+        StreamingDecodeProgress::NeedMore { .. } => Err(ClientError::UnexpectedEof),
+    }
+}
+
+#[cfg(test)]
+#[path = "response_receiver_tests.rs"]
+mod characterization_tests;
+
+// Compiled explicitly by scripts/check-response-contracts.sh, including the
+// positive control with every forbidden operation disabled.
+#[cfg(response_contract)]
+#[allow(dead_code)]
+mod contracts {
+    use super::*;
+
+    fn coordinate_translation() {
+        let end = FrameEnd(0).after_chunk(ChunkConsumed(1));
+        #[cfg(response_contract = "coordinate")]
+        let _ = FrameEnd(0).after_chunk(end);
+        std::hint::black_box(end);
+    }
+
+    fn exclusive_receive(reader: impl AsyncRead + Unpin) {
+        let mut receiver = BufferedResponseReceiver::new(reader);
+        let response = receiver.receive(RequestKind::Stat, 1);
+        #[cfg(response_contract = "receive_alias")]
+        let _conflicting = receiver.receive(RequestKind::Body, 1);
+        std::hint::black_box(response);
+    }
+
+    fn validated_borrow(mut bytes: Vec<u8>) {
+        let ResponseFrameParse::Complete(view) =
+            super::super::ResponseFrame::parse(RequestKind::Body, &bytes)
+        else {
+            return;
+        };
+        #[cfg(response_contract = "validated_mutation")]
+        {
+            bytes[0] = b'x';
+        }
+        std::hint::black_box(view);
+        bytes[0] = b'x';
+    }
+}
