@@ -1131,12 +1131,15 @@ pub(crate) struct ValidatedArticleView<'a> {
     layout: ArticleLayout,
 }
 
-/// Immutable owned article bytes and the layout validated for those bytes.
+/// Immutable article bytes and the layout validated for those bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ValidatedOwnedArticle {
-    bytes: Bytes,
+pub(crate) struct ValidatedArticle<B> {
+    bytes: B,
     layout: ArticleLayout,
 }
+
+/// Owned validated article state used by the buffered client.
+pub(crate) type ValidatedOwnedArticle = ValidatedArticle<Bytes>;
 
 impl<'a> ValidatedArticleView<'a> {
     pub(crate) fn materialize(self) -> Article<'a> {
@@ -1154,23 +1157,23 @@ impl<'a> ValidatedArticleView<'a> {
     }
 }
 
-impl ValidatedOwnedArticle {
+impl<B: AsRef<[u8]>> ValidatedArticle<B> {
     #[must_use]
     pub(crate) fn bytes(&self) -> &[u8] {
-        &self.bytes
+        self.bytes.as_ref()
     }
 
     #[must_use]
     pub(crate) fn content(&self) -> &[u8] {
         self.layout
             .content_range()
-            .slice(&self.bytes)
+            .slice(self.bytes.as_ref())
             .expect("owned article preserves its validated content range")
     }
 
     #[must_use]
     pub(crate) fn materialize(&self) -> Article<'_> {
-        Article::materialize_validated_article(&self.bytes, self.layout)
+        Article::materialize_validated_article(self.bytes.as_ref(), self.layout)
             .expect("owned article preserves its validated bytes")
     }
 }
@@ -1427,6 +1430,12 @@ pub struct Article<'a> {
     pub headers: Option<Headers<'a>>,
     pub body: Option<Cow<'a, [u8]>>,
 }
+
+/// The consumer-facing projection of a validated article.
+///
+/// The name makes the boundary explicit: this value is a reusable view, not
+/// the proof-bearing owner returned by the framing/validation pipeline.
+pub type ArticleView<'a> = Article<'a>;
 
 impl<'a> TryFrom<&'a [u8]> for Article<'a> {
     type Error = ArticleParseError;
@@ -1779,7 +1788,9 @@ fn materialize_validated_message_id(
 ) -> Result<MessageId<'_>, ArticleParseError> {
     let value = std::str::from_utf8(message_id.slice(buffer)?)
         .map_err(|_| ArticleParseError::InvalidMessageId)?;
-    MessageId::from_borrowed(value).map_err(ArticleParseError::from)
+    // `validate_first_line` already checked the complete message-id grammar.
+    // Re-running it here made every typed accessor pay for a second scan.
+    Ok(MessageId::from_validated_borrowed(value))
 }
 
 fn parse_response_article_number(value: &[u8]) -> Result<ArticleNumber, ArticleParseError> {

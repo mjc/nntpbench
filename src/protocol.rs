@@ -17,7 +17,7 @@ use crate::terminator::{
 pub mod article;
 pub(crate) mod response_receiver;
 
-pub use article::{Article, ArticleNumber, ArticleParseError, HeaderIter, Headers};
+pub use article::{Article, ArticleNumber, ArticleParseError, ArticleView, HeaderIter, Headers};
 pub(crate) use article::{ValidatedArticleView, ValidatedOwnedArticle};
 
 pub const MAX_ARTICLE_NUMBER: u64 = 2_147_483_647;
