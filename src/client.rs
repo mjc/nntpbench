@@ -15,6 +15,7 @@ use tokio::task::JoinHandle;
 
 use crate::protocol::{
     ArticleRef, Request, ResponseFrameDecoder, ResponseFrameParse, ResponseInitialParse,
+    ValidatedOwnedArticle, ValidatedResponseContent,
 };
 use crate::terminator::{
     DOT_TERMINATOR, MultilineFrameProgress, MultilineFramer, crlf_normalized_payload_lines,
@@ -2010,9 +2011,51 @@ struct ConnectionHandle {
 pub struct OwnedResponse {
     kind: RequestKind,
     status: StatusCode,
-    content_start: usize,
-    content_end: usize,
-    bytes: Bytes,
+    content: OwnedResponseContent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OwnedResponseContent {
+    Generic {
+        bytes: Bytes,
+        start: usize,
+        end: usize,
+    },
+    Article(ValidatedOwnedArticle),
+}
+
+impl OwnedResponseContent {
+    fn from_frame(
+        bytes: Bytes,
+        content_start: usize,
+        content_end: usize,
+        validation: ValidatedResponseContent<'_>,
+    ) -> Self {
+        match validation {
+            ValidatedResponseContent::Generic => Self::Generic {
+                bytes,
+                start: content_start,
+                end: content_end,
+            },
+            ValidatedResponseContent::Article(validated) => {
+                Self::Article(validated.into_owned(bytes))
+            }
+        }
+    }
+
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Generic { bytes, .. } => bytes,
+            Self::Article(article) => article.bytes(),
+        }
+    }
+
+    fn content(&self) -> &[u8] {
+        match self {
+            Self::Generic { bytes, start, end } => &bytes[*start..*end],
+            Self::Article(article) => article.content(),
+        }
+    }
 }
 
 impl OwnedResponse {
@@ -2031,18 +2074,23 @@ impl OwnedResponse {
     /// Raw response bytes.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
-        &self.bytes
+        self.content.bytes()
     }
 
     /// Borrowed response payload bytes, excluding the initial line and any dot terminator.
     #[must_use]
     pub fn content(&self) -> &[u8] {
-        &self.bytes[self.content_start..self.content_end]
+        self.content.content()
     }
 
     /// Parse the response as an ARTICLE/HEAD/BODY/STAT article-style frame.
     pub fn parse_article(&self) -> Result<Article<'_>, ArticleParseError> {
-        Article::parse_framed(&self.bytes, self.content_start, self.content_end)
+        match &self.content {
+            OwnedResponseContent::Article(article) => Ok(article.materialize()),
+            OwnedResponseContent::Generic { bytes, start, end } => {
+                Article::parse_article_frame(bytes, *start, *end)
+            }
+        }
     }
 }
 
@@ -2099,8 +2147,11 @@ impl OwnedArticle {
     }
 
     /// Borrow the parsed article/body view from the owned wire bytes.
-    pub fn article(&self) -> Result<Article<'_>, ArticleParseError> {
-        self.response.parse_article()
+    pub fn article(&self) -> Article<'_> {
+        let OwnedResponseContent::Article(ref article) = self.response.content else {
+            unreachable!("OwnedArticle is constructed only from article validation");
+        };
+        article.materialize()
     }
 
     /// Borrow the underlying raw response wrapper.
@@ -2167,17 +2218,15 @@ impl TryFrom<OwnedResponse> for OwnedArticle {
             _ => 0,
         };
         if response.status.as_u16() != expected_status {
-            let status = response.status.as_u16();
-            return Err(ClientError::UnexpectedArticleResponse {
-                response,
-                source: ArticleParseError::InvalidStatusCode(status),
-            });
+            return Err(ClientError::UnexpectedArticleResponse { response });
         }
 
-        // `ResponseFrame::parse` has already validated the complete frame and
-        // performed its semantic parse. Avoid performing that allocation-producing
-        // parse a second time while converting the response wrapper; the typed
-        // accessor remains the explicit parse requested by the caller.
+        match response.content {
+            OwnedResponseContent::Article(_) => {}
+            OwnedResponseContent::Generic { .. } => {
+                return Err(ClientError::UnexpectedArticleResponse { response });
+            }
+        }
         Ok(Self { response })
     }
 }
@@ -2208,10 +2257,7 @@ pub enum ClientError {
     InvalidListGroupRange,
     CapabilitiesUnavailable,
     ConnectionClosed,
-    UnexpectedArticleResponse {
-        response: OwnedResponse,
-        source: ArticleParseError,
-    },
+    UnexpectedArticleResponse { response: OwnedResponse },
 }
 
 impl fmt::Display for ClientError {
@@ -2244,9 +2290,9 @@ impl fmt::Display for ClientError {
                 write!(f, "CAPABILITIES did not return a capability list")
             }
             Self::ConnectionClosed => write!(f, "connection engine closed"),
-            Self::UnexpectedArticleResponse { response, source } => write!(
+            Self::UnexpectedArticleResponse { response } => write!(
                 f,
-                "unexpected article response status {}: {source}",
+                "unexpected article response status {}",
                 response.status().as_u16()
             ),
         }
@@ -2332,33 +2378,57 @@ impl ResponseDecoder {
         }
     }
 
-    fn push(&mut self, buffer: &[u8]) -> Result<DecodeProgress, ClientError> {
+    fn push_framing(&mut self, buffer: &[u8]) -> Result<FramingDecodeProgress, ClientError> {
         let start = self.scanned.min(buffer.len());
         let chunk = &buffer[start..];
         self.scanned = buffer.len();
 
         match self.streaming.push(chunk)? {
-            StreamingDecodeProgress::NeedMore { .. } => Ok(DecodeProgress::NeedMore),
-            StreamingDecodeProgress::Complete { status, bounds, .. } => {
-                let response = match bounds {
-                    Some(bounds) => self.inner.complete_multiline(
-                        buffer,
-                        status,
-                        self.streaming.status_line_end(),
-                        bounds,
-                    ),
-                    None => self.inner.complete_single_line(
-                        buffer,
-                        status,
-                        self.streaming.status_line_end(),
-                    ),
-                };
-                match response {
+            StreamingDecodeProgress::NeedMore { .. } => Ok(FramingDecodeProgress::NeedMore),
+            StreamingDecodeProgress::Complete {
+                status,
+                consumed: chunk_consumed,
+                bounds,
+            } => Ok(FramingDecodeProgress::Complete {
+                status,
+                buffer_consumed: start + chunk_consumed,
+                bounds,
+            }),
+        }
+    }
+
+    fn complete_frame<'a>(
+        &self,
+        buffer: &'a [u8],
+        status: StatusCode,
+        bounds: Option<crate::terminator::MultilineFrameBounds>,
+    ) -> ResponseFrameParse<'a> {
+        match bounds {
+            Some(bounds) => self.inner.complete_multiline(
+                buffer,
+                status,
+                self.streaming.status_line_end(),
+                bounds,
+            ),
+            None => {
+                self.inner
+                    .complete_single_line(buffer, status, self.streaming.status_line_end())
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn push<'a>(&mut self, buffer: &'a [u8]) -> Result<DecodeProgress<'a>, ClientError> {
+        match self.push_framing(buffer)? {
+            FramingDecodeProgress::NeedMore => Ok(DecodeProgress::NeedMore),
+            FramingDecodeProgress::Complete { status, bounds, .. } => {
+                match self.complete_frame(buffer, status, bounds) {
                     ResponseFrameParse::Complete(response) => Ok(DecodeProgress::Complete {
                         status: response.status(),
                         consumed: response.consumed(),
                         content_start: response.content_start(),
                         content_end: response.content_end(),
+                        content_validation: response.content_validation(),
                     }),
                     ResponseFrameParse::NeedMore => Ok(DecodeProgress::NeedMore),
                     ResponseFrameParse::Invalid => Err(ClientError::InvalidStatusLine),
@@ -2369,13 +2439,25 @@ impl ResponseDecoder {
 }
 
 #[derive(Debug)]
-enum DecodeProgress {
+enum FramingDecodeProgress {
+    NeedMore,
+    Complete {
+        status: StatusCode,
+        buffer_consumed: usize,
+        bounds: Option<crate::terminator::MultilineFrameBounds>,
+    },
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+enum DecodeProgress<'a> {
     NeedMore,
     Complete {
         status: StatusCode,
         consumed: usize,
         content_start: usize,
         content_end: usize,
+        content_validation: ValidatedResponseContent<'a>,
     },
 }
 
@@ -2507,26 +2589,28 @@ pub fn bench_owned_response_from_bytes(
     kind: RequestKind,
     bytes: &[u8],
 ) -> Result<OwnedResponse, ClientError> {
-    let ResponseFrameParse::Complete(frame) = ResponseFrameDecoder::new(kind).decode(bytes) else {
+    let bytes = Bytes::copy_from_slice(bytes);
+    let ResponseFrameParse::Complete(frame) = ResponseFrameDecoder::new(kind).decode(&bytes) else {
         return Err(ClientError::UnexpectedEof);
     };
 
     Ok(OwnedResponse {
         kind,
         status: frame.status(),
-        content_start: frame.content_start(),
-        content_end: frame.content_end(),
-        bytes: Bytes::copy_from_slice(&bytes[..frame.consumed()]),
+        content: OwnedResponseContent::from_frame(
+            bytes.slice(..frame.consumed()),
+            frame.content_start(),
+            frame.content_end(),
+            frame.content_validation(),
+        ),
     })
 }
 
 /// Measure the article transformation performed by the typed accessor after
 /// response-frame validation has already completed.
 #[doc(hidden)]
-pub fn bench_owned_article_accessor_parse(response: &OwnedResponse) -> Result<usize, ClientError> {
-    let parsed = response
-        .parse_article()
-        .map_err(|_| ClientError::UnexpectedEof)?;
+pub fn bench_owned_article_accessor_parse(article: &OwnedArticle) -> Result<usize, ClientError> {
+    let parsed = article.article();
     Ok(parsed
         .body
         .as_ref()
@@ -2545,9 +2629,9 @@ pub fn bench_article_validation_and_two_parses(
     let ResponseFrameParse::Complete(frame) = ResponseFrameDecoder::new(kind).decode(bytes) else {
         return Err(ClientError::UnexpectedEof);
     };
-    let first = Article::parse_framed(bytes, frame.content_start(), frame.content_end())
+    let first = Article::parse_article_frame(bytes, frame.content_start(), frame.content_end())
         .map_err(|_| ClientError::UnexpectedEof)?;
-    let second = Article::parse_framed(bytes, frame.content_start(), frame.content_end())
+    let second = Article::parse_article_frame(bytes, frame.content_start(), frame.content_end())
         .map_err(|_| ClientError::UnexpectedEof)?;
     Ok(first
         .body
@@ -2558,15 +2642,17 @@ pub fn bench_article_validation_and_two_parses(
 
 /// Measure frame validation followed by one on-demand article transformation.
 #[doc(hidden)]
-pub fn bench_article_validation_and_parse(
+pub fn bench_article_validation_and_materialization(
     kind: RequestKind,
     bytes: &[u8],
 ) -> Result<usize, ClientError> {
     let ResponseFrameParse::Complete(frame) = ResponseFrameDecoder::new(kind).decode(bytes) else {
         return Err(ClientError::UnexpectedEof);
     };
-    let parsed = Article::parse_framed(bytes, frame.content_start(), frame.content_end())
-        .map_err(|_| ClientError::UnexpectedEof)?;
+    let ValidatedResponseContent::Article(validated) = frame.content_validation() else {
+        return Err(ClientError::UnexpectedEof);
+    };
+    let parsed = validated.materialize();
     Ok(parsed
         .body
         .as_ref()
@@ -2574,8 +2660,8 @@ pub fn bench_article_validation_and_parse(
         .saturating_add(parsed.message_id.as_str().len()))
 }
 
-/// Run the current incremental public response decoder against a fragmented
-/// response.
+/// Run the production framing, freeze, and validation sequence against a
+/// fragmented response.
 #[doc(hidden)]
 pub fn bench_public_response_decode_chunks(
     kind: RequestKind,
@@ -2592,11 +2678,20 @@ pub fn bench_public_response_decode_chunks(
         pending.extend_from_slice(&response[offset..end]);
         offset = end;
 
-        if let DecodeProgress::Complete {
-            status, consumed, ..
-        } = decoder.push(&pending)?
-        {
-            return Ok((status, consumed));
+        match decoder.push_framing(&pending)? {
+            FramingDecodeProgress::NeedMore => {}
+            FramingDecodeProgress::Complete {
+                status,
+                buffer_consumed,
+                bounds,
+            } => {
+                let bytes = pending.split_to(buffer_consumed).freeze();
+                return match decoder.complete_frame(&bytes, status, bounds) {
+                    ResponseFrameParse::Complete(frame) => Ok((frame.status(), frame.consumed())),
+                    ResponseFrameParse::NeedMore => Err(ClientError::UnexpectedEof),
+                    ResponseFrameParse::Invalid => Err(ClientError::InvalidStatusLine),
+                };
+            }
         }
     }
 
@@ -3291,21 +3386,32 @@ async fn run_reader_task(
 
         loop {
             if !pending_read.is_empty() {
-                match decoder.push(&pending_read) {
-                    Ok(DecodeProgress::NeedMore) => {}
-                    Ok(DecodeProgress::Complete {
+                match decoder.push_framing(&pending_read) {
+                    Ok(FramingDecodeProgress::NeedMore) => {}
+                    Ok(FramingDecodeProgress::Complete {
                         status,
-                        consumed,
-                        content_start,
-                        content_end,
+                        buffer_consumed,
+                        bounds,
                     }) => {
-                        let bytes = pending_read.split_to(consumed).freeze();
+                        let bytes = pending_read.split_to(buffer_consumed).freeze();
+                        let ResponseFrameParse::Complete(frame) =
+                            decoder.complete_frame(&bytes, status, bounds)
+                        else {
+                            let error = SharedEngineError::InvalidStatusLine;
+                            let _ = response_tx.send(Err(error.clone()));
+                            writer_abort.abort();
+                            poison_reader_engine(&poisoned, &mut inflight_rx, error).await;
+                            return;
+                        };
                         let response = CompletedResponse::Owned(OwnedResponse {
                             kind,
-                            status,
-                            content_start,
-                            content_end,
-                            bytes,
+                            status: frame.status(),
+                            content: OwnedResponseContent::from_frame(
+                                bytes.clone(),
+                                frame.content_start(),
+                                frame.content_end(),
+                                frame.content_validation(),
+                            ),
                         });
                         let _ = response_tx.send(Ok(CompletedRequest { request, response }));
                         drop(barrier_guard);
@@ -3553,6 +3659,34 @@ mod tests {
         }
     }
 
+    fn assert_framing_completion_reports_buffer_offset(
+        kind: RequestKind,
+        buffer: &[u8],
+        split: usize,
+        expected_frame_end: usize,
+    ) {
+        let mut decoder = ResponseDecoder::new(kind);
+        match decoder
+            .push_framing(&buffer[..split])
+            .expect("first framing push should succeed")
+        {
+            FramingDecodeProgress::NeedMore => {}
+            FramingDecodeProgress::Complete { .. } => {
+                panic!("framing completed before the final chunk")
+            }
+        }
+
+        let FramingDecodeProgress::Complete {
+            buffer_consumed, ..
+        } = decoder
+            .push_framing(buffer)
+            .expect("second framing push should succeed")
+        else {
+            panic!("the final chunk should complete the response")
+        };
+        assert_eq!(buffer_consumed, expected_frame_end);
+    }
+
     fn assert_decoder_completes_on_all_three_push_schedules(
         kind: RequestKind,
         frame: &[u8],
@@ -3617,12 +3751,14 @@ mod tests {
                             consumed,
                             content_start,
                             content_end,
+                            content_validation,
                         },
                     ) => {
                         assert_eq!(status, expected.status());
                         assert_eq!(consumed, expected.consumed());
                         assert_eq!(content_start, expected.content_start());
                         assert_eq!(content_end, expected.content_end());
+                        assert_eq!(content_validation, expected.content_validation());
                     }
                     (ResponseFrameParse::Complete(expected), progress) => panic!(
                         "incremental decoder did not match complete stateless frame at split ({first}, {second}): expected {expected:?}, got {progress:?}"
@@ -3643,7 +3779,8 @@ mod tests {
     }
 
     fn response_from_bytes(kind: RequestKind, status: StatusCode, bytes: &[u8]) -> OwnedResponse {
-        let ResponseFrameParse::Complete(frame) = ResponseFrameDecoder::new(kind).decode(bytes)
+        let bytes = Bytes::copy_from_slice(bytes);
+        let ResponseFrameParse::Complete(frame) = ResponseFrameDecoder::new(kind).decode(&bytes)
         else {
             panic!("test response frame should parse");
         };
@@ -3651,10 +3788,62 @@ mod tests {
         OwnedResponse {
             kind,
             status,
-            content_start: frame.content_start(),
-            content_end: frame.content_end(),
-            bytes: Bytes::copy_from_slice(bytes),
+            content: OwnedResponseContent::from_frame(
+                bytes.slice(..frame.consumed()),
+                frame.content_start(),
+                frame.content_end(),
+                frame.content_validation(),
+            ),
         }
+    }
+
+    #[test]
+    fn owned_article_requires_decoder_article_proof() {
+        let mut response = response_from_bytes(
+            RequestKind::Body,
+            StatusCode::parse(b"222").unwrap(),
+            b"222 1 <body@test> body follows\r\nbody\r\n.\r\n",
+        );
+        response.content = OwnedResponseContent::Generic {
+            bytes: response.content.bytes().to_vec().into(),
+            start: 0,
+            end: 0,
+        };
+
+        let Err(ClientError::UnexpectedArticleResponse { .. }) = OwnedArticle::try_from(response)
+        else {
+            panic!("article promotion should require decoder proof");
+        };
+    }
+
+    #[test]
+    fn owned_article_access_is_infallible_after_promotion() {
+        let response = response_from_bytes(
+            RequestKind::Body,
+            StatusCode::parse(b"222").unwrap(),
+            b"222 1 <body@test> body follows\r\nbody\r\n.\r\n",
+        );
+        let article = OwnedArticle::try_from(response).unwrap();
+
+        let parsed: Article<'_> = article.article();
+        assert_eq!(parsed.body.as_deref(), Some(&b"body\r\n"[..]));
+    }
+
+    #[test]
+    fn equivalent_owned_article_responses_compare_equal_across_allocations() {
+        let first = response_from_bytes(
+            RequestKind::Body,
+            StatusCode::parse(b"222").unwrap(),
+            b"222 1 <body@test> body follows\r\nbody\r\n.\r\n",
+        );
+        let second = response_from_bytes(
+            RequestKind::Body,
+            StatusCode::parse(b"222").unwrap(),
+            b"222 1 <body@test> body follows\r\nbody\r\n.\r\n",
+        );
+
+        assert_ne!(first.as_bytes().as_ptr(), second.as_bytes().as_ptr());
+        assert_eq!(first, second);
     }
 
     #[test]
@@ -3874,6 +4063,42 @@ mod tests {
             decoder.push(&too_long),
             Err(ClientError::InvalidStatusLine)
         ));
+    }
+
+    #[test]
+    fn framing_completion_reports_accumulated_single_line_offset() {
+        let response = b"223 1 <stat@test> article exists\r\n";
+        assert_framing_completion_reports_buffer_offset(
+            RequestKind::Stat,
+            response,
+            response.len() - 1,
+            response.len(),
+        );
+    }
+
+    #[test]
+    fn framing_completion_reports_accumulated_multiline_offset() {
+        let response = b"222 1 <body@test> body follows\r\nbody\r\n.\r\n";
+        assert_framing_completion_reports_buffer_offset(
+            RequestKind::Body,
+            response,
+            response.len() - 1,
+            response.len(),
+        );
+    }
+
+    #[test]
+    fn framing_completion_excludes_a_packed_following_response() {
+        let first = b"223 1 <stat@test> article exists\r\n";
+        let mut packed = first.to_vec();
+        packed.extend_from_slice(b"205 closing connection\r\n");
+
+        assert_framing_completion_reports_buffer_offset(
+            RequestKind::Stat,
+            &packed,
+            first.len() - 1,
+            first.len(),
+        );
     }
 
     #[test]
@@ -5444,7 +5669,7 @@ mod tests {
 
         let client = Client::connect(addr).await.unwrap();
         let article = client.article("surface@test").await.unwrap();
-        let parsed = article.article().unwrap();
+        let parsed = article.article();
 
         assert_eq!(article.kind(), RequestKind::Article);
         assert_eq!(article.status().as_u16(), 220);
@@ -5477,7 +5702,7 @@ mod tests {
 
         let client = Client::connect(addr).await.unwrap();
         let exchange = client.article_exchange("exchange@test").await.unwrap();
-        let parsed = exchange.article().article().unwrap();
+        let parsed = exchange.article().article();
 
         assert_eq!(
             exchange.request(),
@@ -5525,10 +5750,7 @@ mod tests {
         );
         assert_eq!(article.status().as_u16(), 220);
         assert_eq!(raw.kind(), RequestKind::Article);
-        assert_eq!(
-            article.article().unwrap().message_id.as_str(),
-            "<pair-surface@test>"
-        );
+        assert_eq!(article.article().message_id.as_str(), "<pair-surface@test>");
 
         server.await.unwrap();
     }
@@ -5561,15 +5783,12 @@ mod tests {
         assert_eq!(current.kind(), RequestKind::Article);
         assert_eq!(current.status().as_u16(), 220);
         assert_eq!(
-            current.article().unwrap().message_id.as_str(),
+            current.article().message_id.as_str(),
             "<surface-current@test>"
         );
         assert_eq!(stat.kind(), RequestKind::Stat);
         assert_eq!(stat.status().as_u16(), 223);
-        assert_eq!(
-            stat.article().unwrap().message_id.as_str(),
-            "<surface-42@test>"
-        );
+        assert_eq!(stat.article().message_id.as_str(), "<surface-42@test>");
 
         server.await.unwrap();
     }
@@ -5989,16 +6208,13 @@ mod tests {
         assert_eq!(head.kind(), RequestKind::Head);
         assert_eq!(head.status().as_u16(), 221);
         assert_eq!(
-            head.article().unwrap().headers.unwrap().get("Subject"),
+            head.article().headers.unwrap().get("Subject"),
             Some(&b"Surface Head"[..])
         );
 
         assert_eq!(stat.kind(), RequestKind::Stat);
         assert_eq!(stat.status().as_u16(), 223);
-        assert_eq!(
-            stat.article().unwrap().message_id.as_str(),
-            "<stat-surface@test>"
-        );
+        assert_eq!(stat.article().message_id.as_str(), "<stat-surface@test>");
 
         server.await.unwrap();
     }
@@ -6027,7 +6243,7 @@ mod tests {
         assert_eq!(exchange.request(), &request);
         assert_eq!(exchange.article().status().as_u16(), 222);
         assert_eq!(
-            exchange.article().article().unwrap().body.as_deref(),
+            exchange.article().article().body.as_deref(),
             Some(&b"direct body\r\n"[..])
         );
 
