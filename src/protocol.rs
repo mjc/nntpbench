@@ -16,7 +16,7 @@ use crate::terminator::{
 
 pub mod article;
 
-pub(crate) use article::ArticleLayout;
+pub(crate) use article::ValidatedArticleLayout;
 pub use article::{Article, ArticleNumber, ArticleParseError, HeaderIter, Headers};
 
 pub const MAX_ARTICLE_NUMBER: u64 = 2_147_483_647;
@@ -99,7 +99,7 @@ pub struct ResponseFrame<'a> {
     terminator: &'a [u8],
     content_start: usize,
     content_end: usize,
-    article_layout: Option<ArticleLayout>,
+    content_validation: ValidatedResponseContent,
     status: StatusCode,
     consumed: usize,
 }
@@ -136,36 +136,35 @@ impl<'a> ResponseFrame<'a> {
             return ResponseFrameParse::Invalid;
         }
 
-        let (consumed, content, terminator, article_layout) = if descriptor.framing().is_multiline()
-        {
-            let Some(block) = find_dot_terminated_block(buffer, status_line_end) else {
-                return ResponseFrameParse::NeedMore;
+        let (consumed, content, terminator, content_validation) =
+            if descriptor.framing().is_multiline() {
+                let Some(block) = find_dot_terminated_block(buffer, status_line_end) else {
+                    return ResponseFrameParse::NeedMore;
+                };
+                let content_validation = match validate_multiline_response_content(
+                    kind,
+                    buffer,
+                    &buffer[..status_line_end],
+                    status_line_end,
+                    block.content_end(),
+                ) {
+                    None => return ResponseFrameParse::Invalid,
+                    Some(validation) => validation,
+                };
+                (
+                    block.block_end(),
+                    block.content(),
+                    block.terminator(),
+                    content_validation,
+                )
+            } else {
+                (
+                    status_line_end,
+                    &buffer[status_line_end..status_line_end],
+                    &buffer[status_line_end..status_line_end],
+                    ValidatedResponseContent::Generic,
+                )
             };
-            let article_layout = match validate_multiline_response_content(
-                kind,
-                buffer,
-                &buffer[..status_line_end],
-                status_line_end,
-                block.content_end(),
-            ) {
-                MultilineValidation::Invalid => return ResponseFrameParse::Invalid,
-                MultilineValidation::Valid => None,
-                MultilineValidation::Article(layout) => Some(layout),
-            };
-            (
-                block.block_end(),
-                block.content(),
-                block.terminator(),
-                article_layout,
-            )
-        } else {
-            (
-                status_line_end,
-                &buffer[status_line_end..status_line_end],
-                &buffer[status_line_end..status_line_end],
-                None,
-            )
-        };
 
         ResponseFrameParse::Complete(Self {
             kind,
@@ -176,7 +175,7 @@ impl<'a> ResponseFrame<'a> {
             terminator,
             content_start: status_line_end,
             content_end: status_line_end + content.len(),
-            article_layout,
+            content_validation,
             status,
             consumed,
         })
@@ -233,8 +232,8 @@ impl<'a> ResponseFrame<'a> {
     }
 
     #[must_use]
-    pub(crate) const fn article_layout(self) -> Option<ArticleLayout> {
-        self.article_layout
+    pub(crate) const fn content_validation(self) -> ValidatedResponseContent {
+        self.content_validation
     }
 }
 
@@ -323,25 +322,24 @@ impl ResponseFrameDecoder {
             return ResponseFrameParse::Invalid;
         }
 
-        let (content, terminator, article_layout) = if descriptor.framing().is_multiline() {
+        let (content, terminator, content_validation) = if descriptor.framing().is_multiline() {
             let Some(content) = buffer.get(status_line_end..content_end) else {
                 return ResponseFrameParse::Invalid;
             };
-            let article_layout = match validate_multiline_response_content(
+            let content_validation = match validate_multiline_response_content(
                 self.kind,
                 buffer,
                 status_line,
                 status_line_end,
                 content_end,
             ) {
-                MultilineValidation::Invalid => return ResponseFrameParse::Invalid,
-                MultilineValidation::Valid => None,
-                MultilineValidation::Article(layout) => Some(layout),
+                None => return ResponseFrameParse::Invalid,
+                Some(validation) => validation,
             };
             let Some(terminator) = buffer.get(content_end..consumed) else {
                 return ResponseFrameParse::Invalid;
             };
-            (content, terminator, article_layout)
+            (content, terminator, content_validation)
         } else {
             if content_end != status_line_end || consumed != status_line_end {
                 return ResponseFrameParse::Invalid;
@@ -349,7 +347,7 @@ impl ResponseFrameDecoder {
             (
                 &buffer[status_line_end..status_line_end],
                 &buffer[status_line_end..status_line_end],
-                None,
+                ValidatedResponseContent::Generic,
             )
         };
 
@@ -362,7 +360,7 @@ impl ResponseFrameDecoder {
             terminator,
             content_start: status_line_end,
             content_end,
-            article_layout,
+            content_validation,
             status,
             consumed,
         })
@@ -2793,10 +2791,10 @@ fn validate_optional_trailing_comment(value: &[u8]) -> bool {
     value.is_empty() || value.strip_prefix(b" ").is_some_and(validate_u_chars)
 }
 
-enum MultilineValidation {
-    Invalid,
-    Valid,
-    Article(ArticleLayout),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ValidatedResponseContent {
+    Generic,
+    Article(ValidatedArticleLayout),
 }
 
 fn validate_multiline_response_content(
@@ -2805,17 +2803,16 @@ fn validate_multiline_response_content(
     status_line: &[u8],
     content_start: usize,
     content_end: usize,
-) -> MultilineValidation {
-    let Some(content) = frame.get(content_start..content_end) else {
-        return MultilineValidation::Invalid;
-    };
+) -> Option<ValidatedResponseContent> {
+    let content = frame.get(content_start..content_end)?;
 
     if matches!(
         kind,
         RequestKind::Article | RequestKind::Head | RequestKind::Body
     ) {
-        return Article::validate_framed(frame, content_start, content_end)
-            .map_or(MultilineValidation::Invalid, MultilineValidation::Article);
+        return Article::validate_article_frame(frame, content_start, content_end)
+            .map(ValidatedResponseContent::Article)
+            .ok();
     }
 
     let valid = match kind {
@@ -2849,9 +2846,9 @@ fn validate_multiline_response_content(
         _ => true,
     };
     if valid {
-        MultilineValidation::Valid
+        Some(ValidatedResponseContent::Generic)
     } else {
-        MultilineValidation::Invalid
+        None
     }
 }
 
