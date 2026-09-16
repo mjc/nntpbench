@@ -1157,23 +1157,23 @@ impl<'a> ValidatedArticleView<'a> {
     }
 }
 
-impl<B: AsRef<[u8]>> ValidatedArticle<B> {
+impl ValidatedArticle<Bytes> {
     #[must_use]
     pub(crate) fn bytes(&self) -> &[u8] {
-        self.bytes.as_ref()
+        &self.bytes
     }
 
     #[must_use]
     pub(crate) fn content(&self) -> &[u8] {
         self.layout
             .content_range()
-            .slice(self.bytes.as_ref())
+            .slice(&self.bytes)
             .expect("owned article preserves its validated content range")
     }
 
     #[must_use]
     pub(crate) fn materialize(&self) -> Article<'_> {
-        Article::materialize_validated_article(self.bytes.as_ref(), self.layout)
+        Article::materialize_validated_article(&self.bytes, self.layout)
             .expect("owned article preserves its validated bytes")
     }
 }
