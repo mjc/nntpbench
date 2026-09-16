@@ -2350,4 +2350,31 @@ Actual body content\r\n\
             );
         }
     }
+
+    #[test]
+    fn compatibility_fixture_matrix_normalizes_only_strict_article_sections() {
+        let folded =
+            b"220 0 <folded@example.com>\r\nSubject: first\r\n second\r\n\r\nbody\r\n.\r\n";
+        let folded_article = Article::parse(folded).unwrap();
+        assert_eq!(
+            folded_article.headers.unwrap().get("Subject"),
+            Some(&b"first second"[..])
+        );
+
+        let stuffed = b"222 0 <stuffed@example.com>\r\n..wire-dot\r\n.\r\n";
+        let stuffed_article = Article::parse(stuffed).unwrap();
+        assert_eq!(
+            stuffed_article.body,
+            Some(Cow::Borrowed(&b".wire-dot\r\n"[..]))
+        );
+
+        let binary = b"222 0 <binary@example.com>\r\nbinary\0body\r\n.\r\n";
+        assert_eq!(Article::parse(binary), Err(ArticleParseError::InvalidBody));
+
+        let bare_lf = b"222 0 <bare@example.com>\r\nbody\nnext\r\n.\r\n";
+        assert!(matches!(
+            Article::parse(bare_lf),
+            Err(ArticleParseError::InvalidBody)
+        ));
+    }
 }
