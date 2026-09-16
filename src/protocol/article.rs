@@ -1060,6 +1060,12 @@ impl ArticleFrameRange {
             .get(self.start..self.end)
             .ok_or(ArticleParseError::BufferTooShort)
     }
+
+    fn validated_slice(self, buffer: &[u8]) -> &[u8] {
+        buffer
+            .get(self.start..self.end)
+            .expect("validated article layout preserves its byte ranges")
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1144,7 +1150,6 @@ pub(crate) type ValidatedOwnedArticle = ValidatedArticle<Bytes>;
 impl<'a> ValidatedArticleView<'a> {
     pub(crate) fn materialize(self) -> Article<'a> {
         Article::materialize_validated_article(self.buffer, self.layout)
-            .expect("validated article view preserves its validated bytes")
     }
 
     pub(crate) fn into_owned(self, bytes: Bytes) -> ValidatedOwnedArticle {
@@ -1174,7 +1179,6 @@ impl ValidatedArticle<Bytes> {
     #[must_use]
     pub(crate) fn materialize(&self) -> Article<'_> {
         Article::materialize_validated_article(&self.bytes, self.layout)
-            .expect("owned article preserves its validated bytes")
     }
 }
 
@@ -1309,14 +1313,14 @@ impl<'a> Headers<'a> {
         buffer: &'a [u8],
         headers: ArticleFrameRange,
         transformation: HeaderTransformation,
-    ) -> Result<Self, ArticleParseError> {
+    ) -> Self {
         match transformation {
-            HeaderTransformation::None => Ok(Self {
-                data: Cow::Borrowed(headers.slice(buffer)?),
-            }),
-            HeaderTransformation::Unfold => Ok(Self {
-                data: unfold_header_continuations(headers.slice(buffer)?),
-            }),
+            HeaderTransformation::None => Self {
+                data: Cow::Borrowed(headers.validated_slice(buffer)),
+            },
+            HeaderTransformation::Unfold => Self {
+                data: unfold_header_continuations(headers.validated_slice(buffer)),
+            },
         }
     }
 
@@ -1498,11 +1502,8 @@ impl<'a> Article<'a> {
     }
 
     /// Materialize an article from proof returned by [`Self::validate_article_frame`].
-    fn materialize_validated_article(
-        buf: &'a [u8],
-        layout: ArticleLayout,
-    ) -> Result<Self, ArticleParseError> {
-        let message_id = materialize_validated_message_id(buf, layout.first_line.message_id)?;
+    fn materialize_validated_article(buf: &'a [u8], layout: ArticleLayout) -> Self {
+        let message_id = materialize_validated_message_id(buf, layout.first_line.message_id);
         let article_number = Some(layout.first_line.article_number);
 
         match layout.content {
@@ -1512,42 +1513,38 @@ impl<'a> Article<'a> {
                 body,
                 body_transformation,
             } => {
-                let headers = Headers::from_validated(buf, headers, header_transformation)?;
-                Ok(Self {
+                let headers = Headers::from_validated(buf, headers, header_transformation);
+                Self {
                     message_id,
                     article_number,
                     headers: Some(headers),
-                    body: Some(materialize_validated_body(buf, body, body_transformation)?),
-                })
+                    body: Some(materialize_validated_body(buf, body, body_transformation)),
+                }
             }
             ValidatedArticleContent::Head {
                 headers,
                 header_transformation,
-            } => Ok(Self {
+            } => Self {
                 message_id,
                 article_number,
-                headers: Some(Headers::from_validated(
-                    buf,
-                    headers,
-                    header_transformation,
-                )?),
+                headers: Some(Headers::from_validated(buf, headers, header_transformation)),
                 body: None,
-            }),
+            },
             ValidatedArticleContent::Body {
                 body,
                 body_transformation,
-            } => Ok(Self {
+            } => Self {
                 message_id,
                 article_number,
                 headers: None,
-                body: Some(materialize_validated_body(buf, body, body_transformation)?),
-            }),
-            ValidatedArticleContent::Stat { .. } => Ok(Self {
+                body: Some(materialize_validated_body(buf, body, body_transformation)),
+            },
+            ValidatedArticleContent::Stat { .. } => Self {
                 message_id,
                 article_number,
                 headers: None,
                 body: None,
-            }),
+            },
         }
     }
 
@@ -1706,10 +1703,10 @@ fn materialize_validated_body(
     buffer: &[u8],
     body: ArticleFrameRange,
     transformation: BodyTransformation,
-) -> Result<Cow<'_, [u8]>, ArticleParseError> {
+) -> Cow<'_, [u8]> {
     match transformation {
-        BodyTransformation::None => Ok(Cow::Borrowed(body.slice(buffer)?)),
-        BodyTransformation::Unstuff => Ok(unstuff_known_dot_lines(body.slice(buffer)?)),
+        BodyTransformation::None => Cow::Borrowed(body.validated_slice(buffer)),
+        BodyTransformation::Unstuff => unstuff_known_dot_lines(body.validated_slice(buffer)),
     }
 }
 
@@ -1782,15 +1779,12 @@ fn validate_first_line(
     })
 }
 
-fn materialize_validated_message_id(
-    buffer: &[u8],
-    message_id: ArticleFrameRange,
-) -> Result<MessageId<'_>, ArticleParseError> {
-    let value = std::str::from_utf8(message_id.slice(buffer)?)
-        .map_err(|_| ArticleParseError::InvalidMessageId)?;
+fn materialize_validated_message_id(buffer: &[u8], message_id: ArticleFrameRange) -> MessageId<'_> {
+    let value = std::str::from_utf8(message_id.validated_slice(buffer))
+        .expect("validated article layout preserves UTF-8 message-id bytes");
     // `validate_first_line` already checked the complete message-id grammar.
     // Re-running it here made every typed accessor pay for a second scan.
-    Ok(MessageId::from_validated_borrowed(value))
+    MessageId::from_validated_borrowed(value)
 }
 
 fn parse_response_article_number(value: &[u8]) -> Result<ArticleNumber, ArticleParseError> {
