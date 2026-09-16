@@ -15,8 +15,10 @@ use crate::terminator::{
 };
 
 pub mod article;
+pub(crate) mod response_receiver;
 
-pub use article::{Article, ArticleNumber, ArticleParseError, HeaderIter, Headers};
+pub use article::{Article, ArticleNumber, ArticleParseError, ArticleView, HeaderIter, Headers};
+pub(crate) use article::{ValidatedArticleView, ValidatedOwnedArticle};
 
 pub const MAX_ARTICLE_NUMBER: u64 = 2_147_483_647;
 /// RFC 3977 section 3.1 command lines and response initial lines are limited
@@ -88,6 +90,18 @@ impl StatusCode {
 }
 
 /// Borrowed whole NNTP response frame parsed from bytes received from the wire.
+///
+/// A parsed frame retains the immutable borrow that validated its article layout,
+/// so the source cannot be mutated while that validation remains usable.
+///
+/// ```compile_fail
+/// use nntpbench::{RequestKind, ResponseFrame};
+///
+/// let mut wire = b"222 1 <body@test> body follows\r\nbody\r\n.\r\n".to_vec();
+/// let parsed = ResponseFrame::parse(RequestKind::Body, &wire);
+/// wire[32] = b'\0';
+/// let _still_validated = parsed;
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResponseFrame<'a> {
     kind: RequestKind,
@@ -98,6 +112,7 @@ pub struct ResponseFrame<'a> {
     terminator: &'a [u8],
     content_start: usize,
     content_end: usize,
+    content_validation: ValidatedResponseContent<'a>,
     status: StatusCode,
     consumed: usize,
 }
@@ -138,15 +153,6 @@ impl<'a> ResponseFrame<'a> {
             let Some(block) = find_dot_terminated_block(buffer, status_line_end) else {
                 return ResponseFrameParse::NeedMore;
             };
-            if !validate_multiline_response_content(
-                kind,
-                buffer,
-                &buffer[..status_line_end],
-                status_line_end,
-                block.content_end(),
-            ) {
-                return ResponseFrameParse::Invalid;
-            }
             (block.block_end(), block.content(), block.terminator())
         } else {
             (
@@ -154,6 +160,19 @@ impl<'a> ResponseFrame<'a> {
                 &buffer[status_line_end..status_line_end],
                 &buffer[status_line_end..status_line_end],
             )
+        };
+        let content_end = status_line_end + content.len();
+        let content_validation = match validate_response_content(
+            kind,
+            status,
+            descriptor.framing(),
+            &buffer[..consumed],
+            &buffer[..status_line_end],
+            status_line_end,
+            content_end,
+        ) {
+            Some(validation) => validation,
+            None => return ResponseFrameParse::Invalid,
         };
 
         ResponseFrameParse::Complete(Self {
@@ -164,7 +183,8 @@ impl<'a> ResponseFrame<'a> {
             content,
             terminator,
             content_start: status_line_end,
-            content_end: status_line_end + content.len(),
+            content_end,
+            content_validation,
             status,
             consumed,
         })
@@ -219,6 +239,11 @@ impl<'a> ResponseFrame<'a> {
     pub const fn consumed(self) -> usize {
         self.consumed
     }
+
+    #[must_use]
+    pub(crate) const fn content_validation(self) -> ValidatedResponseContent<'a> {
+        self.content_validation
+    }
 }
 
 /// Parse status for a borrowed whole NNTP response frame.
@@ -244,32 +269,6 @@ impl ResponseFrameDecoder {
     #[must_use]
     pub(crate) fn decode<'a>(self, buffer: &'a [u8]) -> ResponseFrameParse<'a> {
         ResponseFrame::parse(self.kind, buffer)
-    }
-
-    /// Validate a single-line frame after the status line has been located.
-    ///
-    /// The streaming detector owns delimiter search. Keeping this completion
-    /// step separate avoids searching the accumulated pending buffer a second
-    /// time while preserving the full semantic validation performed by
-    /// [`ResponseFrame::parse`].
-    pub(crate) fn complete_single_line<'a>(
-        self,
-        buffer: &'a [u8],
-        status: StatusCode,
-        status_line_end: usize,
-    ) -> ResponseFrameParse<'a> {
-        self.complete_with_bounds(buffer, status, status_line_end, None)
-    }
-
-    /// Validate a multiline frame after the shared framer has located its end.
-    pub(crate) fn complete_multiline<'a>(
-        self,
-        buffer: &'a [u8],
-        status: StatusCode,
-        status_line_end: usize,
-        bounds: MultilineFrameBounds,
-    ) -> ResponseFrameParse<'a> {
-        self.complete_with_bounds(buffer, status, status_line_end, Some(bounds))
     }
 
     fn complete_with_bounds<'a>(
@@ -310,15 +309,6 @@ impl ResponseFrameDecoder {
             let Some(content) = buffer.get(status_line_end..content_end) else {
                 return ResponseFrameParse::Invalid;
             };
-            if !validate_multiline_response_content(
-                self.kind,
-                buffer,
-                status_line,
-                status_line_end,
-                content_end,
-            ) {
-                return ResponseFrameParse::Invalid;
-            }
             let Some(terminator) = buffer.get(content_end..consumed) else {
                 return ResponseFrameParse::Invalid;
             };
@@ -332,6 +322,18 @@ impl ResponseFrameDecoder {
                 &buffer[status_line_end..status_line_end],
             )
         };
+        let content_validation = match validate_response_content(
+            self.kind,
+            status,
+            descriptor.framing(),
+            &buffer[..consumed],
+            status_line,
+            status_line_end,
+            content_end,
+        ) {
+            Some(validation) => validation,
+            None => return ResponseFrameParse::Invalid,
+        };
 
         ResponseFrameParse::Complete(ResponseFrame {
             kind: self.kind,
@@ -342,6 +344,7 @@ impl ResponseFrameDecoder {
             terminator,
             content_start: status_line_end,
             content_end,
+            content_validation,
             status,
             consumed,
         })
@@ -2772,21 +2775,37 @@ fn validate_optional_trailing_comment(value: &[u8]) -> bool {
     value.is_empty() || value.strip_prefix(b" ").is_some_and(validate_u_chars)
 }
 
-fn validate_multiline_response_content(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ValidatedResponseContent<'a> {
+    Generic,
+    Article(ValidatedArticleView<'a>),
+}
+
+fn validate_response_content<'a>(
     kind: RequestKind,
-    frame: &[u8],
+    status: StatusCode,
+    framing: ResponseFraming,
+    frame: &'a [u8],
     status_line: &[u8],
     content_start: usize,
     content_end: usize,
-) -> bool {
-    let Some(content) = frame.get(content_start..content_end) else {
-        return false;
-    };
+) -> Option<ValidatedResponseContent<'a>> {
+    let content = frame.get(content_start..content_end)?;
 
-    match kind {
-        RequestKind::Article | RequestKind::Head | RequestKind::Body => {
-            Article::parse_framed(frame, content_start, content_end).is_ok()
+    match (kind, status.as_u16()) {
+        (RequestKind::Article, 220)
+        | (RequestKind::Head, 221)
+        | (RequestKind::Body, 222)
+        | (RequestKind::Stat, 223) => {
+            return Article::validate_article_frame(frame, content_start, content_end)
+                .map(ValidatedResponseContent::Article)
+                .ok();
         }
+        _ if !framing.is_multiline() => return Some(ValidatedResponseContent::Generic),
+        _ => {}
+    }
+
+    let valid = match kind {
         RequestKind::List | RequestKind::ListActive | RequestKind::NewGroups => {
             validate_crlf_lines(content, validate_active_response_line)
         }
@@ -2815,6 +2834,11 @@ fn validate_multiline_response_content(
         RequestKind::Help => validate_crlf_lines(content, validate_help_text_line),
         RequestKind::Unknown => validate_generic_multiline_response_content(content),
         _ => true,
+    };
+    if valid {
+        Some(ValidatedResponseContent::Generic)
+    } else {
+        None
     }
 }
 
@@ -6142,7 +6166,7 @@ mod tests {
             };
 
         let ResponseFrameParse::Complete(response) = ResponseFrameDecoder::new(RequestKind::Body)
-            .complete_multiline(wire, status, status_line_end, bounds)
+            .complete_with_bounds(wire, status, status_line_end, Some(bounds))
         else {
             panic!("precomputed response frame did not parse");
         };
@@ -6178,6 +6202,31 @@ mod tests {
             b"222 1 <body@test> body follows\r\nbody line\r\n.\r\n"
         );
         assert_eq!(response.consumed(), response.bytes().len());
+    }
+
+    #[test]
+    fn stat_response_frame_retains_article_validation() {
+        let wire = b"223 1 <stat@test> article exists\r\n";
+        let ResponseFrameParse::Complete(response) = ResponseFrame::parse(RequestKind::Stat, wire)
+        else {
+            panic!("STAT response should parse");
+        };
+
+        let ValidatedResponseContent::Article(_) = response.content_validation() else {
+            panic!("STAT response should retain article validation");
+        };
+    }
+
+    #[test]
+    fn equivalent_article_frames_from_distinct_allocations_compare_equal() {
+        let first = b"222 1 <body@test> body follows\r\nbody\r\n.\r\n".to_vec();
+        let second = first.clone();
+
+        assert_ne!(first.as_ptr(), second.as_ptr());
+        assert_eq!(
+            ResponseFrame::parse(RequestKind::Body, &first),
+            ResponseFrame::parse(RequestKind::Body, &second),
+        );
     }
 
     #[test]
@@ -6250,6 +6299,13 @@ mod tests {
             ResponseFrame::parse(RequestKind::Help, b"100 help follows\r\n.\r\n"),
             ResponseFrameParse::Complete(response)
                 if response.content().is_empty() && response.terminator() == b".\r\n"
+        ));
+        assert!(matches!(
+            ResponseFrame::parse(
+                RequestKind::Article,
+                b"220 1 <article@test>\r\nSubject: folded\r\n continuation\r\n\r\n..payload\r\n.\r\n"
+            ),
+            ResponseFrameParse::Complete(_)
         ));
 
         crate::COUNT_TEST_ALLOCATIONS.with(|enabled| enabled.set(false));

@@ -18,11 +18,11 @@ supported! {
         Callgrind, LibraryBenchmarkConfig, library_benchmark, library_benchmark_group, main,
     };
     use nntpbench::client::{
-        bench_article_validation_and_parse, bench_article_validation_and_two_parses,
+        bench_article_validation_and_materialization, bench_article_validation_and_two_parses,
         bench_owned_article_accessor_parse, bench_owned_response_from_bytes,
         bench_public_response_decode_chunks, bench_public_response_decode_chunks_stateless,
     };
-    use nntpbench::{OwnedResponse, RequestKind, bench_load_read_capacity_in_place};
+    use nntpbench::{OwnedArticle, RequestKind, bench_load_read_capacity_in_place};
     use std::hint::black_box;
     use tokio::runtime::{Builder, Runtime};
 
@@ -32,14 +32,14 @@ supported! {
     const BODY_64K: usize = 64 * 1024;
     const BODY_768K: usize = 768 * 1024;
 
-    fn setup_owned_response(size: usize, variant: ArticleVariant) -> OwnedResponse {
+    fn setup_owned_article(size: usize, variant: ArticleVariant) -> OwnedArticle {
         let kind = if matches!(variant, ArticleVariant::FoldedHeaders) {
             RequestKind::Article
         } else {
             RequestKind::Body
         };
         let bytes = fixtures::article_response(size, variant);
-        bench_owned_response_from_bytes(kind, &bytes).unwrap()
+        OwnedArticle::try_from(bench_owned_response_from_bytes(kind, &bytes).unwrap()).unwrap()
     }
 
     fn setup_body_response(size: usize) -> Vec<u8> {
@@ -57,8 +57,8 @@ supported! {
     #[bench::plain_768k(setup = setup_plain_768k)]
     #[bench::dot_stuffed_768k(setup = setup_dot_stuffed_768k)]
     #[bench::folded_headers_768k(setup = setup_folded_headers_768k)]
-    fn repeated_owned_article_parse(response: OwnedResponse) -> usize {
-        black_box(bench_owned_article_accessor_parse(black_box(&response)).unwrap())
+    fn repeated_owned_article_parse(article: OwnedArticle) -> usize {
+        black_box(bench_owned_article_accessor_parse(black_box(&article)).unwrap())
     }
 
     #[library_benchmark]
@@ -84,35 +84,35 @@ supported! {
     #[bench::dot_stuffed_768k(setup = setup_wire_dot_stuffed_768k)]
     #[bench::folded_headers_768k(setup = setup_wire_folded_headers_768k)]
     fn single_article_parse_path((kind, response): (RequestKind, Vec<u8>)) -> usize {
-        black_box(bench_article_validation_and_parse(
+        black_box(bench_article_validation_and_materialization(
             black_box(kind),
             black_box(&response),
         )
         .unwrap())
     }
 
-    fn setup_plain_64k() -> OwnedResponse {
-        setup_owned_response(BODY_64K, ArticleVariant::PlainBody)
+    fn setup_plain_64k() -> OwnedArticle {
+        setup_owned_article(BODY_64K, ArticleVariant::PlainBody)
     }
 
-    fn setup_dot_stuffed_64k() -> OwnedResponse {
-        setup_owned_response(BODY_64K, ArticleVariant::DotStuffedBody)
+    fn setup_dot_stuffed_64k() -> OwnedArticle {
+        setup_owned_article(BODY_64K, ArticleVariant::DotStuffedBody)
     }
 
-    fn setup_folded_headers_64k() -> OwnedResponse {
-        setup_owned_response(BODY_64K, ArticleVariant::FoldedHeaders)
+    fn setup_folded_headers_64k() -> OwnedArticle {
+        setup_owned_article(BODY_64K, ArticleVariant::FoldedHeaders)
     }
 
-    fn setup_plain_768k() -> OwnedResponse {
-        setup_owned_response(BODY_768K, ArticleVariant::PlainBody)
+    fn setup_plain_768k() -> OwnedArticle {
+        setup_owned_article(BODY_768K, ArticleVariant::PlainBody)
     }
 
-    fn setup_dot_stuffed_768k() -> OwnedResponse {
-        setup_owned_response(BODY_768K, ArticleVariant::DotStuffedBody)
+    fn setup_dot_stuffed_768k() -> OwnedArticle {
+        setup_owned_article(BODY_768K, ArticleVariant::DotStuffedBody)
     }
 
-    fn setup_folded_headers_768k() -> OwnedResponse {
-        setup_owned_response(BODY_768K, ArticleVariant::FoldedHeaders)
+    fn setup_folded_headers_768k() -> OwnedArticle {
+        setup_owned_article(BODY_768K, ArticleVariant::FoldedHeaders)
     }
 
     fn setup_wire_response(size: usize, variant: ArticleVariant) -> (RequestKind, Vec<u8>) {

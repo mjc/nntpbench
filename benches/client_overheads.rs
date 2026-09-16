@@ -6,7 +6,7 @@
 
 use divan::{Bencher, black_box};
 use nntpbench::client::{
-    bench_article_validation_and_parse, bench_article_validation_and_two_parses,
+    bench_article_validation_and_materialization, bench_article_validation_and_two_parses,
     bench_owned_article_accessor_parse, bench_owned_response_from_bytes,
     bench_pending_read_capacity, bench_public_response_decode_chunks,
     bench_public_response_decode_chunks_stateless, bench_streaming_decode_response,
@@ -229,7 +229,7 @@ mod streaming_decode {
 
 mod public_client_experiments {
     use super::{
-        Bencher, RequestKind, bench_article_validation_and_parse,
+        Bencher, RequestKind, bench_article_validation_and_materialization,
         bench_article_validation_and_two_parses, bench_load_read_capacity_in_place,
         bench_owned_article_accessor_parse, bench_owned_response_from_bytes,
         bench_pending_read_capacity, bench_public_response_decode_chunks,
@@ -240,19 +240,20 @@ mod public_client_experiments {
     const BODY_64K: usize = 64 * 1024;
     const BODY_768K: usize = 768 * 1024;
 
-    fn owned_response(size: usize, variant: ArticleVariant) -> nntpbench::OwnedResponse {
+    fn owned_article(size: usize, variant: ArticleVariant) -> nntpbench::OwnedArticle {
         let kind = if matches!(variant, ArticleVariant::FoldedHeaders) {
             RequestKind::Article
         } else {
             RequestKind::Body
         };
         let response = fixtures::article_response(size, variant);
-        bench_owned_response_from_bytes(kind, &response).unwrap()
+        nntpbench::OwnedArticle::try_from(bench_owned_response_from_bytes(kind, &response).unwrap())
+            .unwrap()
     }
 
     fn bench_article_parse_passes(bencher: Bencher, size: usize, variant: ArticleVariant) {
-        let response = owned_response(size, variant);
-        bencher.bench(|| black_box(bench_owned_article_accessor_parse(black_box(&response))));
+        let article = owned_article(size, variant);
+        bencher.bench(|| black_box(bench_owned_article_accessor_parse(black_box(&article))));
     }
 
     fn bench_full_article_parse_path(bencher: Bencher, size: usize, variant: ArticleVariant) {
@@ -278,7 +279,7 @@ mod public_client_experiments {
         };
         let response = fixtures::article_response(size, variant);
         bencher.bench(|| {
-            black_box(bench_article_validation_and_parse(
+            black_box(bench_article_validation_and_materialization(
                 black_box(kind),
                 black_box(&response),
             ))
