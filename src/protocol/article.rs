@@ -585,13 +585,13 @@ mod proptests {
         ) {
             let line = format!("{status} {article_number} {message_id}{suffix}");
 
-            let (parsed_message_id, parsed_number) = parse_first_line(line.as_bytes()).unwrap();
+            let parsed = parse_first_line(line.as_bytes()).unwrap();
             let line_start = line.as_ptr() as usize;
             let line_end = line_start + line.len();
-            prop_assert_eq!(parsed_message_id.as_str(), message_id.as_str());
-            prop_assert!((line_start..line_end).contains(&(parsed_message_id.as_str().as_ptr() as usize)));
+            prop_assert_eq!(parsed.message_id.as_str(), message_id.as_str());
+            prop_assert!((line_start..line_end).contains(&(parsed.message_id.as_str().as_ptr() as usize)));
             prop_assert_eq!(
-                parsed_number,
+                parsed.article_number,
                 Some(ArticleNumber::from(article_number as u64))
             );
         }
@@ -1074,6 +1074,13 @@ struct ValidatedFirstLine {
     article_number: ArticleNumber,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedFirstLine<'a> {
+    message_id: MessageId<'a>,
+    message_id_range: ArticleFrameRange,
+    article_number: Option<ArticleNumber>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HeaderTransformation {
     None,
@@ -1551,7 +1558,9 @@ impl<'a> Article<'a> {
     fn parse_article(buf: &'a [u8]) -> Result<Self, ArticleParseError> {
         let first_line_end =
             strict_crlf_line_content_end_from(buf, 0).ok_or(ArticleParseError::BufferTooShort)?;
-        let (message_id, article_number) = parse_first_line(&buf[..first_line_end])?;
+        let parsed = parse_first_line(&buf[..first_line_end])?;
+        let message_id = parsed.message_id;
+        let article_number = parsed.article_number;
         let content_start = first_line_end + 2;
         let separator_pos = find_blank_line(buf, content_start)?;
         let headers = Some(Headers::parse(&buf[content_start..separator_pos + 2])?);
@@ -1571,7 +1580,9 @@ impl<'a> Article<'a> {
     fn parse_head(buf: &'a [u8]) -> Result<Self, ArticleParseError> {
         let first_line_end =
             strict_crlf_line_content_end_from(buf, 0).ok_or(ArticleParseError::BufferTooShort)?;
-        let (message_id, article_number) = parse_first_line(&buf[..first_line_end])?;
+        let parsed = parse_first_line(&buf[..first_line_end])?;
+        let message_id = parsed.message_id;
+        let article_number = parsed.article_number;
         let content_start = first_line_end + 2;
         if find_blank_line(buf, content_start).is_ok() {
             return Err(ArticleParseError::UnexpectedBody);
@@ -1590,7 +1601,9 @@ impl<'a> Article<'a> {
     fn parse_body(buf: &'a [u8]) -> Result<Self, ArticleParseError> {
         let first_line_end =
             strict_crlf_line_content_end_from(buf, 0).ok_or(ArticleParseError::BufferTooShort)?;
-        let (message_id, article_number) = parse_first_line(&buf[..first_line_end])?;
+        let parsed = parse_first_line(&buf[..first_line_end])?;
+        let message_id = parsed.message_id;
+        let article_number = parsed.article_number;
         let body_start = first_line_end + 2;
         let body_end = find_article_content_end(buf, body_start)
             .ok_or(ArticleParseError::MissingTerminator)?;
@@ -1607,7 +1620,9 @@ impl<'a> Article<'a> {
     fn parse_stat(buf: &'a [u8]) -> Result<Self, ArticleParseError> {
         let first_line_end =
             strict_crlf_line_content_end_from(buf, 0).ok_or(ArticleParseError::BufferTooShort)?;
-        let (message_id, article_number) = parse_first_line(&buf[..first_line_end])?;
+        let parsed = parse_first_line(&buf[..first_line_end])?;
+        let message_id = parsed.message_id;
+        let article_number = parsed.article_number;
         let content_start = first_line_end + 2;
         if content_start != buf.len() {
             return Err(ArticleParseError::UnexpectedBody);
@@ -1723,9 +1738,7 @@ fn parse_status_code(buf: &[u8]) -> Result<u16, ArticleParseError> {
         .ok_or(ArticleParseError::InvalidStatusPrefix)
 }
 
-fn parse_first_line(
-    line: &[u8],
-) -> Result<(MessageId<'_>, Option<ArticleNumber>), ArticleParseError> {
+fn parse_first_line(line: &[u8]) -> Result<ParsedFirstLine<'_>, ArticleParseError> {
     let first_space = memchr::memchr(b' ', line).ok_or(ArticleParseError::InvalidStatusPrefix)?;
     if first_space != 3 {
         return Err(ArticleParseError::InvalidStatusPrefix);
@@ -1752,7 +1765,11 @@ fn parse_first_line(
     let msgid = std::str::from_utf8(&line[msgid_start..msgid_end])
         .map_err(|_| ArticleParseError::InvalidMessageId)?;
 
-    Ok((MessageId::from_borrowed(msgid)?, Some(article_number)))
+    Ok(ParsedFirstLine {
+        message_id: MessageId::from_borrowed(msgid)?,
+        message_id_range: ArticleFrameRange::new(msgid_start, msgid_end)?,
+        article_number: Some(article_number),
+    })
 }
 
 fn validate_first_line(
@@ -1760,22 +1777,21 @@ fn validate_first_line(
     first_line: ArticleFrameRange,
 ) -> Result<ValidatedFirstLine, ArticleParseError> {
     let line = first_line.slice(buffer)?;
-    let (_, article_number) = parse_first_line(line)?;
-    let first_space = memchr::memchr(b' ', line).ok_or(ArticleParseError::InvalidStatusPrefix)?;
-    let second_space = memchr::memchr(b' ', &line[first_space + 1..])
-        .map(|pos| first_space + 1 + pos)
-        .ok_or(ArticleParseError::InvalidArticleNumber)?;
+    let parsed = parse_first_line(line)?;
     let message_start = first_line
         .start
-        .checked_add(second_space + 1)
+        .checked_add(parsed.message_id_range.start)
         .ok_or(ArticleParseError::BufferTooShort)?;
-    let message_end = memchr::memchr(b'>', &line[second_space + 1..])
-        .and_then(|pos| message_start.checked_add(pos + 1))
-        .ok_or(ArticleParseError::InvalidMessageId)?;
+    let message_end = first_line
+        .start
+        .checked_add(parsed.message_id_range.end)
+        .ok_or(ArticleParseError::BufferTooShort)?;
 
     Ok(ValidatedFirstLine {
         message_id: ArticleFrameRange::new(message_start, message_end)?,
-        article_number: article_number.ok_or(ArticleParseError::InvalidArticleNumber)?,
+        article_number: parsed
+            .article_number
+            .ok_or(ArticleParseError::InvalidArticleNumber)?,
     })
 }
 
