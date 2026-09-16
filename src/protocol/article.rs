@@ -2310,4 +2310,44 @@ Actual body content\r\n\
         assert!((original_start..original_end).contains(&headers_ptr));
         assert!((original_start..original_end).contains(&body_ptr));
     }
+
+    #[test]
+    fn compatibility_fixture_matrix_records_strict_article_contract() {
+        let fixtures = [
+            (VALID_ARTICLE_TEXT, Some(ArticleNumber(12345)), true, true),
+            (VALID_HEAD, Some(ArticleNumber(12345)), true, false),
+            (VALID_BODY, Some(ArticleNumber(12345)), false, true),
+            (VALID_STAT, Some(ArticleNumber(12345)), false, false),
+            (
+                b"222 0 <empty@example.com>\r\n.\r\n".as_slice(),
+                Some(ArticleNumber(0)),
+                false,
+                true,
+            ),
+        ];
+
+        for (wire, article_number, has_headers, has_body) in fixtures {
+            let article = Article::parse(wire).expect("nntpbench fixture remains accepted");
+            assert_eq!(article.article_number, article_number);
+            assert_eq!(article.headers.is_some(), has_headers);
+            assert_eq!(article.body.is_some(), has_body);
+        }
+    }
+
+    #[test]
+    fn compatibility_fixture_matrix_keeps_strict_article_number_behavior() {
+        for number in [b"not-a-number".as_slice(), b"18446744073709551616"] {
+            let wire = [
+                b"220 ".as_slice(),
+                number,
+                b" <fixture@example.com>\r\nSubject: fixture\r\n\r\nbody\r\n.\r\n",
+            ]
+            .concat();
+
+            assert_eq!(
+                Article::parse(&wire),
+                Err(ArticleParseError::InvalidArticleNumber)
+            );
+        }
+    }
 }
