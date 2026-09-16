@@ -59,12 +59,8 @@ The equivalent proxy operation borrows a pooled window and streams it; it does
 not need whole-article ownership. Mutable operations consume their permission;
 immutable validated views remain reusable in both designs.
 
-Run the compiler contract checks explicitly (positive controls plus exact
-expected borrow/move/type errors), alongside nextest and doctests:
-
-```bash
-nix develop -c bash scripts/check-response-contracts.sh
-```
+The ownership contracts are exercised by the compile-fail doctests and the
+fragmentation/ownership tests in the normal Rust test suite.
 
 ## Profiling
 
