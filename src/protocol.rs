@@ -2801,7 +2801,7 @@ fn validate_response_content<'a>(
         | (RequestKind::Head, 221)
         | (RequestKind::Body, 222)
         | (RequestKind::Stat, 223) => {
-            return Article::validate_article_frame(frame, content_start, content_end)
+            return Article::validate_framed_article(frame, content_start, content_end)
                 .map(ValidatedResponseContent::Article)
                 .ok();
         }

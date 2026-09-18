@@ -1366,15 +1366,16 @@ impl ValidatedOwnedArticle {
 }
 
 /// Bounds supplied by the response framer for an article-family response.
-#[derive(Debug, Clone, Copy)]
-struct FramedArticle {
+#[derive(Debug, Clone)]
+struct FramedArticle<'a> {
+    buffer: &'a [u8],
     first_line: ArticleFrameRange,
     content: ArticleFrameRange,
 }
 
-impl FramedArticle {
+impl<'a> FramedArticle<'a> {
     fn from_content_bounds(
-        buffer: &[u8],
+        buffer: &'a [u8],
         content_start: usize,
         content_end: usize,
     ) -> Result<Self, ArticleParseError> {
@@ -1393,27 +1394,46 @@ impl FramedArticle {
         }
 
         Ok(Self {
+            buffer,
             first_line,
             content: ArticleFrameRange::new(content_start, content_end)?,
         })
     }
 
-    fn content_prefix(self, buffer: &[u8]) -> Result<&[u8], ArticleParseError> {
-        buffer
+    fn content_prefix(&self) -> Result<&[u8], ArticleParseError> {
+        self.buffer
             .get(..self.content.end)
             .ok_or(ArticleParseError::BufferTooShort)
     }
 
-    fn validate_article_content(
-        self,
-        buffer: &[u8],
-    ) -> Result<ValidatedArticleContent, ArticleParseError> {
-        let separator = find_blank_line(self.content_prefix(buffer)?, self.content.start)?;
+    fn validate(self) -> Result<ValidatedArticleView<'a>, ArticleParseError> {
+        let buffer = self.buffer;
+        let first_line = validate_first_line(buffer, self.first_line)?;
+
+        let content = match parse_status_code(buffer)? {
+            220 => self.validate_article_content(),
+            221 => self.validate_head_content(),
+            222 => self.validate_body_content(),
+            223 => self.validate_stat_content(),
+            status_code => Err(ArticleParseError::InvalidStatusCode(status_code)),
+        }?;
+
+        Ok(ValidatedArticleView {
+            buffer,
+            layout: ArticleLayout {
+                first_line,
+                content,
+            },
+        })
+    }
+
+    fn validate_article_content(self) -> Result<ValidatedArticleContent, ArticleParseError> {
+        let separator = find_blank_line(self.content_prefix()?, self.content.start)?;
         let headers_end = separator
             .checked_add(crate::CRLF.len())
             .ok_or(ArticleParseError::BufferTooShort)?;
         let headers = ArticleFrameRange::new(self.content.start, headers_end)?;
-        let header_transformation = validate_headers(headers.slice(buffer)?)?;
+        let header_transformation = validate_headers(headers.slice(self.buffer)?)?;
 
         let body_start = headers_end
             .checked_add(crate::CRLF.len())
@@ -1422,7 +1442,7 @@ impl FramedArticle {
             return Err(ArticleParseError::BufferTooShort);
         }
         let body = ArticleFrameRange::new(body_start, self.content.end)?;
-        let body_transformation = validate_body_content(body.slice(buffer)?)?;
+        let body_transformation = validate_body_content(body.slice(self.buffer)?)?;
 
         Ok(ValidatedArticleContent::Article {
             headers,
@@ -1432,14 +1452,11 @@ impl FramedArticle {
         })
     }
 
-    fn validate_head_content(
-        self,
-        buffer: &[u8],
-    ) -> Result<ValidatedArticleContent, ArticleParseError> {
-        if find_blank_line(self.content_prefix(buffer)?, self.content.start).is_ok() {
+    fn validate_head_content(self) -> Result<ValidatedArticleContent, ArticleParseError> {
+        if find_blank_line(self.content_prefix()?, self.content.start).is_ok() {
             return Err(ArticleParseError::UnexpectedBody);
         }
-        let header_transformation = validate_headers(self.content.slice(buffer)?)?;
+        let header_transformation = validate_headers(self.content.slice(self.buffer)?)?;
 
         Ok(ValidatedArticleContent::Head {
             headers: self.content,
@@ -1447,11 +1464,8 @@ impl FramedArticle {
         })
     }
 
-    fn validate_body_content(
-        self,
-        buffer: &[u8],
-    ) -> Result<ValidatedArticleContent, ArticleParseError> {
-        let body_transformation = validate_body_content(self.content.slice(buffer)?)?;
+    fn validate_body_content(self) -> Result<ValidatedArticleContent, ArticleParseError> {
+        let body_transformation = validate_body_content(self.content.slice(self.buffer)?)?;
 
         Ok(ValidatedArticleContent::Body {
             body: self.content,
@@ -1654,34 +1668,20 @@ impl<'a> Article<'a> {
         content_start: usize,
         content_end: usize,
     ) -> Result<Self, ArticleParseError> {
-        let validated = Self::validate_article_frame(buf, content_start, content_end)?;
+        let validated = Self::validate_framed_article(buf, content_start, content_end)?;
         Ok(validated.materialize())
     }
 
     /// Validate a framed article without constructing unfolded or unstuffed data.
-    pub(crate) fn validate_article_frame(
+    ///
+    /// The private framed handle keeps the bytes and their checked ranges
+    /// together until validation has produced the reusable article view.
+    pub(crate) fn validate_framed_article(
         buf: &'a [u8],
         content_start: usize,
         content_end: usize,
     ) -> Result<ValidatedArticleView<'a>, ArticleParseError> {
-        let frame = FramedArticle::from_content_bounds(buf, content_start, content_end)?;
-        let first_line = validate_first_line(buf, frame.first_line)?;
-
-        let content = match parse_status_code(buf)? {
-            220 => frame.validate_article_content(buf),
-            221 => frame.validate_head_content(buf),
-            222 => frame.validate_body_content(buf),
-            223 => frame.validate_stat_content(),
-            status_code => Err(ArticleParseError::InvalidStatusCode(status_code)),
-        }?;
-
-        Ok(ValidatedArticleView {
-            buffer: buf,
-            layout: ArticleLayout {
-                first_line,
-                content,
-            },
-        })
+        FramedArticle::from_content_bounds(buf, content_start, content_end)?.validate()
     }
 
     fn parse_article(buf: &'a [u8]) -> Result<Self, ArticleParseError> {
@@ -2142,7 +2142,7 @@ Actual body content\r\n\
                 find_article_content_end(frame, content_start).unwrap()
             };
             let validated =
-                Article::validate_article_frame(frame, content_start, content_end).unwrap();
+                Article::validate_framed_article(frame, content_start, content_end).unwrap();
             let reused = validated.materialize();
             assert_eq!(reused, Article::parse(frame).unwrap());
         }
@@ -2154,7 +2154,7 @@ Actual body content\r\n\
         let content_start = strict_crlf_line_content_end_from(&bytes, 0).unwrap() + 2;
         let content_end = find_article_content_end(&bytes, content_start).unwrap();
         let validated =
-            Article::validate_article_frame(&bytes, content_start, content_end).unwrap();
+            Article::validate_framed_article(&bytes, content_start, content_end).unwrap();
         let owned = validated.into_owned(bytes.clone());
 
         assert_eq!(owned.bytes(), VALID_BODY);
