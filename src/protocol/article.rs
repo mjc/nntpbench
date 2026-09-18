@@ -1045,7 +1045,7 @@ impl From<u64> for ArticleNumber {
 /// The storage adapters remain local to each repository. These state names
 /// describe the guarantees, not a common allocation type.
 pub(crate) mod state {
-    use super::{RequestKind, StatusCode, ValidatedArticle};
+    use super::{ArticleLayout, RequestKind, StatusCode};
 
     /// An article operation in one protocol-owned state.
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1061,7 +1061,25 @@ pub(crate) mod state {
     }
 
     /// Semantic validation state for stable bytes and its private layout.
-    pub(crate) type Validated<B> = ValidatedArticle<B>;
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) struct Validated<B> {
+        bytes: B,
+        layout: ArticleLayout,
+    }
+
+    impl<B> Validated<B> {
+        pub(super) const fn new(bytes: B, layout: ArticleLayout) -> Self {
+            Self { bytes, layout }
+        }
+
+        pub(super) fn bytes(&self) -> &B {
+            &self.bytes
+        }
+
+        pub(super) fn layout(&self) -> &ArticleLayout {
+            &self.layout
+        }
+    }
 }
 
 /// A byte range proven to lie within a validated article frame.
@@ -1169,13 +1187,6 @@ pub(crate) struct ValidatedArticleView<'a> {
     layout: ArticleLayout,
 }
 
-/// Immutable article bytes and the layout validated for those bytes.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ValidatedArticle<B> {
-    bytes: B,
-    layout: ArticleLayout,
-}
-
 /// Owned validated article state used by the buffered client.
 pub(crate) type ValidatedOwnedArticle = state::Article<state::Validated<Bytes>>;
 
@@ -1187,30 +1198,22 @@ impl<'a> ValidatedArticleView<'a> {
     pub(crate) fn into_owned(self, bytes: Bytes) -> ValidatedOwnedArticle {
         assert_eq!(self.buffer.as_ptr(), bytes.as_ptr());
         assert_eq!(self.buffer.len(), bytes.len());
-        state::Article(ValidatedArticle {
-            bytes,
-            layout: self.layout,
-        })
+        state::Article(state::Validated::new(bytes, self.layout))
     }
 }
 
-impl ValidatedArticle<Bytes> {
-    #[must_use]
-    pub(crate) fn bytes(&self) -> &[u8] {
-        &self.bytes
-    }
-
+impl state::Validated<Bytes> {
     #[must_use]
     pub(crate) fn content(&self) -> &[u8] {
-        self.layout
+        self.layout()
             .content_range()
-            .slice(&self.bytes)
+            .slice(self.bytes())
             .expect("owned article preserves its validated content range")
     }
 
     #[must_use]
     pub(crate) fn materialize(&self) -> Article<'_> {
-        Article::materialize_validated_article(&self.bytes, self.layout)
+        Article::materialize_validated_article(self.bytes(), *self.layout())
     }
 }
 
