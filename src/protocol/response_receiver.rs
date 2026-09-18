@@ -5,8 +5,9 @@ use bytes::{Bytes, BytesMut};
 use tokio::io::AsyncRead;
 
 use super::{
-    Article, ArticleParseError, RequestKind, ResponseFrameDecoder, ResponseFrameParse,
-    ResponseInitialParse, StatusCode, ValidatedOwnedArticle, ValidatedResponseContent,
+    Article, ArticleParseError, ArticleState, FramedArticleState, RequestKind,
+    ResponseFrameDecoder, ResponseFrameParse, ResponseInitialParse, StatusCode,
+    ValidatedOwnedArticle, ValidatedResponseContent,
 };
 use crate::client::{ClientError, OWNED_RESPONSE_PREALLOC_BYTES, read_into_pending_bytes};
 use crate::terminator::{MultilineFrameProgress, MultilineFramer};
@@ -85,10 +86,13 @@ impl<R: AsyncRead + Unpin> PendingResponse<'_, R> {
                 bounds,
             } => {
                 let framed = FramedResponse {
-                    bytes: frame_end.extract(&mut self.receiver.pending),
+                    framed: ArticleState(FramedArticleState {
+                        bytes: frame_end.extract(&mut self.receiver.pending),
+                        kind: self.decoder.streaming.kind,
+                        status,
+                        bounds,
+                    }),
                     decoder: &self.decoder,
-                    status,
-                    bounds,
                 };
                 let response = framed.validate()?;
                 self.receiver.state = ReceiverState::Ready;
@@ -141,25 +145,24 @@ fn receive_fragments(
 /// Framing authorizes extraction only. Semantic validation consumes the owned
 /// wire frame before an article layout can be exposed.
 struct FramedResponse<'a> {
-    bytes: Bytes,
+    framed: ArticleState<FramedArticleState<Bytes>>,
     decoder: &'a ResponseDecoder,
-    status: StatusCode,
-    bounds: Option<crate::terminator::MultilineFrameBounds>,
 }
 
 impl FramedResponse<'_> {
     fn validate(self) -> Result<OwnedResponse, ClientError> {
+        let ArticleState(framed) = self.framed;
         let ResponseFrameParse::Complete(frame) =
             self.decoder
-                .validate_frame(&self.bytes, self.status, self.bounds)
+                .validate_frame(&framed.bytes, framed.status, framed.bounds)
         else {
             return Err(ClientError::InvalidStatusLine);
         };
         Ok(OwnedResponse {
-            kind: self.decoder.streaming.kind,
+            kind: framed.kind,
             status: frame.status(),
             content: OwnedResponseContent::from_frame(
-                self.bytes.clone(),
+                framed.bytes.clone(),
                 frame.content_start(),
                 frame.content_end(),
                 frame.content_validation(),

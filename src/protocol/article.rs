@@ -5,7 +5,8 @@ use std::{borrow::Cow, fmt};
 use bytes::Bytes;
 
 use super::{
-    InvalidMessageId, MAX_ARTICLE_NUMBER, MessageId, StatusCode, validate_optional_trailing_comment,
+    InvalidMessageId, MAX_ARTICLE_NUMBER, MessageId, RequestKind, StatusCode,
+    validate_optional_trailing_comment,
 };
 use crate::terminator::{
     DOT_TERMINATOR, find_terminator_content_end, strict_crlf_line_content_end_from,
@@ -1039,6 +1040,30 @@ impl From<u64> for ArticleNumber {
     }
 }
 
+/// Resource-bound response states shared with the proxy's article boundary.
+///
+/// The storage adapters remain local to each repository. These state names
+/// describe the guarantees, not a common allocation type.
+pub(crate) mod state {
+    use super::{RequestKind, StatusCode, ValidatedArticle};
+
+    /// An article operation in one protocol-owned state.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) struct Article<State>(pub(crate) State);
+
+    /// A complete wire response retained by an adapter owner.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) struct Framed<B> {
+        pub(crate) bytes: B,
+        pub(crate) kind: RequestKind,
+        pub(crate) status: StatusCode,
+        pub(crate) bounds: Option<crate::terminator::MultilineFrameBounds>,
+    }
+
+    /// Semantic validation state for stable bytes and its private layout.
+    pub(crate) type Validated<B> = ValidatedArticle<B>;
+}
+
 /// A byte range proven to lie within a validated article frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ArticleFrameRange {
@@ -1152,7 +1177,7 @@ pub(crate) struct ValidatedArticle<B> {
 }
 
 /// Owned validated article state used by the buffered client.
-pub(crate) type ValidatedOwnedArticle = ValidatedArticle<Bytes>;
+pub(crate) type ValidatedOwnedArticle = state::Article<state::Validated<Bytes>>;
 
 impl<'a> ValidatedArticleView<'a> {
     pub(crate) fn materialize(self) -> Article<'a> {
@@ -1162,10 +1187,10 @@ impl<'a> ValidatedArticleView<'a> {
     pub(crate) fn into_owned(self, bytes: Bytes) -> ValidatedOwnedArticle {
         assert_eq!(self.buffer.as_ptr(), bytes.as_ptr());
         assert_eq!(self.buffer.len(), bytes.len());
-        ValidatedOwnedArticle {
+        state::Article(ValidatedArticle {
             bytes,
             layout: self.layout,
-        }
+        })
     }
 }
 
@@ -1186,6 +1211,23 @@ impl ValidatedArticle<Bytes> {
     #[must_use]
     pub(crate) fn materialize(&self) -> Article<'_> {
         Article::materialize_validated_article(&self.bytes, self.layout)
+    }
+}
+
+impl ValidatedOwnedArticle {
+    #[must_use]
+    pub(crate) fn bytes(&self) -> &[u8] {
+        self.0.bytes()
+    }
+
+    #[must_use]
+    pub(crate) fn content(&self) -> &[u8] {
+        self.0.content()
+    }
+
+    #[must_use]
+    pub(crate) fn materialize(&self) -> Article<'_> {
+        self.0.materialize()
     }
 }
 
