@@ -53,7 +53,7 @@ impl<R: AsyncRead + Unpin> BufferedResponseReceiver<R> {
         read_chunk_bytes: usize,
     ) -> Result<OwnedResponse, ClientError> {
         self.start_response()?;
-        let mut response = ArticleState(ReceivingResponse {
+        let mut response = ArticleState::new(ReceivingResponse {
             receiver: self,
             decoder: ResponseDecoder::new(kind),
         });
@@ -61,9 +61,10 @@ impl<R: AsyncRead + Unpin> BufferedResponseReceiver<R> {
             if let Some(completed) = response.extract()? {
                 return Ok(completed);
             }
+            let receiving = response.as_inner_mut();
             if read_into_pending_bytes(
-                &mut response.0.receiver.reader,
-                &mut response.0.receiver.pending,
+                &mut receiving.receiver.reader,
+                &mut receiving.receiver.pending,
                 read_chunk_bytes,
             )
             .await?
@@ -102,7 +103,7 @@ impl<R: AsyncRead + Unpin> ReceivingResponse<'_, R> {
 
 impl<R: AsyncRead + Unpin> ArticleState<ReceivingResponse<'_, R>> {
     fn extract(&mut self) -> Result<Option<OwnedResponse>, ClientError> {
-        self.0.extract()
+        self.as_inner_mut().extract()
     }
 }
 
@@ -133,12 +134,16 @@ fn receive_fragments(
         state: ReceiverState::Ready,
     };
     receiver.start_response()?;
-    let mut pending = ArticleState(ReceivingResponse {
+    let mut pending = ArticleState::new(ReceivingResponse {
         receiver: &mut receiver,
         decoder: ResponseDecoder::new(kind),
     });
     for chunk in response.chunks(chunk_bytes.max(1)) {
-        pending.0.receiver.pending.extend_from_slice(chunk);
+        pending
+            .as_inner_mut()
+            .receiver
+            .pending
+            .extend_from_slice(chunk);
         if let Some(response) = pending.extract()? {
             return Ok(response);
         }
@@ -157,22 +162,22 @@ struct FramedResponse {
 
 impl FramedResponse {
     fn validate(self) -> Result<OwnedResponse, ClientError> {
-        let ArticleState(framed) = self.framed;
-        let ResponseFrameParse::Complete(frame) = ResponseFrameDecoder::new(framed.kind)
+        let framed = self.framed.into_inner();
+        let ResponseFrameParse::Complete(frame) = ResponseFrameDecoder::new(framed.kind())
             .complete_with_bounds(
-                &framed.bytes,
-                framed.status,
+                framed.bytes(),
+                framed.status(),
                 self.status_line_end.get(),
-                framed.bounds,
+                framed.bounds(),
             )
         else {
             return Err(ClientError::InvalidStatusLine);
         };
         Ok(OwnedResponse {
-            kind: framed.kind,
+            kind: framed.kind(),
             status: frame.status(),
             content: OwnedResponseContent::from_frame(
-                framed.bytes.clone(),
+                framed.bytes().clone(),
                 frame.content_start(),
                 frame.content_end(),
                 frame.content_validation(),
@@ -695,12 +700,12 @@ impl ResponseDecoder {
         };
 
         Ok(Some(FramedResponse {
-            framed: ArticleState(FramedArticleState {
-                bytes: frame_end.extract(pending),
-                kind: self.streaming.kind,
+            framed: ArticleState::new(FramedArticleState::new(
+                frame_end.extract(pending),
+                self.streaming.kind,
                 status,
                 bounds,
-            }),
+            )),
             status_line_end: self.streaming.status_line_end(),
         }))
     }

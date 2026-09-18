@@ -1049,15 +1049,65 @@ pub(crate) mod state {
 
     /// An article operation in one protocol-owned state.
     #[derive(Debug, Clone, PartialEq, Eq)]
-    pub(crate) struct Article<State>(pub(crate) State);
+    pub(crate) struct Article<State>(State);
+
+    impl<State> Article<State> {
+        pub(crate) const fn new(state: State) -> Self {
+            Self(state)
+        }
+
+        pub(crate) const fn as_inner(&self) -> &State {
+            &self.0
+        }
+
+        pub(crate) fn as_inner_mut(&mut self) -> &mut State {
+            &mut self.0
+        }
+
+        pub(crate) fn into_inner(self) -> State {
+            self.0
+        }
+    }
 
     /// A complete wire response retained by an adapter owner.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub(crate) struct Framed<B> {
-        pub(crate) bytes: B,
-        pub(crate) kind: RequestKind,
-        pub(crate) status: StatusCode,
-        pub(crate) bounds: Option<crate::terminator::MultilineFrameBounds>,
+        bytes: B,
+        kind: RequestKind,
+        status: StatusCode,
+        bounds: Option<crate::terminator::MultilineFrameBounds>,
+    }
+
+    impl<B> Framed<B> {
+        pub(crate) const fn new(
+            bytes: B,
+            kind: RequestKind,
+            status: StatusCode,
+            bounds: Option<crate::terminator::MultilineFrameBounds>,
+        ) -> Self {
+            Self {
+                bytes,
+                kind,
+                status,
+                bounds,
+            }
+        }
+
+        pub(crate) fn bytes(&self) -> &B {
+            &self.bytes
+        }
+
+        pub(crate) const fn kind(&self) -> RequestKind {
+            self.kind
+        }
+
+        pub(crate) const fn status(&self) -> StatusCode {
+            self.status
+        }
+
+        pub(crate) const fn bounds(&self) -> Option<crate::terminator::MultilineFrameBounds> {
+            self.bounds
+        }
     }
 
     /// Semantic validation state for stable bytes and its private layout.
@@ -1257,7 +1307,7 @@ impl<'a> ValidatedArticleView<'a> {
     pub(crate) fn into_owned(self, bytes: Bytes) -> ValidatedOwnedArticle {
         assert_eq!(self.buffer.as_ptr(), bytes.as_ptr());
         assert_eq!(self.buffer.len(), bytes.len());
-        state::Article(state::Validated::new(bytes, self.layout))
+        state::Article::new(state::Validated::new(bytes, self.layout))
     }
 }
 
@@ -1279,17 +1329,17 @@ impl state::Validated<Bytes> {
 impl ValidatedOwnedArticle {
     #[must_use]
     pub(crate) fn bytes(&self) -> &[u8] {
-        self.0.bytes()
+        self.as_inner().bytes()
     }
 
     #[must_use]
     pub(crate) fn content(&self) -> &[u8] {
-        self.0.content()
+        self.as_inner().content()
     }
 
     #[must_use]
     pub(crate) fn materialize(&self) -> Article<'_> {
-        self.0.materialize()
+        self.as_inner().materialize()
     }
 }
 
