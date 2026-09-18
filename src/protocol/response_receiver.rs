@@ -856,7 +856,7 @@ impl StreamingResponseDecoder {
         match self.framer.push(content_chunk) {
             MultilineFrameProgress::Complete(bounds) => Ok(StreamingDecodeProgress::Complete {
                 status,
-                consumed: ChunkConsumed(content_start + bounds.chunk_consumed()),
+                consumed: ChunkConsumed(content_start + bounds.chunk_consumed().get()),
                 bounds: Some(bounds),
             }),
             MultilineFrameProgress::NeedMore => Ok(StreamingDecodeProgress::NeedMore {

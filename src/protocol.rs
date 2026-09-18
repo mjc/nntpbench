@@ -283,8 +283,8 @@ impl ResponseFrameDecoder {
     ) -> ResponseFrameParse<'a> {
         let (content_end, consumed) = bounds.map_or((status_line_end, status_line_end), |bounds| {
             (
-                status_line_end + bounds.content_end(),
-                status_line_end + bounds.body_consumed(),
+                status_line_end + bounds.content_end().get(),
+                status_line_end + bounds.body_consumed().get(),
             )
         });
         let Some(status_line) = buffer.get(..status_line_end) else {
@@ -6177,7 +6177,7 @@ mod tests {
         assert_eq!(response.content(), b"body line\r\n");
         assert_eq!(
             response.consumed(),
-            status_line_end + bounds.body_consumed()
+            status_line_end + bounds.body_consumed().get()
         );
     }
 

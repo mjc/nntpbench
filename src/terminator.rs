@@ -303,33 +303,63 @@ pub enum EmptyTerminatorStatus {
 
 /// Offsets produced only after the multiline framer has found a complete frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BodyConsumed(usize);
+
+impl BodyConsumed {
+    #[must_use]
+    pub(crate) const fn get(self) -> usize {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ChunkConsumed(usize);
+
+impl ChunkConsumed {
+    #[must_use]
+    pub(crate) const fn get(self) -> usize {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BodyContentEnd(usize);
+
+impl BodyContentEnd {
+    #[must_use]
+    pub(crate) const fn get(self) -> usize {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MultilineFrameBounds {
-    body_consumed: usize,
-    chunk_consumed: usize,
-    content_end: usize,
+    body_consumed: BodyConsumed,
+    chunk_consumed: ChunkConsumed,
+    content_end: BodyContentEnd,
 }
 
 impl MultilineFrameBounds {
     const fn new(body_consumed: usize, chunk_consumed: usize, content_end: usize) -> Self {
         Self {
-            body_consumed,
-            chunk_consumed,
-            content_end,
+            body_consumed: BodyConsumed(body_consumed),
+            chunk_consumed: ChunkConsumed(chunk_consumed),
+            content_end: BodyContentEnd(content_end),
         }
     }
 
     #[must_use]
-    pub(crate) const fn body_consumed(self) -> usize {
+    pub(crate) const fn body_consumed(self) -> BodyConsumed {
         self.body_consumed
     }
 
     #[must_use]
-    pub(crate) const fn chunk_consumed(self) -> usize {
+    pub(crate) const fn chunk_consumed(self) -> ChunkConsumed {
         self.chunk_consumed
     }
 
     #[must_use]
-    pub(crate) const fn content_end(self) -> usize {
+    pub(crate) const fn content_end(self) -> BodyContentEnd {
         self.content_end
     }
 }
