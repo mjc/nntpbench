@@ -78,27 +78,12 @@ struct ReceivingResponse<'a, R> {
 
 impl<R: AsyncRead + Unpin> ReceivingResponse<'_, R> {
     fn extract(&mut self) -> Result<Option<OwnedResponse>, ClientError> {
-        match self.decoder.push_framing(&self.receiver.pending)? {
-            FramingDecodeProgress::NeedMore => Ok(None),
-            FramingDecodeProgress::Complete {
-                status,
-                frame_end,
-                bounds,
-            } => {
-                let framed = FramedResponse {
-                    framed: ArticleState(FramedArticleState {
-                        bytes: frame_end.extract(&mut self.receiver.pending),
-                        kind: self.decoder.streaming.kind,
-                        status,
-                        bounds,
-                    }),
-                    decoder: &self.decoder,
-                };
-                let response = framed.validate()?;
-                self.receiver.state = ReceiverState::Ready;
-                Ok(Some(response))
-            }
-        }
+        let Some(framed) = self.decoder.extract_framed(&mut self.receiver.pending)? else {
+            return Ok(None);
+        };
+        let response = framed.validate()?;
+        self.receiver.state = ReceiverState::Ready;
+        Ok(Some(response))
     }
 }
 
@@ -647,6 +632,33 @@ impl ResponseDecoder {
                 bounds,
             }),
         }
+    }
+
+    /// Complete and extract one frame while its decoder still owns the
+    /// request-scoped framing state. Callers receive a framed state object,
+    /// not independently pairable offsets and status metadata.
+    fn extract_framed<'a>(
+        &'a mut self,
+        pending: &mut BytesMut,
+    ) -> Result<Option<FramedResponse<'a>>, ClientError> {
+        let FramingDecodeProgress::Complete {
+            status,
+            frame_end,
+            bounds,
+        } = self.push_framing(pending)?
+        else {
+            return Ok(None);
+        };
+
+        Ok(Some(FramedResponse {
+            framed: ArticleState(FramedArticleState {
+                bytes: frame_end.extract(pending),
+                kind: self.streaming.kind,
+                status,
+                bounds,
+            }),
+            decoder: self,
+        }))
     }
 
     fn validate_frame<'a>(
