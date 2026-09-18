@@ -274,7 +274,19 @@ impl ResponseFrameDecoder {
         ResponseFrame::parse(self.kind, buffer)
     }
 
-    fn complete_with_bounds<'a>(
+    fn complete_framed<'a>(
+        self,
+        framed: &'a FramedArticleState<bytes::Bytes>,
+    ) -> ResponseFrameParse<'a> {
+        self.complete_with_metadata(
+            framed.as_bytes(),
+            framed.status(),
+            framed.status_line_end(),
+            framed.bounds(),
+        )
+    }
+
+    fn complete_with_metadata<'a>(
         self,
         buffer: &'a [u8],
         status: StatusCode,
@@ -6169,13 +6181,15 @@ mod tests {
                 }
             };
 
-        let ResponseFrameParse::Complete(response) = ResponseFrameDecoder::new(RequestKind::Body)
-            .complete_with_bounds(
-                wire,
-                status,
-                StatusLineEnd::new(status_line_end),
-                Some(bounds),
-            )
+        let framed = FramedArticleState::new(
+            bytes::Bytes::copy_from_slice(wire),
+            RequestKind::Body,
+            status,
+            Some(bounds),
+            StatusLineEnd::new(status_line_end),
+        );
+        let ResponseFrameParse::Complete(response) =
+            ResponseFrameDecoder::new(RequestKind::Body).complete_framed(&framed)
         else {
             panic!("precomputed response frame did not parse");
         };

@@ -155,13 +155,8 @@ struct FramedResponse {
 impl FramedResponse {
     fn validate(self) -> Result<OwnedResponse, ClientError> {
         let framed = self.framed.into_inner();
-        let ResponseFrameParse::Complete(frame) = ResponseFrameDecoder::new(framed.kind())
-            .complete_with_bounds(
-                framed.bytes(),
-                framed.status(),
-                framed.status_line_end(),
-                framed.bounds(),
-            )
+        let ResponseFrameParse::Complete(frame) =
+            ResponseFrameDecoder::new(framed.kind()).complete_framed(&framed)
         else {
             return Err(ClientError::InvalidStatusLine);
         };

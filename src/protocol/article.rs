@@ -1132,6 +1132,12 @@ pub(crate) mod state {
         }
     }
 
+    impl Framed<bytes::Bytes> {
+        pub(crate) fn as_bytes(&self) -> &[u8] {
+            self.bytes.as_ref()
+        }
+    }
+
     /// Semantic validation state for stable bytes and its private layout.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub(crate) struct Validated<B> {
