@@ -5,8 +5,9 @@ use bytes::{Bytes, BytesMut};
 use tokio::io::AsyncRead;
 
 use super::{
-    Article, ArticleParseError, RequestKind, ResponseFrameDecoder, ResponseFrameParse,
-    ResponseInitialParse, StatusCode, ValidatedOwnedArticle, ValidatedResponseContent,
+    Article, ArticleParseError, ArticleState, FramedArticleState, RequestKind,
+    ResponseFrameDecoder, ResponseFrameParse, ResponseInitialParse, StatusCode,
+    ValidatedOwnedArticle, ValidatedResponseContent,
 };
 use crate::client::{ClientError, OWNED_RESPONSE_PREALLOC_BYTES, read_into_pending_bytes};
 use crate::terminator::{MultilineFrameProgress, MultilineFramer};
@@ -39,17 +40,17 @@ impl<R: AsyncRead + Unpin> BufferedResponseReceiver<R> {
         read_chunk_bytes: usize,
     ) -> Result<OwnedResponse, ClientError> {
         self.start_response()?;
-        let mut response = PendingResponse {
+        let mut response = ArticleState(ReceivingResponse {
             receiver: self,
             decoder: ResponseDecoder::new(kind),
-        };
+        });
         loop {
             if let Some(completed) = response.extract()? {
                 return Ok(completed);
             }
             if read_into_pending_bytes(
-                &mut response.receiver.reader,
-                &mut response.receiver.pending,
+                &mut response.0.receiver.reader,
+                &mut response.0.receiver.pending,
                 read_chunk_bytes,
             )
             .await?
@@ -70,31 +71,25 @@ impl<R: AsyncRead + Unpin> BufferedResponseReceiver<R> {
 }
 
 /// Exclusive access keeps accumulated scanner state attached to its input.
-struct PendingResponse<'a, R> {
+struct ReceivingResponse<'a, R> {
     receiver: &'a mut BufferedResponseReceiver<R>,
     decoder: ResponseDecoder,
 }
 
-impl<R: AsyncRead + Unpin> PendingResponse<'_, R> {
+impl<R: AsyncRead + Unpin> ReceivingResponse<'_, R> {
     fn extract(&mut self) -> Result<Option<OwnedResponse>, ClientError> {
-        match self.decoder.push_framing(&self.receiver.pending)? {
-            FramingDecodeProgress::NeedMore => Ok(None),
-            FramingDecodeProgress::Complete {
-                status,
-                frame_end,
-                bounds,
-            } => {
-                let framed = FramedResponse {
-                    bytes: frame_end.extract(&mut self.receiver.pending),
-                    decoder: &self.decoder,
-                    status,
-                    bounds,
-                };
-                let response = framed.validate()?;
-                self.receiver.state = ReceiverState::Ready;
-                Ok(Some(response))
-            }
-        }
+        let Some(framed) = self.decoder.extract_framed(&mut self.receiver.pending)? else {
+            return Ok(None);
+        };
+        let response = framed.validate()?;
+        self.receiver.state = ReceiverState::Ready;
+        Ok(Some(response))
+    }
+}
+
+impl<R: AsyncRead + Unpin> ArticleState<ReceivingResponse<'_, R>> {
+    fn extract(&mut self) -> Result<Option<OwnedResponse>, ClientError> {
+        self.0.extract()
     }
 }
 
@@ -125,12 +120,12 @@ fn receive_fragments(
         state: ReceiverState::Ready,
     };
     receiver.start_response()?;
-    let mut pending = PendingResponse {
+    let mut pending = ArticleState(ReceivingResponse {
         receiver: &mut receiver,
         decoder: ResponseDecoder::new(kind),
-    };
+    });
     for chunk in response.chunks(chunk_bytes.max(1)) {
-        pending.receiver.pending.extend_from_slice(chunk);
+        pending.0.receiver.pending.extend_from_slice(chunk);
         if let Some(response) = pending.extract()? {
             return Ok(response);
         }
@@ -141,25 +136,24 @@ fn receive_fragments(
 /// Framing authorizes extraction only. Semantic validation consumes the owned
 /// wire frame before an article layout can be exposed.
 struct FramedResponse<'a> {
-    bytes: Bytes,
+    framed: ArticleState<FramedArticleState<Bytes>>,
     decoder: &'a ResponseDecoder,
-    status: StatusCode,
-    bounds: Option<crate::terminator::MultilineFrameBounds>,
 }
 
 impl FramedResponse<'_> {
     fn validate(self) -> Result<OwnedResponse, ClientError> {
+        let ArticleState(framed) = self.framed;
         let ResponseFrameParse::Complete(frame) =
             self.decoder
-                .validate_frame(&self.bytes, self.status, self.bounds)
+                .validate_frame(&framed.bytes, framed.status, framed.bounds)
         else {
             return Err(ClientError::InvalidStatusLine);
         };
         Ok(OwnedResponse {
-            kind: self.decoder.streaming.kind,
+            kind: framed.kind,
             status: frame.status(),
             content: OwnedResponseContent::from_frame(
-                self.bytes.clone(),
+                framed.bytes.clone(),
                 frame.content_start(),
                 frame.content_end(),
                 frame.content_validation(),
@@ -638,6 +632,33 @@ impl ResponseDecoder {
                 bounds,
             }),
         }
+    }
+
+    /// Complete and extract one frame while its decoder still owns the
+    /// request-scoped framing state. Callers receive a framed state object,
+    /// not independently pairable offsets and status metadata.
+    fn extract_framed<'a>(
+        &'a mut self,
+        pending: &mut BytesMut,
+    ) -> Result<Option<FramedResponse<'a>>, ClientError> {
+        let FramingDecodeProgress::Complete {
+            status,
+            frame_end,
+            bounds,
+        } = self.push_framing(pending)?
+        else {
+            return Ok(None);
+        };
+
+        Ok(Some(FramedResponse {
+            framed: ArticleState(FramedArticleState {
+                bytes: frame_end.extract(pending),
+                kind: self.streaming.kind,
+                status,
+                bounds,
+            }),
+            decoder: self,
+        }))
     }
 
     fn validate_frame<'a>(
