@@ -15,6 +15,18 @@ use crate::terminator::{MultilineFrameProgress, MultilineFramer};
 
 const STREAMING_STATUS_LINE_BYTES: usize = super::MAX_AUTHINFO_SASL_RESPONSE_LINE_BYTES;
 
+/// Exclusive end of the request-scoped status line in the frozen response.
+/// This is distinct from `FrameEnd`, which includes the response body and
+/// terminator, and from `ChunkConsumed`, which is relative to one push.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StatusLineEnd(usize);
+
+impl StatusLineEnd {
+    const fn get(self) -> usize {
+        self.0
+    }
+}
+
 pub(crate) struct BufferedResponseReceiver<R> {
     reader: R,
     pending: BytesMut,
@@ -135,18 +147,24 @@ fn receive_fragments(
 }
 
 /// Framing authorizes extraction only. Semantic validation consumes the owned
-/// wire frame before an article layout can be exposed.
-struct FramedResponse<'a> {
+/// wire frame before an article layout can be exposed. The extracted bytes and
+/// the status-line boundary travel together; no decoder borrow or detached
+/// range can be supplied by a caller.
+struct FramedResponse {
     framed: ArticleState<FramedArticleState<Bytes>>,
-    decoder: &'a ResponseDecoder,
+    status_line_end: StatusLineEnd,
 }
 
-impl FramedResponse<'_> {
+impl FramedResponse {
     fn validate(self) -> Result<OwnedResponse, ClientError> {
         let ArticleState(framed) = self.framed;
-        let ResponseFrameParse::Complete(frame) =
-            self.decoder
-                .validate_frame(&framed.bytes, framed.status, framed.bounds)
+        let ResponseFrameParse::Complete(frame) = ResponseFrameDecoder::new(framed.kind)
+            .complete_with_bounds(
+                &framed.bytes,
+                framed.status,
+                self.status_line_end.get(),
+                framed.bounds,
+            )
         else {
             return Err(ClientError::InvalidStatusLine);
         };
@@ -659,13 +677,14 @@ impl ResponseDecoder {
         }
     }
 
-    /// Complete and extract one frame while its decoder still owns the
-    /// request-scoped framing state. Callers receive a framed state object,
-    /// not independently pairable offsets and status metadata.
-    fn extract_framed<'a>(
-        &'a mut self,
+    /// Complete and extract one frame while the decoder still owns the
+    /// request-scoped framing state. The returned state owns the frozen bytes
+    /// and the metadata needed for semantic validation; callers cannot pair
+    /// an extracted buffer with a different decoder.
+    fn extract_framed(
+        &mut self,
         pending: &mut BytesMut,
-    ) -> Result<Option<FramedResponse<'a>>, ClientError> {
+    ) -> Result<Option<FramedResponse>, ClientError> {
         let FramingDecodeProgress::Complete {
             status,
             frame_end,
@@ -682,10 +701,11 @@ impl ResponseDecoder {
                 status,
                 bounds,
             }),
-            decoder: self,
+            status_line_end: self.streaming.status_line_end(),
         }))
     }
 
+    #[cfg(test)]
     fn validate_frame<'a>(
         &self,
         buffer: &'a [u8],
@@ -695,7 +715,7 @@ impl ResponseDecoder {
         ResponseFrameDecoder::new(self.streaming.kind).complete_with_bounds(
             buffer,
             status,
-            self.streaming.status_line_end(),
+            self.streaming.status_line_end().get(),
             bounds,
         )
     }
@@ -768,7 +788,7 @@ enum DecodeProgress<'a> {
 struct StreamingResponseDecoder {
     kind: RequestKind,
     status: Option<StatusCode>,
-    status_line_end: usize,
+    status_line_end: StatusLineEnd,
     framer: MultilineFramer,
     status_buf: [u8; STREAMING_STATUS_LINE_BYTES],
     status_len: usize,
@@ -779,7 +799,7 @@ impl StreamingResponseDecoder {
         Self {
             kind,
             status: None,
-            status_line_end: 0,
+            status_line_end: StatusLineEnd(0),
             framer: MultilineFramer::default(),
             status_buf: [0; STREAMING_STATUS_LINE_BYTES],
             status_len: 0,
@@ -807,7 +827,7 @@ impl StreamingResponseDecoder {
                         ResponseInitialParse::Complete(initial) => {
                             let status = initial.status();
                             self.status = Some(status);
-                            self.status_line_end = self.status_len;
+                            self.status_line_end = StatusLineEnd(self.status_len);
                             if !initial.descriptor().framing().is_multiline() {
                                 return Ok(StreamingDecodeProgress::Complete {
                                     status,
@@ -853,7 +873,7 @@ impl StreamingResponseDecoder {
         }
     }
 
-    fn status_line_end(&self) -> usize {
+    fn status_line_end(&self) -> StatusLineEnd {
         self.status_line_end
     }
 }
