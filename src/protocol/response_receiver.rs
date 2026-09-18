@@ -40,7 +40,7 @@ impl<R: AsyncRead + Unpin> BufferedResponseReceiver<R> {
         read_chunk_bytes: usize,
     ) -> Result<OwnedResponse, ClientError> {
         self.start_response()?;
-        let mut response = PendingResponse {
+        let mut response = ReceivingResponse {
             receiver: self,
             decoder: ResponseDecoder::new(kind),
         };
@@ -71,12 +71,12 @@ impl<R: AsyncRead + Unpin> BufferedResponseReceiver<R> {
 }
 
 /// Exclusive access keeps accumulated scanner state attached to its input.
-struct PendingResponse<'a, R> {
+struct ReceivingResponse<'a, R> {
     receiver: &'a mut BufferedResponseReceiver<R>,
     decoder: ResponseDecoder,
 }
 
-impl<R: AsyncRead + Unpin> PendingResponse<'_, R> {
+impl<R: AsyncRead + Unpin> ReceivingResponse<'_, R> {
     fn extract(&mut self) -> Result<Option<OwnedResponse>, ClientError> {
         match self.decoder.push_framing(&self.receiver.pending)? {
             FramingDecodeProgress::NeedMore => Ok(None),
@@ -129,7 +129,7 @@ fn receive_fragments(
         state: ReceiverState::Ready,
     };
     receiver.start_response()?;
-    let mut pending = PendingResponse {
+    let mut pending = ReceivingResponse {
         receiver: &mut receiver,
         decoder: ResponseDecoder::new(kind),
     };
