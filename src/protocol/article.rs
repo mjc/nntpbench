@@ -1047,6 +1047,21 @@ impl From<u64> for ArticleNumber {
 pub(crate) mod state {
     use super::{ArticleLayout, RequestKind, StatusCode};
 
+    /// Exclusive end of the request-scoped status line in a framed response.
+    /// This coordinate is relative to the same immutable bytes as the frame.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct StatusLineEnd(usize);
+
+    impl StatusLineEnd {
+        pub(crate) const fn new(value: usize) -> Self {
+            Self(value)
+        }
+
+        pub(crate) const fn get(self) -> usize {
+            self.0
+        }
+    }
+
     /// An article operation in one protocol-owned state.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub(crate) struct Article<State>(State);
@@ -1076,6 +1091,7 @@ pub(crate) mod state {
         kind: RequestKind,
         status: StatusCode,
         bounds: Option<crate::terminator::MultilineFrameBounds>,
+        status_line_end: StatusLineEnd,
     }
 
     impl<B> Framed<B> {
@@ -1084,12 +1100,14 @@ pub(crate) mod state {
             kind: RequestKind,
             status: StatusCode,
             bounds: Option<crate::terminator::MultilineFrameBounds>,
+            status_line_end: StatusLineEnd,
         ) -> Self {
             Self {
                 bytes,
                 kind,
                 status,
                 bounds,
+                status_line_end,
             }
         }
 
@@ -1107,6 +1125,10 @@ pub(crate) mod state {
 
         pub(crate) const fn bounds(&self) -> Option<crate::terminator::MultilineFrameBounds> {
             self.bounds
+        }
+
+        pub(crate) const fn status_line_end(&self) -> StatusLineEnd {
+            self.status_line_end
         }
     }
 

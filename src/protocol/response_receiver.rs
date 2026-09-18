@@ -7,25 +7,13 @@ use tokio::io::AsyncRead;
 
 use super::{
     Article, ArticleParseError, ArticleState, FramedArticleState, RequestKind,
-    ResponseFrameDecoder, ResponseFrameParse, ResponseInitialParse, StatusCode,
+    ResponseFrameDecoder, ResponseFrameParse, ResponseInitialParse, StatusCode, StatusLineEnd,
     ValidatedOwnedArticle, ValidatedResponseContent,
 };
 use crate::client::{ClientError, OWNED_RESPONSE_PREALLOC_BYTES, read_into_pending_bytes};
 use crate::terminator::{MultilineFrameProgress, MultilineFramer};
 
 const STREAMING_STATUS_LINE_BYTES: usize = super::MAX_AUTHINFO_SASL_RESPONSE_LINE_BYTES;
-
-/// Exclusive end of the request-scoped status line in the frozen response.
-/// This is distinct from `FrameEnd`, which includes the response body and
-/// terminator, and from `ChunkConsumed`, which is relative to one push.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct StatusLineEnd(usize);
-
-impl StatusLineEnd {
-    const fn get(self) -> usize {
-        self.0
-    }
-}
 
 pub(crate) struct BufferedResponseReceiver<R> {
     reader: R,
@@ -157,7 +145,6 @@ fn receive_fragments(
 /// range can be supplied by a caller.
 struct FramedResponse {
     framed: ArticleState<FramedArticleState<Bytes>>,
-    status_line_end: StatusLineEnd,
 }
 
 impl FramedResponse {
@@ -167,7 +154,7 @@ impl FramedResponse {
             .complete_with_bounds(
                 framed.bytes(),
                 framed.status(),
-                self.status_line_end.get(),
+                framed.status_line_end().get(),
                 framed.bounds(),
             )
         else {
@@ -705,8 +692,8 @@ impl ResponseDecoder {
                 self.streaming.kind,
                 status,
                 bounds,
+                self.streaming.status_line_end(),
             )),
-            status_line_end: self.streaming.status_line_end(),
         }))
     }
 
@@ -804,7 +791,7 @@ impl StreamingResponseDecoder {
         Self {
             kind,
             status: None,
-            status_line_end: StatusLineEnd(0),
+            status_line_end: StatusLineEnd::new(0),
             framer: MultilineFramer::default(),
             status_buf: [0; STREAMING_STATUS_LINE_BYTES],
             status_len: 0,
@@ -832,7 +819,7 @@ impl StreamingResponseDecoder {
                         ResponseInitialParse::Complete(initial) => {
                             let status = initial.status();
                             self.status = Some(status);
-                            self.status_line_end = StatusLineEnd(self.status_len);
+                            self.status_line_end = StatusLineEnd::new(self.status_len);
                             if !initial.descriptor().framing().is_multiline() {
                                 return Ok(StreamingDecodeProgress::Complete {
                                     status,

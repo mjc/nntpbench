@@ -17,7 +17,9 @@ use crate::terminator::{
 pub mod article;
 pub(crate) mod response_receiver;
 
-pub(crate) use article::state::{Article as ArticleState, Framed as FramedArticleState};
+pub(crate) use article::state::{
+    Article as ArticleState, Framed as FramedArticleState, StatusLineEnd,
+};
 pub use article::{Article, ArticleNumber, ArticleParseError, ArticleView, HeaderIter, Headers};
 pub(crate) use article::{ValidatedArticleView, ValidatedOwnedArticle};
 
