@@ -1045,7 +1045,7 @@ impl From<u64> for ArticleNumber {
 /// The storage adapters remain local to each repository. These state names
 /// describe the guarantees, not a common allocation type.
 pub(crate) mod state {
-    use super::{ArticleLayout, RequestKind, StatusCode};
+    use super::{ArticleLayout, ArticleParseError, RequestKind, StatusCode};
 
     /// Exclusive end of the request-scoped status line in a framed response.
     /// This coordinate is relative to the same immutable bytes as the frame.
@@ -1135,6 +1135,24 @@ pub(crate) mod state {
     impl Framed<bytes::Bytes> {
         pub(crate) fn as_bytes(&self) -> &[u8] {
             self.bytes.as_ref()
+        }
+    }
+
+    impl<B: AsRef<[u8]>> Framed<B> {
+        /// Consume a framed article response at the semantic boundary.
+        ///
+        /// The framing state already owns the exact bytes and the request
+        /// status-line boundary, so validation can produce the article layout
+        /// without reconstructing a temporary response frame or accepting a
+        /// detached buffer and range pair.
+        pub(crate) fn validate(self) -> Result<Article<Validated<B>>, ArticleParseError> {
+            let layout = ArticleLayout::parse_framed(
+                self.bytes.as_ref(),
+                self.status,
+                self.status_line_end,
+                self.bounds,
+            )?;
+            Ok(Article::new(Validated::new(self.bytes, layout)))
         }
     }
 
@@ -1242,6 +1260,31 @@ struct ArticleLayout {
 }
 
 impl ArticleLayout {
+    fn parse_framed(
+        buffer: &[u8],
+        status: crate::protocol::StatusCode,
+        status_line_end: state::StatusLineEnd,
+        bounds: Option<crate::terminator::MultilineFrameBounds>,
+    ) -> Result<Self, ArticleParseError> {
+        if !matches!(status.as_u16(), 220..=223) {
+            return Err(ArticleParseError::InvalidStatusCode(status.as_u16()));
+        }
+        let content_end = bounds.map_or(Ok(status_line_end.get()), |bounds| {
+            status_line_end
+                .get()
+                .checked_add(bounds.content_end().get())
+                .ok_or(ArticleParseError::BufferTooShort)
+        })?;
+        FramedArticle::from_known_content_bounds(
+            buffer,
+            status_line_end.get(),
+            content_end,
+            status_line_end,
+        )?
+        .validate_for_status(status.as_u16())
+        .map(|view| view.layout)
+    }
+
     fn materialize<'a>(self, buffer: &'a [u8]) -> Article<'a> {
         let message_id = materialize_validated_message_id(buffer, self.first_line.message_id);
         let article_number = Some(self.first_line.article_number);
@@ -1391,11 +1434,32 @@ impl<'a> FramedArticle<'a> {
 
         let first_line_end = strict_crlf_line_content_end_from(buffer, 0)
             .ok_or(ArticleParseError::BufferTooShort)?;
-        let first_line = ArticleFrameRange::new(0, first_line_end)?;
-        let expected_content_start = first_line_end
-            .checked_add(crate::CRLF.len())
+        Self::from_known_content_bounds(
+            buffer,
+            content_start,
+            content_end,
+            state::StatusLineEnd::new(first_line_end + crate::CRLF.len()),
+        )
+    }
+
+    fn from_known_content_bounds(
+        buffer: &'a [u8],
+        content_start: usize,
+        content_end: usize,
+        status_line_end: state::StatusLineEnd,
+    ) -> Result<Self, ArticleParseError> {
+        if content_start > content_end || content_end > buffer.len() {
+            return Err(ArticleParseError::BufferTooShort);
+        }
+
+        let first_line_end = status_line_end
+            .get()
+            .checked_sub(crate::CRLF.len())
             .ok_or(ArticleParseError::BufferTooShort)?;
-        if expected_content_start != content_start {
+        let first_line = ArticleFrameRange::new(0, first_line_end)?;
+        if first_line_end + crate::CRLF.len() != content_start
+            || buffer.get(first_line_end..content_start) != Some(crate::CRLF)
+        {
             return Err(ArticleParseError::BufferTooShort);
         }
 
@@ -1413,10 +1477,18 @@ impl<'a> FramedArticle<'a> {
     }
 
     fn validate(self) -> Result<ValidatedArticleView<'a>, ArticleParseError> {
+        let status = parse_status_code(self.buffer)?;
+        self.validate_for_status(status)
+    }
+
+    fn validate_for_status(
+        self,
+        status: u16,
+    ) -> Result<ValidatedArticleView<'a>, ArticleParseError> {
         let buffer = self.buffer;
         let first_line = validate_first_line(buffer, self.first_line)?;
 
-        let content = match parse_status_code(buffer)? {
+        let content = match status {
             220 => self.validate_article_content(),
             221 => self.validate_head_content(),
             222 => self.validate_body_content(),

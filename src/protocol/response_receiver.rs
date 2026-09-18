@@ -155,6 +155,25 @@ struct FramedResponse {
 impl FramedResponse {
     fn validate(self) -> Result<OwnedResponse, ClientError> {
         let framed = self.framed.into_inner();
+        let kind = framed.kind();
+        let status = framed.status();
+        if matches!(
+            (kind, status.as_u16()),
+            (RequestKind::Article, 220)
+                | (RequestKind::Head, 221)
+                | (RequestKind::Body, 222)
+                | (RequestKind::Stat, 223)
+        ) {
+            let article = framed
+                .validate()
+                .map_err(|_| ClientError::InvalidStatusLine)?;
+            return Ok(OwnedResponse {
+                kind,
+                status,
+                content: OwnedResponseContent::Article(article),
+            });
+        }
+
         let ResponseFrameParse::Complete(frame) =
             ResponseFrameDecoder::new(framed.kind()).complete_framed(&framed)
         else {
