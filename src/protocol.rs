@@ -17,7 +17,9 @@ use crate::terminator::{
 pub mod article;
 pub(crate) mod response_receiver;
 
-pub(crate) use article::state::{Article as ArticleState, Framed as FramedArticleState};
+pub(crate) use article::state::{
+    Article as ArticleState, Framed as FramedArticleState, StatusLineEnd,
+};
 pub use article::{Article, ArticleNumber, ArticleParseError, ArticleView, HeaderIter, Headers};
 pub(crate) use article::{ValidatedArticleView, ValidatedOwnedArticle};
 
@@ -272,17 +274,30 @@ impl ResponseFrameDecoder {
         ResponseFrame::parse(self.kind, buffer)
     }
 
-    fn complete_with_bounds<'a>(
+    fn complete_framed<'a>(
+        self,
+        framed: &'a FramedArticleState<bytes::Bytes>,
+    ) -> ResponseFrameParse<'a> {
+        self.complete_with_metadata(
+            framed.as_bytes(),
+            framed.status(),
+            framed.status_line_end(),
+            framed.bounds(),
+        )
+    }
+
+    fn complete_with_metadata<'a>(
         self,
         buffer: &'a [u8],
         status: StatusCode,
-        status_line_end: usize,
+        status_line_end: StatusLineEnd,
         bounds: Option<MultilineFrameBounds>,
     ) -> ResponseFrameParse<'a> {
+        let status_line_end = status_line_end.get();
         let (content_end, consumed) = bounds.map_or((status_line_end, status_line_end), |bounds| {
             (
-                status_line_end + bounds.content_end(),
-                status_line_end + bounds.body_consumed(),
+                status_line_end + bounds.content_end().get(),
+                status_line_end + bounds.body_consumed().get(),
             )
         });
         let Some(status_line) = buffer.get(..status_line_end) else {
@@ -2798,7 +2813,7 @@ fn validate_response_content<'a>(
         | (RequestKind::Head, 221)
         | (RequestKind::Body, 222)
         | (RequestKind::Stat, 223) => {
-            return Article::validate_article_frame(frame, content_start, content_end)
+            return Article::validate_framed_article(frame, content_start, content_end)
                 .map(ValidatedResponseContent::Article)
                 .ok();
         }
@@ -6166,8 +6181,15 @@ mod tests {
                 }
             };
 
-        let ResponseFrameParse::Complete(response) = ResponseFrameDecoder::new(RequestKind::Body)
-            .complete_with_bounds(wire, status, status_line_end, Some(bounds))
+        let framed = FramedArticleState::new(
+            bytes::Bytes::copy_from_slice(wire),
+            RequestKind::Body,
+            status,
+            Some(bounds),
+            StatusLineEnd::new(status_line_end),
+        );
+        let ResponseFrameParse::Complete(response) =
+            ResponseFrameDecoder::new(RequestKind::Body).complete_framed(&framed)
         else {
             panic!("precomputed response frame did not parse");
         };
@@ -6175,7 +6197,7 @@ mod tests {
         assert_eq!(response.content(), b"body line\r\n");
         assert_eq!(
             response.consumed(),
-            status_line_end + bounds.body_consumed()
+            status_line_end + bounds.body_consumed().get()
         );
     }
 

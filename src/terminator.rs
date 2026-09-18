@@ -302,34 +302,76 @@ pub enum EmptyTerminatorStatus {
 }
 
 /// Offsets produced only after the multiline framer has found a complete frame.
+/// Exclusive end of the bytes consumed from the complete multiline body.
+///
+/// This includes the wire terminator and is relative to the beginning of the
+/// body, not to the current input chunk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BodyConsumed(usize);
+
+impl BodyConsumed {
+    #[must_use]
+    pub(crate) const fn get(self) -> usize {
+        self.0
+    }
+}
+
+/// Exclusive end of the bytes consumed from the current body input chunk.
+///
+/// This is chunk-relative and must be translated before it is used to split an
+/// accumulated response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ChunkConsumed(usize);
+
+impl ChunkConsumed {
+    #[must_use]
+    pub(crate) const fn get(self) -> usize {
+        self.0
+    }
+}
+
+/// Exclusive end of multiline body content before its wire terminator.
+///
+/// This is relative to the beginning of the complete body and excludes the
+/// terminator bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BodyContentEnd(usize);
+
+impl BodyContentEnd {
+    #[must_use]
+    pub(crate) const fn get(self) -> usize {
+        self.0
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MultilineFrameBounds {
-    body_consumed: usize,
-    chunk_consumed: usize,
-    content_end: usize,
+    body_consumed: BodyConsumed,
+    chunk_consumed: ChunkConsumed,
+    content_end: BodyContentEnd,
 }
 
 impl MultilineFrameBounds {
     const fn new(body_consumed: usize, chunk_consumed: usize, content_end: usize) -> Self {
         Self {
-            body_consumed,
-            chunk_consumed,
-            content_end,
+            body_consumed: BodyConsumed(body_consumed),
+            chunk_consumed: ChunkConsumed(chunk_consumed),
+            content_end: BodyContentEnd(content_end),
         }
     }
 
     #[must_use]
-    pub(crate) const fn body_consumed(self) -> usize {
+    pub(crate) const fn body_consumed(self) -> BodyConsumed {
         self.body_consumed
     }
 
     #[must_use]
-    pub(crate) const fn chunk_consumed(self) -> usize {
+    pub(crate) const fn chunk_consumed(self) -> ChunkConsumed {
         self.chunk_consumed
     }
 
     #[must_use]
-    pub(crate) const fn content_end(self) -> usize {
+    pub(crate) const fn content_end(self) -> BodyContentEnd {
         self.content_end
     }
 }

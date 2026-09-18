@@ -2,6 +2,37 @@
 use super::*;
 use proptest::collection::vec;
 use proptest::prelude::*;
+use std::cell::RefCell;
+use std::io;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, ReadBuf};
+
+thread_local! {
+    static RUNTIME: RefCell<Option<tokio::runtime::Runtime>> = const { RefCell::new(None) };
+}
+
+struct FragmentedInput {
+    bytes: Vec<u8>,
+    offset: usize,
+    chunk_bytes: usize,
+}
+
+impl AsyncRead for FragmentedInput {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        destination: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let remaining = self.bytes.len().saturating_sub(self.offset);
+        let count = remaining
+            .min(self.chunk_bytes.max(1))
+            .min(destination.remaining());
+        destination.put_slice(&self.bytes[self.offset..self.offset + count]);
+        self.offset += count;
+        Poll::Ready(Ok(()))
+    }
+}
 
 fn dangerous_wire_bytes() -> impl Strategy<Value = u8> {
     prop_oneof![
@@ -35,24 +66,9 @@ fn remove_rfc_multiline_terminators(buffer: &mut [u8]) {
 }
 
 fn complete_after_split(kind: RequestKind, frame: &[u8], split: usize) -> (StatusCode, usize) {
-    let mut decoder = ResponseDecoder::new(kind);
-    match decoder
-        .push(&frame[..split])
-        .expect("first decoder push should succeed")
-    {
-        DecodeProgress::Complete {
-            status, consumed, ..
-        } => (status, consumed),
-        DecodeProgress::NeedMore => match decoder
-            .push(frame)
-            .expect("second decoder push should succeed")
-        {
-            DecodeProgress::Complete {
-                status, consumed, ..
-            } => (status, consumed),
-            DecodeProgress::NeedMore => panic!("decoder did not complete at split {split}"),
-        },
-    }
+    let response = receive_response(kind, frame, split.max(1))
+        .unwrap_or_else(|error| panic!("receiver did not complete at split {split}: {error:?}"));
+    (response.status(), response.as_bytes().len())
 }
 
 fn assert_framing_completion_reports_buffer_offset(
@@ -87,33 +103,12 @@ fn assert_decoder_completes_on_all_three_push_schedules(
     expected_status: u16,
     expected_consumed: usize,
 ) {
-    for first in 0..=frame.len() {
-        for second in first..=frame.len() {
-            let mut decoder = ResponseDecoder::new(kind);
-            for prefix_len in [first, second, frame.len()] {
-                let progress = decoder
-                    .push(&frame[..prefix_len])
-                    .expect("decoder push should succeed");
-                if prefix_len < expected_consumed {
-                    assert!(
-                        matches!(progress, DecodeProgress::NeedMore),
-                        "completed before frame end: first {first} second {second} prefix {prefix_len} frame {frame:?}",
-                    );
-                } else {
-                    let DecodeProgress::Complete {
-                        status, consumed, ..
-                    } = progress
-                    else {
-                        panic!(
-                            "decoder did not complete: first {first} second {second} prefix {prefix_len} frame {frame:?}"
-                        );
-                    };
-                    assert_eq!(status.as_u16(), expected_status);
-                    assert_eq!(consumed, expected_consumed);
-                    break;
-                }
-            }
-        }
+    for chunk_bytes in 1..=frame.len() {
+        let response = receive_response(kind, frame, chunk_bytes).unwrap_or_else(|error| {
+            panic!("receiver failed with chunks of {chunk_bytes}: {error:?}")
+        });
+        assert_eq!(response.status().as_u16(), expected_status);
+        assert_eq!(response.as_bytes().len(), expected_consumed);
     }
 }
 
@@ -121,49 +116,45 @@ fn assert_incremental_matches_stateless_for_all_two_push_schedules(
     kind: RequestKind,
     frame: &[u8],
 ) {
-    let expected = ResponseFrameDecoder::new(kind).decode(frame);
-    for first in 0..=frame.len() {
-        for second in first..=frame.len() {
-            let mut decoder = ResponseDecoder::new(kind);
-            let mut progress = DecodeProgress::NeedMore;
-            for prefix_len in [first, second, frame.len()] {
-                progress = decoder.push(&frame[..prefix_len]).unwrap_or_else(|error| {
-                        panic!(
-                            "incremental decoder errored at prefix {prefix_len} for split ({first}, {second}): {error:?}"
-                        )
-                    });
-                if matches!(progress, DecodeProgress::Complete { .. }) {
-                    break;
-                }
+    for chunk_bytes in 1..=frame.len().max(1) {
+        let expected = ResponseFrameDecoder::new(kind).decode(frame);
+        let actual = receive_response(kind, frame, chunk_bytes);
+        match (expected, actual) {
+            (ResponseFrameParse::Complete(expected), Ok(actual)) => {
+                assert_eq!(actual.status(), expected.status());
+                assert_eq!(actual.as_bytes(), &frame[..expected.consumed()]);
             }
-
-            match (expected, progress) {
-                (
-                    ResponseFrameParse::Complete(expected),
-                    DecodeProgress::Complete {
-                        status,
-                        consumed,
-                        content_start,
-                        content_end,
-                        content_validation,
-                    },
-                ) => {
-                    assert_eq!(status, expected.status());
-                    assert_eq!(consumed, expected.consumed());
-                    assert_eq!(content_start, expected.content_start());
-                    assert_eq!(content_end, expected.content_end());
-                    assert_eq!(content_validation, expected.content_validation());
-                }
-                (ResponseFrameParse::Complete(expected), progress) => panic!(
-                    "incremental decoder did not match complete stateless frame at split ({first}, {second}): expected {expected:?}, got {progress:?}"
-                ),
-                (ResponseFrameParse::NeedMore, DecodeProgress::NeedMore) => {}
-                (expected, progress) => panic!(
-                    "incremental decoder did not match stateless result at split ({first}, {second}): expected {expected:?}, got {progress:?}"
-                ),
-            }
+            (ResponseFrameParse::NeedMore, Err(ClientError::UnexpectedEof)) => {}
+            (expected, actual) => panic!(
+                "production receiver did not match stateless frame: expected {expected:?}, got {actual:?}"
+            ),
         }
     }
+}
+
+fn receive_response(
+    kind: RequestKind,
+    bytes: &[u8],
+    chunk_bytes: usize,
+) -> Result<OwnedResponse, ClientError> {
+    let receiver = BufferedResponseReceiver::new(FragmentedInput {
+        bytes: bytes.to_vec(),
+        offset: 0,
+        chunk_bytes,
+    });
+    RUNTIME.with(|runtime| {
+        let mut runtime = runtime.borrow_mut();
+        let runtime = runtime.get_or_insert_with(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime should build")
+        });
+        runtime.block_on(async move {
+            let mut receiver = receiver;
+            receiver.receive(kind, chunk_bytes).await
+        })
+    })
 }
 
 fn response_from_bytes(kind: RequestKind, status: StatusCode, bytes: &[u8]) -> OwnedResponse {
@@ -193,8 +184,7 @@ fn owned_article_requires_decoder_article_proof() {
     );
     response.content = OwnedResponseContent::Generic {
         bytes: response.content.bytes().to_vec().into(),
-        start: 0,
-        end: 0,
+        content: ResponseContentRange::new(0, 0, response.content.bytes().len()).unwrap(),
     };
 
     let Err(ClientError::UnexpectedArticleResponse { .. }) = OwnedArticle::try_from(response)
@@ -239,22 +229,17 @@ fn decoder_completes_single_line_error_without_waiting_for_terminator() {
     // Error statuses for ARTICLE are single-line responses, so the decoder must stop
     // after that CRLF without waiting for any multiline terminator:
     // https://www.rfc-editor.org/rfc/rfc3977#section-3.1
-    let mut decoder = ResponseDecoder::new(RequestKind::Article);
-    let DecodeProgress::Complete {
-        status, consumed, ..
-    } = decoder
-        .push(b"430 no article with that message-id\r\n")
-        .unwrap()
-    else {
-        panic!("decoder should complete");
-    };
-    let response = response_from_bytes(
+    let response = receive_response(
         RequestKind::Article,
-        status,
         b"430 no article with that message-id\r\n",
-    );
+        1,
+    )
+    .unwrap();
 
-    assert_eq!(consumed, b"430 no article with that message-id\r\n".len());
+    assert_eq!(
+        response.as_bytes().len(),
+        b"430 no article with that message-id\r\n".len()
+    );
     assert_eq!(response.kind(), RequestKind::Article);
     assert_eq!(response.status().as_u16(), 430);
     assert_eq!(
@@ -267,29 +252,28 @@ fn decoder_completes_single_line_error_without_waiting_for_terminator() {
 fn decoder_compact_frames_do_not_allocate() {
     // RFC 3977 section 9.4 frames responses as either an initial response
     // line alone or that line followed by a multi-line data block.
-    let mut stat_decoder = ResponseDecoder::new(RequestKind::Stat);
-    let mut body_decoder = ResponseDecoder::new(RequestKind::Body);
-
     crate::COUNT_TEST_ALLOCATIONS.with(|enabled| enabled.set(false));
     crate::TEST_ALLOCATIONS.store(0, std::sync::atomic::Ordering::Relaxed);
     crate::COUNT_TEST_ALLOCATIONS.with(|enabled| enabled.set(true));
 
+    let mut stat_decoder = StreamingResponseDecoder::new(RequestKind::Stat);
+    let mut body_decoder = StreamingResponseDecoder::new(RequestKind::Body);
     assert!(matches!(
         stat_decoder.push(b"223 1 <stat@test> article retrieved\r\n"),
-        Ok(DecodeProgress::Complete { status, consumed, .. })
+        Ok(StreamingDecodeProgress::Complete { status, consumed, .. })
             if status.as_u16() == 223
-                && consumed == b"223 1 <stat@test> article retrieved\r\n".len()
+                && consumed == ChunkConsumed(b"223 1 <stat@test> article retrieved\r\n".len())
     ));
     assert!(matches!(
         body_decoder.push(b"222 1 <body@test> body follows\r\nbody\r\n.\r\n"),
-        Ok(DecodeProgress::Complete { status, consumed, .. })
+        Ok(StreamingDecodeProgress::Complete { status, consumed, .. })
             if status.as_u16() == 222
-                && consumed == b"222 1 <body@test> body follows\r\nbody\r\n.\r\n".len()
+                && consumed == ChunkConsumed(b"222 1 <body@test> body follows\r\nbody\r\n.\r\n".len())
     ));
 
     crate::COUNT_TEST_ALLOCATIONS.with(|enabled| enabled.set(false));
     let allocations = crate::TEST_ALLOCATIONS.load(std::sync::atomic::Ordering::Relaxed);
-    assert_eq!(allocations, 0, "compact decoder push allocated");
+    assert_eq!(allocations, 0, "compact streaming decoder allocated");
 }
 
 #[test]
@@ -297,25 +281,25 @@ fn decoder_waits_for_complete_crlf_status_line() {
     // RFC 3977 section 3.1 requires CRLF, not a lone final CR, to terminate the
     // response initial line. The decoder must keep waiting until LF arrives:
     // https://www.rfc-editor.org/rfc/rfc3977#section-3.1
-    let mut decoder = ResponseDecoder::new(RequestKind::Article);
     assert!(matches!(
-        decoder
-            .push(b"430 no article with that message-id\r")
-            .unwrap(),
-        DecodeProgress::NeedMore
+        receive_response(
+            RequestKind::Article,
+            b"430 no article with that message-id\r",
+            1,
+        ),
+        Err(ClientError::UnexpectedEof)
     ));
-
-    let DecodeProgress::Complete {
-        status, consumed, ..
-    } = decoder
-        .push(b"430 no article with that message-id\r\n")
-        .unwrap()
-    else {
-        panic!("decoder should complete once CRLF arrives");
-    };
-
-    assert_eq!(consumed, b"430 no article with that message-id\r\n".len());
-    assert_eq!(status.as_u16(), 430);
+    let response = receive_response(
+        RequestKind::Article,
+        b"430 no article with that message-id\r\n",
+        1,
+    )
+    .unwrap();
+    assert_eq!(
+        response.as_bytes().len(),
+        b"430 no article with that message-id\r\n".len()
+    );
+    assert_eq!(response.status().as_u16(), 430);
 }
 
 #[test]
@@ -330,7 +314,7 @@ fn decoder_rejects_bare_lf_status_line() {
     ] {
         assert!(
             matches!(
-                ResponseDecoder::new(RequestKind::Article).push(input),
+                receive_response(RequestKind::Article, input, input.len()),
                 Err(ClientError::InvalidStatusLine)
             ),
             "{input:?}"
@@ -349,7 +333,7 @@ fn decoder_rejects_embedded_cr_in_status_line() {
     ] {
         assert!(
             matches!(
-                ResponseDecoder::new(RequestKind::Article).push(input),
+                receive_response(RequestKind::Article, input, input.len()),
                 Err(ClientError::InvalidStatusLine)
             ),
             "{input:?}"
@@ -368,10 +352,7 @@ fn decoder_enforces_rfc_initial_response_line_limit() {
         exact.len(),
         crate::protocol::MAX_INITIAL_RESPONSE_LINE_BYTES
     );
-    assert!(matches!(
-        ResponseDecoder::new(RequestKind::Stat).push(&exact),
-        Ok(DecodeProgress::Complete { .. })
-    ));
+    assert!(receive_response(RequestKind::Stat, &exact, exact.len()).is_ok());
 
     let mut too_long_complete = Vec::from(b"223 1 <stat@test> ".as_slice());
     too_long_complete.resize(crate::protocol::MAX_INITIAL_RESPONSE_LINE_BYTES - 1, b'x');
@@ -381,14 +362,22 @@ fn decoder_enforces_rfc_initial_response_line_limit() {
         crate::protocol::MAX_INITIAL_RESPONSE_LINE_BYTES + 1
     );
     assert!(matches!(
-        ResponseDecoder::new(RequestKind::Stat).push(&too_long_complete),
+        receive_response(
+            RequestKind::Stat,
+            &too_long_complete,
+            too_long_complete.len()
+        ),
         Err(ClientError::InvalidStatusLine)
     ));
 
     let mut too_long_incomplete = Vec::from(b"223 1 <stat@test> ".as_slice());
     too_long_incomplete.resize(crate::protocol::MAX_INITIAL_RESPONSE_LINE_BYTES, b'x');
     assert!(matches!(
-        ResponseDecoder::new(RequestKind::Stat).push(&too_long_incomplete),
+        receive_response(
+            RequestKind::Stat,
+            &too_long_incomplete,
+            too_long_incomplete.len()
+        ),
         Err(ClientError::InvalidStatusLine)
     ));
 }
@@ -405,8 +394,8 @@ fn decoder_accepts_rfc4643_long_authinfo_sasl_response_lines() {
         assert!(wire.len() > crate::protocol::MAX_INITIAL_RESPONSE_LINE_BYTES);
 
         assert!(matches!(
-            ResponseDecoder::new(RequestKind::AuthInfo).push(wire.as_bytes()),
-            Ok(DecodeProgress::Complete { status, .. }) if status.as_u16() == expected
+            receive_response(RequestKind::AuthInfo, wire.as_bytes(), wire.len()),
+            Ok(response) if response.status().as_u16() == expected
         ));
 
         let split = crate::protocol::MAX_INITIAL_RESPONSE_LINE_BYTES;
@@ -493,22 +482,18 @@ fn decoder_completes_multiline_response_across_chunks() {
     // RFC 3977 section 3.1.1 terminates multiline data with CRLF "." CRLF.
     // The decoder must retain enough state to recognize that sequence across reads:
     // https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1
-    let mut decoder = ResponseDecoder::new(RequestKind::Body);
     let mut buffer = b"222 1 <a@b> body follows\r\nbody\r".to_vec();
     assert!(matches!(
-        decoder.push(&buffer).unwrap(),
-        DecodeProgress::NeedMore
+        receive_response(RequestKind::Body, &buffer, 1),
+        Err(ClientError::UnexpectedEof)
     ));
     buffer.extend_from_slice(b"\n.\r\n");
-    let DecodeProgress::Complete {
-        status, consumed, ..
-    } = decoder.push(&buffer).unwrap()
-    else {
-        panic!("decoder should complete");
-    };
-    let response = response_from_bytes(RequestKind::Body, status, &buffer[..consumed]);
+    let response = receive_response(RequestKind::Body, &buffer, 1).unwrap();
 
-    assert_eq!(consumed, b"222 1 <a@b> body follows\r\nbody\r\n.\r\n".len());
+    assert_eq!(
+        response.as_bytes().len(),
+        b"222 1 <a@b> body follows\r\nbody\r\n.\r\n".len()
+    );
     assert_eq!(response.status().as_u16(), 222);
     assert_eq!(
         response.as_bytes(),
@@ -521,18 +506,13 @@ fn decoder_treats_rfc2980_xhdr_221_as_multiline() {
     // RFC 2980 section 2.6 specifies XHDR as a 221 multiline response.
     // The decoder must consume through the dot line so pipelined reads do
     // not leave XHDR payload bytes in the socket buffer.
-    let mut decoder = ResponseDecoder::new(RequestKind::Xhdr);
     let buffer = b"221 Header follows\r\n1 Subject\r\n.\r\nNEXT";
+    let response = receive_response(RequestKind::Xhdr, buffer, buffer.len()).unwrap();
 
-    let DecodeProgress::Complete {
-        status, consumed, ..
-    } = decoder.push(buffer).unwrap()
-    else {
-        panic!("decoder should complete");
-    };
-    let response = response_from_bytes(RequestKind::Xhdr, status, &buffer[..consumed]);
-
-    assert_eq!(consumed, b"221 Header follows\r\n1 Subject\r\n.\r\n".len());
+    assert_eq!(
+        response.as_bytes().len(),
+        b"221 Header follows\r\n1 Subject\r\n.\r\n".len()
+    );
     assert_eq!(response.status().as_u16(), 221);
     assert_eq!(
         response.as_bytes(),
@@ -545,18 +525,10 @@ fn decoder_completes_empty_multiline_response() {
     // RFC 3977 section 3.1.1 represents an empty multiline response as "." CRLF
     // immediately after the response initial line:
     // https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1
-    let mut decoder = ResponseDecoder::new(RequestKind::Help);
     let buffer = b"100 help text follows\r\n.\r\n";
+    let response = receive_response(RequestKind::Help, buffer, buffer.len()).unwrap();
 
-    let DecodeProgress::Complete {
-        status, consumed, ..
-    } = decoder.push(buffer).unwrap()
-    else {
-        panic!("decoder should complete");
-    };
-    let response = response_from_bytes(RequestKind::Help, status, &buffer[..consumed]);
-
-    assert_eq!(consumed, buffer.len());
+    assert_eq!(response.as_bytes().len(), buffer.len());
     assert_eq!(response.status().as_u16(), 100);
     assert_eq!(response.as_bytes(), buffer);
 }
@@ -566,23 +538,16 @@ fn decoder_completes_empty_multiline_response_across_pushes() {
     // RFC 3977 section 3.1.1 allows the empty "." CRLF terminator to arrive in a
     // later read; the decoder must still treat it as content-start termination:
     // https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1
-    let mut decoder = ResponseDecoder::new(RequestKind::Help);
     let mut buffer = b"100 help text follows\r\n".to_vec();
     assert!(matches!(
-        decoder.push(&buffer).unwrap(),
-        DecodeProgress::NeedMore
+        receive_response(RequestKind::Help, &buffer, 1),
+        Err(ClientError::UnexpectedEof)
     ));
 
     buffer.extend_from_slice(b".\r\n");
-    let DecodeProgress::Complete {
-        status, consumed, ..
-    } = decoder.push(&buffer).unwrap()
-    else {
-        panic!("decoder should complete");
-    };
-    let response = response_from_bytes(RequestKind::Help, status, &buffer[..consumed]);
+    let response = receive_response(RequestKind::Help, &buffer, 1).unwrap();
 
-    assert_eq!(consumed, buffer.len());
+    assert_eq!(response.as_bytes().len(), buffer.len());
     assert_eq!(response.status().as_u16(), 100);
     assert_eq!(response.as_bytes(), buffer);
 }
@@ -593,24 +558,17 @@ fn decoder_completes_empty_multiline_response_with_split_terminator() {
     // This exercises all split positions inside that three-byte terminator:
     // https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1
     for split in 1..3 {
-        let mut decoder = ResponseDecoder::new(RequestKind::Help);
         let mut buffer = b"100 help text follows\r\n".to_vec();
         buffer.extend_from_slice(&b".\r\n"[..split]);
         assert!(matches!(
-            decoder.push(&buffer).unwrap(),
-            DecodeProgress::NeedMore
+            receive_response(RequestKind::Help, &buffer, 1),
+            Err(ClientError::UnexpectedEof)
         ));
 
         buffer.extend_from_slice(&b".\r\n"[split..]);
-        let DecodeProgress::Complete {
-            status, consumed, ..
-        } = decoder.push(&buffer).unwrap()
-        else {
-            panic!("decoder should complete for split {split}");
-        };
-        let response = response_from_bytes(RequestKind::Help, status, &buffer[..consumed]);
+        let response = receive_response(RequestKind::Help, &buffer, 1).unwrap();
 
-        assert_eq!(consumed, buffer.len());
+        assert_eq!(response.as_bytes().len(), buffer.len());
         assert_eq!(response.status().as_u16(), 100);
         assert_eq!(response.as_bytes(), buffer);
     }
@@ -621,24 +579,17 @@ fn decoder_does_not_treat_start_of_next_chunk_as_terminator() {
     // RFC 3977 section 3.1.1 requires CRLF before the dot line. A dot that merely
     // starts the next read after body bytes is data, not the terminator:
     // https://www.rfc-editor.org/rfc/rfc3977#section-3.1.1
-    let mut decoder = ResponseDecoder::new(RequestKind::Body);
     let mut buffer = b"222 1 <a@b> body follows\r\nbody".to_vec();
     assert!(matches!(
-        decoder.push(&buffer).unwrap(),
-        DecodeProgress::NeedMore
+        receive_response(RequestKind::Body, &buffer, 1),
+        Err(ClientError::UnexpectedEof)
     ));
 
     buffer.extend_from_slice(b".\r\nstill body\r\n.\r\n");
-    let DecodeProgress::Complete {
-        status, consumed, ..
-    } = decoder.push(&buffer).unwrap()
-    else {
-        panic!("decoder should complete");
-    };
-    let response = response_from_bytes(RequestKind::Body, status, &buffer[..consumed]);
+    let response = receive_response(RequestKind::Body, &buffer, 1).unwrap();
 
     assert_eq!(
-        consumed,
+        response.as_bytes().len(),
         b"222 1 <a@b> body follows\r\nbody.\r\nstill body\r\n.\r\n".len()
     );
     assert_eq!(response.status().as_u16(), 222);
@@ -655,7 +606,7 @@ fn decoder_rejects_bare_lf_before_later_crlf_status_line() {
     // resynchronizing on the later CRLF:
     // https://www.rfc-editor.org/rfc/rfc3977#section-3.1
     assert!(matches!(
-        ResponseDecoder::new(RequestKind::Article).push(b"210 foo\nboo \r\n"),
+        receive_response(RequestKind::Article, b"210 foo\nboo \r\n", 1),
         Err(ClientError::InvalidStatusLine)
     ));
 }
@@ -803,7 +754,7 @@ proptest! {
         frame.extend_from_slice(b"\r\n");
 
         prop_assert!(matches!(
-            ResponseDecoder::new(RequestKind::Article).push(&frame),
+            receive_response(RequestKind::Article, &frame, 1),
             Err(ClientError::InvalidStatusLine),
         ));
     }
@@ -946,35 +897,16 @@ fn decoder_reports_consumed_bytes_and_preserves_leftover_chunk_data() {
     let chunk =
             b"222 1 <a@b> body follows\r\nbody\r\n.\r\n220 1 <b@c> article follows\r\nh: v\r\n\r\nx\r\n.\r\n";
 
-    let mut first = ResponseDecoder::new(RequestKind::Body);
-    let DecodeProgress::Complete {
-        status, consumed, ..
-    } = first.push(chunk).unwrap()
-    else {
-        panic!("first decoder should complete");
-    };
-    let response = response_from_bytes(RequestKind::Body, status, &chunk[..consumed]);
+    let response = receive_response(RequestKind::Body, chunk, 1).unwrap();
     assert_eq!(response.status().as_u16(), 222);
     assert_eq!(
         response.as_bytes(),
         b"222 1 <a@b> body follows\r\nbody\r\n.\r\n"
     );
 
-    let mut second = ResponseDecoder::new(RequestKind::Article);
-    let DecodeProgress::Complete {
-        status: second_status,
-        consumed: second_consumed,
-        ..
-    } = second.push(&chunk[consumed..]).unwrap()
-    else {
-        panic!("second decoder should complete");
-    };
-    let second_response = response_from_bytes(
-        RequestKind::Article,
-        second_status,
-        &chunk[consumed..consumed + second_consumed],
-    );
-    assert_eq!(second_consumed, chunk.len() - consumed);
+    let first_len = response.as_bytes().len();
+    let second_response = receive_response(RequestKind::Article, &chunk[first_len..], 1).unwrap();
+    assert_eq!(second_response.as_bytes().len(), chunk.len() - first_len);
     assert_eq!(second_response.status().as_u16(), 220);
 }
 
@@ -998,15 +930,11 @@ fn incremental_decoder_rejects_malformed_body_like_stateless_parser() {
         ResponseFrameParse::Invalid
     ));
 
-    for split in 0..=frame.len() {
-        let mut decoder = ResponseDecoder::new(RequestKind::Body);
-        let first = decoder.push(&frame[..split]);
-        let second = decoder.push(frame);
-        assert!(
-            matches!(first, Err(ClientError::InvalidStatusLine))
-                || matches!(second, Err(ClientError::InvalidStatusLine)),
-            "malformed frame accepted at split {split}: first={first:?} second={second:?}"
-        );
+    for chunk_bytes in 1..=frame.len() {
+        assert!(matches!(
+            receive_response(RequestKind::Body, frame, chunk_bytes),
+            Err(ClientError::InvalidStatusLine)
+        ));
     }
 }
 
