@@ -193,8 +193,7 @@ fn owned_article_requires_decoder_article_proof() {
     );
     response.content = OwnedResponseContent::Generic {
         bytes: response.content.bytes().to_vec().into(),
-        start: 0,
-        end: 0,
+        content: ResponseContentRange::new(0, 0, response.content.bytes().len()).unwrap(),
     };
 
     let Err(ClientError::UnexpectedArticleResponse { .. }) = OwnedArticle::try_from(response)

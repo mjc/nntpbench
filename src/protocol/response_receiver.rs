@@ -2,6 +2,7 @@
 //! may change input while decoding; completed prefixes leave as immutable bytes.
 
 use bytes::{Bytes, BytesMut};
+use std::ops::Range;
 use tokio::io::AsyncRead;
 
 use super::{
@@ -454,10 +455,33 @@ pub struct OwnedResponse {
 enum OwnedResponseContent {
     Generic {
         bytes: Bytes,
-        start: usize,
-        end: usize,
+        content: ResponseContentRange,
     },
     Article(ValidatedOwnedArticle),
+}
+
+/// Exclusive content coordinates relative to the owned framed response.
+///
+/// This is deliberately kept with the generic response bytes. Callers cannot
+/// accidentally pair a content range from one response with another buffer,
+/// or swap a start/end coordinate at the enum boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResponseContentRange(Range<usize>);
+
+impl ResponseContentRange {
+    fn new(start: usize, end: usize, response_len: usize) -> Option<Self> {
+        (start <= end && end <= response_len).then_some(Self(start..end))
+    }
+
+    fn range(&self) -> Range<usize> {
+        self.0.clone()
+    }
+
+    fn slice<'a>(&self, response: &'a [u8]) -> &'a [u8] {
+        response
+            .get(self.0.clone())
+            .expect("validated response content range remains in its response")
+    }
 }
 
 impl OwnedResponseContent {
@@ -469,9 +493,9 @@ impl OwnedResponseContent {
     ) -> Self {
         match validation {
             ValidatedResponseContent::Generic => Self::Generic {
+                content: ResponseContentRange::new(content_start, content_end, bytes.len())
+                    .expect("response parser established an in-bounds content range"),
                 bytes,
-                start: content_start,
-                end: content_end,
             },
             ValidatedResponseContent::Article(validated) => {
                 Self::Article(validated.into_owned(bytes))
@@ -488,7 +512,7 @@ impl OwnedResponseContent {
 
     fn content(&self) -> &[u8] {
         match self {
-            Self::Generic { bytes, start, end } => &bytes[*start..*end],
+            Self::Generic { bytes, content } => content.slice(bytes),
             Self::Article(article) => article.content(),
         }
     }
@@ -523,8 +547,9 @@ impl OwnedResponse {
     pub fn parse_article(&self) -> Result<Article<'_>, ArticleParseError> {
         match &self.content {
             OwnedResponseContent::Article(article) => Ok(article.materialize()),
-            OwnedResponseContent::Generic { bytes, start, end } => {
-                Article::parse_article_frame(bytes, *start, *end)
+            OwnedResponseContent::Generic { bytes, content } => {
+                let range = content.range();
+                Article::parse_article_frame(bytes, range.start, range.end)
             }
         }
     }
