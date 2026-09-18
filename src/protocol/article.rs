@@ -1164,6 +1164,65 @@ struct ArticleLayout {
 }
 
 impl ArticleLayout {
+    fn materialize<'a>(self, buffer: &'a [u8]) -> Article<'a> {
+        let message_id = materialize_validated_message_id(buffer, self.first_line.message_id);
+        let article_number = Some(self.first_line.article_number);
+
+        match self.content {
+            ValidatedArticleContent::Article {
+                headers,
+                header_transformation,
+                body,
+                body_transformation,
+            } => Article {
+                message_id,
+                article_number,
+                headers: Some(Headers::from_validated(
+                    buffer,
+                    headers,
+                    header_transformation,
+                )),
+                body: Some(materialize_validated_body(
+                    buffer,
+                    body,
+                    body_transformation,
+                )),
+            },
+            ValidatedArticleContent::Head {
+                headers,
+                header_transformation,
+            } => Article {
+                message_id,
+                article_number,
+                headers: Some(Headers::from_validated(
+                    buffer,
+                    headers,
+                    header_transformation,
+                )),
+                body: None,
+            },
+            ValidatedArticleContent::Body {
+                body,
+                body_transformation,
+            } => Article {
+                message_id,
+                article_number,
+                headers: None,
+                body: Some(materialize_validated_body(
+                    buffer,
+                    body,
+                    body_transformation,
+                )),
+            },
+            ValidatedArticleContent::Stat { .. } => Article {
+                message_id,
+                article_number,
+                headers: None,
+                body: None,
+            },
+        }
+    }
+
     fn content_range(self) -> ArticleFrameRange {
         match self.content {
             ValidatedArticleContent::Article { headers, body, .. } => ArticleFrameRange {
@@ -1192,7 +1251,7 @@ pub(crate) type ValidatedOwnedArticle = state::Article<state::Validated<Bytes>>;
 
 impl<'a> ValidatedArticleView<'a> {
     pub(crate) fn materialize(self) -> Article<'a> {
-        Article::materialize_validated_article(self.buffer, self.layout)
+        self.layout.materialize(self.buffer)
     }
 
     pub(crate) fn into_owned(self, bytes: Bytes) -> ValidatedOwnedArticle {
@@ -1213,7 +1272,7 @@ impl state::Validated<Bytes> {
 
     #[must_use]
     pub(crate) fn materialize(&self) -> Article<'_> {
-        Article::materialize_validated_article(self.bytes(), *self.layout())
+        self.layout().materialize(self.bytes())
     }
 }
 
@@ -1551,53 +1610,6 @@ impl<'a> Article<'a> {
                 content,
             },
         })
-    }
-
-    /// Materialize an article from proof returned by [`Self::validate_article_frame`].
-    fn materialize_validated_article(buf: &'a [u8], layout: ArticleLayout) -> Self {
-        let message_id = materialize_validated_message_id(buf, layout.first_line.message_id);
-        let article_number = Some(layout.first_line.article_number);
-
-        match layout.content {
-            ValidatedArticleContent::Article {
-                headers,
-                header_transformation,
-                body,
-                body_transformation,
-            } => {
-                let headers = Headers::from_validated(buf, headers, header_transformation);
-                Self {
-                    message_id,
-                    article_number,
-                    headers: Some(headers),
-                    body: Some(materialize_validated_body(buf, body, body_transformation)),
-                }
-            }
-            ValidatedArticleContent::Head {
-                headers,
-                header_transformation,
-            } => Self {
-                message_id,
-                article_number,
-                headers: Some(Headers::from_validated(buf, headers, header_transformation)),
-                body: None,
-            },
-            ValidatedArticleContent::Body {
-                body,
-                body_transformation,
-            } => Self {
-                message_id,
-                article_number,
-                headers: None,
-                body: Some(materialize_validated_body(buf, body, body_transformation)),
-            },
-            ValidatedArticleContent::Stat { .. } => Self {
-                message_id,
-                article_number,
-                headers: None,
-                body: None,
-            },
-        }
     }
 
     fn parse_article(buf: &'a [u8]) -> Result<Self, ArticleParseError> {
