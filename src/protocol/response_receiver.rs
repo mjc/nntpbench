@@ -701,43 +701,6 @@ impl ResponseDecoder {
             )),
         }))
     }
-
-    #[cfg(test)]
-    fn validate_frame<'a>(
-        &self,
-        buffer: &'a [u8],
-        status: StatusCode,
-        bounds: Option<crate::terminator::MultilineFrameBounds>,
-    ) -> ResponseFrameParse<'a> {
-        ResponseFrameDecoder::new(self.streaming.kind).complete_with_bounds(
-            buffer,
-            status,
-            self.streaming.status_line_end(),
-            bounds,
-        )
-    }
-
-    #[cfg(test)]
-    fn push<'a>(&mut self, buffer: &'a [u8]) -> Result<DecodeProgress<'a>, ClientError> {
-        match self.push_framing(buffer)? {
-            FramingDecodeProgress::NeedMore => Ok(DecodeProgress::NeedMore),
-            FramingDecodeProgress::Complete {
-                status,
-                bounds,
-                frame_end,
-            } => match self.validate_frame(&buffer[..frame_end.0], status, bounds) {
-                ResponseFrameParse::Complete(response) => Ok(DecodeProgress::Complete {
-                    status: response.status(),
-                    consumed: response.consumed(),
-                    content_start: response.content_start(),
-                    content_end: response.content_end(),
-                    content_validation: response.content_validation(),
-                }),
-                ResponseFrameParse::NeedMore => Ok(DecodeProgress::NeedMore),
-                ResponseFrameParse::Invalid => Err(ClientError::InvalidStatusLine),
-            },
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -767,19 +730,6 @@ impl FrameEnd {
 /// Count consumed from this push's chunk, not the accumulated response.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ChunkConsumed(usize);
-
-#[cfg(test)]
-#[derive(Debug)]
-enum DecodeProgress<'a> {
-    NeedMore,
-    Complete {
-        status: StatusCode,
-        consumed: usize,
-        content_start: usize,
-        content_end: usize,
-        content_validation: ValidatedResponseContent<'a>,
-    },
-}
 
 #[derive(Debug)]
 struct StreamingResponseDecoder {
