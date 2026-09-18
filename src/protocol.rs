@@ -278,9 +278,10 @@ impl ResponseFrameDecoder {
         self,
         buffer: &'a [u8],
         status: StatusCode,
-        status_line_end: usize,
+        status_line_end: StatusLineEnd,
         bounds: Option<MultilineFrameBounds>,
     ) -> ResponseFrameParse<'a> {
+        let status_line_end = status_line_end.get();
         let (content_end, consumed) = bounds.map_or((status_line_end, status_line_end), |bounds| {
             (
                 status_line_end + bounds.content_end().get(),
@@ -6169,7 +6170,12 @@ mod tests {
             };
 
         let ResponseFrameParse::Complete(response) = ResponseFrameDecoder::new(RequestKind::Body)
-            .complete_with_bounds(wire, status, status_line_end, Some(bounds))
+            .complete_with_bounds(
+                wire,
+                status,
+                StatusLineEnd::new(status_line_end),
+                Some(bounds),
+            )
         else {
             panic!("precomputed response frame did not parse");
         };

@@ -154,7 +154,7 @@ impl FramedResponse {
             .complete_with_bounds(
                 framed.bytes(),
                 framed.status(),
-                framed.status_line_end().get(),
+                framed.status_line_end(),
                 framed.bounds(),
             )
         else {
@@ -707,7 +707,7 @@ impl ResponseDecoder {
         ResponseFrameDecoder::new(self.streaming.kind).complete_with_bounds(
             buffer,
             status,
-            self.streaming.status_line_end().get(),
+            self.streaming.status_line_end(),
             bounds,
         )
     }
