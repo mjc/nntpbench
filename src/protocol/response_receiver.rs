@@ -41,7 +41,7 @@ impl<R: AsyncRead + Unpin> BufferedResponseReceiver<R> {
         read_chunk_bytes: usize,
     ) -> Result<OwnedResponse, ClientError> {
         self.start_response()?;
-        let mut response = ArticleState::new(ReceivingResponse {
+        let mut response = ReceivingResponse::new(Receiving {
             receiver: self,
             decoder: ResponseDecoder::new(kind),
         });
@@ -72,13 +72,18 @@ impl<R: AsyncRead + Unpin> BufferedResponseReceiver<R> {
     }
 }
 
-/// Exclusive access keeps accumulated scanner state attached to its input.
-struct ReceivingResponse<'a, R> {
+/// Receiving state keeps accumulated input and its request decoder together.
+///
+/// The borrow prevents either resource from being replaced while framing is
+/// in progress; completion moves the state into the framed owner below.
+struct Receiving<'a, R> {
     receiver: &'a mut BufferedResponseReceiver<R>,
     decoder: ResponseDecoder,
 }
 
-impl<R: AsyncRead + Unpin> ReceivingResponse<'_, R> {
+type ReceivingResponse<'a, R> = ArticleState<Receiving<'a, R>>;
+
+impl<R: AsyncRead + Unpin> Receiving<'_, R> {
     fn extract(&mut self) -> Result<Option<OwnedResponse>, ClientError> {
         let Some(framed) = self.decoder.extract_framed(&mut self.receiver.pending)? else {
             return Ok(None);
@@ -89,7 +94,7 @@ impl<R: AsyncRead + Unpin> ReceivingResponse<'_, R> {
     }
 }
 
-impl<R: AsyncRead + Unpin> ArticleState<ReceivingResponse<'_, R>> {
+impl<R: AsyncRead + Unpin> ArticleState<Receiving<'_, R>> {
     fn extract(&mut self) -> Result<Option<OwnedResponse>, ClientError> {
         self.as_inner_mut().extract()
     }
@@ -122,7 +127,7 @@ fn receive_fragments(
         state: ReceiverState::Ready,
     };
     receiver.start_response()?;
-    let mut pending = ArticleState::new(ReceivingResponse {
+    let mut pending = ReceivingResponse::new(Receiving {
         receiver: &mut receiver,
         decoder: ResponseDecoder::new(kind),
     });
