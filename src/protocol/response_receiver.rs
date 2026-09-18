@@ -40,17 +40,17 @@ impl<R: AsyncRead + Unpin> BufferedResponseReceiver<R> {
         read_chunk_bytes: usize,
     ) -> Result<OwnedResponse, ClientError> {
         self.start_response()?;
-        let mut response = ReceivingResponse {
+        let mut response = ArticleState(ReceivingResponse {
             receiver: self,
             decoder: ResponseDecoder::new(kind),
-        };
+        });
         loop {
             if let Some(completed) = response.extract()? {
                 return Ok(completed);
             }
             if read_into_pending_bytes(
-                &mut response.receiver.reader,
-                &mut response.receiver.pending,
+                &mut response.0.receiver.reader,
+                &mut response.0.receiver.pending,
                 read_chunk_bytes,
             )
             .await?
@@ -102,6 +102,12 @@ impl<R: AsyncRead + Unpin> ReceivingResponse<'_, R> {
     }
 }
 
+impl<R: AsyncRead + Unpin> ArticleState<ReceivingResponse<'_, R>> {
+    fn extract(&mut self) -> Result<Option<OwnedResponse>, ClientError> {
+        self.0.extract()
+    }
+}
+
 pub(crate) fn benchmark_receive(
     kind: RequestKind,
     response: &[u8],
@@ -129,12 +135,12 @@ fn receive_fragments(
         state: ReceiverState::Ready,
     };
     receiver.start_response()?;
-    let mut pending = ReceivingResponse {
+    let mut pending = ArticleState(ReceivingResponse {
         receiver: &mut receiver,
         decoder: ResponseDecoder::new(kind),
-    };
+    });
     for chunk in response.chunks(chunk_bytes.max(1)) {
-        pending.receiver.pending.extend_from_slice(chunk);
+        pending.0.receiver.pending.extend_from_slice(chunk);
         if let Some(response) = pending.extract()? {
             return Ok(response);
         }
