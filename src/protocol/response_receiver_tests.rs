@@ -260,6 +260,19 @@ fn owned_article_access_is_infallible_after_promotion() {
 }
 
 #[test]
+fn framing_does_not_validate_article_semantics_until_requested() {
+    let wire = b"222 1 <body@test> body follows\r\nbody\0\r\n.\r\n";
+    let response = receive_response(RequestKind::Body, wire, 1)
+        .expect("framing should complete before article validation");
+
+    assert_eq!(response.as_bytes(), wire);
+    assert_eq!(
+        response.parse_article(),
+        Err(ArticleParseError::InvalidBody)
+    );
+}
+
+#[test]
 fn owned_article_round_trip_rebuilds_the_same_response_without_reparsing() {
     let response = response_from_bytes(
         RequestKind::Body,
@@ -1006,7 +1019,7 @@ fn incremental_decoder_matches_stateless_layout_for_split_valid_and_incomplete_f
 }
 
 #[test]
-fn incremental_decoder_rejects_malformed_body_like_stateless_parser() {
+fn incremental_decoder_frames_malformed_body_before_semantic_validation() {
     let frame = b"222 1 <body@test> body follows\r\nnot an article\n\r\n.\r\n";
     assert!(matches!(
         ResponseFrame::parse(RequestKind::Body, frame),
@@ -1014,10 +1027,12 @@ fn incremental_decoder_rejects_malformed_body_like_stateless_parser() {
     ));
 
     for chunk_bytes in 1..=frame.len() {
-        assert!(matches!(
-            receive_response(RequestKind::Body, frame, chunk_bytes),
-            Err(ClientError::InvalidStatusLine)
-        ));
+        let response = receive_response(RequestKind::Body, frame, chunk_bytes)
+            .expect("framing must not manufacture semantic article proof");
+        assert_eq!(
+            response.parse_article(),
+            Err(ArticleParseError::InvalidBody)
+        );
     }
 }
 

@@ -1146,6 +1146,25 @@ pub(crate) mod state {
     }
 
     impl<B: StableBytes> Article<Framed<B>> {
+        /// Validate the framed bytes without moving their owner. This is the
+        /// compatibility projection used by borrowed response access; the
+        /// consuming transition below remains the canonical owned path.
+        pub(crate) fn validate_borrowed(
+            &self,
+        ) -> Result<super::ValidatedArticleView<'_>, super::ArticleParseError> {
+            Ok(super::ValidatedArticleView {
+                buffer: self.as_bytes(),
+                layout: self.0.validated_layout()?,
+            })
+        }
+
+        pub(crate) fn content(&self) -> &[u8] {
+            self.0
+                .generic_content_range()
+                .map(|range| range.slice(self.as_bytes()))
+                .expect("framed article content remains within its owner")
+        }
+
         /// Consume a framed article after validating its semantics while the
         /// bytes and layout remain in the same owner.
         pub(crate) fn validate(self) -> Result<Article<Validated<B>>, super::ArticleParseError> {
@@ -1154,23 +1173,28 @@ pub(crate) mod state {
     }
 
     impl<B: StableBytes> Framed<B> {
-        /// Establish semantic article validity without detaching the bytes
-        /// from the private layout produced by this frame.
-        fn validate(self) -> Result<Validated<B>, super::ArticleParseError> {
-            let kind = self.kind;
+        fn validated_layout(&self) -> Result<ArticleLayout, super::ArticleParseError> {
             let status = self.status;
             if !matches!(status.as_u16(), 220..=223) {
                 return Err(super::ArticleParseError::InvalidStatusCode(status.as_u16()));
             }
             let first_line =
                 super::validated_first_line_from_initial(self.initial, self.status_line_end)?;
-            let layout = super::FramedArticle::from_known_content_bounds(
+            super::FramedArticle::from_known_content_bounds(
                 self.bytes.as_slice(),
                 self.status_line_end.get(),
                 self.content_end.get(),
                 self.status_line_end,
             )?
-            .validate_for_status_with_first_line(status.as_u16(), first_line)?;
+            .validate_for_status_with_first_line(status.as_u16(), first_line)
+        }
+
+        /// Establish semantic article validity without detaching the bytes
+        /// from the private layout produced by this frame.
+        fn validate(self) -> Result<Validated<B>, super::ArticleParseError> {
+            let kind = self.kind;
+            let status = self.status;
+            let layout = self.validated_layout()?;
             Ok(Validated::new(self.bytes, kind, status, layout))
         }
     }

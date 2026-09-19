@@ -7,7 +7,7 @@ use tokio::io::AsyncRead;
 use super::{
     Article, ArticleParseError, ArticleState, ContentEnd, FramedArticleState, RequestKind,
     ResponseContentRange, ResponseInitial, ResponseInitialParse, StatusCode, StatusLineEnd,
-    ValidatedOwnedArticle,
+    ValidatedArticleView, ValidatedOwnedArticle,
 };
 use crate::client::{ClientError, OWNED_RESPONSE_PREALLOC_BYTES, read_into_pending_bytes};
 use crate::terminator::{MultilineFrameProgress, MultilineFramer};
@@ -189,11 +189,8 @@ impl ArticleState<FramedArticleState<Bytes>> {
                 | (RequestKind::Stat, 223)
         );
         if article_response {
-            let article = self
-                .validate()
-                .map_err(|_| ClientError::InvalidStatusLine)?;
             return Ok(OwnedResponse {
-                content: OwnedResponseContent::Article(article),
+                content: OwnedResponseContent::Article(self),
             });
         }
         let status_line_end = self.status_line_end().get();
@@ -473,22 +470,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn malformed_article_never_becomes_a_validated_owned_response() {
+    async fn malformed_article_is_framed_but_not_validated_at_receive() {
         let wire = b"222 1 <body@test> body follows\r\nbo\0dy\r\n.\r\n";
         for split in 1..wire.len() {
             let input = FragmentedInput([&wire[..split], &wire[split..]].into());
             let mut receiver = BufferedResponseReceiver::new(input);
-            assert!(
-                matches!(
-                    receiver.receive(RequestKind::Body, 4096).await,
-                    Err(ClientError::InvalidStatusLine)
-                ),
+            let response = receiver
+                .receive(RequestKind::Body, 4096)
+                .await
+                .unwrap_or_else(|error| panic!("split={split}: {error:?}"));
+            assert_eq!(
+                response.parse_article(),
+                Err(ArticleParseError::InvalidBody),
                 "split={split}"
             );
-            assert!(matches!(
-                receiver.receive(RequestKind::Body, 4096).await,
-                Err(ClientError::ConnectionClosed)
-            ));
         }
     }
 
@@ -530,10 +525,21 @@ mod tests {
 }
 
 /// Owned response bytes for the client path.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct OwnedResponse {
     content: OwnedResponseContent,
 }
+
+impl PartialEq for OwnedResponse {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind() == other.kind()
+            && self.status() == other.status()
+            && self.as_bytes() == other.as_bytes()
+            && self.content() == other.content()
+    }
+}
+
+impl Eq for OwnedResponse {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum OwnedResponseContent {
@@ -543,14 +549,16 @@ enum OwnedResponseContent {
         bytes: Bytes,
         content: ResponseContentRange,
     },
-    Article(ValidatedOwnedArticle),
+    Article(FramedResponse),
+    ValidatedArticle(ValidatedOwnedArticle),
 }
 
 impl OwnedResponseContent {
     fn bytes(&self) -> &[u8] {
         match self {
             Self::Generic { bytes, .. } => bytes,
-            Self::Article(article) => article.bytes(),
+            Self::Article(article) => article.as_bytes(),
+            Self::ValidatedArticle(article) => article.bytes(),
         }
     }
 
@@ -558,6 +566,7 @@ impl OwnedResponseContent {
         match self {
             Self::Generic { bytes, content, .. } => content.slice(bytes),
             Self::Article(article) => article.content(),
+            Self::ValidatedArticle(article) => article.content(),
         }
     }
 }
@@ -569,6 +578,7 @@ impl OwnedResponse {
         match &self.content {
             OwnedResponseContent::Generic { kind, .. } => *kind,
             OwnedResponseContent::Article(article) => article.kind(),
+            OwnedResponseContent::ValidatedArticle(article) => article.kind(),
         }
     }
 
@@ -578,6 +588,7 @@ impl OwnedResponse {
         match &self.content {
             OwnedResponseContent::Generic { status, .. } => *status,
             OwnedResponseContent::Article(article) => article.status(),
+            OwnedResponseContent::ValidatedArticle(article) => article.status(),
         }
     }
 
@@ -596,7 +607,10 @@ impl OwnedResponse {
     /// Parse the response as an ARTICLE/HEAD/BODY/STAT article-style frame.
     pub fn parse_article(&self) -> Result<Article<'_>, ArticleParseError> {
         match &self.content {
-            OwnedResponseContent::Article(article) => Ok(article.materialize()),
+            OwnedResponseContent::Article(article) => article
+                .validate_borrowed()
+                .map(ValidatedArticleView::materialize),
+            OwnedResponseContent::ValidatedArticle(article) => Ok(article.materialize()),
             OwnedResponseContent::Generic { .. } => Err(ArticleParseError::NotArticleResponse),
         }
     }
@@ -641,7 +655,7 @@ impl OwnedArticle {
     #[must_use]
     pub fn into_response(self) -> OwnedResponse {
         OwnedResponse {
-            content: OwnedResponseContent::Article(self.article),
+            content: OwnedResponseContent::ValidatedArticle(self.article),
         }
     }
 }
@@ -664,7 +678,12 @@ impl TryFrom<OwnedResponse> for OwnedArticle {
 
         let OwnedResponse { content } = response;
         match content {
-            OwnedResponseContent::Article(article) => Ok(Self { article }),
+            OwnedResponseContent::Article(article) => Ok(Self {
+                article: article
+                    .validate()
+                    .map_err(|_| ClientError::InvalidStatusLine)?,
+            }),
+            OwnedResponseContent::ValidatedArticle(article) => Ok(Self { article }),
             content @ OwnedResponseContent::Generic { .. } => {
                 Err(ClientError::UnexpectedArticleResponse {
                     response: OwnedResponse { content },
