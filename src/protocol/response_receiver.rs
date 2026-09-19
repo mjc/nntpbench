@@ -213,7 +213,7 @@ impl FramedResponse {
             kind,
             status: frame.status(),
             content: OwnedResponseContent::from_frame(
-                framed.as_inner().bytes().clone(),
+                framed.clone_bytes(),
                 frame.content_start(),
                 frame.content_end(),
                 frame.content_validation(),

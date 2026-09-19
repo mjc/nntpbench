@@ -1122,6 +1122,12 @@ pub(crate) mod state {
         }
     }
 
+    impl Article<Framed<bytes::Bytes>> {
+        pub(crate) fn clone_bytes(&self) -> bytes::Bytes {
+            self.0.bytes().clone()
+        }
+    }
+
     /// A complete wire response retained by an adapter owner.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub(crate) struct Framed<B> {
