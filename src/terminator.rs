@@ -301,35 +301,55 @@ pub enum EmptyTerminatorStatus {
     NotFound { previous_prefix_len: usize },
 }
 
-/// Offsets produced only after the multiline framer has found a complete frame.
+/// Exclusive end of the bytes consumed from the current body input chunk.
+///
+/// This is chunk-relative and must be translated before it is used to split an
+/// accumulated response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ChunkConsumed(usize);
+
+impl ChunkConsumed {
+    #[must_use]
+    pub(crate) const fn get(self) -> usize {
+        self.0
+    }
+}
+
+/// Exclusive end of multiline body content before its wire terminator.
+///
+/// This is relative to the beginning of the complete body and excludes the
+/// terminator bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BodyContentEnd(usize);
+
+impl BodyContentEnd {
+    #[must_use]
+    pub(crate) const fn get(self) -> usize {
+        self.0
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MultilineFrameBounds {
-    body_consumed: usize,
-    chunk_consumed: usize,
-    content_end: usize,
+    chunk_consumed: ChunkConsumed,
+    content_end: BodyContentEnd,
 }
 
 impl MultilineFrameBounds {
-    const fn new(body_consumed: usize, chunk_consumed: usize, content_end: usize) -> Self {
+    const fn new(chunk_consumed: usize, content_end: usize) -> Self {
         Self {
-            body_consumed,
-            chunk_consumed,
-            content_end,
+            chunk_consumed: ChunkConsumed(chunk_consumed),
+            content_end: BodyContentEnd(content_end),
         }
     }
 
     #[must_use]
-    pub(crate) const fn body_consumed(self) -> usize {
-        self.body_consumed
-    }
-
-    #[must_use]
-    pub(crate) const fn chunk_consumed(self) -> usize {
+    pub(crate) const fn chunk_consumed(self) -> ChunkConsumed {
         self.chunk_consumed
     }
 
     #[must_use]
-    pub(crate) const fn content_end(self) -> usize {
+    pub(crate) const fn content_end(self) -> BodyContentEnd {
         self.content_end
     }
 }
@@ -364,11 +384,7 @@ impl MultilineFramer {
         if !self.content_started || self.empty_terminator.is_active() {
             match self.empty_terminator.detect(chunk) {
                 EmptyTerminatorStatus::FoundAt(end) => {
-                    return MultilineFrameProgress::Complete(MultilineFrameBounds::new(
-                        fed + end,
-                        end,
-                        0,
-                    ));
+                    return MultilineFrameProgress::Complete(MultilineFrameBounds::new(end, 0));
                 }
                 EmptyTerminatorStatus::NeedMore => return MultilineFrameProgress::NeedMore,
                 EmptyTerminatorStatus::NotFound {
@@ -384,7 +400,6 @@ impl MultilineFramer {
 
         match detect_streaming_terminator(&self.tail, chunk) {
             Some(end) => MultilineFrameProgress::Complete(MultilineFrameBounds::new(
-                fed + end,
                 end,
                 fed + end - DOT_TERMINATOR.len(),
             )),
@@ -1201,14 +1216,14 @@ mod tests {
         assert_eq!(framer.push(b"body\r"), MultilineFrameProgress::NeedMore);
         assert_eq!(
             framer.push(b"\n.\r\n"),
-            MultilineFrameProgress::Complete(MultilineFrameBounds::new(9, 4, 6))
+            MultilineFrameProgress::Complete(MultilineFrameBounds::new(4, 6))
         );
 
         let mut empty = MultilineFramer::default();
         assert_eq!(empty.push(b"."), MultilineFrameProgress::NeedMore);
         assert_eq!(
             empty.push(b"\r\n"),
-            MultilineFrameProgress::Complete(MultilineFrameBounds::new(3, 2, 0))
+            MultilineFrameProgress::Complete(MultilineFrameBounds::new(2, 0))
         );
     }
 
