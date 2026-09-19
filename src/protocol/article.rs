@@ -1047,6 +1047,19 @@ impl From<u64> for ArticleNumber {
 pub(crate) mod state {
     use super::{ArticleLayout, ArticleParseError, RequestKind, StatusCode};
 
+    /// Storage whose bytes remain stable while a validated layout is used.
+    /// This crate-private contract prevents validation from accepting an
+    /// arbitrary `AsRef<[u8]>` implementation with changing contents.
+    pub(crate) trait StableBytes {
+        fn as_slice(&self) -> &[u8];
+    }
+
+    impl StableBytes for bytes::Bytes {
+        fn as_slice(&self) -> &[u8] {
+            self.as_ref()
+        }
+    }
+
     /// Exclusive end of the request-scoped status line in a framed response.
     /// This coordinate is relative to the same immutable bytes as the frame.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1084,6 +1097,37 @@ pub(crate) mod state {
         }
     }
 
+    impl<B> Article<Framed<B>> {
+        pub(crate) const fn kind(&self) -> RequestKind {
+            self.0.kind()
+        }
+
+        pub(crate) const fn status(&self) -> StatusCode {
+            self.0.status()
+        }
+
+        pub(crate) const fn bounds(&self) -> Option<crate::terminator::MultilineFrameBounds> {
+            self.0.bounds()
+        }
+
+        pub(crate) const fn status_line_end(&self) -> StatusLineEnd {
+            self.0.status_line_end()
+        }
+
+        pub(crate) fn as_bytes(&self) -> &[u8]
+        where
+            B: StableBytes,
+        {
+            self.0.bytes().as_slice()
+        }
+    }
+
+    impl Article<Framed<bytes::Bytes>> {
+        pub(crate) fn clone_bytes(&self) -> bytes::Bytes {
+            self.0.bytes().clone()
+        }
+    }
+
     /// A complete wire response retained by an adapter owner.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub(crate) struct Framed<B> {
@@ -1092,6 +1136,7 @@ pub(crate) mod state {
         status: StatusCode,
         bounds: Option<crate::terminator::MultilineFrameBounds>,
         status_line_end: StatusLineEnd,
+        content_end: ContentEnd,
     }
 
     impl<B> Framed<B> {
@@ -1101,6 +1146,7 @@ pub(crate) mod state {
             status: StatusCode,
             bounds: Option<crate::terminator::MultilineFrameBounds>,
             status_line_end: StatusLineEnd,
+            content_end: ContentEnd,
         ) -> Self {
             Self {
                 bytes,
@@ -1108,6 +1154,7 @@ pub(crate) mod state {
                 status,
                 bounds,
                 status_line_end,
+                content_end,
             }
         }
 
@@ -1132,13 +1179,7 @@ pub(crate) mod state {
         }
     }
 
-    impl Framed<bytes::Bytes> {
-        pub(crate) fn as_bytes(&self) -> &[u8] {
-            self.bytes.as_ref()
-        }
-    }
-
-    impl<B: AsRef<[u8]>> Framed<B> {
+    impl<B: StableBytes> Framed<B> {
         /// Consume a framed article response at the semantic boundary.
         ///
         /// The framing state already owns the exact bytes and the request
@@ -1147,10 +1188,10 @@ pub(crate) mod state {
         /// detached buffer and range pair.
         pub(crate) fn validate(self) -> Result<Article<Validated<B>>, ArticleParseError> {
             let layout = ArticleLayout::parse_framed(
-                self.bytes.as_ref(),
+                self.bytes.as_slice(),
                 self.status,
                 self.status_line_end,
-                self.bounds,
+                self.content_end,
             )?;
             Ok(Article::new(Validated::new(self.bytes, layout)))
         }
@@ -1161,6 +1202,22 @@ pub(crate) mod state {
     pub(crate) struct Validated<B> {
         bytes: B,
         layout: ArticleLayout,
+    }
+
+    /// Exclusive end of the semantic response content in frame-relative
+    /// coordinates. Multiline terminator bytes and packed suffixes are after
+    /// this boundary.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct ContentEnd(usize);
+
+    impl ContentEnd {
+        pub(crate) const fn new(value: usize) -> Self {
+            Self(value)
+        }
+
+        pub(crate) const fn get(self) -> usize {
+            self.0
+        }
     }
 
     impl<B> Validated<B> {
@@ -1264,21 +1321,15 @@ impl ArticleLayout {
         buffer: &[u8],
         status: crate::protocol::StatusCode,
         status_line_end: state::StatusLineEnd,
-        bounds: Option<crate::terminator::MultilineFrameBounds>,
+        content_end: state::ContentEnd,
     ) -> Result<Self, ArticleParseError> {
         if !matches!(status.as_u16(), 220..=223) {
             return Err(ArticleParseError::InvalidStatusCode(status.as_u16()));
         }
-        let content_end = bounds.map_or(Ok(status_line_end.get()), |bounds| {
-            status_line_end
-                .get()
-                .checked_add(bounds.content_end().get())
-                .ok_or(ArticleParseError::BufferTooShort)
-        })?;
         FramedArticle::from_known_content_bounds(
             buffer,
             status_line_end.get(),
-            content_end,
+            content_end.get(),
             status_line_end,
         )?
         .validate_for_status(status.as_u16())

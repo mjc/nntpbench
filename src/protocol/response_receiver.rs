@@ -6,9 +6,9 @@ use std::ops::Range;
 use tokio::io::AsyncRead;
 
 use super::{
-    Article, ArticleParseError, ArticleState, FramedArticleState, RequestKind,
-    ResponseFrameDecoder, ResponseFrameParse, ResponseInitialParse, StatusCode, StatusLineEnd,
-    ValidatedOwnedArticle, ValidatedResponseContent,
+    Article, ArticleParseError, ArticleState, ContentEnd, FramedArticleState, RequestKind,
+    ResponseFrameDecoder, ResponseFrameParse, ResponseInitial, ResponseInitialParse, StatusCode,
+    StatusLineEnd, ValidatedOwnedArticle, ValidatedResponseContent,
 };
 use crate::client::{ClientError, OWNED_RESPONSE_PREALLOC_BYTES, read_into_pending_bytes};
 use crate::terminator::{MultilineFrameProgress, MultilineFramer};
@@ -109,6 +109,34 @@ pub(crate) fn benchmark_receive(
         .map(|response| (response.status(), response.as_bytes().len()))
 }
 
+pub(crate) async fn benchmark_receive_async(
+    kind: RequestKind,
+    response: &[u8],
+    chunk_bytes: usize,
+) -> Result<(StatusCode, usize), ClientError> {
+    let mut receiver = BufferedResponseReceiver::new(std::io::Cursor::new(response));
+    receiver
+        .receive(kind, chunk_bytes)
+        .await
+        .map(|response| (response.status(), response.as_bytes().len()))
+}
+
+pub(crate) async fn benchmark_receive_packed_async(
+    first_kind: RequestKind,
+    second_kind: RequestKind,
+    response: &[u8],
+    chunk_bytes: usize,
+) -> Result<(StatusCode, StatusCode, usize), ClientError> {
+    let mut receiver = BufferedResponseReceiver::new(std::io::Cursor::new(response));
+    let first = receiver.receive(first_kind, chunk_bytes).await?;
+    let second = receiver.receive(second_kind, chunk_bytes).await?;
+    Ok((
+        first.status(),
+        second.status(),
+        first.as_bytes().len() + second.as_bytes().len(),
+    ))
+}
+
 pub(crate) fn owned_from_bytes(
     kind: RequestKind,
     bytes: &[u8],
@@ -150,11 +178,12 @@ fn receive_fragments(
 /// range can be supplied by a caller.
 struct FramedResponse {
     framed: ArticleState<FramedArticleState<Bytes>>,
+    initial: ResponseInitial,
 }
 
 impl FramedResponse {
     fn validate(self) -> Result<OwnedResponse, ClientError> {
-        let framed = self.framed.into_inner();
+        let Self { framed, initial } = self;
         let kind = framed.kind();
         let status = framed.status();
         if matches!(
@@ -165,6 +194,7 @@ impl FramedResponse {
                 | (RequestKind::Stat, 223)
         ) {
             let article = framed
+                .into_inner()
                 .validate()
                 .map_err(|_| ClientError::InvalidStatusLine)?;
             return Ok(OwnedResponse {
@@ -175,15 +205,15 @@ impl FramedResponse {
         }
 
         let ResponseFrameParse::Complete(frame) =
-            ResponseFrameDecoder::new(framed.kind()).complete_framed(&framed)
+            ResponseFrameDecoder::new(kind).complete_framed_after_initial(&framed, initial)
         else {
             return Err(ClientError::InvalidStatusLine);
         };
         Ok(OwnedResponse {
-            kind: framed.kind(),
+            kind,
             status: frame.status(),
             content: OwnedResponseContent::from_frame(
-                framed.bytes().clone(),
+                framed.clone_bytes(),
                 frame.content_start(),
                 frame.content_end(),
                 frame.content_validation(),
@@ -502,10 +532,6 @@ impl ResponseContentRange {
         (start <= end && end <= response_len).then_some(Self(start..end))
     }
 
-    fn range(&self) -> Range<usize> {
-        self.0.clone()
-    }
-
     fn slice<'a>(&self, response: &'a [u8]) -> &'a [u8] {
         response
             .get(self.0.clone())
@@ -576,10 +602,7 @@ impl OwnedResponse {
     pub fn parse_article(&self) -> Result<Article<'_>, ArticleParseError> {
         match &self.content {
             OwnedResponseContent::Article(article) => Ok(article.materialize()),
-            OwnedResponseContent::Generic { bytes, content } => {
-                let range = content.range();
-                Article::parse_article_frame(bytes, range.start, range.end)
-            }
+            OwnedResponseContent::Generic { bytes, .. } => Article::parse(bytes),
         }
     }
 }
@@ -704,6 +727,19 @@ impl ResponseDecoder {
         else {
             return Ok(None);
         };
+        let initial = self
+            .streaming
+            .initial()
+            .ok_or(ClientError::InvalidStatusLine)?;
+        let status_line_end = self.streaming.status_line_end();
+        let content_end = bounds
+            .as_ref()
+            .map_or(Ok(status_line_end.get()), |bounds| {
+                status_line_end
+                    .get()
+                    .checked_add(bounds.content_end().get())
+                    .ok_or(ClientError::InvalidStatusLine)
+            })?;
 
         Ok(Some(FramedResponse {
             framed: ArticleState::new(FramedArticleState::new(
@@ -711,8 +747,10 @@ impl ResponseDecoder {
                 self.streaming.kind,
                 status,
                 bounds,
-                self.streaming.status_line_end(),
+                status_line_end,
+                ContentEnd::new(content_end),
             )),
+            initial,
         }))
     }
 }
@@ -732,7 +770,7 @@ enum FramingDecodeProgress {
 struct FrameEnd(usize);
 
 impl FrameEnd {
-    fn after_chunk(self, consumed: ChunkConsumed) -> Self {
+    fn after_chunk(self, consumed: DecoderChunkConsumed) -> Self {
         Self(self.0 + consumed.0)
     }
 
@@ -741,14 +779,17 @@ impl FrameEnd {
     }
 }
 
-/// Count consumed from this push's chunk, not the accumulated response.
+/// Count consumed from this decoder push, relative to the newly supplied
+/// response chunk. This includes status-line bytes and is distinct from the
+/// multiline framer's body-relative chunk coordinate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ChunkConsumed(usize);
+struct DecoderChunkConsumed(usize);
 
 #[derive(Debug)]
 struct StreamingResponseDecoder {
     kind: RequestKind,
     status: Option<StatusCode>,
+    initial: Option<ResponseInitial>,
     status_line_end: StatusLineEnd,
     framer: MultilineFramer,
     status_buf: [u8; STREAMING_STATUS_LINE_BYTES],
@@ -760,6 +801,7 @@ impl StreamingResponseDecoder {
         Self {
             kind,
             status: None,
+            initial: None,
             status_line_end: StatusLineEnd::new(0),
             framer: MultilineFramer::default(),
             status_buf: [0; STREAMING_STATUS_LINE_BYTES],
@@ -788,11 +830,12 @@ impl StreamingResponseDecoder {
                         ResponseInitialParse::Complete(initial) => {
                             let status = initial.status();
                             self.status = Some(status);
+                            self.initial = Some(initial);
                             self.status_line_end = StatusLineEnd::new(self.status_len);
                             if !initial.descriptor().framing().is_multiline() {
                                 return Ok(StreamingDecodeProgress::Complete {
                                     status,
-                                    consumed: ChunkConsumed(consumed),
+                                    consumed: DecoderChunkConsumed(consumed),
                                     bounds: None,
                                 });
                             }
@@ -808,7 +851,7 @@ impl StreamingResponseDecoder {
 
                 let Some(status) = self.status else {
                     return Ok(StreamingDecodeProgress::NeedMore {
-                        consumed: ChunkConsumed(chunk.len()),
+                        consumed: DecoderChunkConsumed(chunk.len()),
                     });
                 };
                 status
@@ -817,7 +860,7 @@ impl StreamingResponseDecoder {
 
         if content_start >= chunk.len() {
             return Ok(StreamingDecodeProgress::NeedMore {
-                consumed: ChunkConsumed(chunk.len()),
+                consumed: DecoderChunkConsumed(chunk.len()),
             });
         }
 
@@ -825,11 +868,11 @@ impl StreamingResponseDecoder {
         match self.framer.push(content_chunk) {
             MultilineFrameProgress::Complete(bounds) => Ok(StreamingDecodeProgress::Complete {
                 status,
-                consumed: ChunkConsumed(content_start + bounds.chunk_consumed().get()),
+                consumed: DecoderChunkConsumed(content_start + bounds.chunk_consumed().get()),
                 bounds: Some(bounds),
             }),
             MultilineFrameProgress::NeedMore => Ok(StreamingDecodeProgress::NeedMore {
-                consumed: ChunkConsumed(chunk.len()),
+                consumed: DecoderChunkConsumed(chunk.len()),
             }),
         }
     }
@@ -837,17 +880,21 @@ impl StreamingResponseDecoder {
     fn status_line_end(&self) -> StatusLineEnd {
         self.status_line_end
     }
+
+    fn initial(&self) -> Option<ResponseInitial> {
+        self.initial
+    }
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug)]
 enum StreamingDecodeProgress {
     NeedMore {
-        consumed: ChunkConsumed,
+        consumed: DecoderChunkConsumed,
     },
     Complete {
         status: StatusCode,
-        consumed: ChunkConsumed,
+        consumed: DecoderChunkConsumed,
         bounds: Option<crate::terminator::MultilineFrameBounds>,
     },
 }
@@ -863,6 +910,44 @@ pub fn bench_streaming_decode_response(
             status, consumed, ..
         } => Ok((status, consumed.0)),
         StreamingDecodeProgress::NeedMore { .. } => Err(ClientError::UnexpectedEof),
+    }
+}
+
+#[allow(unexpected_cfgs)]
+#[cfg(response_contract)]
+mod response_contracts {
+    use super::*;
+
+    /// Positive controls compile with the production coordinate and ownership
+    /// boundaries in place.
+    fn positive() {
+        let consumed = DecoderChunkConsumed(1);
+        let _ = FrameEnd(0).after_chunk(consumed);
+        let _ = std::hint::black_box(consumed);
+    }
+
+    #[cfg(response_contract = "coordinate")]
+    fn coordinate_substitution_must_fail() {
+        // A chunk-relative count cannot be used as an accumulated-buffer end.
+        let _ = FrameEnd(0).after_chunk(FrameEnd(1));
+    }
+
+    #[cfg(response_contract = "receive_alias")]
+    async fn receiving_borrow_must_fail<R: AsyncRead + Unpin>(
+        receiver: &mut BufferedResponseReceiver<R>,
+    ) {
+        let decoder = ResponseDecoder::new(RequestKind::Stat);
+        let _first = Receiving { receiver, decoder };
+        let _second = &mut *receiver;
+        std::hint::black_box(_first);
+    }
+
+    #[cfg(response_contract = "validated_mutation")]
+    fn validated_borrow_must_fail() {
+        let mut bytes = vec![0u8];
+        let borrowed = &bytes[..];
+        let _mutable = &mut bytes;
+        std::hint::black_box(borrowed);
     }
 }
 

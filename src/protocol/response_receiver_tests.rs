@@ -262,13 +262,15 @@ fn decoder_compact_frames_do_not_allocate() {
         stat_decoder.push(b"223 1 <stat@test> article retrieved\r\n"),
         Ok(StreamingDecodeProgress::Complete { status, consumed, .. })
             if status.as_u16() == 223
-                && consumed == ChunkConsumed(b"223 1 <stat@test> article retrieved\r\n".len())
+                && consumed
+                    == DecoderChunkConsumed(b"223 1 <stat@test> article retrieved\r\n".len())
     ));
     assert!(matches!(
         body_decoder.push(b"222 1 <body@test> body follows\r\nbody\r\n.\r\n"),
         Ok(StreamingDecodeProgress::Complete { status, consumed, .. })
             if status.as_u16() == 222
-                && consumed == ChunkConsumed(b"222 1 <body@test> body follows\r\nbody\r\n.\r\n".len())
+                && consumed
+                    == DecoderChunkConsumed(b"222 1 <body@test> body follows\r\nbody\r\n.\r\n".len())
     ));
 
     crate::COUNT_TEST_ALLOCATIONS.with(|enabled| enabled.set(false));
@@ -402,12 +404,14 @@ fn decoder_accepts_rfc4643_long_authinfo_sasl_response_lines() {
         let mut decoder = StreamingResponseDecoder::new(RequestKind::AuthInfo);
         assert!(matches!(
             decoder.push(&wire.as_bytes()[..split]),
-            Ok(StreamingDecodeProgress::NeedMore { consumed }) if consumed == ChunkConsumed(split)
+            Ok(StreamingDecodeProgress::NeedMore { consumed })
+                if consumed == DecoderChunkConsumed(split)
         ));
         assert!(matches!(
             decoder.push(&wire.as_bytes()[split..]),
             Ok(StreamingDecodeProgress::Complete { status, consumed, .. })
-                if status.as_u16() == expected && consumed == ChunkConsumed(wire.len() - split)
+                if status.as_u16() == expected
+                    && consumed == DecoderChunkConsumed(wire.len() - split)
         ));
     }
 }
@@ -423,12 +427,14 @@ fn streaming_decoder_enforces_rfc_initial_response_line_limit() {
     let mut decoder = StreamingResponseDecoder::new(RequestKind::Stat);
     assert!(matches!(
         decoder.push(&exact[..split]),
-        Ok(StreamingDecodeProgress::NeedMore { consumed }) if consumed == ChunkConsumed(split)
+            Ok(StreamingDecodeProgress::NeedMore { consumed })
+                if consumed == DecoderChunkConsumed(split)
     ));
     assert!(matches!(
         decoder.push(&exact[split..]),
         Ok(StreamingDecodeProgress::Complete { status, consumed, .. })
-            if status.as_u16() == 223 && consumed == ChunkConsumed(exact.len() - split)
+            if status.as_u16() == 223
+                && consumed == DecoderChunkConsumed(exact.len() - split)
     ));
 
     let mut too_long = Vec::from(b"223 1 <stat@test> ".as_slice());
@@ -475,6 +481,18 @@ fn framing_completion_excludes_a_packed_following_response() {
         first.len() - 1,
         first.len(),
     );
+}
+
+#[test]
+fn received_article_validation_excludes_packed_following_response() {
+    let first = b"222 1 <body@test> body follows\r\nwire body\r\n.\r\n";
+    let mut packed = first.to_vec();
+    packed.extend_from_slice(b"223 1 <next@test> article exists\r\n");
+
+    let response = receive_response(RequestKind::Body, &packed, 1).unwrap();
+    let article = response.parse_article().unwrap();
+
+    assert_eq!(article.body.as_deref(), Some(&b"wire body\r\n"[..]));
 }
 
 #[test]
@@ -867,7 +885,7 @@ proptest! {
 
             match decoder.push(chunk)? {
                 StreamingDecodeProgress::NeedMore { consumed } => {
-                    prop_assert_eq!(consumed, ChunkConsumed(chunk.len()));
+                    prop_assert_eq!(consumed, DecoderChunkConsumed(chunk.len()));
                     offset += consumed.0;
                     prop_assert!(
                         offset < expected_consumed,
@@ -972,7 +990,7 @@ fn streaming_drained_decoder_does_not_allocate_for_large_multiline_responses() {
     else {
         panic!("streaming decoder should complete at RFC terminator");
     };
-    assert_eq!(consumed, ChunkConsumed(terminator.len()));
+    assert_eq!(consumed, DecoderChunkConsumed(terminator.len()));
 
     bytes = 0;
     assert!(matches!(
@@ -993,7 +1011,7 @@ fn streaming_drained_decoder_does_not_allocate_for_large_multiline_responses() {
     else {
         panic!("streaming OVER decoder should complete at RFC terminator");
     };
-    assert_eq!(consumed, ChunkConsumed(terminator.len()));
+    assert_eq!(consumed, DecoderChunkConsumed(terminator.len()));
 
     crate::COUNT_TEST_ALLOCATIONS.with(|enabled| enabled.set(false));
     assert_eq!(
