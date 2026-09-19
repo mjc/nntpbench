@@ -2289,6 +2289,24 @@ pub async fn bench_public_response_receive(
     response_receiver::benchmark_receive_async(kind, response, chunk_bytes).await
 }
 
+/// Measure two production receives over a packed input buffer, including the
+/// receiver's retained-suffix transition between responses.
+#[doc(hidden)]
+pub async fn bench_public_packed_response_receive(
+    first_kind: RequestKind,
+    second_kind: RequestKind,
+    response: &[u8],
+    chunk_bytes: usize,
+) -> Result<(StatusCode, StatusCode, usize), ClientError> {
+    response_receiver::benchmark_receive_packed_async(
+        first_kind,
+        second_kind,
+        response,
+        chunk_bytes,
+    )
+    .await
+}
+
 /// Run the pre-incremental whole-pending-buffer decoder as a benchmark control.
 #[doc(hidden)]
 pub fn bench_public_response_decode_chunks_stateless(
