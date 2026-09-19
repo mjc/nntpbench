@@ -197,8 +197,6 @@ impl FramedResponse {
                 .validate_article()
                 .map_err(|_| ClientError::InvalidStatusLine)?;
             return Ok(OwnedResponse {
-                kind,
-                status,
                 content: OwnedResponseContent::Article(article),
             });
         }
@@ -207,9 +205,12 @@ impl FramedResponse {
             .ok_or(ClientError::InvalidStatusLine)?;
         let bytes = framed.into_inner().into_bytes();
         Ok(OwnedResponse {
-            kind,
-            status,
-            content: OwnedResponseContent::Generic { bytes, content },
+            content: OwnedResponseContent::Generic {
+                kind,
+                status,
+                bytes,
+                content,
+            },
         })
     }
 }
@@ -497,14 +498,14 @@ mod tests {
 /// Owned response bytes for the client path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnedResponse {
-    kind: RequestKind,
-    status: StatusCode,
     content: OwnedResponseContent,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum OwnedResponseContent {
     Generic {
+        kind: RequestKind,
+        status: StatusCode,
         bytes: Bytes,
         content: ResponseContentRange,
     },
@@ -521,7 +522,7 @@ impl OwnedResponseContent {
 
     fn content(&self) -> &[u8] {
         match self {
-            Self::Generic { bytes, content } => content.slice(bytes),
+            Self::Generic { bytes, content, .. } => content.slice(bytes),
             Self::Article(article) => article.content(),
         }
     }
@@ -531,13 +532,19 @@ impl OwnedResponse {
     /// Request kind that produced this response.
     #[must_use]
     pub const fn kind(&self) -> RequestKind {
-        self.kind
+        match &self.content {
+            OwnedResponseContent::Generic { kind, .. } => *kind,
+            OwnedResponseContent::Article(article) => article.kind(),
+        }
     }
 
     /// Parsed status code from the response status line.
     #[must_use]
     pub const fn status(&self) -> StatusCode {
-        self.status
+        match &self.content {
+            OwnedResponseContent::Generic { status, .. } => *status,
+            OwnedResponseContent::Article(article) => article.status(),
+        }
     }
 
     /// Raw response bytes.
@@ -600,8 +607,6 @@ impl OwnedArticle {
     #[must_use]
     pub fn into_response(self) -> OwnedResponse {
         OwnedResponse {
-            kind: self.article.kind(),
-            status: self.article.status(),
             content: OwnedResponseContent::Article(self.article),
         }
     }
@@ -611,37 +616,24 @@ impl TryFrom<OwnedResponse> for OwnedArticle {
     type Error = ClientError;
 
     fn try_from(response: OwnedResponse) -> Result<Self, Self::Error> {
-        let expected_status = match response.kind {
+        let expected_status = match response.kind() {
             RequestKind::Article => 220,
             RequestKind::Head => 221,
             RequestKind::Body => 222,
             RequestKind::Stat => 223,
             _ => 0,
         };
-        let OwnedResponse {
-            kind,
-            status,
-            content,
-        } = response;
+        let status = response.status();
         if status.as_u16() != expected_status {
-            return Err(ClientError::UnexpectedArticleResponse {
-                response: OwnedResponse {
-                    kind,
-                    status,
-                    content,
-                },
-            });
+            return Err(ClientError::UnexpectedArticleResponse { response });
         }
 
+        let OwnedResponse { content } = response;
         match content {
             OwnedResponseContent::Article(article) => Ok(Self { article }),
             content @ OwnedResponseContent::Generic { .. } => {
                 Err(ClientError::UnexpectedArticleResponse {
-                    response: OwnedResponse {
-                        kind,
-                        status,
-                        content,
-                    },
+                    response: OwnedResponse { content },
                 })
             }
         }

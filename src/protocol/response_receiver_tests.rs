@@ -172,6 +172,8 @@ fn owned_article_requires_decoder_article_proof() {
         b"222 1 <body@test> body follows\r\nbody\r\n.\r\n",
     );
     response.content = OwnedResponseContent::Generic {
+        kind: response.kind(),
+        status: response.status(),
         bytes: response.content.bytes().to_vec().into(),
         content: ResponseContentRange::new(0, 0, response.content.bytes().len()).unwrap(),
     };
