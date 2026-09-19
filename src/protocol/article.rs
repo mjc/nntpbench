@@ -1138,6 +1138,7 @@ pub(crate) mod state {
         pub(crate) fn validate_article(
             self,
         ) -> Result<Article<Validated<bytes::Bytes>>, super::ArticleParseError> {
+            let kind = self.kind();
             let status = self.status();
             if !matches!(status.as_u16(), 220..=223) {
                 return Err(super::ArticleParseError::InvalidStatusCode(status.as_u16()));
@@ -1150,6 +1151,8 @@ pub(crate) mod state {
             .validate_for_status(status.as_u16())?;
             Ok(Article::new(Validated::new(
                 self.into_inner().into_bytes(),
+                kind,
+                status,
                 layout,
             )))
         }
@@ -1214,6 +1217,8 @@ pub(crate) mod state {
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub(crate) struct Validated<B> {
         bytes: B,
+        kind: RequestKind,
+        status: StatusCode,
         layout: ArticleLayout,
     }
 
@@ -1234,8 +1239,26 @@ pub(crate) mod state {
     }
 
     impl<B> Validated<B> {
-        pub(super) const fn new(bytes: B, layout: ArticleLayout) -> Self {
-            Self { bytes, layout }
+        pub(super) const fn new(
+            bytes: B,
+            kind: RequestKind,
+            status: StatusCode,
+            layout: ArticleLayout,
+        ) -> Self {
+            Self {
+                bytes,
+                kind,
+                status,
+                layout,
+            }
+        }
+
+        pub(super) const fn kind(&self) -> RequestKind {
+            self.kind
+        }
+
+        pub(super) const fn status(&self) -> StatusCode {
+            self.status
         }
 
         pub(super) fn bytes(&self) -> &B {
@@ -1437,6 +1460,16 @@ impl state::Validated<Bytes> {
 }
 
 impl ValidatedOwnedArticle {
+    #[must_use]
+    pub(crate) const fn kind(&self) -> RequestKind {
+        self.as_inner().kind()
+    }
+
+    #[must_use]
+    pub(crate) const fn status(&self) -> StatusCode {
+        self.as_inner().status()
+    }
+
     #[must_use]
     pub(crate) fn bytes(&self) -> &[u8] {
         self.as_inner().bytes()

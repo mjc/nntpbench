@@ -569,8 +569,6 @@ impl OwnedResponse {
 /// by the public article surface.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnedArticle {
-    kind: RequestKind,
-    status: StatusCode,
     article: ValidatedOwnedArticle,
 }
 
@@ -578,13 +576,13 @@ impl OwnedArticle {
     /// Request kind that produced this article-style response.
     #[must_use]
     pub const fn kind(&self) -> RequestKind {
-        self.kind
+        self.article.kind()
     }
 
     /// Parsed status code from the response status line.
     #[must_use]
     pub const fn status(&self) -> StatusCode {
-        self.status
+        self.article.status()
     }
 
     /// Raw response bytes.
@@ -602,8 +600,8 @@ impl OwnedArticle {
     #[must_use]
     pub fn into_response(self) -> OwnedResponse {
         OwnedResponse {
-            kind: self.kind,
-            status: self.status,
+            kind: self.article.kind(),
+            status: self.article.status(),
             content: OwnedResponseContent::Article(self.article),
         }
     }
@@ -636,11 +634,7 @@ impl TryFrom<OwnedResponse> for OwnedArticle {
         }
 
         match content {
-            OwnedResponseContent::Article(article) => Ok(Self {
-                kind,
-                status,
-                article,
-            }),
+            OwnedResponseContent::Article(article) => Ok(Self { article }),
             content @ OwnedResponseContent::Generic { .. } => {
                 Err(ClientError::UnexpectedArticleResponse {
                     response: OwnedResponse {
