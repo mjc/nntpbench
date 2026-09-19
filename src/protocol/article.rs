@@ -1269,6 +1269,24 @@ pub(crate) mod state {
             &self.layout
         }
     }
+
+    impl<B: StableBytes> Article<Validated<B>> {
+        pub(crate) const fn kind(&self) -> RequestKind {
+            self.0.kind()
+        }
+
+        pub(crate) const fn status(&self) -> StatusCode {
+            self.0.status()
+        }
+
+        pub(crate) fn as_bytes(&self) -> &[u8] {
+            self.0.bytes.as_slice()
+        }
+
+        pub(crate) fn article(&self) -> super::Article<'_> {
+            self.0.layout.materialize(self.as_bytes())
+        }
+    }
 }
 
 /// A byte range proven to lie within a validated article frame.
@@ -1460,16 +1478,6 @@ impl state::Validated<Bytes> {
 }
 
 impl ValidatedOwnedArticle {
-    #[must_use]
-    pub(crate) const fn kind(&self) -> RequestKind {
-        self.as_inner().kind()
-    }
-
-    #[must_use]
-    pub(crate) const fn status(&self) -> StatusCode {
-        self.as_inner().status()
-    }
-
     #[must_use]
     pub(crate) fn bytes(&self) -> &[u8] {
         self.as_inner().bytes()

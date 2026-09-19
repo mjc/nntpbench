@@ -588,12 +588,12 @@ impl OwnedArticle {
     /// Raw response bytes.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
-        self.article.bytes()
+        self.article.as_bytes()
     }
 
     /// Borrow the parsed article/body view from the owned wire bytes.
     pub fn article(&self) -> Article<'_> {
-        self.article.materialize()
+        self.article.article()
     }
 
     /// Consume the client article-style wrapper and return the raw response.
