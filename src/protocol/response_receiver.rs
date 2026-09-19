@@ -186,26 +186,43 @@ impl FramedResponse {
         let Self { framed, initial } = self;
         let kind = framed.kind();
         let status = framed.status();
+        let article_response = matches!(
+            (kind, status.as_u16()),
+            (RequestKind::Article, 220)
+                | (RequestKind::Head, 221)
+                | (RequestKind::Body, 222)
+                | (RequestKind::Stat, 223)
+        );
+        if article_response {
+            let article = framed
+                .validate_article()
+                .map_err(|_| ClientError::InvalidStatusLine)?;
+            return Ok(OwnedResponse {
+                kind,
+                status,
+                content: OwnedResponseContent::Article(article),
+            });
+        }
         let validation = ResponseFrameDecoder::new(kind)
             .validate_framed_after_initial(&framed, initial)
             .ok_or(ClientError::InvalidStatusLine)?;
-        let bytes = framed.clone_bytes();
         match validation {
-            ValidatedResponseContent::Article(view) => Ok(OwnedResponse {
-                kind,
-                status,
-                content: OwnedResponseContent::Article(view.into_owned(bytes)),
-            }),
-            ValidatedResponseContent::Generic => Ok(OwnedResponse {
-                kind,
-                status,
-                content: OwnedResponseContent::from_frame(
-                    bytes,
-                    framed.status_line_end().get(),
-                    framed.content_end().get(),
-                    ValidatedResponseContent::Generic,
-                ),
-            }),
+            ValidatedResponseContent::Article(_) => {
+                unreachable!("article responses use the consuming framed article validation path")
+            }
+            ValidatedResponseContent::Generic => {
+                let bytes = framed.clone_bytes();
+                Ok(OwnedResponse {
+                    kind,
+                    status,
+                    content: OwnedResponseContent::from_frame(
+                        bytes,
+                        framed.status_line_end().get(),
+                        framed.content_end().get(),
+                        ValidatedResponseContent::Generic,
+                    ),
+                })
+            }
         }
     }
 }

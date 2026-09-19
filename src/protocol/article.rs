@@ -1091,6 +1091,10 @@ pub(crate) mod state {
         pub(crate) fn as_inner_mut(&mut self) -> &mut State {
             &mut self.0
         }
+
+        pub(crate) fn into_inner(self) -> State {
+            self.0
+        }
     }
 
     impl<B> Article<Framed<B>> {
@@ -1122,9 +1126,36 @@ pub(crate) mod state {
         }
     }
 
+    impl<B> Framed<B> {
+        pub(crate) fn into_bytes(self) -> B {
+            self.bytes
+        }
+    }
+
     impl Article<Framed<bytes::Bytes>> {
         pub(crate) fn clone_bytes(&self) -> bytes::Bytes {
             self.0.bytes().clone()
+        }
+
+        /// Consume a framed article after validating its semantics while the
+        /// bytes and layout remain in the same owner.
+        pub(crate) fn validate_article(
+            self,
+        ) -> Result<Article<Validated<bytes::Bytes>>, super::ArticleParseError> {
+            let status = self.status();
+            if !matches!(status.as_u16(), 220..=223) {
+                return Err(super::ArticleParseError::InvalidStatusCode(status.as_u16()));
+            }
+            let layout = super::FramedArticle::from_content_bounds(
+                self.as_bytes(),
+                self.status_line_end().get(),
+                self.content_end().get(),
+            )?
+            .validate_for_status(status.as_u16())?;
+            Ok(Article::new(Validated::new(
+                self.into_inner().into_bytes(),
+                layout,
+            )))
         }
     }
 
@@ -1496,13 +1527,12 @@ impl<'a> FramedArticle<'a> {
 
     fn validate(self) -> Result<ValidatedArticleView<'a>, ArticleParseError> {
         let status = parse_status_code(self.buffer)?;
-        self.validate_for_status(status)
+        let buffer = self.buffer;
+        let layout = self.validate_for_status(status)?;
+        Ok(ValidatedArticleView { buffer, layout })
     }
 
-    fn validate_for_status(
-        self,
-        status: u16,
-    ) -> Result<ValidatedArticleView<'a>, ArticleParseError> {
+    fn validate_for_status(self, status: u16) -> Result<ArticleLayout, ArticleParseError> {
         let buffer = self.buffer;
         let first_line = validate_first_line(buffer, self.first_line)?;
 
@@ -1514,12 +1544,9 @@ impl<'a> FramedArticle<'a> {
             status_code => Err(ArticleParseError::InvalidStatusCode(status_code)),
         }?;
 
-        Ok(ValidatedArticleView {
-            buffer,
-            layout: ArticleLayout {
-                first_line,
-                content,
-            },
+        Ok(ArticleLayout {
+            first_line,
+            content,
         })
     }
 
