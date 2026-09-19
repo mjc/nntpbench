@@ -1061,6 +1061,12 @@ pub(crate) mod state {
         }
     }
 
+    impl StableBytes for &[u8] {
+        fn as_slice(&self) -> &[u8] {
+            self
+        }
+    }
+
     /// Exclusive end of the request-scoped status line in a framed response.
     /// This coordinate is relative to the same immutable bytes as the frame.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2736,5 +2742,38 @@ Actual body content\r\n\
             Article::parse(bare_lf),
             Err(ArticleParseError::InvalidBody)
         ));
+    }
+
+    #[test]
+    fn borrowed_bytes_can_carry_a_validated_article_view() {
+        let bytes: &[u8] = b"222 1 <body@test> follows\r\nbody\r\n";
+        let initial = match ResponseInitial::parse(RequestKind::Body, bytes) {
+            crate::protocol::ResponseInitialParse::Complete(initial) => initial,
+            _ => panic!("valid response line should parse"),
+        };
+        let status_line_end = state::StatusLineEnd::new(b"222 1 <body@test> follows\r\n".len());
+        let layout = FramedArticle::from_known_content_bounds(
+            bytes,
+            status_line_end.get(),
+            bytes.len(),
+            status_line_end,
+        )
+        .expect("valid framed article")
+        .validate_for_status_with_first_line(
+            222,
+            validated_first_line_from_initial(initial, status_line_end).unwrap(),
+        )
+        .unwrap();
+        let article = state::Article::new(state::Validated::new(
+            bytes,
+            RequestKind::Body,
+            StatusCode::parse(b"222").unwrap(),
+            layout,
+        ));
+
+        assert_eq!(
+            article.article().body,
+            Some(std::borrow::Cow::Borrowed(&b"body\r\n"[..]))
+        );
     }
 }
