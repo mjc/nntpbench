@@ -9,8 +9,8 @@ use nntpbench::client::{
     bench_article_validation_and_materialization, bench_article_validation_and_two_parses,
     bench_owned_article_accessor_parse, bench_owned_response_from_bytes,
     bench_pending_read_capacity, bench_public_response_decode_chunks,
-    bench_public_response_decode_chunks_stateless, bench_streaming_decode_response,
-    bench_write_request_wire_to_sink,
+    bench_public_response_decode_chunks_stateless, bench_public_response_receive,
+    bench_streaming_decode_response, bench_write_request_wire_to_sink,
 };
 use nntpbench::{
     ClientCommandMix, MessageId, Request, RequestKind, bench_append_load_workload_request,
@@ -233,7 +233,8 @@ mod public_client_experiments {
         bench_article_validation_and_two_parses, bench_load_read_capacity_in_place,
         bench_owned_article_accessor_parse, bench_owned_response_from_bytes,
         bench_pending_read_capacity, bench_public_response_decode_chunks,
-        bench_public_response_decode_chunks_stateless, black_box, fixtures, runtime,
+        bench_public_response_decode_chunks_stateless, bench_public_response_receive, black_box,
+        fixtures, runtime,
     };
     use fixtures::ArticleVariant;
 
@@ -398,6 +399,47 @@ mod public_client_experiments {
         let response = fixtures::body_response(size, false);
         let chunk_bytes = response.len();
         bench_fragmented_decode_response(bencher, response, chunk_bytes);
+    }
+
+    fn bench_async_receive_response(bencher: Bencher, response: Vec<u8>, chunk_bytes: usize) {
+        let rt = runtime();
+        bencher.bench_local(|| {
+            black_box(rt.block_on(bench_public_response_receive(
+                black_box(RequestKind::Body),
+                black_box(&response),
+                black_box(chunk_bytes),
+            )))
+        });
+    }
+
+    fn bench_async_receive(bencher: Bencher, size: usize, chunk_bytes: usize) {
+        bench_async_receive_response(bencher, fixtures::body_response(size, false), chunk_bytes);
+    }
+
+    fn bench_async_receive_whole_read(bencher: Bencher, size: usize) {
+        let response = fixtures::body_response(size, false);
+        let chunk_bytes = response.len();
+        bench_async_receive_response(bencher, response, chunk_bytes);
+    }
+
+    #[divan::bench(sample_count = 50, sample_size = 10)]
+    fn async_receive_64k_256_bytes(bencher: Bencher) {
+        bench_async_receive(bencher, BODY_64K, 256);
+    }
+
+    #[divan::bench(sample_count = 50, sample_size = 10)]
+    fn async_receive_64k_whole_read(bencher: Bencher) {
+        bench_async_receive_whole_read(bencher, BODY_64K);
+    }
+
+    #[divan::bench(sample_count = 20, sample_size = 5)]
+    fn async_receive_768k_256k(bencher: Bencher) {
+        bench_async_receive(bencher, BODY_768K, 256 * 1024);
+    }
+
+    #[divan::bench(sample_count = 20, sample_size = 5)]
+    fn async_receive_768k_whole_read(bencher: Bencher) {
+        bench_async_receive_whole_read(bencher, BODY_768K);
     }
 
     fn bench_stateless_decode_response(bencher: Bencher, response: Vec<u8>, chunk_bytes: usize) {

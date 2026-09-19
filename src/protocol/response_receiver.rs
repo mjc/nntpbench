@@ -109,6 +109,18 @@ pub(crate) fn benchmark_receive(
         .map(|response| (response.status(), response.as_bytes().len()))
 }
 
+pub(crate) async fn benchmark_receive_async(
+    kind: RequestKind,
+    response: &[u8],
+    chunk_bytes: usize,
+) -> Result<(StatusCode, usize), ClientError> {
+    let mut receiver = BufferedResponseReceiver::new(std::io::Cursor::new(response));
+    receiver
+        .receive(kind, chunk_bytes)
+        .await
+        .map(|response| (response.status(), response.as_bytes().len()))
+}
+
 pub(crate) fn owned_from_bytes(
     kind: RequestKind,
     bytes: &[u8],

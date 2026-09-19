@@ -2277,6 +2277,18 @@ pub fn bench_public_response_decode_chunks(
     response_receiver::benchmark_receive(kind, response, chunk_bytes)
 }
 
+/// Measure the production buffered receiver with an asynchronous in-memory
+/// reader. The response bytes are borrowed by the reader, so fixture creation
+/// stays outside the timed receive operation.
+#[doc(hidden)]
+pub async fn bench_public_response_receive(
+    kind: RequestKind,
+    response: &[u8],
+    chunk_bytes: usize,
+) -> Result<(StatusCode, usize), ClientError> {
+    response_receiver::benchmark_receive_async(kind, response, chunk_bytes).await
+}
+
 /// Run the pre-incremental whole-pending-buffer decoder as a benchmark control.
 #[doc(hidden)]
 pub fn bench_public_response_decode_chunks_stateless(
