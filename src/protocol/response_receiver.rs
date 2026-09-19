@@ -186,37 +186,27 @@ impl FramedResponse {
         let Self { framed, initial } = self;
         let kind = framed.kind();
         let status = framed.status();
-        if matches!(
-            (kind, status.as_u16()),
-            (RequestKind::Article, 220)
-                | (RequestKind::Head, 221)
-                | (RequestKind::Body, 222)
-                | (RequestKind::Stat, 223)
-        ) {
-            let article = framed
-                .into_inner()
-                .validate()
-                .map_err(|_| ClientError::InvalidStatusLine)?;
-            return Ok(OwnedResponse {
-                kind,
-                status,
-                content: OwnedResponseContent::Article(article),
-            });
-        }
-
         let validation = ResponseFrameDecoder::new(kind)
             .validate_framed_after_initial(&framed, initial)
             .ok_or(ClientError::InvalidStatusLine)?;
-        Ok(OwnedResponse {
-            kind,
-            status,
-            content: OwnedResponseContent::from_frame(
-                framed.clone_bytes(),
-                framed.status_line_end().get(),
-                framed.content_end().get(),
-                validation,
-            ),
-        })
+        let bytes = framed.clone_bytes();
+        match validation {
+            ValidatedResponseContent::Article(view) => Ok(OwnedResponse {
+                kind,
+                status,
+                content: OwnedResponseContent::Article(view.into_owned(bytes)),
+            }),
+            ValidatedResponseContent::Generic => Ok(OwnedResponse {
+                kind,
+                status,
+                content: OwnedResponseContent::from_frame(
+                    bytes,
+                    framed.status_line_end().get(),
+                    framed.content_end().get(),
+                    ValidatedResponseContent::Generic,
+                ),
+            }),
+        }
     }
 }
 

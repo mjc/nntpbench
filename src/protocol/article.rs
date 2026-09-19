@@ -1045,7 +1045,7 @@ impl From<u64> for ArticleNumber {
 /// The storage adapters remain local to each repository. These state names
 /// describe the guarantees, not a common allocation type.
 pub(crate) mod state {
-    use super::{ArticleLayout, ArticleParseError, RequestKind, StatusCode};
+    use super::{ArticleLayout, RequestKind, StatusCode};
 
     /// Storage whose bytes remain stable while a validated layout is used.
     /// This crate-private contract prevents validation from accepting an
@@ -1090,10 +1090,6 @@ pub(crate) mod state {
 
         pub(crate) fn as_inner_mut(&mut self) -> &mut State {
             &mut self.0
-        }
-
-        pub(crate) fn into_inner(self) -> State {
-            self.0
         }
     }
 
@@ -1184,24 +1180,6 @@ pub(crate) mod state {
 
         pub(crate) const fn content_end(&self) -> ContentEnd {
             self.content_end
-        }
-    }
-
-    impl<B: StableBytes> Framed<B> {
-        /// Consume a framed article response at the semantic boundary.
-        ///
-        /// The framing state already owns the exact bytes and the request
-        /// status-line boundary, so validation can produce the article layout
-        /// without reconstructing a temporary response frame or accepting a
-        /// detached buffer and range pair.
-        pub(crate) fn validate(self) -> Result<Article<Validated<B>>, ArticleParseError> {
-            let layout = ArticleLayout::parse_framed(
-                self.bytes.as_slice(),
-                self.status,
-                self.status_line_end,
-                self.content_end,
-            )?;
-            Ok(Article::new(Validated::new(self.bytes, layout)))
         }
     }
 
@@ -1325,25 +1303,6 @@ struct ArticleLayout {
 }
 
 impl ArticleLayout {
-    fn parse_framed(
-        buffer: &[u8],
-        status: crate::protocol::StatusCode,
-        status_line_end: state::StatusLineEnd,
-        content_end: state::ContentEnd,
-    ) -> Result<Self, ArticleParseError> {
-        if !matches!(status.as_u16(), 220..=223) {
-            return Err(ArticleParseError::InvalidStatusCode(status.as_u16()));
-        }
-        FramedArticle::from_known_content_bounds(
-            buffer,
-            status_line_end.get(),
-            content_end.get(),
-            status_line_end,
-        )?
-        .validate_for_status(status.as_u16())
-        .map(|view| view.layout)
-    }
-
     fn materialize<'a>(self, buffer: &'a [u8]) -> Article<'a> {
         let message_id = materialize_validated_message_id(buffer, self.first_line.message_id);
         let article_number = Some(self.first_line.article_number);
