@@ -559,7 +559,7 @@ impl OwnedResponse {
     pub fn parse_article(&self) -> Result<Article<'_>, ArticleParseError> {
         match &self.content {
             OwnedResponseContent::Article(article) => Ok(article.materialize()),
-            OwnedResponseContent::Generic { bytes, .. } => Article::parse(bytes),
+            OwnedResponseContent::Generic { .. } => Err(ArticleParseError::NotArticleResponse),
         }
     }
 }

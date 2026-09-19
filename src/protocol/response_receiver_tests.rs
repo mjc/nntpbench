@@ -198,6 +198,26 @@ fn owned_article_requires_decoder_article_proof() {
 }
 
 #[test]
+fn generic_owned_response_does_not_reparse_as_an_article() {
+    let mut response = response_from_bytes(
+        RequestKind::Body,
+        StatusCode::parse(b"222").unwrap(),
+        b"222 1 <body@test> body follows\r\nbody\r\n.\r\n",
+    );
+    response.content = OwnedResponseContent::Generic {
+        kind: RequestKind::Body,
+        status: StatusCode::parse(b"222").unwrap(),
+        bytes: response.content.bytes().to_vec().into(),
+        content: ResponseContentRange::new(0, 0, response.content.bytes().len()).unwrap(),
+    };
+
+    assert_eq!(
+        response.parse_article(),
+        Err(ArticleParseError::NotArticleResponse)
+    );
+}
+
+#[test]
 fn owned_article_access_is_infallible_after_promotion() {
     let response = response_from_bytes(
         RequestKind::Body,

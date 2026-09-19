@@ -15,6 +15,8 @@ use crate::terminator::{
 /// Article parsing error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ArticleParseError {
+    /// The response was framed successfully but is not an article-family response.
+    NotArticleResponse,
     InvalidStatusCode(u16),
     InvalidStatusPrefix,
     MissingSeparator,
@@ -983,6 +985,7 @@ mod proptests {
 impl fmt::Display for ArticleParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::NotArticleResponse => write!(f, "response is not an article-family response"),
             Self::InvalidStatusCode(code) => write!(f, "invalid status code: {code}"),
             Self::InvalidStatusPrefix => write!(f, "invalid status code prefix"),
             Self::MissingSeparator => {
