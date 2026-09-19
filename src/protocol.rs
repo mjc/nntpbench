@@ -165,20 +165,7 @@ impl<'a> ResponseFrame<'a> {
             )
         };
         let content_end = status_line_end + content.len();
-        let content_validation = match validate_response_content(
-            kind,
-            status,
-            descriptor.framing(),
-            &buffer[..consumed],
-            &buffer[..status_line_end],
-            status_line_end,
-            content_end,
-        ) {
-            Some(validation) => validation,
-            None => return ResponseFrameParse::Invalid,
-        };
-
-        ResponseFrameParse::Complete(Self {
+        let frame = Self {
             kind,
             descriptor,
             bytes: &buffer[..consumed],
@@ -187,9 +174,18 @@ impl<'a> ResponseFrame<'a> {
             terminator,
             content_start: status_line_end,
             content_end,
-            content_validation,
+            content_validation: ValidatedResponseContent::Generic,
             status,
             consumed,
+        };
+        let content_validation = match validate_response_content(frame) {
+            Some(validation) => validation,
+            None => return ResponseFrameParse::Invalid,
+        };
+
+        ResponseFrameParse::Complete(Self {
+            content_validation,
+            ..frame
         })
     }
 
@@ -274,35 +270,35 @@ impl ResponseFrameDecoder {
         ResponseFrame::parse(self.kind, buffer)
     }
 
-    #[cfg(test)]
-    fn complete_framed<'a>(
+    /// Validate a non-article frame while retaining only its resource-bound
+    /// content coordinates. The caller can then consume the framed owner
+    /// without cloning its immutable byte storage.
+    pub(crate) fn validate_generic_framed_after_initial(
         self,
-        framed: &'a ArticleState<FramedArticleState<bytes::Bytes>>,
-    ) -> ResponseFrameParse<'a> {
-        self.complete_with_metadata(
-            framed.as_bytes(),
-            framed.status(),
-            framed.status_line_end(),
-            framed.bounds(),
-            None,
-        )
-    }
-
-    /// Complete a frame after the streaming decoder has already validated its
-    /// request-scoped initial line. The proof prevents reparsing that line;
-    /// content validation still runs against the exact retained bytes.
-    pub(crate) fn complete_framed_after_initial<'a>(
-        self,
-        framed: &'a ArticleState<FramedArticleState<bytes::Bytes>>,
+        framed: &ArticleState<FramedArticleState<bytes::Bytes>>,
         initial: ResponseInitial,
-    ) -> ResponseFrameParse<'a> {
-        self.complete_with_metadata(
+    ) -> Option<ResponseContentRange> {
+        let ResponseFrameParse::Complete(frame) = self.complete_with_metadata(
             framed.as_bytes(),
             framed.status(),
             framed.status_line_end(),
             framed.bounds(),
             Some(initial),
+        ) else {
+            return None;
+        };
+        matches!(
+            frame.content_validation(),
+            ValidatedResponseContent::Generic
         )
+        .then(|| {
+            ResponseContentRange::new(
+                frame.content_start(),
+                frame.content_end(),
+                frame.bytes().len(),
+            )
+            .expect("response parser established an in-bounds content range")
+        })
     }
 
     fn complete_with_metadata<'a>(
@@ -364,20 +360,7 @@ impl ResponseFrameDecoder {
                 &buffer[status_line_end..status_line_end],
             )
         };
-        let content_validation = match validate_response_content(
-            self.kind,
-            status,
-            descriptor.framing(),
-            &buffer[..consumed],
-            status_line,
-            status_line_end,
-            content_end,
-        ) {
-            Some(validation) => validation,
-            None => return ResponseFrameParse::Invalid,
-        };
-
-        ResponseFrameParse::Complete(ResponseFrame {
+        let frame = ResponseFrame {
             kind: self.kind,
             descriptor,
             bytes: &buffer[..consumed],
@@ -386,9 +369,18 @@ impl ResponseFrameDecoder {
             terminator,
             content_start: status_line_end,
             content_end,
-            content_validation,
+            content_validation: ValidatedResponseContent::Generic,
             status,
             consumed,
+        };
+        let content_validation = match validate_response_content(frame) {
+            Some(validation) => validation,
+            None => return ResponseFrameParse::Invalid,
+        };
+
+        ResponseFrameParse::Complete(ResponseFrame {
+            content_validation,
+            ..frame
         })
     }
 }
@@ -398,6 +390,48 @@ impl ResponseFrameDecoder {
 pub(crate) struct ResponseInitial {
     status: StatusCode,
     descriptor: ResponseDescriptor,
+    article: Option<ResponseInitialArticle>,
+}
+
+/// Article-family fields parsed from the initial response line.
+///
+/// Ranges are exclusive and relative to the same response bytes that produced
+/// the initial state. They are metadata only; the owning framed state remains
+/// responsible for binding them to its immutable bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ResponseInitialArticle {
+    article_number: u64,
+    message_id: ResponseInitialRange,
+}
+
+impl ResponseInitialArticle {
+    #[must_use]
+    pub(crate) const fn article_number(self) -> u64 {
+        self.article_number
+    }
+
+    #[must_use]
+    pub(crate) const fn message_id(self) -> ResponseInitialRange {
+        self.message_id
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ResponseInitialRange {
+    start: usize,
+    end: usize,
+}
+
+impl ResponseInitialRange {
+    #[must_use]
+    pub(crate) const fn start(self) -> usize {
+        self.start
+    }
+
+    #[must_use]
+    pub(crate) const fn end(self) -> usize {
+        self.end
+    }
 }
 
 impl ResponseInitial {
@@ -411,12 +445,31 @@ impl ResponseInitial {
                     return ResponseInitialParse::Invalid;
                 };
                 let descriptor = ResponseDescriptor::for_request_status(kind, status);
-                if matches!(descriptor.framing(), ResponseFraming::Unexpected)
-                    || !validate_response_initial_line(kind, status, &buffer[..line_end])
-                {
+                if matches!(descriptor.framing(), ResponseFraming::Unexpected) {
                     return ResponseInitialParse::Invalid;
                 }
-                ResponseInitialParse::Complete(Self { status, descriptor })
+                let article = if matches!(
+                    (kind, status.as_u16()),
+                    (RequestKind::Article, 220)
+                        | (RequestKind::Head, 221)
+                        | (RequestKind::Body, 222)
+                        | (RequestKind::Stat, 223)
+                ) {
+                    let Some(article) = parse_response_initial_article(&buffer[..line_end]) else {
+                        return ResponseInitialParse::Invalid;
+                    };
+                    Some(article)
+                } else {
+                    if !validate_response_initial_line(kind, status, &buffer[..line_end]) {
+                        return ResponseInitialParse::Invalid;
+                    }
+                    None
+                };
+                ResponseInitialParse::Complete(Self {
+                    status,
+                    descriptor,
+                    article,
+                })
             }
             BoundedResponseLineStatus::NeedMore => ResponseInitialParse::NeedMore,
             BoundedResponseLineStatus::Invalid | BoundedResponseLineStatus::TooLong => {
@@ -433,6 +486,11 @@ impl ResponseInitial {
     #[must_use]
     pub(crate) const fn descriptor(self) -> ResponseDescriptor {
         self.descriptor
+    }
+
+    #[must_use]
+    pub(crate) const fn article(self) -> Option<ResponseInitialArticle> {
+        self.article
     }
 }
 
@@ -2777,6 +2835,35 @@ fn validate_article_status_response_arguments(value: &[u8], allow_zero_number: b
         && validate_optional_trailing_comment(trailing_text)
 }
 
+fn parse_response_initial_article(line: &[u8]) -> Option<ResponseInitialArticle> {
+    let content = line.strip_suffix(crate::CRLF)?;
+    if content.get(3) != Some(&b' ') {
+        return None;
+    }
+    let arguments_start = 4;
+    let number_end = arguments_start + memchr::memchr(b' ', &content[arguments_start..])?;
+    let number = parse_response_initial_article_number(&content[arguments_start..number_end])?;
+    let message_id_start = number_end + 1;
+    let message_id_end = memchr::memchr(b' ', &content[message_id_start..])
+        .map_or(content.len(), |offset| message_id_start + offset);
+    let message_id = std::str::from_utf8(&content[message_id_start..message_id_end]).ok()?;
+    MessageId::from_borrowed(message_id).ok()?;
+    if !validate_optional_trailing_comment(&content[message_id_end..]) {
+        return None;
+    }
+    Some(ResponseInitialArticle {
+        article_number: number,
+        message_id: ResponseInitialRange {
+            start: message_id_start,
+            end: message_id_end,
+        },
+    })
+}
+
+fn parse_response_initial_article_number(value: &[u8]) -> Option<u64> {
+    parse_response_article_number(value)
+}
+
 fn validate_response_article_number_with_zero_policy(value: &[u8], allow_zero: bool) -> bool {
     parse_response_article_number(value).is_some_and(|number| allow_zero || number != 0)
 }
@@ -2823,23 +2910,36 @@ pub(crate) enum ValidatedResponseContent<'a> {
     Article(ValidatedArticleView<'a>),
 }
 
-fn validate_response_content<'a>(
-    kind: RequestKind,
-    status: StatusCode,
-    framing: ResponseFraming,
-    frame: &'a [u8],
-    status_line: &[u8],
-    content_start: usize,
-    content_end: usize,
-) -> Option<ValidatedResponseContent<'a>> {
-    let content = frame.get(content_start..content_end)?;
+/// Exclusive content coordinates relative to one immutable framed response.
+/// The range is only constructed after framing has checked its bounds, and
+/// is consumed immediately with that same framed owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResponseContentRange(std::ops::Range<usize>);
+
+impl ResponseContentRange {
+    pub(crate) fn new(start: usize, end: usize, response_len: usize) -> Option<Self> {
+        (start <= end && end <= response_len).then_some(Self(start..end))
+    }
+
+    pub(crate) fn slice<'a>(&self, response: &'a [u8]) -> &'a [u8] {
+        response
+            .get(self.0.clone())
+            .expect("validated response content range remains in its response")
+    }
+}
+
+fn validate_response_content<'a>(frame: ResponseFrame<'a>) -> Option<ValidatedResponseContent<'a>> {
+    let kind = frame.kind;
+    let status = frame.status;
+    let framing = frame.descriptor.framing();
+    let content = frame.content;
 
     match (kind, status.as_u16()) {
         (RequestKind::Article, 220)
         | (RequestKind::Head, 221)
         | (RequestKind::Body, 222)
         | (RequestKind::Stat, 223) => {
-            return Article::validate_framed_article(frame, content_start, content_end)
+            return Article::validate_response_frame(frame)
                 .map(ValidatedResponseContent::Article)
                 .ok();
         }
@@ -2862,7 +2962,7 @@ fn validate_response_content<'a>(
         RequestKind::ListDistribPats => {
             validate_crlf_lines(content, validate_distrib_pats_response_line)
         }
-        RequestKind::ListGroup => validate_listgroup_response_content(status_line, content),
+        RequestKind::ListGroup => validate_listgroup_response_content(frame.status_line, content),
         RequestKind::NewNews => validate_crlf_lines(content, |line| {
             std::str::from_utf8(line)
                 .ok()
@@ -6195,37 +6295,17 @@ mod tests {
     }
 
     #[test]
-    fn response_frame_decoder_accepts_precomputed_boundaries() {
+    fn response_frame_parser_accepts_a_packed_suffix() {
         let wire = b"222 1 <body@test> body follows\r\nbody line\r\n.\r\nNEXT";
-        let status_line_end = b"222 1 <body@test> body follows\r\n".len();
-        let status = StatusCode::parse(wire).unwrap();
-        let bounds =
-            match crate::terminator::MultilineFramer::default().push(&wire[status_line_end..]) {
-                crate::terminator::MultilineFrameProgress::Complete(bounds) => bounds,
-                crate::terminator::MultilineFrameProgress::NeedMore => {
-                    panic!("test frame should be complete")
-                }
-            };
-
-        let framed = FramedArticleState::new(
-            bytes::Bytes::copy_from_slice(wire),
-            RequestKind::Body,
-            status,
-            Some(bounds),
-            StatusLineEnd::new(status_line_end),
-            ContentEnd::new(status_line_end + bounds.content_end().get()),
-        );
-        let framed = ArticleState::new(framed);
-        let ResponseFrameParse::Complete(response) =
-            ResponseFrameDecoder::new(RequestKind::Body).complete_framed(&framed)
+        let ResponseFrameParse::Complete(response) = ResponseFrame::parse(RequestKind::Body, wire)
         else {
-            panic!("precomputed response frame did not parse");
+            panic!("response frame did not parse");
         };
 
         assert_eq!(response.content(), b"body line\r\n");
         assert_eq!(
             response.consumed(),
-            status_line_end + bounds.body_consumed().get()
+            b"222 1 <body@test> body follows\r\nbody line\r\n.\r\n".len()
         );
     }
 
@@ -6327,6 +6407,23 @@ mod tests {
             assert_eq!(initial.status(), status);
             assert_eq!(initial.descriptor().framing(), ResponseFraming::SingleLine);
         }
+    }
+
+    #[test]
+    fn response_initial_retains_article_identity_ranges() {
+        let wire = b"222 42 <body@test> body follows\r\n";
+        let ResponseInitialParse::Complete(initial) =
+            ResponseInitial::parse(RequestKind::Body, wire)
+        else {
+            panic!("article-family initial line should parse");
+        };
+        let article = initial
+            .article()
+            .expect("article metadata should be present");
+        let message_id = article.message_id();
+
+        assert_eq!(article.article_number(), 42);
+        assert_eq!(&wire[message_id.start()..message_id.end()], b"<body@test>");
     }
 
     #[test]

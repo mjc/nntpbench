@@ -91,6 +91,22 @@ supported! {
         .unwrap())
     }
 
+    #[library_benchmark]
+    #[bench::plain_64k(setup = setup_wire_plain_64k)]
+    #[bench::dot_stuffed_64k(setup = setup_wire_dot_stuffed_64k)]
+    #[bench::folded_headers_64k(setup = setup_wire_folded_headers_64k)]
+    #[bench::plain_768k(setup = setup_wire_plain_768k)]
+    #[bench::dot_stuffed_768k(setup = setup_wire_dot_stuffed_768k)]
+    #[bench::folded_headers_768k(setup = setup_wire_folded_headers_768k)]
+    fn owned_response_receive((kind, response): (RequestKind, Vec<u8>)) -> usize {
+        black_box(
+            bench_owned_response_from_bytes(black_box(kind), black_box(&response))
+                .unwrap()
+                .as_bytes()
+                .len(),
+        )
+    }
+
     fn setup_plain_64k() -> OwnedArticle {
         setup_owned_article(BODY_64K, ArticleVariant::PlainBody)
     }
@@ -291,6 +307,7 @@ supported! {
         repeated_owned_article_parse,
         full_article_parse_path,
         single_article_parse_path,
+        owned_response_receive,
         fragmented_public_decode,
         stateless_public_decode_control,
         load_read_capacity

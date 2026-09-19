@@ -5,7 +5,7 @@ use std::{borrow::Cow, fmt};
 use bytes::Bytes;
 
 use super::{
-    InvalidMessageId, MAX_ARTICLE_NUMBER, MessageId, RequestKind, StatusCode,
+    InvalidMessageId, MAX_ARTICLE_NUMBER, MessageId, RequestKind, ResponseInitial, StatusCode,
     validate_optional_trailing_comment,
 };
 use crate::terminator::{
@@ -1045,7 +1045,8 @@ impl From<u64> for ArticleNumber {
 /// The storage adapters remain local to each repository. These state names
 /// describe the guarantees, not a common allocation type.
 pub(crate) mod state {
-    use super::{ArticleLayout, ArticleParseError, RequestKind, StatusCode};
+    use super::{ArticleLayout, RequestKind, StatusCode};
+    use crate::protocol::ResponseInitial;
 
     /// Storage whose bytes remain stable while a validated layout is used.
     /// This crate-private contract prevents validation from accepting an
@@ -1114,6 +1115,14 @@ pub(crate) mod state {
             self.0.status_line_end()
         }
 
+        pub(crate) const fn content_end(&self) -> ContentEnd {
+            self.0.content_end()
+        }
+
+        pub(crate) const fn initial(&self) -> ResponseInitial {
+            self.0.initial()
+        }
+
         pub(crate) fn as_bytes(&self) -> &[u8]
         where
             B: StableBytes,
@@ -1122,9 +1131,37 @@ pub(crate) mod state {
         }
     }
 
+    impl<B> Framed<B> {
+        pub(crate) fn into_bytes(self) -> B {
+            self.bytes
+        }
+    }
+
     impl Article<Framed<bytes::Bytes>> {
-        pub(crate) fn clone_bytes(&self) -> bytes::Bytes {
-            self.0.bytes().clone()
+        /// Consume a framed article after validating its semantics while the
+        /// bytes and layout remain in the same owner.
+        pub(crate) fn validate_article(
+            self,
+        ) -> Result<Article<Validated<bytes::Bytes>>, super::ArticleParseError> {
+            let kind = self.kind();
+            let status = self.status();
+            if !matches!(status.as_u16(), 220..=223) {
+                return Err(super::ArticleParseError::InvalidStatusCode(status.as_u16()));
+            }
+            let first_line =
+                super::validated_first_line_from_initial(self.initial(), self.status_line_end())?;
+            let layout = super::FramedArticle::from_content_bounds(
+                self.as_bytes(),
+                self.status_line_end().get(),
+                self.content_end().get(),
+            )?
+            .validate_for_status_with_first_line(status.as_u16(), first_line)?;
+            Ok(Article::new(Validated::new(
+                self.into_inner().into_bytes(),
+                kind,
+                status,
+                layout,
+            )))
         }
     }
 
@@ -1137,6 +1174,7 @@ pub(crate) mod state {
         bounds: Option<crate::terminator::MultilineFrameBounds>,
         status_line_end: StatusLineEnd,
         content_end: ContentEnd,
+        initial: ResponseInitial,
     }
 
     impl<B> Framed<B> {
@@ -1147,6 +1185,7 @@ pub(crate) mod state {
             bounds: Option<crate::terminator::MultilineFrameBounds>,
             status_line_end: StatusLineEnd,
             content_end: ContentEnd,
+            initial: ResponseInitial,
         ) -> Self {
             Self {
                 bytes,
@@ -1155,6 +1194,7 @@ pub(crate) mod state {
                 bounds,
                 status_line_end,
                 content_end,
+                initial,
             }
         }
 
@@ -1177,23 +1217,13 @@ pub(crate) mod state {
         pub(crate) const fn status_line_end(&self) -> StatusLineEnd {
             self.status_line_end
         }
-    }
 
-    impl<B: StableBytes> Framed<B> {
-        /// Consume a framed article response at the semantic boundary.
-        ///
-        /// The framing state already owns the exact bytes and the request
-        /// status-line boundary, so validation can produce the article layout
-        /// without reconstructing a temporary response frame or accepting a
-        /// detached buffer and range pair.
-        pub(crate) fn validate(self) -> Result<Article<Validated<B>>, ArticleParseError> {
-            let layout = ArticleLayout::parse_framed(
-                self.bytes.as_slice(),
-                self.status,
-                self.status_line_end,
-                self.content_end,
-            )?;
-            Ok(Article::new(Validated::new(self.bytes, layout)))
+        pub(crate) const fn content_end(&self) -> ContentEnd {
+            self.content_end
+        }
+
+        pub(crate) const fn initial(&self) -> ResponseInitial {
+            self.initial
         }
     }
 
@@ -1201,6 +1231,8 @@ pub(crate) mod state {
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub(crate) struct Validated<B> {
         bytes: B,
+        kind: RequestKind,
+        status: StatusCode,
         layout: ArticleLayout,
     }
 
@@ -1221,8 +1253,26 @@ pub(crate) mod state {
     }
 
     impl<B> Validated<B> {
-        pub(super) const fn new(bytes: B, layout: ArticleLayout) -> Self {
-            Self { bytes, layout }
+        pub(super) const fn new(
+            bytes: B,
+            kind: RequestKind,
+            status: StatusCode,
+            layout: ArticleLayout,
+        ) -> Self {
+            Self {
+                bytes,
+                kind,
+                status,
+                layout,
+            }
+        }
+
+        pub(super) const fn kind(&self) -> RequestKind {
+            self.kind
+        }
+
+        pub(super) const fn status(&self) -> StatusCode {
+            self.status
         }
 
         pub(super) fn bytes(&self) -> &B {
@@ -1231,6 +1281,24 @@ pub(crate) mod state {
 
         pub(super) fn layout(&self) -> &ArticleLayout {
             &self.layout
+        }
+    }
+
+    impl<B: StableBytes> Article<Validated<B>> {
+        pub(crate) const fn kind(&self) -> RequestKind {
+            self.0.kind()
+        }
+
+        pub(crate) const fn status(&self) -> StatusCode {
+            self.0.status()
+        }
+
+        pub(crate) fn as_bytes(&self) -> &[u8] {
+            self.0.bytes.as_slice()
+        }
+
+        pub(crate) fn article(&self) -> super::Article<'_> {
+            self.0.layout.materialize(self.as_bytes())
         }
     }
 }
@@ -1317,25 +1385,6 @@ struct ArticleLayout {
 }
 
 impl ArticleLayout {
-    fn parse_framed(
-        buffer: &[u8],
-        status: crate::protocol::StatusCode,
-        status_line_end: state::StatusLineEnd,
-        content_end: state::ContentEnd,
-    ) -> Result<Self, ArticleParseError> {
-        if !matches!(status.as_u16(), 220..=223) {
-            return Err(ArticleParseError::InvalidStatusCode(status.as_u16()));
-        }
-        FramedArticle::from_known_content_bounds(
-            buffer,
-            status_line_end.get(),
-            content_end.get(),
-            status_line_end,
-        )?
-        .validate_for_status(status.as_u16())
-        .map(|view| view.layout)
-    }
-
     fn materialize<'a>(self, buffer: &'a [u8]) -> Article<'a> {
         let message_id = materialize_validated_message_id(buffer, self.first_line.message_id);
         let article_number = Some(self.first_line.article_number);
@@ -1424,12 +1473,6 @@ pub(crate) type ValidatedOwnedArticle = state::Article<state::Validated<Bytes>>;
 impl<'a> ValidatedArticleView<'a> {
     pub(crate) fn materialize(self) -> Article<'a> {
         self.layout.materialize(self.buffer)
-    }
-
-    pub(crate) fn into_owned(self, bytes: Bytes) -> ValidatedOwnedArticle {
-        assert_eq!(self.buffer.as_ptr(), bytes.as_ptr());
-        assert_eq!(self.buffer.len(), bytes.len());
-        state::Article::new(state::Validated::new(bytes, self.layout))
     }
 }
 
@@ -1529,16 +1572,23 @@ impl<'a> FramedArticle<'a> {
 
     fn validate(self) -> Result<ValidatedArticleView<'a>, ArticleParseError> {
         let status = parse_status_code(self.buffer)?;
-        self.validate_for_status(status)
+        let buffer = self.buffer;
+        let layout = self.validate_for_status(status)?;
+        Ok(ValidatedArticleView { buffer, layout })
     }
 
-    fn validate_for_status(
-        self,
-        status: u16,
-    ) -> Result<ValidatedArticleView<'a>, ArticleParseError> {
+    fn validate_for_status(self, status: u16) -> Result<ArticleLayout, ArticleParseError> {
         let buffer = self.buffer;
         let first_line = validate_first_line(buffer, self.first_line)?;
 
+        self.validate_for_status_with_first_line(status, first_line)
+    }
+
+    fn validate_for_status_with_first_line(
+        self,
+        status: u16,
+        first_line: ValidatedFirstLine,
+    ) -> Result<ArticleLayout, ArticleParseError> {
         let content = match status {
             220 => self.validate_article_content(),
             221 => self.validate_head_content(),
@@ -1547,12 +1597,9 @@ impl<'a> FramedArticle<'a> {
             status_code => Err(ArticleParseError::InvalidStatusCode(status_code)),
         }?;
 
-        Ok(ValidatedArticleView {
-            buffer,
-            layout: ArticleLayout {
-                first_line,
-                content,
-            },
+        Ok(ArticleLayout {
+            first_line,
+            content,
         })
     }
 
@@ -1797,20 +1844,26 @@ impl<'a> Article<'a> {
         content_start: usize,
         content_end: usize,
     ) -> Result<Self, ArticleParseError> {
-        let validated = Self::validate_framed_article(buf, content_start, content_end)?;
-        Ok(validated.materialize())
+        FramedArticle::from_content_bounds(buf, content_start, content_end)?
+            .validate()
+            .map(ValidatedArticleView::materialize)
     }
 
-    /// Validate a framed article without constructing unfolded or unstuffed data.
+    /// Validate the article sections of one already framed response.
     ///
-    /// The private framed handle keeps the bytes and their checked ranges
-    /// together until validation has produced the reusable article view.
-    pub(crate) fn validate_framed_article(
-        buf: &'a [u8],
-        content_start: usize,
-        content_end: usize,
+    /// The response frame carries both the immutable bytes and the framing
+    /// coordinates, so callers cannot validate one allocation and later bind
+    /// the layout to another buffer.
+    pub(crate) fn validate_response_frame(
+        frame: super::ResponseFrame<'a>,
     ) -> Result<ValidatedArticleView<'a>, ArticleParseError> {
-        FramedArticle::from_content_bounds(buf, content_start, content_end)?.validate()
+        FramedArticle::from_known_content_bounds(
+            frame.bytes(),
+            frame.content_start(),
+            frame.content_end(),
+            state::StatusLineEnd::new(frame.content_start()),
+        )?
+        .validate()
     }
 
     fn parse_article(buf: &'a [u8]) -> Result<Self, ArticleParseError> {
@@ -2053,6 +2106,28 @@ fn validate_first_line(
     })
 }
 
+fn validated_first_line_from_initial(
+    initial: ResponseInitial,
+    status_line_end: state::StatusLineEnd,
+) -> Result<ValidatedFirstLine, ArticleParseError> {
+    let article = initial
+        .article()
+        .ok_or(ArticleParseError::InvalidStatusPrefix)?;
+    let message_id = article.message_id();
+    let first_line_end = status_line_end
+        .get()
+        .checked_sub(crate::CRLF.len())
+        .ok_or(ArticleParseError::BufferTooShort)?;
+    if message_id.end() > first_line_end {
+        return Err(ArticleParseError::BufferTooShort);
+    }
+
+    Ok(ValidatedFirstLine {
+        message_id: ArticleFrameRange::new(message_id.start(), message_id.end())?,
+        article_number: ArticleNumber::from(article.article_number()),
+    })
+}
+
 fn materialize_validated_message_id(buffer: &[u8], message_id: ArticleFrameRange) -> MessageId<'_> {
     let value = std::str::from_utf8(message_id.validated_slice(buffer))
         .expect("validated article layout preserves UTF-8 message-id bytes");
@@ -2169,6 +2244,7 @@ fn validate_headers(data: &[u8]) -> Result<HeaderTransformation, ArticleParseErr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::{ResponseFrame, ResponseFrameParse, ValidatedResponseContent};
 
     const VALID_ARTICLE_TEXT: &[u8] = b"220 12345 <test@example.com>\r\n\
 Subject: Test Article\r\n\
@@ -2263,28 +2339,44 @@ Actual body content\r\n\
 
     #[test]
     fn framed_validation_materializes_every_article_response() {
-        for frame in [VALID_ARTICLE_TEXT, VALID_HEAD, VALID_BODY, VALID_STAT] {
-            let content_start = strict_crlf_line_content_end_from(frame, 0).unwrap() + 2;
-            let content_end = if frame.starts_with(b"223") {
-                content_start
-            } else {
-                find_article_content_end(frame, content_start).unwrap()
+        for (kind, frame) in [
+            (RequestKind::Article, VALID_ARTICLE_TEXT),
+            (RequestKind::Head, VALID_HEAD),
+            (RequestKind::Body, VALID_BODY),
+            (RequestKind::Stat, VALID_STAT),
+        ] {
+            let ResponseFrameParse::Complete(frame) = ResponseFrame::parse(kind, frame) else {
+                panic!("article fixture should be a complete frame");
             };
-            let validated =
-                Article::validate_framed_article(frame, content_start, content_end).unwrap();
+            let ValidatedResponseContent::Article(validated) = frame.content_validation() else {
+                panic!("article fixture should retain article validation");
+            };
             let reused = validated.materialize();
-            assert_eq!(reused, Article::parse(frame).unwrap());
+            assert_eq!(reused, Article::parse(frame.bytes()).unwrap());
         }
     }
 
     #[test]
     fn owned_article_validation_preserves_the_bound_bytes_and_layout() {
+        use crate::protocol::{ResponseInitial, ResponseInitialParse};
+
         let bytes = Bytes::from_static(VALID_BODY);
         let content_start = strict_crlf_line_content_end_from(&bytes, 0).unwrap() + 2;
         let content_end = find_article_content_end(&bytes, content_start).unwrap();
-        let validated =
-            Article::validate_framed_article(&bytes, content_start, content_end).unwrap();
-        let owned = validated.into_owned(bytes.clone());
+        let initial = match ResponseInitial::parse(RequestKind::Body, &bytes) {
+            ResponseInitialParse::Complete(initial) => initial,
+            _ => panic!("valid body fixture should have a complete initial line"),
+        };
+        let framed = state::Article::new(state::Framed::new(
+            bytes,
+            RequestKind::Body,
+            StatusCode::parse(b"222").unwrap(),
+            None,
+            state::StatusLineEnd::new(content_start),
+            state::ContentEnd::new(content_end),
+            initial,
+        ));
+        let owned = framed.validate_article().unwrap();
 
         assert_eq!(owned.bytes(), VALID_BODY);
         assert_eq!(owned.materialize(), Article::parse(VALID_BODY).unwrap());
