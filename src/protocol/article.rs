@@ -1047,6 +1047,19 @@ impl From<u64> for ArticleNumber {
 pub(crate) mod state {
     use super::{ArticleLayout, ArticleParseError, RequestKind, StatusCode};
 
+    /// Storage whose bytes remain stable while a validated layout is used.
+    /// This crate-private contract prevents validation from accepting an
+    /// arbitrary `AsRef<[u8]>` implementation with changing contents.
+    pub(crate) trait StableBytes {
+        fn as_slice(&self) -> &[u8];
+    }
+
+    impl StableBytes for bytes::Bytes {
+        fn as_slice(&self) -> &[u8] {
+            self.as_ref()
+        }
+    }
+
     /// Exclusive end of the request-scoped status line in a framed response.
     /// This coordinate is relative to the same immutable bytes as the frame.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1138,7 +1151,7 @@ pub(crate) mod state {
         }
     }
 
-    impl<B: AsRef<[u8]>> Framed<B> {
+    impl<B: StableBytes> Framed<B> {
         /// Consume a framed article response at the semantic boundary.
         ///
         /// The framing state already owns the exact bytes and the request
@@ -1147,7 +1160,7 @@ pub(crate) mod state {
         /// detached buffer and range pair.
         pub(crate) fn validate(self) -> Result<Article<Validated<B>>, ArticleParseError> {
             let layout = ArticleLayout::parse_framed(
-                self.bytes.as_ref(),
+                self.bytes.as_slice(),
                 self.status,
                 self.status_line_end,
                 self.bounds,
