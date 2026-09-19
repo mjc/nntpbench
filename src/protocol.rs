@@ -18,7 +18,7 @@ pub mod article;
 pub(crate) mod response_receiver;
 
 pub(crate) use article::state::{
-    Article as ArticleState, Framed as FramedArticleState, StatusLineEnd,
+    Article as ArticleState, ContentEnd, Framed as FramedArticleState, StatusLineEnd,
 };
 pub use article::{Article, ArticleNumber, ArticleParseError, ArticleView, HeaderIter, Headers};
 pub(crate) use article::{ValidatedArticleView, ValidatedOwnedArticle};
@@ -6213,6 +6213,7 @@ mod tests {
             status,
             Some(bounds),
             StatusLineEnd::new(status_line_end),
+            ContentEnd::new(status_line_end + bounds.content_end().get()),
         );
         let framed = ArticleState::new(framed);
         let ResponseFrameParse::Complete(response) =

@@ -6,7 +6,7 @@ use std::ops::Range;
 use tokio::io::AsyncRead;
 
 use super::{
-    Article, ArticleParseError, ArticleState, FramedArticleState, RequestKind,
+    Article, ArticleParseError, ArticleState, ContentEnd, FramedArticleState, RequestKind,
     ResponseFrameDecoder, ResponseFrameParse, ResponseInitial, ResponseInitialParse, StatusCode,
     StatusLineEnd, ValidatedOwnedArticle, ValidatedResponseContent,
 };
@@ -731,6 +731,15 @@ impl ResponseDecoder {
             .streaming
             .initial()
             .ok_or(ClientError::InvalidStatusLine)?;
+        let status_line_end = self.streaming.status_line_end();
+        let content_end = bounds
+            .as_ref()
+            .map_or(Ok(status_line_end.get()), |bounds| {
+                status_line_end
+                    .get()
+                    .checked_add(bounds.content_end().get())
+                    .ok_or(ClientError::InvalidStatusLine)
+            })?;
 
         Ok(Some(FramedResponse {
             framed: ArticleState::new(FramedArticleState::new(
@@ -738,7 +747,8 @@ impl ResponseDecoder {
                 self.streaming.kind,
                 status,
                 bounds,
-                self.streaming.status_line_end(),
+                status_line_end,
+                ContentEnd::new(content_end),
             )),
             initial,
         }))

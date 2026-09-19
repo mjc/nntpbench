@@ -1136,6 +1136,7 @@ pub(crate) mod state {
         status: StatusCode,
         bounds: Option<crate::terminator::MultilineFrameBounds>,
         status_line_end: StatusLineEnd,
+        content_end: ContentEnd,
     }
 
     impl<B> Framed<B> {
@@ -1145,6 +1146,7 @@ pub(crate) mod state {
             status: StatusCode,
             bounds: Option<crate::terminator::MultilineFrameBounds>,
             status_line_end: StatusLineEnd,
+            content_end: ContentEnd,
         ) -> Self {
             Self {
                 bytes,
@@ -1152,6 +1154,7 @@ pub(crate) mod state {
                 status,
                 bounds,
                 status_line_end,
+                content_end,
             }
         }
 
@@ -1188,7 +1191,7 @@ pub(crate) mod state {
                 self.bytes.as_slice(),
                 self.status,
                 self.status_line_end,
-                self.bounds,
+                self.content_end,
             )?;
             Ok(Article::new(Validated::new(self.bytes, layout)))
         }
@@ -1199,6 +1202,22 @@ pub(crate) mod state {
     pub(crate) struct Validated<B> {
         bytes: B,
         layout: ArticleLayout,
+    }
+
+    /// Exclusive end of the semantic response content in frame-relative
+    /// coordinates. Multiline terminator bytes and packed suffixes are after
+    /// this boundary.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct ContentEnd(usize);
+
+    impl ContentEnd {
+        pub(crate) const fn new(value: usize) -> Self {
+            Self(value)
+        }
+
+        pub(crate) const fn get(self) -> usize {
+            self.0
+        }
     }
 
     impl<B> Validated<B> {
@@ -1302,21 +1321,15 @@ impl ArticleLayout {
         buffer: &[u8],
         status: crate::protocol::StatusCode,
         status_line_end: state::StatusLineEnd,
-        bounds: Option<crate::terminator::MultilineFrameBounds>,
+        content_end: state::ContentEnd,
     ) -> Result<Self, ArticleParseError> {
         if !matches!(status.as_u16(), 220..=223) {
             return Err(ArticleParseError::InvalidStatusCode(status.as_u16()));
         }
-        let content_end = bounds.map_or(Ok(status_line_end.get()), |bounds| {
-            status_line_end
-                .get()
-                .checked_add(bounds.content_end().get())
-                .ok_or(ArticleParseError::BufferTooShort)
-        })?;
         FramedArticle::from_known_content_bounds(
             buffer,
             status_line_end.get(),
-            content_end,
+            content_end.get(),
             status_line_end,
         )?
         .validate_for_status(status.as_u16())
