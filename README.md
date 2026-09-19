@@ -39,15 +39,17 @@ BUILD=0 RUNS=10 ./scripts/direct-e2e-bench.sh
 
 The public client's `BufferedResponseReceiver::receive` owns pending input and
 exclusively controls its request-scoped decoder. It extracts and freezes exactly
-one framed prefix, retains packed following input, then validates semantics.
-Framing alone does not certify article content. Cancellation after polling or a
-decode/read error makes the receiver unavailable; dropping an unpolled receive
-does not consume it.
+one framed prefix, retains packed following input, and validates generic
+response semantics. Article semantics are validated only when an article is
+promoted or accessed as an article view; framing alone does not certify article
+content. Cancellation after polling or a decode/read error makes the receiver
+unavailable; dropping an unpolled receive does not consume it.
 
 `protocol::response_receiver` is the trusted extraction/ownership boundary.
 Its private `ChunkConsumed` counts bytes from the latest scanner push;
 `FrameEnd` is an exclusive position from the accumulated response's start.
-Translation and split/freeze never occur in the I/O task.
+Coordinate translation and split/freeze remain inside this boundary; callers do
+not reconstruct them from scanner results.
 
 `OwnedResponse` and `OwnedArticle` keep their existing client API paths.
 Article layouts remain private and associated with immutable bytes. Validation

@@ -1052,8 +1052,8 @@ pub(crate) mod state {
     use crate::protocol::ResponseInitial;
 
     /// Storage whose bytes remain stable while a validated layout is used.
-    /// This crate-private contract prevents validation from accepting an
-    /// arbitrary `AsRef<[u8]>` implementation with changing contents.
+    /// This crate-private contract keeps validation tied to owners whose byte
+    /// slice remains stable for the lifetime of the validated state.
     pub(crate) trait StableBytes {
         fn as_slice(&self) -> &[u8];
     }
@@ -1823,10 +1823,10 @@ pub struct Article<'a> {
     pub body: Option<Cow<'a, [u8]>>,
 }
 
-/// The consumer-facing projection of a validated article.
+/// The consumer-facing article view.
 ///
-/// The name makes the boundary explicit: this value is a reusable view, not
-/// the proof-bearing owner returned by the framing/validation pipeline.
+/// This compatibility name aliases [`Article`]. It is a reusable parsed view,
+/// not the proof-bearing owner returned by the framing/validation pipeline.
 pub type ArticleView<'a> = Article<'a>;
 
 impl<'a> TryFrom<&'a [u8]> for Article<'a> {
@@ -1853,7 +1853,8 @@ impl<'a> Article<'a> {
     /// Parse a response frame whose multiline content boundary was already found.
     ///
     /// This is for callers that already performed RFC 3977 section 3.1.1
-    /// dot-terminator framing and can pass the payload range directly.
+    /// dot-terminator framing and can pass the complete response frame. The
+    /// frame keeps its immutable bytes and content boundaries together.
     pub(crate) fn parse_framed_response(
         frame: super::ResponseFrame<'a>,
     ) -> Result<Self, ArticleParseError> {
