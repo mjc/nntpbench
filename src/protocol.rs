@@ -277,7 +277,7 @@ impl ResponseFrameDecoder {
     #[cfg(test)]
     fn complete_framed<'a>(
         self,
-        framed: &'a FramedArticleState<bytes::Bytes>,
+        framed: &'a ArticleState<FramedArticleState<bytes::Bytes>>,
     ) -> ResponseFrameParse<'a> {
         self.complete_with_metadata(
             framed.as_bytes(),
@@ -293,7 +293,7 @@ impl ResponseFrameDecoder {
     /// content validation still runs against the exact retained bytes.
     pub(crate) fn complete_framed_after_initial<'a>(
         self,
-        framed: &'a FramedArticleState<bytes::Bytes>,
+        framed: &'a ArticleState<FramedArticleState<bytes::Bytes>>,
         initial: ResponseInitial,
     ) -> ResponseFrameParse<'a> {
         self.complete_with_metadata(
@@ -6214,6 +6214,7 @@ mod tests {
             Some(bounds),
             StatusLineEnd::new(status_line_end),
         );
+        let framed = ArticleState::new(framed);
         let ResponseFrameParse::Complete(response) =
             ResponseFrameDecoder::new(RequestKind::Body).complete_framed(&framed)
         else {

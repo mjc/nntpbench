@@ -1097,6 +1097,31 @@ pub(crate) mod state {
         }
     }
 
+    impl<B> Article<Framed<B>> {
+        pub(crate) const fn kind(&self) -> RequestKind {
+            self.0.kind()
+        }
+
+        pub(crate) const fn status(&self) -> StatusCode {
+            self.0.status()
+        }
+
+        pub(crate) const fn bounds(&self) -> Option<crate::terminator::MultilineFrameBounds> {
+            self.0.bounds()
+        }
+
+        pub(crate) const fn status_line_end(&self) -> StatusLineEnd {
+            self.0.status_line_end()
+        }
+
+        pub(crate) fn as_bytes(&self) -> &[u8]
+        where
+            B: StableBytes,
+        {
+            self.0.bytes().as_slice()
+        }
+    }
+
     /// A complete wire response retained by an adapter owner.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub(crate) struct Framed<B> {
@@ -1142,12 +1167,6 @@ pub(crate) mod state {
 
         pub(crate) const fn status_line_end(&self) -> StatusLineEnd {
             self.status_line_end
-        }
-    }
-
-    impl Framed<bytes::Bytes> {
-        pub(crate) fn as_bytes(&self) -> &[u8] {
-            self.bytes.as_ref()
         }
     }
 
