@@ -1149,27 +1149,29 @@ pub(crate) mod state {
         /// Consume a framed article after validating its semantics while the
         /// bytes and layout remain in the same owner.
         pub(crate) fn validate(self) -> Result<Article<Validated<B>>, super::ArticleParseError> {
-            let framed = self.into_inner();
-            let kind = framed.kind;
-            let status = framed.status;
+            self.into_inner().validate().map(Article::new)
+        }
+    }
+
+    impl<B: StableBytes> Framed<B> {
+        /// Establish semantic article validity without detaching the bytes
+        /// from the private layout produced by this frame.
+        fn validate(self) -> Result<Validated<B>, super::ArticleParseError> {
+            let kind = self.kind;
+            let status = self.status;
             if !matches!(status.as_u16(), 220..=223) {
                 return Err(super::ArticleParseError::InvalidStatusCode(status.as_u16()));
             }
             let first_line =
-                super::validated_first_line_from_initial(framed.initial, framed.status_line_end)?;
+                super::validated_first_line_from_initial(self.initial, self.status_line_end)?;
             let layout = super::FramedArticle::from_known_content_bounds(
-                framed.bytes.as_slice(),
-                framed.status_line_end.get(),
-                framed.content_end.get(),
-                framed.status_line_end,
+                self.bytes.as_slice(),
+                self.status_line_end.get(),
+                self.content_end.get(),
+                self.status_line_end,
             )?
             .validate_for_status_with_first_line(status.as_u16(), first_line)?;
-            Ok(Article::new(Validated::new(
-                framed.bytes,
-                kind,
-                status,
-                layout,
-            )))
+            Ok(Validated::new(self.bytes, kind, status, layout))
         }
     }
 
