@@ -562,6 +562,26 @@ fn framing_completion_excludes_a_packed_following_response() {
 }
 
 #[test]
+fn production_receiver_translates_a_split_status_end_to_the_pending_buffer() {
+    let response = b"223 1 <stat@test> article exists\r\n";
+    let received = receive_response(RequestKind::Stat, response, response.len() - 1)
+        .expect("the production receiver should complete when the final LF arrives");
+
+    assert_eq!(received.status().as_u16(), 223);
+    assert_eq!(received.as_bytes(), response);
+}
+
+#[test]
+fn production_receiver_translates_a_split_multiline_end_to_the_pending_buffer() {
+    let response = b"222 1 <body@test> body follows\r\nbody\r\n.\r\n";
+    let received = receive_response(RequestKind::Body, response, response.len() - 1)
+        .expect("the production receiver should complete when the final LF arrives");
+
+    assert_eq!(received.status().as_u16(), 222);
+    assert_eq!(received.as_bytes(), response);
+}
+
+#[test]
 fn received_article_validation_excludes_packed_following_response() {
     let first = b"222 1 <body@test> body follows\r\nwire body\r\n.\r\n";
     let mut packed = first.to_vec();

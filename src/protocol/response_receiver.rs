@@ -48,16 +48,8 @@ impl<R: AsyncRead + Unpin> BufferedResponseReceiver<R> {
             if let Some(completed) = response.extract()? {
                 return Ok(completed);
             }
-            let receiving = response.as_inner_mut();
-            if read_into_pending_bytes(
-                &mut receiving.receiver.reader,
-                &mut receiving.receiver.pending,
-                read_chunk_bytes,
-            )
-            .await?
-                == 0
-            {
-                return Err(ClientError::UnexpectedEof);
+            if let Some(completed) = response.read_and_extract(read_chunk_bytes).await? {
+                return Ok(completed);
             }
         }
     }
@@ -91,11 +83,44 @@ impl<R: AsyncRead + Unpin> Receiving<'_, R> {
         self.receiver.state = ReceiverState::Ready;
         Ok(Some(response))
     }
+
+    async fn read_and_extract(
+        &mut self,
+        read_chunk_bytes: usize,
+    ) -> Result<Option<OwnedResponse>, ClientError> {
+        if read_into_pending_bytes(
+            &mut self.receiver.reader,
+            &mut self.receiver.pending,
+            read_chunk_bytes,
+        )
+        .await?
+            == 0
+        {
+            return Err(ClientError::UnexpectedEof);
+        }
+        self.extract()
+    }
+
+    fn append_and_extract(&mut self, chunk: &[u8]) -> Result<Option<OwnedResponse>, ClientError> {
+        self.receiver.pending.extend_from_slice(chunk);
+        self.extract()
+    }
 }
 
 impl<R: AsyncRead + Unpin> ArticleState<Receiving<'_, R>> {
     fn extract(&mut self) -> Result<Option<OwnedResponse>, ClientError> {
         self.as_inner_mut().extract()
+    }
+
+    async fn read_and_extract(
+        &mut self,
+        read_chunk_bytes: usize,
+    ) -> Result<Option<OwnedResponse>, ClientError> {
+        self.as_inner_mut().read_and_extract(read_chunk_bytes).await
+    }
+
+    fn append_and_extract(&mut self, chunk: &[u8]) -> Result<Option<OwnedResponse>, ClientError> {
+        self.as_inner_mut().append_and_extract(chunk)
     }
 }
 
@@ -143,6 +168,9 @@ pub(crate) fn owned_from_bytes(
     receive_fragments(kind, bytes, bytes.len())
 }
 
+/// Synchronous chunk feeding is used by benchmarks and byte-fixture adapters;
+/// it calls the same receiving state and extraction operation as the async
+/// production reader, rather than rebuilding a frame from decoder metadata.
 fn receive_fragments(
     kind: RequestKind,
     response: &[u8],
@@ -159,12 +187,7 @@ fn receive_fragments(
         decoder: ResponseDecoder::new(kind),
     });
     for chunk in response.chunks(chunk_bytes.max(1)) {
-        pending
-            .as_inner_mut()
-            .receiver
-            .pending
-            .extend_from_slice(chunk);
-        if let Some(response) = pending.extract()? {
+        if let Some(response) = pending.append_and_extract(chunk)? {
             return Ok(response);
         }
     }
