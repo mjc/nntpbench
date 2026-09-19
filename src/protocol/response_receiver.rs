@@ -913,6 +913,44 @@ pub fn bench_streaming_decode_response(
     }
 }
 
+#[allow(unexpected_cfgs)]
+#[cfg(response_contract)]
+mod response_contracts {
+    use super::*;
+
+    /// Positive controls compile with the production coordinate and ownership
+    /// boundaries in place.
+    fn positive() {
+        let consumed = DecoderChunkConsumed(1);
+        let _ = FrameEnd(0).after_chunk(consumed);
+        let _ = std::hint::black_box(consumed);
+    }
+
+    #[cfg(response_contract = "coordinate")]
+    fn coordinate_substitution_must_fail() {
+        // A chunk-relative count cannot be used as an accumulated-buffer end.
+        let _ = FrameEnd(0).after_chunk(FrameEnd(1));
+    }
+
+    #[cfg(response_contract = "receive_alias")]
+    async fn receiving_borrow_must_fail<R: AsyncRead + Unpin>(
+        receiver: &mut BufferedResponseReceiver<R>,
+    ) {
+        let decoder = ResponseDecoder::new(RequestKind::Stat);
+        let _first = Receiving { receiver, decoder };
+        let _second = &mut *receiver;
+        std::hint::black_box(_first);
+    }
+
+    #[cfg(response_contract = "validated_mutation")]
+    fn validated_borrow_must_fail() {
+        let mut bytes = vec![0u8];
+        let borrowed = &bytes[..];
+        let _mutable = &mut bytes;
+        std::hint::black_box(borrowed);
+    }
+}
+
 #[cfg(test)]
 #[path = "response_receiver_tests.rs"]
 mod characterization_tests;
