@@ -1046,6 +1046,7 @@ impl From<u64> for ArticleNumber {
 /// describe the guarantees, not a common allocation type.
 pub(crate) mod state {
     use super::{ArticleLayout, RequestKind, StatusCode};
+    use crate::protocol::ResponseInitial;
 
     /// Storage whose bytes remain stable while a validated layout is used.
     /// This crate-private contract prevents validation from accepting an
@@ -1118,6 +1119,10 @@ pub(crate) mod state {
             self.0.content_end()
         }
 
+        pub(crate) const fn initial(&self) -> ResponseInitial {
+            self.0.initial()
+        }
+
         pub(crate) fn as_bytes(&self) -> &[u8]
         where
             B: StableBytes,
@@ -1167,6 +1172,7 @@ pub(crate) mod state {
         bounds: Option<crate::terminator::MultilineFrameBounds>,
         status_line_end: StatusLineEnd,
         content_end: ContentEnd,
+        initial: ResponseInitial,
     }
 
     impl<B> Framed<B> {
@@ -1177,6 +1183,7 @@ pub(crate) mod state {
             bounds: Option<crate::terminator::MultilineFrameBounds>,
             status_line_end: StatusLineEnd,
             content_end: ContentEnd,
+            initial: ResponseInitial,
         ) -> Self {
             Self {
                 bytes,
@@ -1185,6 +1192,7 @@ pub(crate) mod state {
                 bounds,
                 status_line_end,
                 content_end,
+                initial,
             }
         }
 
@@ -1210,6 +1218,10 @@ pub(crate) mod state {
 
         pub(crate) const fn content_end(&self) -> ContentEnd {
             self.content_end
+        }
+
+        pub(crate) const fn initial(&self) -> ResponseInitial {
+            self.initial
         }
     }
 
@@ -2314,9 +2326,15 @@ Actual body content\r\n\
 
     #[test]
     fn owned_article_validation_preserves_the_bound_bytes_and_layout() {
+        use crate::protocol::{ResponseInitial, ResponseInitialParse};
+
         let bytes = Bytes::from_static(VALID_BODY);
         let content_start = strict_crlf_line_content_end_from(&bytes, 0).unwrap() + 2;
         let content_end = find_article_content_end(&bytes, content_start).unwrap();
+        let initial = match ResponseInitial::parse(RequestKind::Body, &bytes) {
+            ResponseInitialParse::Complete(initial) => initial,
+            _ => panic!("valid body fixture should have a complete initial line"),
+        };
         let framed = state::Article::new(state::Framed::new(
             bytes,
             RequestKind::Body,
@@ -2324,6 +2342,7 @@ Actual body content\r\n\
             None,
             state::StatusLineEnd::new(content_start),
             state::ContentEnd::new(content_end),
+            initial,
         ));
         let owned = framed.validate_article().unwrap();
 

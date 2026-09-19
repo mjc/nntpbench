@@ -177,12 +177,11 @@ fn receive_fragments(
 /// range can be supplied by a caller.
 struct FramedResponse {
     framed: ArticleState<FramedArticleState<Bytes>>,
-    initial: ResponseInitial,
 }
 
 impl FramedResponse {
     fn validate(self) -> Result<OwnedResponse, ClientError> {
-        let Self { framed, initial } = self;
+        let Self { framed } = self;
         let kind = framed.kind();
         let status = framed.status();
         let article_response = matches!(
@@ -201,7 +200,7 @@ impl FramedResponse {
             });
         }
         let content = ResponseFrameDecoder::new(kind)
-            .validate_generic_framed_after_initial(&framed, initial)
+            .validate_generic_framed_after_initial(&framed, framed.initial())
             .ok_or(ClientError::InvalidStatusLine)?;
         let bytes = framed.into_inner().into_bytes();
         Ok(OwnedResponse {
@@ -711,8 +710,8 @@ impl ResponseDecoder {
                 bounds,
                 status_line_end,
                 ContentEnd::new(content_end),
+                initial,
             )),
-            initial,
         }))
     }
 }
