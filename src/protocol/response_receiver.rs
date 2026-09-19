@@ -196,6 +196,23 @@ impl ArticleState<FramedArticleState<Bytes>> {
                 content: OwnedResponseContent::Article(article),
             });
         }
+        let status_line_end = self.status_line_end().get();
+        let content_end = self.content_end().get();
+        let bytes = self.as_bytes();
+        let status_line = bytes
+            .get(..status_line_end)
+            .ok_or(ClientError::InvalidStatusLine)?;
+        let content = bytes
+            .get(status_line_end..content_end)
+            .ok_or(ClientError::InvalidStatusLine)?;
+        if !crate::protocol::validate_framed_non_article_response_content(
+            kind,
+            status,
+            status_line,
+            content,
+        ) {
+            return Err(ClientError::InvalidStatusLine);
+        }
         let content = self
             .generic_content_range()
             .ok_or(ClientError::InvalidStatusLine)?;
@@ -472,6 +489,27 @@ mod tests {
                 receiver.receive(RequestKind::Body, 4096).await,
                 Err(ClientError::ConnectionClosed)
             ));
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_generic_multiline_is_rejected_at_the_receive_boundary() {
+        let wire = b"100 help text follows\r\nok\0bad\r\n.\r\n";
+        assert!(matches!(
+            crate::protocol::ResponseFrame::parse(RequestKind::Help, wire),
+            crate::protocol::ResponseFrameParse::Invalid
+        ));
+
+        for chunk_bytes in 1..=wire.len() {
+            let input = FragmentedInput(wire.chunks(chunk_bytes).collect());
+            let mut receiver = BufferedResponseReceiver::new(input);
+            assert!(
+                matches!(
+                    receiver.receive(RequestKind::Help, chunk_bytes).await,
+                    Err(ClientError::InvalidStatusLine)
+                ),
+                "chunk_bytes={chunk_bytes}"
+            );
         }
     }
 

@@ -2815,7 +2815,49 @@ fn validate_response_content<'a>(frame: ResponseFrame<'a>) -> Option<ValidatedRe
         _ => {}
     }
 
-    let valid = match kind {
+    validate_non_article_response_content(kind, frame.status_line, content)
+        .then_some(ValidatedResponseContent::Generic)
+}
+
+/// Validate the semantic content of a response whose framing boundary is
+/// already known by another decoder.
+///
+/// The buffered receiver uses this after its streaming framer has established
+/// the exact status-line and content ranges. Keeping this check separate from
+/// boundary discovery preserves the incremental decoder's no-rescan contract
+/// while retaining the stateless parser's acceptance behavior for generic
+/// multiline responses.
+pub(crate) fn validate_framed_non_article_response_content(
+    kind: RequestKind,
+    status: StatusCode,
+    status_line: &[u8],
+    content: &[u8],
+) -> bool {
+    if matches!(
+        (kind, status.as_u16()),
+        (RequestKind::Article, 220)
+            | (RequestKind::Head, 221)
+            | (RequestKind::Body, 222)
+            | (RequestKind::Stat, 223)
+    ) {
+        return true;
+    }
+    if !ResponseDescriptor::for_request_status(kind, status)
+        .framing()
+        .is_multiline()
+    {
+        return true;
+    }
+
+    validate_non_article_response_content(kind, status_line, content)
+}
+
+fn validate_non_article_response_content(
+    kind: RequestKind,
+    status_line: &[u8],
+    content: &[u8],
+) -> bool {
+    match kind {
         RequestKind::List | RequestKind::ListActive | RequestKind::NewGroups => {
             validate_crlf_lines(content, validate_active_response_line)
         }
@@ -2830,7 +2872,7 @@ fn validate_response_content<'a>(frame: ResponseFrame<'a>) -> Option<ValidatedRe
         RequestKind::ListDistribPats => {
             validate_crlf_lines(content, validate_distrib_pats_response_line)
         }
-        RequestKind::ListGroup => validate_listgroup_response_content(frame.status_line, content),
+        RequestKind::ListGroup => validate_listgroup_response_content(status_line, content),
         RequestKind::NewNews => validate_crlf_lines(content, |line| {
             std::str::from_utf8(line)
                 .ok()
@@ -2844,11 +2886,6 @@ fn validate_response_content<'a>(frame: ResponseFrame<'a>) -> Option<ValidatedRe
         RequestKind::Help => validate_crlf_lines(content, validate_help_text_line),
         RequestKind::Unknown => validate_generic_multiline_response_content(content),
         _ => true,
-    };
-    if valid {
-        Some(ValidatedResponseContent::Generic)
-    } else {
-        None
     }
 }
 
