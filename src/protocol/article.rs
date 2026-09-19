@@ -1857,14 +1857,7 @@ impl<'a> Article<'a> {
     pub(crate) fn parse_framed_response(
         frame: super::ResponseFrame<'a>,
     ) -> Result<Self, ArticleParseError> {
-        FramedArticle::from_known_content_bounds(
-            frame.bytes(),
-            frame.content_start(),
-            frame.content_end(),
-            state::StatusLineEnd::new(frame.content_start()),
-        )?
-        .validate()
-        .map(ValidatedArticleView::materialize)
+        Self::validate_response_frame(frame).map(ValidatedArticleView::materialize)
     }
 
     /// Validate the article sections of one already framed response.
@@ -2371,7 +2364,14 @@ Actual body content\r\n\
             };
             let reused = validated.materialize();
             assert_eq!(reused, Article::parse(frame.bytes()).unwrap());
+            assert_eq!(reused, Article::parse_framed_response(frame).unwrap());
         }
+    }
+
+    #[test]
+    fn article_view_alias_keeps_the_consumer_projection_compatible() {
+        let view: ArticleView<'_> = Article::parse(VALID_BODY).unwrap();
+        assert_eq!(view, Article::parse(VALID_BODY).unwrap());
     }
 
     #[test]
