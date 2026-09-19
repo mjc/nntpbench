@@ -274,14 +274,14 @@ impl ResponseFrameDecoder {
         ResponseFrame::parse(self.kind, buffer)
     }
 
-    /// Validate the content of a framed response after the streaming decoder
-    /// has already accepted its request-scoped initial line. The borrowed
-    /// result remains tied to the exact immutable frame owner.
-    pub(crate) fn validate_framed_after_initial<'a>(
+    /// Validate a non-article frame while retaining only its resource-bound
+    /// content coordinates. The caller can then consume the framed owner
+    /// without cloning its immutable byte storage.
+    pub(crate) fn validate_generic_framed_after_initial(
         self,
-        framed: &'a ArticleState<FramedArticleState<bytes::Bytes>>,
+        framed: &ArticleState<FramedArticleState<bytes::Bytes>>,
         initial: ResponseInitial,
-    ) -> Option<ValidatedResponseContent<'a>> {
+    ) -> Option<ResponseContentRange> {
         let ResponseFrameParse::Complete(frame) = self.complete_with_metadata(
             framed.as_bytes(),
             framed.status(),
@@ -291,7 +291,18 @@ impl ResponseFrameDecoder {
         ) else {
             return None;
         };
-        Some(frame.content_validation())
+        matches!(
+            frame.content_validation(),
+            ValidatedResponseContent::Generic
+        )
+        .then(|| {
+            ResponseContentRange::new(
+                frame.content_start(),
+                frame.content_end(),
+                frame.bytes().len(),
+            )
+            .expect("response parser established an in-bounds content range")
+        })
     }
 
     fn complete_with_metadata<'a>(
@@ -2810,6 +2821,24 @@ fn validate_optional_trailing_comment(value: &[u8]) -> bool {
 pub(crate) enum ValidatedResponseContent<'a> {
     Generic,
     Article(ValidatedArticleView<'a>),
+}
+
+/// Exclusive content coordinates relative to one immutable framed response.
+/// The range is only constructed after framing has checked its bounds, and
+/// is consumed immediately with that same framed owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResponseContentRange(std::ops::Range<usize>);
+
+impl ResponseContentRange {
+    pub(crate) fn new(start: usize, end: usize, response_len: usize) -> Option<Self> {
+        (start <= end && end <= response_len).then_some(Self(start..end))
+    }
+
+    pub(crate) fn slice<'a>(&self, response: &'a [u8]) -> &'a [u8] {
+        response
+            .get(self.0.clone())
+            .expect("validated response content range remains in its response")
+    }
 }
 
 fn validate_response_content<'a>(

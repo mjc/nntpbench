@@ -2,13 +2,12 @@
 //! may change input while decoding; completed prefixes leave as immutable bytes.
 
 use bytes::{Bytes, BytesMut};
-use std::ops::Range;
 use tokio::io::AsyncRead;
 
 use super::{
     Article, ArticleParseError, ArticleState, ContentEnd, FramedArticleState, RequestKind,
-    ResponseFrameDecoder, ResponseInitial, ResponseInitialParse, StatusCode, StatusLineEnd,
-    ValidatedOwnedArticle, ValidatedResponseContent,
+    ResponseContentRange, ResponseFrameDecoder, ResponseInitial, ResponseInitialParse, StatusCode,
+    StatusLineEnd, ValidatedOwnedArticle,
 };
 use crate::client::{ClientError, OWNED_RESPONSE_PREALLOC_BYTES, read_into_pending_bytes};
 use crate::terminator::{MultilineFrameProgress, MultilineFramer};
@@ -203,27 +202,15 @@ impl FramedResponse {
                 content: OwnedResponseContent::Article(article),
             });
         }
-        let validation = ResponseFrameDecoder::new(kind)
-            .validate_framed_after_initial(&framed, initial)
+        let content = ResponseFrameDecoder::new(kind)
+            .validate_generic_framed_after_initial(&framed, initial)
             .ok_or(ClientError::InvalidStatusLine)?;
-        match validation {
-            ValidatedResponseContent::Article(_) => {
-                unreachable!("article responses use the consuming framed article validation path")
-            }
-            ValidatedResponseContent::Generic => {
-                let bytes = framed.clone_bytes();
-                Ok(OwnedResponse {
-                    kind,
-                    status,
-                    content: OwnedResponseContent::from_frame(
-                        bytes,
-                        framed.status_line_end().get(),
-                        framed.content_end().get(),
-                        ValidatedResponseContent::Generic,
-                    ),
-                })
-            }
-        }
+        let bytes = framed.into_inner().into_bytes();
+        Ok(OwnedResponse {
+            kind,
+            status,
+            content: OwnedResponseContent::Generic { bytes, content },
+        })
     }
 }
 
@@ -524,45 +511,7 @@ enum OwnedResponseContent {
     Article(ValidatedOwnedArticle),
 }
 
-/// Exclusive content coordinates relative to the owned framed response.
-///
-/// This is deliberately kept with the generic response bytes. Callers cannot
-/// accidentally pair a content range from one response with another buffer,
-/// or swap a start/end coordinate at the enum boundary.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ResponseContentRange(Range<usize>);
-
-impl ResponseContentRange {
-    fn new(start: usize, end: usize, response_len: usize) -> Option<Self> {
-        (start <= end && end <= response_len).then_some(Self(start..end))
-    }
-
-    fn slice<'a>(&self, response: &'a [u8]) -> &'a [u8] {
-        response
-            .get(self.0.clone())
-            .expect("validated response content range remains in its response")
-    }
-}
-
 impl OwnedResponseContent {
-    fn from_frame(
-        bytes: Bytes,
-        content_start: usize,
-        content_end: usize,
-        validation: ValidatedResponseContent<'_>,
-    ) -> Self {
-        match validation {
-            ValidatedResponseContent::Generic => Self::Generic {
-                content: ResponseContentRange::new(content_start, content_end, bytes.len())
-                    .expect("response parser established an in-bounds content range"),
-                bytes,
-            },
-            ValidatedResponseContent::Article(validated) => {
-                Self::Article(validated.into_owned(bytes))
-            }
-        }
-    }
-
     fn bytes(&self) -> &[u8] {
         match self {
             Self::Generic { bytes, .. } => bytes,

@@ -1133,10 +1133,6 @@ pub(crate) mod state {
     }
 
     impl Article<Framed<bytes::Bytes>> {
-        pub(crate) fn clone_bytes(&self) -> bytes::Bytes {
-            self.0.bytes().clone()
-        }
-
         /// Consume a framed article after validating its semantics while the
         /// bytes and layout remain in the same owner.
         pub(crate) fn validate_article(
@@ -1422,12 +1418,6 @@ pub(crate) type ValidatedOwnedArticle = state::Article<state::Validated<Bytes>>;
 impl<'a> ValidatedArticleView<'a> {
     pub(crate) fn materialize(self) -> Article<'a> {
         self.layout.materialize(self.buffer)
-    }
-
-    pub(crate) fn into_owned(self, bytes: Bytes) -> ValidatedOwnedArticle {
-        assert_eq!(self.buffer.as_ptr(), bytes.as_ptr());
-        assert_eq!(self.buffer.len(), bytes.len());
-        state::Article::new(state::Validated::new(bytes, self.layout))
     }
 }
 
@@ -2276,9 +2266,15 @@ Actual body content\r\n\
         let bytes = Bytes::from_static(VALID_BODY);
         let content_start = strict_crlf_line_content_end_from(&bytes, 0).unwrap() + 2;
         let content_end = find_article_content_end(&bytes, content_start).unwrap();
-        let validated =
-            Article::validate_framed_article(&bytes, content_start, content_end).unwrap();
-        let owned = validated.into_owned(bytes.clone());
+        let framed = state::Article::new(state::Framed::new(
+            bytes,
+            RequestKind::Body,
+            StatusCode::parse(b"222").unwrap(),
+            None,
+            state::StatusLineEnd::new(content_start),
+            state::ContentEnd::new(content_end),
+        ));
+        let owned = framed.validate_article().unwrap();
 
         assert_eq!(owned.bytes(), VALID_BODY);
         assert_eq!(owned.materialize(), Article::parse(VALID_BODY).unwrap());

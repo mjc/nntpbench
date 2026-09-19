@@ -159,21 +159,9 @@ fn receive_response(
 }
 
 fn response_from_bytes(kind: RequestKind, status: StatusCode, bytes: &[u8]) -> OwnedResponse {
-    let bytes = Bytes::copy_from_slice(bytes);
-    let ResponseFrameParse::Complete(frame) = ResponseFrameDecoder::new(kind).decode(&bytes) else {
-        panic!("test response frame should parse");
-    };
-    assert_eq!(frame.status(), status);
-    OwnedResponse {
-        kind,
-        status,
-        content: OwnedResponseContent::from_frame(
-            bytes.slice(..frame.consumed()),
-            frame.content_start(),
-            frame.content_end(),
-            frame.content_validation(),
-        ),
-    }
+    let response = receive_fragments(kind, bytes, bytes.len()).expect("response should parse");
+    assert_eq!(response.status(), status);
+    response
 }
 
 #[test]
