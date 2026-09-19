@@ -532,10 +532,6 @@ impl ResponseContentRange {
         (start <= end && end <= response_len).then_some(Self(start..end))
     }
 
-    fn range(&self) -> Range<usize> {
-        self.0.clone()
-    }
-
     fn slice<'a>(&self, response: &'a [u8]) -> &'a [u8] {
         response
             .get(self.0.clone())
@@ -606,10 +602,7 @@ impl OwnedResponse {
     pub fn parse_article(&self) -> Result<Article<'_>, ArticleParseError> {
         match &self.content {
             OwnedResponseContent::Article(article) => Ok(article.materialize()),
-            OwnedResponseContent::Generic { bytes, content } => {
-                let range = content.range();
-                Article::parse_article_frame(bytes, range.start, range.end)
-            }
+            OwnedResponseContent::Generic { bytes, .. } => Article::parse(bytes),
         }
     }
 }
