@@ -165,20 +165,7 @@ impl<'a> ResponseFrame<'a> {
             )
         };
         let content_end = status_line_end + content.len();
-        let content_validation = match validate_response_content(
-            kind,
-            status,
-            descriptor.framing(),
-            &buffer[..consumed],
-            &buffer[..status_line_end],
-            status_line_end,
-            content_end,
-        ) {
-            Some(validation) => validation,
-            None => return ResponseFrameParse::Invalid,
-        };
-
-        ResponseFrameParse::Complete(Self {
+        let frame = Self {
             kind,
             descriptor,
             bytes: &buffer[..consumed],
@@ -187,9 +174,18 @@ impl<'a> ResponseFrame<'a> {
             terminator,
             content_start: status_line_end,
             content_end,
-            content_validation,
+            content_validation: ValidatedResponseContent::Generic,
             status,
             consumed,
+        };
+        let content_validation = match validate_response_content(frame) {
+            Some(validation) => validation,
+            None => return ResponseFrameParse::Invalid,
+        };
+
+        ResponseFrameParse::Complete(Self {
+            content_validation,
+            ..frame
         })
     }
 
@@ -364,20 +360,7 @@ impl ResponseFrameDecoder {
                 &buffer[status_line_end..status_line_end],
             )
         };
-        let content_validation = match validate_response_content(
-            self.kind,
-            status,
-            descriptor.framing(),
-            &buffer[..consumed],
-            status_line,
-            status_line_end,
-            content_end,
-        ) {
-            Some(validation) => validation,
-            None => return ResponseFrameParse::Invalid,
-        };
-
-        ResponseFrameParse::Complete(ResponseFrame {
+        let frame = ResponseFrame {
             kind: self.kind,
             descriptor,
             bytes: &buffer[..consumed],
@@ -386,9 +369,18 @@ impl ResponseFrameDecoder {
             terminator,
             content_start: status_line_end,
             content_end,
-            content_validation,
+            content_validation: ValidatedResponseContent::Generic,
             status,
             consumed,
+        };
+        let content_validation = match validate_response_content(frame) {
+            Some(validation) => validation,
+            None => return ResponseFrameParse::Invalid,
+        };
+
+        ResponseFrameParse::Complete(ResponseFrame {
+            content_validation,
+            ..frame
         })
     }
 }
@@ -2841,23 +2833,18 @@ impl ResponseContentRange {
     }
 }
 
-fn validate_response_content<'a>(
-    kind: RequestKind,
-    status: StatusCode,
-    framing: ResponseFraming,
-    frame: &'a [u8],
-    status_line: &[u8],
-    content_start: usize,
-    content_end: usize,
-) -> Option<ValidatedResponseContent<'a>> {
-    let content = frame.get(content_start..content_end)?;
+fn validate_response_content<'a>(frame: ResponseFrame<'a>) -> Option<ValidatedResponseContent<'a>> {
+    let kind = frame.kind;
+    let status = frame.status;
+    let framing = frame.descriptor.framing();
+    let content = frame.content;
 
     match (kind, status.as_u16()) {
         (RequestKind::Article, 220)
         | (RequestKind::Head, 221)
         | (RequestKind::Body, 222)
         | (RequestKind::Stat, 223) => {
-            return Article::validate_framed_article(frame, content_start, content_end)
+            return Article::validate_response_frame(frame)
                 .map(ValidatedResponseContent::Article)
                 .ok();
         }
@@ -2880,7 +2867,7 @@ fn validate_response_content<'a>(
         RequestKind::ListDistribPats => {
             validate_crlf_lines(content, validate_distrib_pats_response_line)
         }
-        RequestKind::ListGroup => validate_listgroup_response_content(status_line, content),
+        RequestKind::ListGroup => validate_listgroup_response_content(frame.status_line, content),
         RequestKind::NewNews => validate_crlf_lines(content, |line| {
             std::str::from_utf8(line)
                 .ok()

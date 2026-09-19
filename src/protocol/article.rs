@@ -1781,20 +1781,26 @@ impl<'a> Article<'a> {
         content_start: usize,
         content_end: usize,
     ) -> Result<Self, ArticleParseError> {
-        let validated = Self::validate_framed_article(buf, content_start, content_end)?;
-        Ok(validated.materialize())
+        FramedArticle::from_content_bounds(buf, content_start, content_end)?
+            .validate()
+            .map(ValidatedArticleView::materialize)
     }
 
-    /// Validate a framed article without constructing unfolded or unstuffed data.
+    /// Validate the article sections of one already framed response.
     ///
-    /// The private framed handle keeps the bytes and their checked ranges
-    /// together until validation has produced the reusable article view.
-    pub(crate) fn validate_framed_article(
-        buf: &'a [u8],
-        content_start: usize,
-        content_end: usize,
+    /// The response frame carries both the immutable bytes and the framing
+    /// coordinates, so callers cannot validate one allocation and later bind
+    /// the layout to another buffer.
+    pub(crate) fn validate_response_frame(
+        frame: super::ResponseFrame<'a>,
     ) -> Result<ValidatedArticleView<'a>, ArticleParseError> {
-        FramedArticle::from_content_bounds(buf, content_start, content_end)?.validate()
+        FramedArticle::from_known_content_bounds(
+            frame.bytes(),
+            frame.content_start(),
+            frame.content_end(),
+            state::StatusLineEnd::new(frame.content_start()),
+        )?
+        .validate()
     }
 
     fn parse_article(buf: &'a [u8]) -> Result<Self, ArticleParseError> {
@@ -2153,6 +2159,7 @@ fn validate_headers(data: &[u8]) -> Result<HeaderTransformation, ArticleParseErr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::{ResponseFrame, ResponseFrameParse, ValidatedResponseContent};
 
     const VALID_ARTICLE_TEXT: &[u8] = b"220 12345 <test@example.com>\r\n\
 Subject: Test Article\r\n\
@@ -2247,17 +2254,20 @@ Actual body content\r\n\
 
     #[test]
     fn framed_validation_materializes_every_article_response() {
-        for frame in [VALID_ARTICLE_TEXT, VALID_HEAD, VALID_BODY, VALID_STAT] {
-            let content_start = strict_crlf_line_content_end_from(frame, 0).unwrap() + 2;
-            let content_end = if frame.starts_with(b"223") {
-                content_start
-            } else {
-                find_article_content_end(frame, content_start).unwrap()
+        for (kind, frame) in [
+            (RequestKind::Article, VALID_ARTICLE_TEXT),
+            (RequestKind::Head, VALID_HEAD),
+            (RequestKind::Body, VALID_BODY),
+            (RequestKind::Stat, VALID_STAT),
+        ] {
+            let ResponseFrameParse::Complete(frame) = ResponseFrame::parse(kind, frame) else {
+                panic!("article fixture should be a complete frame");
             };
-            let validated =
-                Article::validate_framed_article(frame, content_start, content_end).unwrap();
+            let ValidatedResponseContent::Article(validated) = frame.content_validation() else {
+                panic!("article fixture should retain article validation");
+            };
             let reused = validated.materialize();
-            assert_eq!(reused, Article::parse(frame).unwrap());
+            assert_eq!(reused, Article::parse(frame.bytes()).unwrap());
         }
     }
 
