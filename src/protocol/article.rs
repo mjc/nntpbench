@@ -1156,10 +1156,11 @@ pub(crate) mod state {
             }
             let first_line =
                 super::validated_first_line_from_initial(self.initial(), self.status_line_end())?;
-            let layout = super::FramedArticle::from_content_bounds(
+            let layout = super::FramedArticle::from_known_content_bounds(
                 self.as_bytes(),
                 self.status_line_end().get(),
                 self.content_end().get(),
+                self.status_line_end(),
             )?
             .validate_for_status_with_first_line(status.as_u16(), first_line)?;
             Ok(Article::new(Validated::new(
@@ -1523,25 +1524,6 @@ struct FramedArticle<'a> {
 }
 
 impl<'a> FramedArticle<'a> {
-    fn from_content_bounds(
-        buffer: &'a [u8],
-        content_start: usize,
-        content_end: usize,
-    ) -> Result<Self, ArticleParseError> {
-        if content_start > content_end || content_end > buffer.len() {
-            return Err(ArticleParseError::BufferTooShort);
-        }
-
-        let first_line_end = strict_crlf_line_content_end_from(buffer, 0)
-            .ok_or(ArticleParseError::BufferTooShort)?;
-        Self::from_known_content_bounds(
-            buffer,
-            content_start,
-            content_end,
-            state::StatusLineEnd::new(first_line_end + crate::CRLF.len()),
-        )
-    }
-
     fn from_known_content_bounds(
         buffer: &'a [u8],
         content_start: usize,
@@ -1845,14 +1827,17 @@ impl<'a> Article<'a> {
     ///
     /// This is for callers that already performed RFC 3977 section 3.1.1
     /// dot-terminator framing and can pass the payload range directly.
-    pub(crate) fn parse_article_frame(
-        buf: &'a [u8],
-        content_start: usize,
-        content_end: usize,
+    pub(crate) fn parse_framed_response(
+        frame: super::ResponseFrame<'a>,
     ) -> Result<Self, ArticleParseError> {
-        FramedArticle::from_content_bounds(buf, content_start, content_end)?
-            .validate()
-            .map(ValidatedArticleView::materialize)
+        FramedArticle::from_known_content_bounds(
+            frame.bytes(),
+            frame.content_start(),
+            frame.content_end(),
+            state::StatusLineEnd::new(frame.content_start()),
+        )?
+        .validate()
+        .map(ValidatedArticleView::materialize)
     }
 
     /// Validate the article sections of one already framed response.

@@ -2235,10 +2235,8 @@ pub fn bench_article_validation_and_two_parses(
     let ResponseFrameParse::Complete(frame) = ResponseFrameDecoder::new(kind).decode(bytes) else {
         return Err(ClientError::UnexpectedEof);
     };
-    let first = Article::parse_article_frame(bytes, frame.content_start(), frame.content_end())
-        .map_err(|_| ClientError::UnexpectedEof)?;
-    let second = Article::parse_article_frame(bytes, frame.content_start(), frame.content_end())
-        .map_err(|_| ClientError::UnexpectedEof)?;
+    let first = Article::parse_framed_response(frame).map_err(|_| ClientError::UnexpectedEof)?;
+    let second = Article::parse_framed_response(frame).map_err(|_| ClientError::UnexpectedEof)?;
     Ok(first
         .body
         .as_ref()
