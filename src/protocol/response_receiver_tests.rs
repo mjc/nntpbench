@@ -484,6 +484,18 @@ fn framing_completion_excludes_a_packed_following_response() {
 }
 
 #[test]
+fn received_article_validation_excludes_packed_following_response() {
+    let first = b"222 1 <body@test> body follows\r\nwire body\r\n.\r\n";
+    let mut packed = first.to_vec();
+    packed.extend_from_slice(b"223 1 <next@test> article exists\r\n");
+
+    let response = receive_response(RequestKind::Body, &packed, 1).unwrap();
+    let article = response.parse_article().unwrap();
+
+    assert_eq!(article.body.as_deref(), Some(&b"wire body\r\n"[..]));
+}
+
+#[test]
 fn decoder_completes_multiline_response_across_chunks() {
     // RFC 3977 section 3.1.1 terminates multiline data with CRLF "." CRLF.
     // The decoder must retain enough state to recognize that sequence across reads:
