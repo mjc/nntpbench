@@ -1149,7 +1149,7 @@ pub(crate) mod state {
     impl Article<Framed<bytes::Bytes>> {
         /// Consume a framed article after validating its semantics while the
         /// bytes and layout remain in the same owner.
-        pub(crate) fn validate_article(
+        pub(crate) fn validate(
             self,
         ) -> Result<Article<Validated<bytes::Bytes>>, super::ArticleParseError> {
             let kind = self.kind();
@@ -2373,7 +2373,7 @@ Actual body content\r\n\
             state::ContentEnd::new(content_end),
             initial,
         ));
-        let owned = framed.validate_article().unwrap();
+        let owned = framed.validate().unwrap();
 
         assert_eq!(owned.bytes(), VALID_BODY);
         assert_eq!(owned.materialize(), Article::parse(VALID_BODY).unwrap());

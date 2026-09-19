@@ -87,7 +87,7 @@ impl<R: AsyncRead + Unpin> Receiving<'_, R> {
         let Some(framed) = self.decoder.extract_framed(&mut self.receiver.pending)? else {
             return Ok(None);
         };
-        let response = framed.validate()?;
+        let response = framed.into_owned_response()?;
         self.receiver.state = ReceiverState::Ready;
         Ok(Some(response))
     }
@@ -178,7 +178,7 @@ fn receive_fragments(
 type FramedResponse = ArticleState<FramedArticleState<Bytes>>;
 
 impl ArticleState<FramedArticleState<Bytes>> {
-    fn validate(self) -> Result<OwnedResponse, ClientError> {
+    fn into_owned_response(self) -> Result<OwnedResponse, ClientError> {
         let kind = self.kind();
         let status = self.status();
         let article_response = matches!(
@@ -190,7 +190,7 @@ impl ArticleState<FramedArticleState<Bytes>> {
         );
         if article_response {
             let article = self
-                .validate_article()
+                .validate()
                 .map_err(|_| ClientError::InvalidStatusLine)?;
             return Ok(OwnedResponse {
                 content: OwnedResponseContent::Article(article),
