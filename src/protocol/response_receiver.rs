@@ -175,15 +175,12 @@ fn receive_fragments(
 /// wire frame before an article layout can be exposed. The extracted bytes and
 /// the status-line boundary travel together; no decoder borrow or detached
 /// range can be supplied by a caller.
-struct FramedResponse {
-    framed: ArticleState<FramedArticleState<Bytes>>,
-}
+type FramedResponse = ArticleState<FramedArticleState<Bytes>>;
 
-impl FramedResponse {
+impl ArticleState<FramedArticleState<Bytes>> {
     fn validate(self) -> Result<OwnedResponse, ClientError> {
-        let Self { framed } = self;
-        let kind = framed.kind();
-        let status = framed.status();
+        let kind = self.kind();
+        let status = self.status();
         let article_response = matches!(
             (kind, status.as_u16()),
             (RequestKind::Article, 220)
@@ -192,7 +189,7 @@ impl FramedResponse {
                 | (RequestKind::Stat, 223)
         );
         if article_response {
-            let article = framed
+            let article = self
                 .validate_article()
                 .map_err(|_| ClientError::InvalidStatusLine)?;
             return Ok(OwnedResponse {
@@ -200,9 +197,9 @@ impl FramedResponse {
             });
         }
         let content = ResponseFrameDecoder::new(kind)
-            .validate_generic_framed_after_initial(&framed, framed.initial())
+            .validate_generic_framed_after_initial(&self, self.initial())
             .ok_or(ClientError::InvalidStatusLine)?;
-        let bytes = framed.into_inner().into_bytes();
+        let bytes = self.into_inner().into_bytes();
         Ok(OwnedResponse {
             content: OwnedResponseContent::Generic {
                 kind,
@@ -702,17 +699,15 @@ impl ResponseDecoder {
                     .ok_or(ClientError::InvalidStatusLine)
             })?;
 
-        Ok(Some(FramedResponse {
-            framed: ArticleState::new(FramedArticleState::new(
-                frame_end.extract(pending),
-                self.streaming.kind,
-                status,
-                bounds,
-                status_line_end,
-                ContentEnd::new(content_end),
-                initial,
-            )),
-        }))
+        Ok(Some(ArticleState::new(FramedArticleState::new(
+            frame_end.extract(pending),
+            self.streaming.kind,
+            status,
+            bounds,
+            status_line_end,
+            ContentEnd::new(content_end),
+            initial,
+        ))))
     }
 }
 
