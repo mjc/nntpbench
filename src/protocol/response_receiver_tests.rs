@@ -582,6 +582,45 @@ fn production_receiver_translates_a_split_multiline_end_to_the_pending_buffer() 
 }
 
 #[test]
+fn production_receiver_split_article_family_promotes_and_reuses_typed_access() {
+    let frames = [
+        (
+            RequestKind::Article,
+            b"220 1 <article@test> article follows\r\nSubject: value\r\n\r\nbody\r\n.\r\n"
+                .as_slice(),
+            "<article@test>",
+        ),
+        (
+            RequestKind::Head,
+            b"221 1 <head@test> headers follow\r\nSubject: value\r\n.\r\n".as_slice(),
+            "<head@test>",
+        ),
+        (
+            RequestKind::Body,
+            b"222 1 <body@test> body follows\r\nbody\r\n.\r\n".as_slice(),
+            "<body@test>",
+        ),
+        (
+            RequestKind::Stat,
+            b"223 1 <stat@test> article exists\r\n".as_slice(),
+            "<stat@test>",
+        ),
+    ];
+
+    for (kind, frame, expected_message_id) in frames {
+        let response = receive_response(kind, frame, frame.len() - 1)
+            .unwrap_or_else(|error| panic!("{kind:?} split receive failed: {error:?}"));
+        let article = OwnedArticle::try_from(response)
+            .unwrap_or_else(|error| panic!("{kind:?} article promotion failed: {error:?}"));
+
+        let first = article.article();
+        let second = article.article();
+        assert_eq!(first, second, "{kind:?} typed access changed between calls");
+        assert_eq!(first.message_id.as_str(), expected_message_id);
+    }
+}
+
+#[test]
 fn received_article_validation_excludes_packed_following_response() {
     let first = b"222 1 <body@test> body follows\r\nwire body\r\n.\r\n";
     let mut packed = first.to_vec();

@@ -831,7 +831,7 @@ mod proptests {
             let parsed = Article::parse(&frame).unwrap();
             let mut expected_body = body;
             expected_body.extend_from_slice(crate::CRLF);
-            let expected_body = unstuff_dot_lines(&expected_body);
+            let expected_body = unstuff_known_dot_lines(&expected_body);
             prop_assert_eq!(parsed.message_id.as_str(), message_id.as_str());
             prop_assert_eq!(parsed.article_number, Some(ArticleNumber::from(article_number as u64)));
             prop_assert_eq!(parsed.body.as_deref(), Some(expected_body.as_ref()));
@@ -1841,13 +1841,7 @@ impl<'a> Article<'a> {
     /// Parse a full NNTP ARTICLE/HEAD/BODY/STAT response frame.
     pub fn parse(buf: &'a [u8]) -> Result<Self, ArticleParseError> {
         let status_code = parse_status_code(buf)?;
-        match status_code {
-            220 => Self::parse_article(buf),
-            221 => Self::parse_head(buf),
-            222 => Self::parse_body(buf),
-            223 => Self::parse_stat(buf),
-            _ => Err(ArticleParseError::InvalidStatusCode(status_code)),
-        }
+        parse_compatibility_response(buf, status_code)
     }
 
     /// Parse a response frame whose multiline content boundary was already found.
@@ -1877,87 +1871,73 @@ impl<'a> Article<'a> {
         )?
         .validate()
     }
+}
 
-    fn parse_article(buf: &'a [u8]) -> Result<Self, ArticleParseError> {
-        let first_line_end =
-            strict_crlf_line_content_end_from(buf, 0).ok_or(ArticleParseError::BufferTooShort)?;
-        let parsed = parse_first_line(&buf[..first_line_end])?;
-        let message_id = parsed.message_id;
-        let article_number = parsed.article_number;
-        let content_start = first_line_end + 2;
-        let separator_pos = find_blank_line(buf, content_start)?;
-        let headers = Some(Headers::parse(&buf[content_start..separator_pos + 2])?);
-        let body_start = separator_pos + 4;
-        let body_end = find_article_content_end(buf, body_start)
-            .ok_or(ArticleParseError::MissingTerminator)?;
-        validate_body_content(&buf[body_start..body_end])?;
-
-        Ok(Self {
-            message_id,
-            article_number,
-            headers,
-            body: Some(unstuff_dot_lines(&buf[body_start..body_end])),
-        })
+/// Keep the legacy borrowed parser on the same framed-layout validation path
+/// as responses received through [`ResponseFrame`]. The compatibility entry
+/// point still accepts a packed buffer and preserves its historical error
+/// ordering, but it no longer has one parser for each article shape.
+fn parse_compatibility_response<'a>(
+    buffer: &'a [u8],
+    status: u16,
+) -> Result<Article<'a>, ArticleParseError> {
+    if !matches!(status, 220..=223) {
+        return Err(ArticleParseError::InvalidStatusCode(status));
     }
 
-    fn parse_head(buf: &'a [u8]) -> Result<Self, ArticleParseError> {
-        let first_line_end =
-            strict_crlf_line_content_end_from(buf, 0).ok_or(ArticleParseError::BufferTooShort)?;
-        let parsed = parse_first_line(&buf[..first_line_end])?;
-        let message_id = parsed.message_id;
-        let article_number = parsed.article_number;
-        let content_start = first_line_end + 2;
-        if find_blank_line(buf, content_start).is_ok() {
-            return Err(ArticleParseError::UnexpectedBody);
-        }
-        let headers_end = find_article_content_end(buf, content_start)
-            .ok_or(ArticleParseError::MissingTerminator)?;
+    let first_line_end =
+        strict_crlf_line_content_end_from(buffer, 0).ok_or(ArticleParseError::BufferTooShort)?;
+    let status_line_end = first_line_end
+        .checked_add(crate::CRLF.len())
+        .ok_or(ArticleParseError::BufferTooShort)?;
+    let first_line = validate_first_line(buffer, ArticleFrameRange::new(0, first_line_end)?)?;
+    let content_end = compatibility_content_end(buffer, status, status_line_end)?;
+    let framed = FramedArticle::from_known_content_bounds(
+        buffer,
+        status_line_end,
+        content_end,
+        state::StatusLineEnd::new(status_line_end),
+    )?;
+    framed
+        .validate_for_status_with_first_line(status, first_line)
+        .map(|layout| layout.materialize(buffer))
+}
 
-        Ok(Self {
-            message_id,
-            article_number,
-            headers: Some(Headers::parse(&buf[content_start..headers_end])?),
-            body: None,
-        })
+fn compatibility_content_end(
+    buffer: &[u8],
+    status: u16,
+    status_line_end: usize,
+) -> Result<usize, ArticleParseError> {
+    if status == 223 {
+        return Ok(buffer.len());
     }
 
-    fn parse_body(buf: &'a [u8]) -> Result<Self, ArticleParseError> {
-        let first_line_end =
-            strict_crlf_line_content_end_from(buf, 0).ok_or(ArticleParseError::BufferTooShort)?;
-        let parsed = parse_first_line(&buf[..first_line_end])?;
-        let message_id = parsed.message_id;
-        let article_number = parsed.article_number;
-        let body_start = first_line_end + 2;
-        let body_end = find_article_content_end(buf, body_start)
-            .ok_or(ArticleParseError::MissingTerminator)?;
-        validate_body_content(&buf[body_start..body_end])?;
+    let Some(content_end) = find_article_content_end(buffer, status_line_end) else {
+        // The legacy parser reported structural errors that occur before a
+        // missing multiline terminator. Keep that ordering for incomplete
+        // compatibility input without repeating any work on complete frames.
+        return match status {
+            220 => {
+                let separator = find_blank_line(buffer, status_line_end)?;
+                let headers_end = separator
+                    .checked_add(crate::CRLF.len())
+                    .ok_or(ArticleParseError::BufferTooShort)?;
+                Headers::parse(&buffer[status_line_end..headers_end])?;
+                Err(ArticleParseError::MissingTerminator)
+            }
+            221 => {
+                if find_blank_line(buffer, status_line_end).is_ok() {
+                    Err(ArticleParseError::UnexpectedBody)
+                } else {
+                    Err(ArticleParseError::MissingTerminator)
+                }
+            }
+            222 => Err(ArticleParseError::MissingTerminator),
+            _ => unreachable!("unsupported status was rejected above"),
+        };
+    };
 
-        Ok(Self {
-            message_id,
-            article_number,
-            headers: None,
-            body: Some(unstuff_dot_lines(&buf[body_start..body_end])),
-        })
-    }
-
-    fn parse_stat(buf: &'a [u8]) -> Result<Self, ArticleParseError> {
-        let first_line_end =
-            strict_crlf_line_content_end_from(buf, 0).ok_or(ArticleParseError::BufferTooShort)?;
-        let parsed = parse_first_line(&buf[..first_line_end])?;
-        let message_id = parsed.message_id;
-        let article_number = parsed.article_number;
-        let content_start = first_line_end + 2;
-        if content_start != buf.len() {
-            return Err(ArticleParseError::UnexpectedBody);
-        }
-
-        Ok(Self {
-            message_id,
-            article_number,
-            headers: None,
-            body: None,
-        })
-    }
+    Ok(content_end)
 }
 
 fn find_article_content_end(buf: &[u8], start: usize) -> Option<usize> {
@@ -2015,14 +1995,6 @@ fn unfold_header_continuations(buf: &[u8]) -> Cow<'_, [u8]> {
     Cow::Owned(unfolded)
 }
 
-fn unstuff_dot_lines(buf: &[u8]) -> Cow<'_, [u8]> {
-    if !has_dot_stuffed_line(buf) {
-        return Cow::Borrowed(buf);
-    }
-
-    unstuff_known_dot_lines(buf)
-}
-
 fn unstuff_known_dot_lines(buf: &[u8]) -> Cow<'_, [u8]> {
     let mut unstuffed = Vec::with_capacity(buf.len());
     let mut line_start = true;
@@ -2046,13 +2018,6 @@ fn materialize_validated_body(
         BodyTransformation::None => Cow::Borrowed(body.validated_slice(buffer)),
         BodyTransformation::Unstuff => unstuff_known_dot_lines(body.validated_slice(buffer)),
     }
-}
-
-fn has_dot_stuffed_line(buf: &[u8]) -> bool {
-    buf.first() == Some(&b'.')
-        || buf
-            .windows(3)
-            .any(|window| window[0] == b'\r' && window[1] == b'\n' && window[2] == b'.')
 }
 
 fn parse_status_code(buf: &[u8]) -> Result<u16, ArticleParseError> {
@@ -2640,6 +2605,18 @@ Actual body content\r\n\
                 (actual, expected) => assert_eq!(actual, expected),
             }
         }
+    }
+
+    #[test]
+    fn compatibility_parser_preserves_structural_error_order() {
+        assert_eq!(
+            Article::parse(b"220 1 <test@example.com>\r\nSubject: value\r\nbody\r\n"),
+            Err(ArticleParseError::MissingSeparator)
+        );
+        assert_eq!(
+            Article::parse(b"221 1 <test@example.com>\r\nSubject: value\r\n\r\nbody\r\n"),
+            Err(ArticleParseError::UnexpectedBody)
+        );
     }
 
     #[test]
