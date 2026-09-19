@@ -1113,16 +1113,19 @@ pub(crate) mod state {
             self.0.status()
         }
 
-        pub(crate) const fn bounds(&self) -> Option<crate::terminator::MultilineFrameBounds> {
-            self.0.bounds()
-        }
-
         pub(crate) const fn status_line_end(&self) -> StatusLineEnd {
             self.0.status_line_end()
         }
 
         pub(crate) const fn content_end(&self) -> ContentEnd {
             self.0.content_end()
+        }
+
+        pub(crate) fn generic_content_range(&self) -> Option<crate::protocol::ResponseContentRange>
+        where
+            B: StableBytes,
+        {
+            self.0.generic_content_range()
         }
 
         pub(crate) const fn initial(&self) -> ResponseInitial {
@@ -1178,7 +1181,6 @@ pub(crate) mod state {
         bytes: B,
         kind: RequestKind,
         status: StatusCode,
-        bounds: Option<crate::terminator::MultilineFrameBounds>,
         status_line_end: StatusLineEnd,
         content_end: ContentEnd,
         initial: ResponseInitial,
@@ -1189,7 +1191,6 @@ pub(crate) mod state {
             bytes: B,
             kind: RequestKind,
             status: StatusCode,
-            bounds: Option<crate::terminator::MultilineFrameBounds>,
             status_line_end: StatusLineEnd,
             content_end: ContentEnd,
             initial: ResponseInitial,
@@ -1198,7 +1199,6 @@ pub(crate) mod state {
                 bytes,
                 kind,
                 status,
-                bounds,
                 status_line_end,
                 content_end,
                 initial,
@@ -1217,10 +1217,6 @@ pub(crate) mod state {
             self.status
         }
 
-        pub(crate) const fn bounds(&self) -> Option<crate::terminator::MultilineFrameBounds> {
-            self.bounds
-        }
-
         pub(crate) const fn status_line_end(&self) -> StatusLineEnd {
             self.status_line_end
         }
@@ -1231,6 +1227,17 @@ pub(crate) mod state {
 
         pub(crate) const fn initial(&self) -> ResponseInitial {
             self.initial
+        }
+
+        pub(crate) fn generic_content_range(&self) -> Option<crate::protocol::ResponseContentRange>
+        where
+            B: StableBytes,
+        {
+            crate::protocol::ResponseContentRange::new(
+                self.status_line_end.get(),
+                self.content_end.get(),
+                self.bytes.as_slice().len(),
+            )
         }
     }
 
@@ -2362,7 +2369,6 @@ Actual body content\r\n\
             bytes,
             RequestKind::Body,
             StatusCode::parse(b"222").unwrap(),
-            None,
             state::StatusLineEnd::new(content_start),
             state::ContentEnd::new(content_end),
             initial,

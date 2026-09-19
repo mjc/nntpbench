@@ -4,10 +4,12 @@
 use bytes::{Bytes, BytesMut};
 use tokio::io::AsyncRead;
 
+#[cfg(test)]
+use super::ResponseFrameDecoder;
 use super::{
     Article, ArticleParseError, ArticleState, ContentEnd, FramedArticleState, RequestKind,
-    ResponseContentRange, ResponseFrameDecoder, ResponseInitial, ResponseInitialParse, StatusCode,
-    StatusLineEnd, ValidatedOwnedArticle,
+    ResponseContentRange, ResponseInitial, ResponseInitialParse, StatusCode, StatusLineEnd,
+    ValidatedOwnedArticle,
 };
 use crate::client::{ClientError, OWNED_RESPONSE_PREALLOC_BYTES, read_into_pending_bytes};
 use crate::terminator::{MultilineFrameProgress, MultilineFramer};
@@ -196,7 +198,8 @@ impl ArticleState<FramedArticleState<Bytes>> {
                 content: OwnedResponseContent::Article(article),
             });
         }
-        let content = ResponseFrameDecoder::validate_generic_framed(&self)
+        let content = self
+            .generic_content_range()
             .ok_or(ClientError::InvalidStatusLine)?;
         let bytes = self.into_inner().into_bytes();
         Ok(OwnedResponse {
@@ -702,7 +705,6 @@ impl ResponseDecoder {
             frame_end.extract(pending),
             self.streaming.kind,
             status,
-            bounds,
             status_line_end,
             ContentEnd::new(content_end),
             initial,
