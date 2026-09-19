@@ -4,8 +4,6 @@
 use bytes::{Bytes, BytesMut};
 use tokio::io::AsyncRead;
 
-#[cfg(test)]
-use super::ResponseFrameDecoder;
 use super::{
     Article, ArticleParseError, ArticleState, ContentEnd, FramedArticleState, RequestKind,
     ResponseContentRange, ResponseInitial, ResponseInitialParse, StatusCode, StatusLineEnd,

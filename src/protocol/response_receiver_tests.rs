@@ -13,7 +13,7 @@ fn article_state_wrapper_adds_no_storage_to_framed_or_validated_owner() {
         std::mem::size_of::<ValidatedArticleState<Bytes>>()
     );
 }
-use crate::protocol::ResponseFrameParse;
+use crate::protocol::{ResponseFrame, ResponseFrameParse};
 use proptest::collection::vec;
 use proptest::prelude::*;
 use std::cell::RefCell;
@@ -131,7 +131,7 @@ fn assert_incremental_matches_stateless_for_all_two_push_schedules(
     frame: &[u8],
 ) {
     for chunk_bytes in 1..=frame.len().max(1) {
-        let expected = ResponseFrameDecoder::new(kind).decode(frame);
+        let expected = ResponseFrame::parse(kind, frame);
         let actual = receive_response(kind, frame, chunk_bytes);
         match (expected, actual) {
             (ResponseFrameParse::Complete(expected), Ok(actual)) => {
@@ -960,7 +960,7 @@ fn incremental_decoder_matches_stateless_layout_for_split_valid_and_incomplete_f
 fn incremental_decoder_rejects_malformed_body_like_stateless_parser() {
     let frame = b"222 1 <body@test> body follows\r\nnot an article\n\r\n.\r\n";
     assert!(matches!(
-        ResponseFrameDecoder::new(RequestKind::Body).decode(frame),
+        ResponseFrame::parse(RequestKind::Body, frame),
         ResponseFrameParse::Invalid
     ));
 

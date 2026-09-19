@@ -253,24 +253,6 @@ pub enum ResponseFrameParse<'a> {
     Invalid,
 }
 
-/// Stateless protocol response decoder for callers that already retain pending bytes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ResponseFrameDecoder {
-    kind: RequestKind,
-}
-
-impl ResponseFrameDecoder {
-    #[must_use]
-    pub(crate) const fn new(kind: RequestKind) -> Self {
-        Self { kind }
-    }
-
-    #[must_use]
-    pub(crate) fn decode<'a>(self, buffer: &'a [u8]) -> ResponseFrameParse<'a> {
-        ResponseFrame::parse(self.kind, buffer)
-    }
-}
-
 /// Protocol status-line result for streaming callers that cannot retain a full frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ResponseInitial {
