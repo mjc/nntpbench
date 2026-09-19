@@ -1131,10 +1131,6 @@ pub(crate) mod state {
             self.0.generic_content_range()
         }
 
-        pub(crate) const fn initial(&self) -> ResponseInitial {
-            self.0.initial()
-        }
-
         pub(crate) fn as_bytes(&self) -> &[u8]
         where
             B: StableBytes,
@@ -1149,28 +1145,27 @@ pub(crate) mod state {
         }
     }
 
-    impl Article<Framed<bytes::Bytes>> {
+    impl<B: StableBytes> Article<Framed<B>> {
         /// Consume a framed article after validating its semantics while the
         /// bytes and layout remain in the same owner.
-        pub(crate) fn validate(
-            self,
-        ) -> Result<Article<Validated<bytes::Bytes>>, super::ArticleParseError> {
-            let kind = self.kind();
-            let status = self.status();
+        pub(crate) fn validate(self) -> Result<Article<Validated<B>>, super::ArticleParseError> {
+            let framed = self.into_inner();
+            let kind = framed.kind;
+            let status = framed.status;
             if !matches!(status.as_u16(), 220..=223) {
                 return Err(super::ArticleParseError::InvalidStatusCode(status.as_u16()));
             }
             let first_line =
-                super::validated_first_line_from_initial(self.initial(), self.status_line_end())?;
+                super::validated_first_line_from_initial(framed.initial, framed.status_line_end)?;
             let layout = super::FramedArticle::from_known_content_bounds(
-                self.as_bytes(),
-                self.status_line_end().get(),
-                self.content_end().get(),
-                self.status_line_end(),
+                framed.bytes.as_slice(),
+                framed.status_line_end.get(),
+                framed.content_end.get(),
+                framed.status_line_end,
             )?
             .validate_for_status_with_first_line(status.as_u16(), first_line)?;
             Ok(Article::new(Validated::new(
-                self.into_inner().into_bytes(),
+                framed.bytes,
                 kind,
                 status,
                 layout,
@@ -1226,10 +1221,6 @@ pub(crate) mod state {
 
         pub(crate) const fn content_end(&self) -> ContentEnd {
             self.content_end
-        }
-
-        pub(crate) const fn initial(&self) -> ResponseInitial {
-            self.initial
         }
 
         pub(crate) fn generic_content_range(&self) -> Option<crate::protocol::ResponseContentRange>

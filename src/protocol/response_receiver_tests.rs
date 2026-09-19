@@ -13,6 +13,35 @@ fn article_state_wrapper_adds_no_storage_to_framed_or_validated_owner() {
         std::mem::size_of::<ValidatedArticleState<Bytes>>()
     );
 }
+
+#[test]
+fn borrowed_framed_owner_can_validate_without_changing_storage_contract() {
+    let wire = b"222 1 <body@test> body follows\r\nbody\r\n\r\n.\r\n";
+    let status_line_end = wire
+        .windows(crate::CRLF.len())
+        .position(|line| line == crate::CRLF)
+        .map(|end| StatusLineEnd::new(end + crate::CRLF.len()))
+        .expect("fixture has a status line");
+    let content_end = ContentEnd::new(wire.len() - crate::TERMINATOR.len());
+    let initial = match ResponseInitial::parse(RequestKind::Body, &wire[..status_line_end.get()]) {
+        ResponseInitialParse::Complete(initial) => initial,
+        other => panic!("expected a complete initial line, got {other:?}"),
+    };
+    let framed = ArticleState::new(FramedArticleState::new(
+        wire.as_slice(),
+        RequestKind::Body,
+        StatusCode::parse(b"222").expect("valid status"),
+        status_line_end,
+        content_end,
+        initial,
+    ));
+
+    let validated = framed
+        .validate()
+        .expect("borrowed bytes should satisfy the article contract");
+    assert_eq!(validated.article().body.as_deref(), Some(&b"body\r\n"[..]));
+    assert_eq!(validated.as_bytes(), wire);
+}
 use crate::protocol::{ResponseFrame, ResponseFrameParse};
 use proptest::collection::vec;
 use proptest::prelude::*;
