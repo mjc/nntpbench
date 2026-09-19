@@ -5,7 +5,7 @@ use std::{borrow::Cow, fmt};
 use bytes::Bytes;
 
 use super::{
-    InvalidMessageId, MAX_ARTICLE_NUMBER, MessageId, RequestKind, StatusCode,
+    InvalidMessageId, MAX_ARTICLE_NUMBER, MessageId, RequestKind, ResponseInitial, StatusCode,
     validate_optional_trailing_comment,
 };
 use crate::terminator::{
@@ -1148,12 +1148,14 @@ pub(crate) mod state {
             if !matches!(status.as_u16(), 220..=223) {
                 return Err(super::ArticleParseError::InvalidStatusCode(status.as_u16()));
             }
+            let first_line =
+                super::validated_first_line_from_initial(self.initial(), self.status_line_end())?;
             let layout = super::FramedArticle::from_content_bounds(
                 self.as_bytes(),
                 self.status_line_end().get(),
                 self.content_end().get(),
             )?
-            .validate_for_status(status.as_u16())?;
+            .validate_for_status_with_first_line(status.as_u16(), first_line)?;
             Ok(Article::new(Validated::new(
                 self.into_inner().into_bytes(),
                 kind,
@@ -1579,6 +1581,14 @@ impl<'a> FramedArticle<'a> {
         let buffer = self.buffer;
         let first_line = validate_first_line(buffer, self.first_line)?;
 
+        self.validate_for_status_with_first_line(status, first_line)
+    }
+
+    fn validate_for_status_with_first_line(
+        self,
+        status: u16,
+        first_line: ValidatedFirstLine,
+    ) -> Result<ArticleLayout, ArticleParseError> {
         let content = match status {
             220 => self.validate_article_content(),
             221 => self.validate_head_content(),
@@ -2093,6 +2103,28 @@ fn validate_first_line(
         article_number: parsed
             .article_number
             .ok_or(ArticleParseError::InvalidArticleNumber)?,
+    })
+}
+
+fn validated_first_line_from_initial(
+    initial: ResponseInitial,
+    status_line_end: state::StatusLineEnd,
+) -> Result<ValidatedFirstLine, ArticleParseError> {
+    let article = initial
+        .article()
+        .ok_or(ArticleParseError::InvalidStatusPrefix)?;
+    let message_id = article.message_id();
+    let first_line_end = status_line_end
+        .get()
+        .checked_sub(crate::CRLF.len())
+        .ok_or(ArticleParseError::BufferTooShort)?;
+    if message_id.end() > first_line_end {
+        return Err(ArticleParseError::BufferTooShort);
+    }
+
+    Ok(ValidatedFirstLine {
+        message_id: ArticleFrameRange::new(message_id.start(), message_id.end())?,
+        article_number: ArticleNumber::from(article.article_number()),
     })
 }
 

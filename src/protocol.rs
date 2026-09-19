@@ -390,6 +390,48 @@ impl ResponseFrameDecoder {
 pub(crate) struct ResponseInitial {
     status: StatusCode,
     descriptor: ResponseDescriptor,
+    article: Option<ResponseInitialArticle>,
+}
+
+/// Article-family fields parsed from the initial response line.
+///
+/// Ranges are exclusive and relative to the same response bytes that produced
+/// the initial state. They are metadata only; the owning framed state remains
+/// responsible for binding them to its immutable bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ResponseInitialArticle {
+    article_number: u64,
+    message_id: ResponseInitialRange,
+}
+
+impl ResponseInitialArticle {
+    #[must_use]
+    pub(crate) const fn article_number(self) -> u64 {
+        self.article_number
+    }
+
+    #[must_use]
+    pub(crate) const fn message_id(self) -> ResponseInitialRange {
+        self.message_id
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ResponseInitialRange {
+    start: usize,
+    end: usize,
+}
+
+impl ResponseInitialRange {
+    #[must_use]
+    pub(crate) const fn start(self) -> usize {
+        self.start
+    }
+
+    #[must_use]
+    pub(crate) const fn end(self) -> usize {
+        self.end
+    }
 }
 
 impl ResponseInitial {
@@ -403,12 +445,31 @@ impl ResponseInitial {
                     return ResponseInitialParse::Invalid;
                 };
                 let descriptor = ResponseDescriptor::for_request_status(kind, status);
-                if matches!(descriptor.framing(), ResponseFraming::Unexpected)
-                    || !validate_response_initial_line(kind, status, &buffer[..line_end])
-                {
+                if matches!(descriptor.framing(), ResponseFraming::Unexpected) {
                     return ResponseInitialParse::Invalid;
                 }
-                ResponseInitialParse::Complete(Self { status, descriptor })
+                let article = if matches!(
+                    (kind, status.as_u16()),
+                    (RequestKind::Article, 220)
+                        | (RequestKind::Head, 221)
+                        | (RequestKind::Body, 222)
+                        | (RequestKind::Stat, 223)
+                ) {
+                    let Some(article) = parse_response_initial_article(&buffer[..line_end]) else {
+                        return ResponseInitialParse::Invalid;
+                    };
+                    Some(article)
+                } else {
+                    if !validate_response_initial_line(kind, status, &buffer[..line_end]) {
+                        return ResponseInitialParse::Invalid;
+                    }
+                    None
+                };
+                ResponseInitialParse::Complete(Self {
+                    status,
+                    descriptor,
+                    article,
+                })
             }
             BoundedResponseLineStatus::NeedMore => ResponseInitialParse::NeedMore,
             BoundedResponseLineStatus::Invalid | BoundedResponseLineStatus::TooLong => {
@@ -425,6 +486,11 @@ impl ResponseInitial {
     #[must_use]
     pub(crate) const fn descriptor(self) -> ResponseDescriptor {
         self.descriptor
+    }
+
+    #[must_use]
+    pub(crate) const fn article(self) -> Option<ResponseInitialArticle> {
+        self.article
     }
 }
 
@@ -2767,6 +2833,35 @@ fn validate_article_status_response_arguments(value: &[u8], allow_zero_number: b
             .ok()
             .is_some_and(|message_id| MessageId::from_borrowed(message_id).is_ok())
         && validate_optional_trailing_comment(trailing_text)
+}
+
+fn parse_response_initial_article(line: &[u8]) -> Option<ResponseInitialArticle> {
+    let content = line.strip_suffix(crate::CRLF)?;
+    if content.get(3) != Some(&b' ') {
+        return None;
+    }
+    let arguments_start = 4;
+    let number_end = arguments_start + memchr::memchr(b' ', &content[arguments_start..])?;
+    let number = parse_response_initial_article_number(&content[arguments_start..number_end])?;
+    let message_id_start = number_end + 1;
+    let message_id_end = memchr::memchr(b' ', &content[message_id_start..])
+        .map_or(content.len(), |offset| message_id_start + offset);
+    let message_id = std::str::from_utf8(&content[message_id_start..message_id_end]).ok()?;
+    MessageId::from_borrowed(message_id).ok()?;
+    if !validate_optional_trailing_comment(&content[message_id_end..]) {
+        return None;
+    }
+    Some(ResponseInitialArticle {
+        article_number: number,
+        message_id: ResponseInitialRange {
+            start: message_id_start,
+            end: message_id_end,
+        },
+    })
+}
+
+fn parse_response_initial_article_number(value: &[u8]) -> Option<u64> {
+    parse_response_article_number(value)
 }
 
 fn validate_response_article_number_with_zero_policy(value: &[u8], allow_zero: bool) -> bool {
@@ -6312,6 +6407,23 @@ mod tests {
             assert_eq!(initial.status(), status);
             assert_eq!(initial.descriptor().framing(), ResponseFraming::SingleLine);
         }
+    }
+
+    #[test]
+    fn response_initial_retains_article_identity_ranges() {
+        let wire = b"222 42 <body@test> body follows\r\n";
+        let ResponseInitialParse::Complete(initial) =
+            ResponseInitial::parse(RequestKind::Body, wire)
+        else {
+            panic!("article-family initial line should parse");
+        };
+        let article = initial
+            .article()
+            .expect("article metadata should be present");
+        let message_id = article.message_id();
+
+        assert_eq!(article.article_number(), 42);
+        assert_eq!(&wire[message_id.start()..message_id.end()], b"<body@test>");
     }
 
     #[test]
