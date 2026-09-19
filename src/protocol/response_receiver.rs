@@ -561,49 +561,51 @@ impl OwnedResponse {
     }
 }
 
-/// Owned client article-style response that materializes its retained validated layout on demand.
+/// Owned client article-style response backed by one validated article owner.
+///
+/// The article bytes/layout are stored directly rather than nesting an
+/// `OwnedResponse` only to recover its article enum variant.  This keeps the
+/// typestate owner authoritative while retaining the response metadata needed
+/// by the public article surface.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnedArticle {
-    response: OwnedResponse,
+    kind: RequestKind,
+    status: StatusCode,
+    article: ValidatedOwnedArticle,
 }
 
 impl OwnedArticle {
     /// Request kind that produced this article-style response.
     #[must_use]
     pub const fn kind(&self) -> RequestKind {
-        self.response.kind()
+        self.kind
     }
 
     /// Parsed status code from the response status line.
     #[must_use]
     pub const fn status(&self) -> StatusCode {
-        self.response.status()
+        self.status
     }
 
     /// Raw response bytes.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
-        self.response.as_bytes()
+        self.article.bytes()
     }
 
     /// Borrow the parsed article/body view from the owned wire bytes.
     pub fn article(&self) -> Article<'_> {
-        let OwnedResponseContent::Article(ref article) = self.response.content else {
-            unreachable!("OwnedArticle is constructed only from article validation");
-        };
-        article.materialize()
-    }
-
-    /// Borrow the underlying raw response wrapper.
-    #[must_use]
-    pub const fn response(&self) -> &OwnedResponse {
-        &self.response
+        self.article.materialize()
     }
 
     /// Consume the client article-style wrapper and return the raw response.
     #[must_use]
     pub fn into_response(self) -> OwnedResponse {
-        self.response
+        OwnedResponse {
+            kind: self.kind,
+            status: self.status,
+            content: OwnedResponseContent::Article(self.article),
+        }
     }
 }
 
@@ -618,17 +620,37 @@ impl TryFrom<OwnedResponse> for OwnedArticle {
             RequestKind::Stat => 223,
             _ => 0,
         };
-        if response.status.as_u16() != expected_status {
-            return Err(ClientError::UnexpectedArticleResponse { response });
+        let OwnedResponse {
+            kind,
+            status,
+            content,
+        } = response;
+        if status.as_u16() != expected_status {
+            return Err(ClientError::UnexpectedArticleResponse {
+                response: OwnedResponse {
+                    kind,
+                    status,
+                    content,
+                },
+            });
         }
 
-        match response.content {
-            OwnedResponseContent::Article(_) => {}
-            OwnedResponseContent::Generic { .. } => {
-                return Err(ClientError::UnexpectedArticleResponse { response });
+        match content {
+            OwnedResponseContent::Article(article) => Ok(Self {
+                kind,
+                status,
+                article,
+            }),
+            content @ OwnedResponseContent::Generic { .. } => {
+                Err(ClientError::UnexpectedArticleResponse {
+                    response: OwnedResponse {
+                        kind,
+                        status,
+                        content,
+                    },
+                })
             }
         }
-        Ok(Self { response })
     }
 }
 

@@ -196,6 +196,18 @@ fn owned_article_access_is_infallible_after_promotion() {
 }
 
 #[test]
+fn owned_article_round_trip_rebuilds_the_same_response_without_reparsing() {
+    let response = response_from_bytes(
+        RequestKind::Body,
+        StatusCode::parse(b"222").unwrap(),
+        b"222 1 <body@test> body follows\r\nbody\r\n.\r\n",
+    );
+    let article = OwnedArticle::try_from(response.clone()).unwrap();
+
+    assert_eq!(article.into_response(), response);
+}
+
+#[test]
 fn equivalent_owned_article_responses_compare_equal_across_allocations() {
     let first = response_from_bytes(
         RequestKind::Body,
