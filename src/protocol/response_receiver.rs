@@ -7,8 +7,8 @@ use tokio::io::AsyncRead;
 
 use super::{
     Article, ArticleParseError, ArticleState, FramedArticleState, RequestKind,
-    ResponseFrameDecoder, ResponseFrameParse, ResponseInitialParse, StatusCode, StatusLineEnd,
-    ValidatedOwnedArticle, ValidatedResponseContent,
+    ResponseFrameDecoder, ResponseFrameParse, ResponseInitial, ResponseInitialParse, StatusCode,
+    StatusLineEnd, ValidatedOwnedArticle, ValidatedResponseContent,
 };
 use crate::client::{ClientError, OWNED_RESPONSE_PREALLOC_BYTES, read_into_pending_bytes};
 use crate::terminator::{MultilineFrameProgress, MultilineFramer};
@@ -150,11 +150,13 @@ fn receive_fragments(
 /// range can be supplied by a caller.
 struct FramedResponse {
     framed: ArticleState<FramedArticleState<Bytes>>,
+    initial: ResponseInitial,
 }
 
 impl FramedResponse {
     fn validate(self) -> Result<OwnedResponse, ClientError> {
-        let framed = self.framed.into_inner();
+        let Self { framed, initial } = self;
+        let framed = framed.into_inner();
         let kind = framed.kind();
         let status = framed.status();
         if matches!(
@@ -174,8 +176,8 @@ impl FramedResponse {
             });
         }
 
-        let ResponseFrameParse::Complete(frame) =
-            ResponseFrameDecoder::new(framed.kind()).complete_framed(&framed)
+        let ResponseFrameParse::Complete(frame) = ResponseFrameDecoder::new(framed.kind())
+            .complete_framed_after_initial(&framed, initial)
         else {
             return Err(ClientError::InvalidStatusLine);
         };
@@ -704,6 +706,10 @@ impl ResponseDecoder {
         else {
             return Ok(None);
         };
+        let initial = self
+            .streaming
+            .initial()
+            .ok_or(ClientError::InvalidStatusLine)?;
 
         Ok(Some(FramedResponse {
             framed: ArticleState::new(FramedArticleState::new(
@@ -713,6 +719,7 @@ impl ResponseDecoder {
                 bounds,
                 self.streaming.status_line_end(),
             )),
+            initial,
         }))
     }
 }
@@ -749,6 +756,7 @@ struct ChunkConsumed(usize);
 struct StreamingResponseDecoder {
     kind: RequestKind,
     status: Option<StatusCode>,
+    initial: Option<ResponseInitial>,
     status_line_end: StatusLineEnd,
     framer: MultilineFramer,
     status_buf: [u8; STREAMING_STATUS_LINE_BYTES],
@@ -760,6 +768,7 @@ impl StreamingResponseDecoder {
         Self {
             kind,
             status: None,
+            initial: None,
             status_line_end: StatusLineEnd::new(0),
             framer: MultilineFramer::default(),
             status_buf: [0; STREAMING_STATUS_LINE_BYTES],
@@ -788,6 +797,7 @@ impl StreamingResponseDecoder {
                         ResponseInitialParse::Complete(initial) => {
                             let status = initial.status();
                             self.status = Some(status);
+                            self.initial = Some(initial);
                             self.status_line_end = StatusLineEnd::new(self.status_len);
                             if !initial.descriptor().framing().is_multiline() {
                                 return Ok(StreamingDecodeProgress::Complete {
@@ -836,6 +846,10 @@ impl StreamingResponseDecoder {
 
     fn status_line_end(&self) -> StatusLineEnd {
         self.status_line_end
+    }
+
+    fn initial(&self) -> Option<ResponseInitial> {
+        self.initial
     }
 }
 

@@ -274,6 +274,7 @@ impl ResponseFrameDecoder {
         ResponseFrame::parse(self.kind, buffer)
     }
 
+    #[cfg(test)]
     fn complete_framed<'a>(
         self,
         framed: &'a FramedArticleState<bytes::Bytes>,
@@ -283,6 +284,24 @@ impl ResponseFrameDecoder {
             framed.status(),
             framed.status_line_end(),
             framed.bounds(),
+            None,
+        )
+    }
+
+    /// Complete a frame after the streaming decoder has already validated its
+    /// request-scoped initial line. The proof prevents reparsing that line;
+    /// content validation still runs against the exact retained bytes.
+    pub(crate) fn complete_framed_after_initial<'a>(
+        self,
+        framed: &'a FramedArticleState<bytes::Bytes>,
+        initial: ResponseInitial,
+    ) -> ResponseFrameParse<'a> {
+        self.complete_with_metadata(
+            framed.as_bytes(),
+            framed.status(),
+            framed.status_line_end(),
+            framed.bounds(),
+            Some(initial),
         )
     }
 
@@ -292,6 +311,7 @@ impl ResponseFrameDecoder {
         status: StatusCode,
         status_line_end: StatusLineEnd,
         bounds: Option<MultilineFrameBounds>,
+        initial: Option<ResponseInitial>,
     ) -> ResponseFrameParse<'a> {
         let status_line_end = status_line_end.get();
         let (content_end, consumed) = bounds.map_or((status_line_end, status_line_end), |bounds| {
@@ -312,10 +332,16 @@ impl ResponseFrameDecoder {
         }
 
         let descriptor = ResponseDescriptor::for_request_status(self.kind, status);
-        if matches!(descriptor.framing(), ResponseFraming::Unexpected)
-            || !validate_response_initial_line(self.kind, status, status_line)
-        {
+        if matches!(descriptor.framing(), ResponseFraming::Unexpected) {
             return ResponseFrameParse::Invalid;
+        }
+        match initial {
+            Some(initial) if initial.status() == status && initial.descriptor() == descriptor => {}
+            Some(_) => return ResponseFrameParse::Invalid,
+            None if !validate_response_initial_line(self.kind, status, status_line) => {
+                return ResponseFrameParse::Invalid;
+            }
+            None => {}
         }
         if descriptor.framing().is_multiline() != bounds.is_some() {
             return ResponseFrameParse::Invalid;
