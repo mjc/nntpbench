@@ -274,35 +274,24 @@ impl ResponseFrameDecoder {
         ResponseFrame::parse(self.kind, buffer)
     }
 
-    #[cfg(test)]
-    fn complete_framed<'a>(
-        self,
-        framed: &'a ArticleState<FramedArticleState<bytes::Bytes>>,
-    ) -> ResponseFrameParse<'a> {
-        self.complete_with_metadata(
-            framed.as_bytes(),
-            framed.status(),
-            framed.status_line_end(),
-            framed.bounds(),
-            None,
-        )
-    }
-
-    /// Complete a frame after the streaming decoder has already validated its
-    /// request-scoped initial line. The proof prevents reparsing that line;
-    /// content validation still runs against the exact retained bytes.
-    pub(crate) fn complete_framed_after_initial<'a>(
+    /// Validate the content of a framed response after the streaming decoder
+    /// has already accepted its request-scoped initial line. The borrowed
+    /// result remains tied to the exact immutable frame owner.
+    pub(crate) fn validate_framed_after_initial<'a>(
         self,
         framed: &'a ArticleState<FramedArticleState<bytes::Bytes>>,
         initial: ResponseInitial,
-    ) -> ResponseFrameParse<'a> {
-        self.complete_with_metadata(
+    ) -> Option<ValidatedResponseContent<'a>> {
+        let ResponseFrameParse::Complete(frame) = self.complete_with_metadata(
             framed.as_bytes(),
             framed.status(),
             framed.status_line_end(),
             framed.bounds(),
             Some(initial),
-        )
+        ) else {
+            return None;
+        };
+        Some(frame.content_validation())
     }
 
     fn complete_with_metadata<'a>(
@@ -6195,37 +6184,17 @@ mod tests {
     }
 
     #[test]
-    fn response_frame_decoder_accepts_precomputed_boundaries() {
+    fn response_frame_parser_accepts_a_packed_suffix() {
         let wire = b"222 1 <body@test> body follows\r\nbody line\r\n.\r\nNEXT";
-        let status_line_end = b"222 1 <body@test> body follows\r\n".len();
-        let status = StatusCode::parse(wire).unwrap();
-        let bounds =
-            match crate::terminator::MultilineFramer::default().push(&wire[status_line_end..]) {
-                crate::terminator::MultilineFrameProgress::Complete(bounds) => bounds,
-                crate::terminator::MultilineFrameProgress::NeedMore => {
-                    panic!("test frame should be complete")
-                }
-            };
-
-        let framed = FramedArticleState::new(
-            bytes::Bytes::copy_from_slice(wire),
-            RequestKind::Body,
-            status,
-            Some(bounds),
-            StatusLineEnd::new(status_line_end),
-            ContentEnd::new(status_line_end + bounds.content_end().get()),
-        );
-        let framed = ArticleState::new(framed);
-        let ResponseFrameParse::Complete(response) =
-            ResponseFrameDecoder::new(RequestKind::Body).complete_framed(&framed)
+        let ResponseFrameParse::Complete(response) = ResponseFrame::parse(RequestKind::Body, wire)
         else {
-            panic!("precomputed response frame did not parse");
+            panic!("response frame did not parse");
         };
 
         assert_eq!(response.content(), b"body line\r\n");
         assert_eq!(
             response.consumed(),
-            status_line_end + bounds.body_consumed().get()
+            b"222 1 <body@test> body follows\r\nbody line\r\n.\r\n".len()
         );
     }
 

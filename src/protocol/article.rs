@@ -1114,6 +1114,10 @@ pub(crate) mod state {
             self.0.status_line_end()
         }
 
+        pub(crate) const fn content_end(&self) -> ContentEnd {
+            self.0.content_end()
+        }
+
         pub(crate) fn as_bytes(&self) -> &[u8]
         where
             B: StableBytes,
@@ -1176,6 +1180,10 @@ pub(crate) mod state {
 
         pub(crate) const fn status_line_end(&self) -> StatusLineEnd {
             self.status_line_end
+        }
+
+        pub(crate) const fn content_end(&self) -> ContentEnd {
+            self.content_end
         }
     }
 

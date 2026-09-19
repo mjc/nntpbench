@@ -1,5 +1,6 @@
 //! Characterization tests for the private scanner and semantic boundary.
 use super::*;
+use crate::protocol::ResponseFrameParse;
 use proptest::collection::vec;
 use proptest::prelude::*;
 use std::cell::RefCell;

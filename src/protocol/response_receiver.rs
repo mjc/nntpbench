@@ -7,8 +7,8 @@ use tokio::io::AsyncRead;
 
 use super::{
     Article, ArticleParseError, ArticleState, ContentEnd, FramedArticleState, RequestKind,
-    ResponseFrameDecoder, ResponseFrameParse, ResponseInitial, ResponseInitialParse, StatusCode,
-    StatusLineEnd, ValidatedOwnedArticle, ValidatedResponseContent,
+    ResponseFrameDecoder, ResponseInitial, ResponseInitialParse, StatusCode, StatusLineEnd,
+    ValidatedOwnedArticle, ValidatedResponseContent,
 };
 use crate::client::{ClientError, OWNED_RESPONSE_PREALLOC_BYTES, read_into_pending_bytes};
 use crate::terminator::{MultilineFrameProgress, MultilineFramer};
@@ -204,19 +204,17 @@ impl FramedResponse {
             });
         }
 
-        let ResponseFrameParse::Complete(frame) =
-            ResponseFrameDecoder::new(kind).complete_framed_after_initial(&framed, initial)
-        else {
-            return Err(ClientError::InvalidStatusLine);
-        };
+        let validation = ResponseFrameDecoder::new(kind)
+            .validate_framed_after_initial(&framed, initial)
+            .ok_or(ClientError::InvalidStatusLine)?;
         Ok(OwnedResponse {
             kind,
-            status: frame.status(),
+            status,
             content: OwnedResponseContent::from_frame(
                 framed.clone_bytes(),
-                frame.content_start(),
-                frame.content_end(),
-                frame.content_validation(),
+                framed.status_line_end().get(),
+                framed.content_end().get(),
+                validation,
             ),
         })
     }
