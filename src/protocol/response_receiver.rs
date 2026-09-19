@@ -767,7 +767,7 @@ enum FramingDecodeProgress {
 struct FrameEnd(usize);
 
 impl FrameEnd {
-    fn after_chunk(self, consumed: ChunkConsumed) -> Self {
+    fn after_chunk(self, consumed: DecoderChunkConsumed) -> Self {
         Self(self.0 + consumed.0)
     }
 
@@ -776,9 +776,11 @@ impl FrameEnd {
     }
 }
 
-/// Count consumed from this push's chunk, not the accumulated response.
+/// Count consumed from this decoder push, relative to the newly supplied
+/// response chunk. This includes status-line bytes and is distinct from the
+/// multiline framer's body-relative chunk coordinate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ChunkConsumed(usize);
+struct DecoderChunkConsumed(usize);
 
 #[derive(Debug)]
 struct StreamingResponseDecoder {
@@ -830,7 +832,7 @@ impl StreamingResponseDecoder {
                             if !initial.descriptor().framing().is_multiline() {
                                 return Ok(StreamingDecodeProgress::Complete {
                                     status,
-                                    consumed: ChunkConsumed(consumed),
+                                    consumed: DecoderChunkConsumed(consumed),
                                     bounds: None,
                                 });
                             }
@@ -846,7 +848,7 @@ impl StreamingResponseDecoder {
 
                 let Some(status) = self.status else {
                     return Ok(StreamingDecodeProgress::NeedMore {
-                        consumed: ChunkConsumed(chunk.len()),
+                        consumed: DecoderChunkConsumed(chunk.len()),
                     });
                 };
                 status
@@ -855,7 +857,7 @@ impl StreamingResponseDecoder {
 
         if content_start >= chunk.len() {
             return Ok(StreamingDecodeProgress::NeedMore {
-                consumed: ChunkConsumed(chunk.len()),
+                consumed: DecoderChunkConsumed(chunk.len()),
             });
         }
 
@@ -863,11 +865,11 @@ impl StreamingResponseDecoder {
         match self.framer.push(content_chunk) {
             MultilineFrameProgress::Complete(bounds) => Ok(StreamingDecodeProgress::Complete {
                 status,
-                consumed: ChunkConsumed(content_start + bounds.chunk_consumed().get()),
+                consumed: DecoderChunkConsumed(content_start + bounds.chunk_consumed().get()),
                 bounds: Some(bounds),
             }),
             MultilineFrameProgress::NeedMore => Ok(StreamingDecodeProgress::NeedMore {
-                consumed: ChunkConsumed(chunk.len()),
+                consumed: DecoderChunkConsumed(chunk.len()),
             }),
         }
     }
@@ -885,11 +887,11 @@ impl StreamingResponseDecoder {
 #[derive(Debug)]
 enum StreamingDecodeProgress {
     NeedMore {
-        consumed: ChunkConsumed,
+        consumed: DecoderChunkConsumed,
     },
     Complete {
         status: StatusCode,
-        consumed: ChunkConsumed,
+        consumed: DecoderChunkConsumed,
         bounds: Option<crate::terminator::MultilineFrameBounds>,
     },
 }
