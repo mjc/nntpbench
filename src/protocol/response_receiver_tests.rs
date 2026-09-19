@@ -1,5 +1,18 @@
 //! Characterization tests for the private scanner and semantic boundary.
 use super::*;
+use crate::protocol::article::state::Validated as ValidatedArticleState;
+
+#[test]
+fn article_state_wrapper_adds_no_storage_to_framed_or_validated_owner() {
+    assert_eq!(
+        std::mem::size_of::<ArticleState<FramedArticleState<Bytes>>>(),
+        std::mem::size_of::<FramedArticleState<Bytes>>()
+    );
+    assert_eq!(
+        std::mem::size_of::<ArticleState<ValidatedArticleState<Bytes>>>(),
+        std::mem::size_of::<ValidatedArticleState<Bytes>>()
+    );
+}
 use crate::protocol::ResponseFrameParse;
 use proptest::collection::vec;
 use proptest::prelude::*;
