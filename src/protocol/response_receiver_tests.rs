@@ -13,7 +13,36 @@ fn article_state_wrapper_adds_no_storage_to_framed_or_validated_owner() {
         std::mem::size_of::<ValidatedArticleState<Bytes>>()
     );
 }
-use crate::protocol::ResponseFrameParse;
+
+#[test]
+fn borrowed_framed_owner_can_validate_without_changing_storage_contract() {
+    let wire = b"222 1 <body@test> body follows\r\nbody\r\n\r\n.\r\n";
+    let status_line_end = wire
+        .windows(crate::CRLF.len())
+        .position(|line| line == crate::CRLF)
+        .map(|end| StatusLineEnd::new(end + crate::CRLF.len()))
+        .expect("fixture has a status line");
+    let content_end = ContentEnd::new(wire.len() - crate::TERMINATOR.len());
+    let initial = match ResponseInitial::parse(RequestKind::Body, &wire[..status_line_end.get()]) {
+        ResponseInitialParse::Complete(initial) => initial,
+        other => panic!("expected a complete initial line, got {other:?}"),
+    };
+    let framed = ArticleState::new(FramedArticleState::new(
+        wire.as_slice(),
+        RequestKind::Body,
+        StatusCode::parse(b"222").expect("valid status"),
+        status_line_end,
+        content_end,
+        initial,
+    ));
+
+    let validated = framed
+        .validate()
+        .expect("borrowed bytes should satisfy the article contract");
+    assert_eq!(validated.article().body.as_deref(), Some(&b"body\r\n"[..]));
+    assert_eq!(validated.as_bytes(), wire);
+}
+use crate::protocol::{ResponseFrame, ResponseFrameParse};
 use proptest::collection::vec;
 use proptest::prelude::*;
 use std::cell::RefCell;
@@ -131,7 +160,7 @@ fn assert_incremental_matches_stateless_for_all_two_push_schedules(
     frame: &[u8],
 ) {
     for chunk_bytes in 1..=frame.len().max(1) {
-        let expected = ResponseFrameDecoder::new(kind).decode(frame);
+        let expected = ResponseFrame::parse(kind, frame);
         let actual = receive_response(kind, frame, chunk_bytes);
         match (expected, actual) {
             (ResponseFrameParse::Complete(expected), Ok(actual)) => {
@@ -198,6 +227,26 @@ fn owned_article_requires_decoder_article_proof() {
 }
 
 #[test]
+fn generic_owned_response_does_not_reparse_as_an_article() {
+    let mut response = response_from_bytes(
+        RequestKind::Body,
+        StatusCode::parse(b"222").unwrap(),
+        b"222 1 <body@test> body follows\r\nbody\r\n.\r\n",
+    );
+    response.content = OwnedResponseContent::Generic {
+        kind: RequestKind::Body,
+        status: StatusCode::parse(b"222").unwrap(),
+        bytes: response.content.bytes().to_vec().into(),
+        content: ResponseContentRange::new(0, 0, response.content.bytes().len()).unwrap(),
+    };
+
+    assert_eq!(
+        response.parse_article(),
+        Err(ArticleParseError::NotArticleResponse)
+    );
+}
+
+#[test]
 fn owned_article_access_is_infallible_after_promotion() {
     let response = response_from_bytes(
         RequestKind::Body,
@@ -208,6 +257,19 @@ fn owned_article_access_is_infallible_after_promotion() {
 
     let parsed: Article<'_> = article.article();
     assert_eq!(parsed.body.as_deref(), Some(&b"body\r\n"[..]));
+}
+
+#[test]
+fn framing_does_not_validate_article_semantics_until_requested() {
+    let wire = b"222 1 <body@test> body follows\r\nbody\0\r\n.\r\n";
+    let response = receive_response(RequestKind::Body, wire, 1)
+        .expect("framing should complete before article validation");
+
+    assert_eq!(response.as_bytes(), wire);
+    assert_eq!(
+        response.parse_article(),
+        Err(ArticleParseError::InvalidBody)
+    );
 }
 
 #[test]
@@ -497,6 +559,65 @@ fn framing_completion_excludes_a_packed_following_response() {
         first.len() - 1,
         first.len(),
     );
+}
+
+#[test]
+fn production_receiver_translates_a_split_status_end_to_the_pending_buffer() {
+    let response = b"223 1 <stat@test> article exists\r\n";
+    let received = receive_response(RequestKind::Stat, response, response.len() - 1)
+        .expect("the production receiver should complete when the final LF arrives");
+
+    assert_eq!(received.status().as_u16(), 223);
+    assert_eq!(received.as_bytes(), response);
+}
+
+#[test]
+fn production_receiver_translates_a_split_multiline_end_to_the_pending_buffer() {
+    let response = b"222 1 <body@test> body follows\r\nbody\r\n.\r\n";
+    let received = receive_response(RequestKind::Body, response, response.len() - 1)
+        .expect("the production receiver should complete when the final LF arrives");
+
+    assert_eq!(received.status().as_u16(), 222);
+    assert_eq!(received.as_bytes(), response);
+}
+
+#[test]
+fn production_receiver_split_article_family_promotes_and_reuses_typed_access() {
+    let frames = [
+        (
+            RequestKind::Article,
+            b"220 1 <article@test> article follows\r\nSubject: value\r\n\r\nbody\r\n.\r\n"
+                .as_slice(),
+            "<article@test>",
+        ),
+        (
+            RequestKind::Head,
+            b"221 1 <head@test> headers follow\r\nSubject: value\r\n.\r\n".as_slice(),
+            "<head@test>",
+        ),
+        (
+            RequestKind::Body,
+            b"222 1 <body@test> body follows\r\nbody\r\n.\r\n".as_slice(),
+            "<body@test>",
+        ),
+        (
+            RequestKind::Stat,
+            b"223 1 <stat@test> article exists\r\n".as_slice(),
+            "<stat@test>",
+        ),
+    ];
+
+    for (kind, frame, expected_message_id) in frames {
+        let response = receive_response(kind, frame, frame.len() - 1)
+            .unwrap_or_else(|error| panic!("{kind:?} split receive failed: {error:?}"));
+        let article = OwnedArticle::try_from(response)
+            .unwrap_or_else(|error| panic!("{kind:?} article promotion failed: {error:?}"));
+
+        let first = article.article();
+        let second = article.article();
+        assert_eq!(first, second, "{kind:?} typed access changed between calls");
+        assert_eq!(first.message_id.as_str(), expected_message_id);
+    }
 }
 
 #[test]
@@ -957,18 +1078,20 @@ fn incremental_decoder_matches_stateless_layout_for_split_valid_and_incomplete_f
 }
 
 #[test]
-fn incremental_decoder_rejects_malformed_body_like_stateless_parser() {
+fn incremental_decoder_frames_malformed_body_before_semantic_validation() {
     let frame = b"222 1 <body@test> body follows\r\nnot an article\n\r\n.\r\n";
     assert!(matches!(
-        ResponseFrameDecoder::new(RequestKind::Body).decode(frame),
+        ResponseFrame::parse(RequestKind::Body, frame),
         ResponseFrameParse::Invalid
     ));
 
     for chunk_bytes in 1..=frame.len() {
-        assert!(matches!(
-            receive_response(RequestKind::Body, frame, chunk_bytes),
-            Err(ClientError::InvalidStatusLine)
-        ));
+        let response = receive_response(RequestKind::Body, frame, chunk_bytes)
+            .expect("framing must not manufacture semantic article proof");
+        assert_eq!(
+            response.parse_article(),
+            Err(ArticleParseError::InvalidBody)
+        );
     }
 }
 

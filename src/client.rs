@@ -19,7 +19,7 @@ pub use crate::protocol::response_receiver::{
 };
 
 use crate::protocol::{
-    ArticleRef, Request, ResponseFrameDecoder, ResponseFrameParse, ValidatedResponseContent,
+    ArticleRef, Request, ResponseFrame, ResponseFrameParse, ValidatedResponseContent,
 };
 use crate::terminator::{DOT_TERMINATOR, crlf_normalized_payload_lines};
 use crate::{
@@ -2232,13 +2232,11 @@ pub fn bench_article_validation_and_two_parses(
     kind: RequestKind,
     bytes: &[u8],
 ) -> Result<usize, ClientError> {
-    let ResponseFrameParse::Complete(frame) = ResponseFrameDecoder::new(kind).decode(bytes) else {
+    let ResponseFrameParse::Complete(frame) = ResponseFrame::parse(kind, bytes) else {
         return Err(ClientError::UnexpectedEof);
     };
-    let first = Article::parse_article_frame(bytes, frame.content_start(), frame.content_end())
-        .map_err(|_| ClientError::UnexpectedEof)?;
-    let second = Article::parse_article_frame(bytes, frame.content_start(), frame.content_end())
-        .map_err(|_| ClientError::UnexpectedEof)?;
+    let first = Article::parse_framed_response(frame).map_err(|_| ClientError::UnexpectedEof)?;
+    let second = Article::parse_framed_response(frame).map_err(|_| ClientError::UnexpectedEof)?;
     Ok(first
         .body
         .as_ref()
@@ -2252,7 +2250,7 @@ pub fn bench_article_validation_and_materialization(
     kind: RequestKind,
     bytes: &[u8],
 ) -> Result<usize, ClientError> {
-    let ResponseFrameParse::Complete(frame) = ResponseFrameDecoder::new(kind).decode(bytes) else {
+    let ResponseFrameParse::Complete(frame) = ResponseFrame::parse(kind, bytes) else {
         return Err(ClientError::UnexpectedEof);
     };
     let ValidatedResponseContent::Article(validated) = frame.content_validation() else {
@@ -2315,7 +2313,6 @@ pub fn bench_public_response_decode_chunks_stateless(
     chunk_bytes: usize,
 ) -> Result<(StatusCode, usize), ClientError> {
     let chunk_bytes = chunk_bytes.max(1);
-    let decoder = ResponseFrameDecoder::new(kind);
     let mut pending = BytesMut::with_capacity(response.len());
     let mut offset = 0;
 
@@ -2324,7 +2321,7 @@ pub fn bench_public_response_decode_chunks_stateless(
         pending.extend_from_slice(&response[offset..end]);
         offset = end;
 
-        match decoder.decode(&pending) {
+        match ResponseFrame::parse(kind, &pending) {
             ResponseFrameParse::Complete(frame) => {
                 return Ok((frame.status(), frame.consumed()));
             }

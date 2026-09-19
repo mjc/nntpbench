@@ -9,7 +9,7 @@ use std::sync::Arc;
 #[cfg(test)]
 use crate::terminator::append_crlf;
 use crate::terminator::{
-    BoundedResponseLineStatus, DOT_TERMINATOR, MultilineFrameBounds, crlf_normalized_payload_lines,
+    BoundedResponseLineStatus, DOT_TERMINATOR, crlf_normalized_payload_lines,
     detect_bounded_response_line_end, find_dot_terminated_block, strict_crlf_line_content_end_from,
     strip_complete_crlf_line,
 };
@@ -251,138 +251,6 @@ pub enum ResponseFrameParse<'a> {
     Complete(ResponseFrame<'a>),
     NeedMore,
     Invalid,
-}
-
-/// Stateless protocol response decoder for callers that already retain pending bytes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ResponseFrameDecoder {
-    kind: RequestKind,
-}
-
-impl ResponseFrameDecoder {
-    #[must_use]
-    pub(crate) const fn new(kind: RequestKind) -> Self {
-        Self { kind }
-    }
-
-    #[must_use]
-    pub(crate) fn decode<'a>(self, buffer: &'a [u8]) -> ResponseFrameParse<'a> {
-        ResponseFrame::parse(self.kind, buffer)
-    }
-
-    /// Validate a non-article frame while retaining only its resource-bound
-    /// content coordinates. The caller can then consume the framed owner
-    /// without cloning its immutable byte storage.
-    pub(crate) fn validate_generic_framed_after_initial(
-        self,
-        framed: &ArticleState<FramedArticleState<bytes::Bytes>>,
-        initial: ResponseInitial,
-    ) -> Option<ResponseContentRange> {
-        let ResponseFrameParse::Complete(frame) = self.complete_with_metadata(
-            framed.as_bytes(),
-            framed.status(),
-            framed.status_line_end(),
-            framed.bounds(),
-            Some(initial),
-        ) else {
-            return None;
-        };
-        matches!(
-            frame.content_validation(),
-            ValidatedResponseContent::Generic
-        )
-        .then(|| {
-            ResponseContentRange::new(
-                frame.content_start(),
-                frame.content_end(),
-                frame.bytes().len(),
-            )
-            .expect("response parser established an in-bounds content range")
-        })
-    }
-
-    fn complete_with_metadata<'a>(
-        self,
-        buffer: &'a [u8],
-        status: StatusCode,
-        status_line_end: StatusLineEnd,
-        bounds: Option<MultilineFrameBounds>,
-        initial: Option<ResponseInitial>,
-    ) -> ResponseFrameParse<'a> {
-        let status_line_end = status_line_end.get();
-        let (content_end, consumed) = bounds.map_or((status_line_end, status_line_end), |bounds| {
-            (
-                status_line_end + bounds.content_end().get(),
-                status_line_end + bounds.body_consumed().get(),
-            )
-        });
-        let Some(status_line) = buffer.get(..status_line_end) else {
-            return ResponseFrameParse::Invalid;
-        };
-        if status_line_end < 5
-            || content_end < status_line_end
-            || consumed < content_end
-            || consumed > buffer.len()
-        {
-            return ResponseFrameParse::Invalid;
-        }
-
-        let descriptor = ResponseDescriptor::for_request_status(self.kind, status);
-        if matches!(descriptor.framing(), ResponseFraming::Unexpected) {
-            return ResponseFrameParse::Invalid;
-        }
-        match initial {
-            Some(initial) if initial.status() == status && initial.descriptor() == descriptor => {}
-            Some(_) => return ResponseFrameParse::Invalid,
-            None if !validate_response_initial_line(self.kind, status, status_line) => {
-                return ResponseFrameParse::Invalid;
-            }
-            None => {}
-        }
-        if descriptor.framing().is_multiline() != bounds.is_some() {
-            return ResponseFrameParse::Invalid;
-        }
-
-        let (content, terminator) = if descriptor.framing().is_multiline() {
-            let Some(content) = buffer.get(status_line_end..content_end) else {
-                return ResponseFrameParse::Invalid;
-            };
-            let Some(terminator) = buffer.get(content_end..consumed) else {
-                return ResponseFrameParse::Invalid;
-            };
-            (content, terminator)
-        } else {
-            if content_end != status_line_end || consumed != status_line_end {
-                return ResponseFrameParse::Invalid;
-            }
-            (
-                &buffer[status_line_end..status_line_end],
-                &buffer[status_line_end..status_line_end],
-            )
-        };
-        let frame = ResponseFrame {
-            kind: self.kind,
-            descriptor,
-            bytes: &buffer[..consumed],
-            status_line,
-            content,
-            terminator,
-            content_start: status_line_end,
-            content_end,
-            content_validation: ValidatedResponseContent::Generic,
-            status,
-            consumed,
-        };
-        let content_validation = match validate_response_content(frame) {
-            Some(validation) => validation,
-            None => return ResponseFrameParse::Invalid,
-        };
-
-        ResponseFrameParse::Complete(ResponseFrame {
-            content_validation,
-            ..frame
-        })
-    }
 }
 
 /// Protocol status-line result for streaming callers that cannot retain a full frame.
@@ -2947,7 +2815,49 @@ fn validate_response_content<'a>(frame: ResponseFrame<'a>) -> Option<ValidatedRe
         _ => {}
     }
 
-    let valid = match kind {
+    validate_non_article_response_content(kind, frame.status_line, content)
+        .then_some(ValidatedResponseContent::Generic)
+}
+
+/// Validate the semantic content of a response whose framing boundary is
+/// already known by another decoder.
+///
+/// The buffered receiver uses this after its streaming framer has established
+/// the exact status-line and content ranges. Keeping this check separate from
+/// boundary discovery preserves the incremental decoder's no-rescan contract
+/// while retaining the stateless parser's acceptance behavior for generic
+/// multiline responses.
+pub(crate) fn validate_framed_non_article_response_content(
+    kind: RequestKind,
+    status: StatusCode,
+    status_line: &[u8],
+    content: &[u8],
+) -> bool {
+    if matches!(
+        (kind, status.as_u16()),
+        (RequestKind::Article, 220)
+            | (RequestKind::Head, 221)
+            | (RequestKind::Body, 222)
+            | (RequestKind::Stat, 223)
+    ) {
+        return true;
+    }
+    if !ResponseDescriptor::for_request_status(kind, status)
+        .framing()
+        .is_multiline()
+    {
+        return true;
+    }
+
+    validate_non_article_response_content(kind, status_line, content)
+}
+
+fn validate_non_article_response_content(
+    kind: RequestKind,
+    status_line: &[u8],
+    content: &[u8],
+) -> bool {
+    match kind {
         RequestKind::List | RequestKind::ListActive | RequestKind::NewGroups => {
             validate_crlf_lines(content, validate_active_response_line)
         }
@@ -2962,7 +2872,7 @@ fn validate_response_content<'a>(frame: ResponseFrame<'a>) -> Option<ValidatedRe
         RequestKind::ListDistribPats => {
             validate_crlf_lines(content, validate_distrib_pats_response_line)
         }
-        RequestKind::ListGroup => validate_listgroup_response_content(frame.status_line, content),
+        RequestKind::ListGroup => validate_listgroup_response_content(status_line, content),
         RequestKind::NewNews => validate_crlf_lines(content, |line| {
             std::str::from_utf8(line)
                 .ok()
@@ -2976,11 +2886,6 @@ fn validate_response_content<'a>(frame: ResponseFrame<'a>) -> Option<ValidatedRe
         RequestKind::Help => validate_crlf_lines(content, validate_help_text_line),
         RequestKind::Unknown => validate_generic_multiline_response_content(content),
         _ => true,
-    };
-    if valid {
-        Some(ValidatedResponseContent::Generic)
-    } else {
-        None
     }
 }
 

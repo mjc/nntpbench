@@ -28,3 +28,10 @@ fi
 test "$(rg -o 'error\[E[0-9]+\]' "$log_dir/validated_mutation.log" | sort -u)" = 'error[E0502]'
 rg -q 'bytes' "$log_dir/validated_mutation.log"
 echo "PASS: validated_mutation rejected with E0502"
+if cargo rustc --lib -- --cfg response_contract --cfg 'response_contract="validated_rebind"' --emit=metadata >"$log_dir/validated_rebind.log" 2>&1; then
+    echo "FAIL: validated_rebind unexpectedly compiled"
+    exit 1
+fi
+test "$(rg -o 'error\[E[0-9]+\]' "$log_dir/validated_rebind.log" | sort -u)" = 'error[E0451]'
+rg -q 'private field' "$log_dir/validated_rebind.log"
+echo "PASS: validated_rebind rejected with E0451"

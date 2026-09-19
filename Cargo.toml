@@ -29,7 +29,7 @@ gungraun = "0.19.4"
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = [
     "cfg(coverage_nightly)",
-    "cfg(response_contract, values(none(), \"coordinate\", \"receive_alias\", \"validated_mutation\"))",
+    "cfg(response_contract, values(none(), \"coordinate\", \"receive_alias\", \"validated_mutation\", \"validated_rebind\"))",
 ] }
 
 [[bench]]

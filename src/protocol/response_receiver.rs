@@ -6,8 +6,8 @@ use tokio::io::AsyncRead;
 
 use super::{
     Article, ArticleParseError, ArticleState, ContentEnd, FramedArticleState, RequestKind,
-    ResponseContentRange, ResponseFrameDecoder, ResponseInitial, ResponseInitialParse, StatusCode,
-    StatusLineEnd, ValidatedOwnedArticle,
+    ResponseContentRange, ResponseInitial, ResponseInitialParse, StatusCode, StatusLineEnd,
+    ValidatedArticleView, ValidatedOwnedArticle,
 };
 use crate::client::{ClientError, OWNED_RESPONSE_PREALLOC_BYTES, read_into_pending_bytes};
 use crate::terminator::{MultilineFrameProgress, MultilineFramer};
@@ -48,16 +48,8 @@ impl<R: AsyncRead + Unpin> BufferedResponseReceiver<R> {
             if let Some(completed) = response.extract()? {
                 return Ok(completed);
             }
-            let receiving = response.as_inner_mut();
-            if read_into_pending_bytes(
-                &mut receiving.receiver.reader,
-                &mut receiving.receiver.pending,
-                read_chunk_bytes,
-            )
-            .await?
-                == 0
-            {
-                return Err(ClientError::UnexpectedEof);
+            if let Some(completed) = response.read_and_extract(read_chunk_bytes).await? {
+                return Ok(completed);
             }
         }
     }
@@ -87,15 +79,48 @@ impl<R: AsyncRead + Unpin> Receiving<'_, R> {
         let Some(framed) = self.decoder.extract_framed(&mut self.receiver.pending)? else {
             return Ok(None);
         };
-        let response = framed.validate()?;
+        let response = framed.into_owned_response()?;
         self.receiver.state = ReceiverState::Ready;
         Ok(Some(response))
+    }
+
+    async fn read_and_extract(
+        &mut self,
+        read_chunk_bytes: usize,
+    ) -> Result<Option<OwnedResponse>, ClientError> {
+        if read_into_pending_bytes(
+            &mut self.receiver.reader,
+            &mut self.receiver.pending,
+            read_chunk_bytes,
+        )
+        .await?
+            == 0
+        {
+            return Err(ClientError::UnexpectedEof);
+        }
+        self.extract()
+    }
+
+    fn append_and_extract(&mut self, chunk: &[u8]) -> Result<Option<OwnedResponse>, ClientError> {
+        self.receiver.pending.extend_from_slice(chunk);
+        self.extract()
     }
 }
 
 impl<R: AsyncRead + Unpin> ArticleState<Receiving<'_, R>> {
     fn extract(&mut self) -> Result<Option<OwnedResponse>, ClientError> {
         self.as_inner_mut().extract()
+    }
+
+    async fn read_and_extract(
+        &mut self,
+        read_chunk_bytes: usize,
+    ) -> Result<Option<OwnedResponse>, ClientError> {
+        self.as_inner_mut().read_and_extract(read_chunk_bytes).await
+    }
+
+    fn append_and_extract(&mut self, chunk: &[u8]) -> Result<Option<OwnedResponse>, ClientError> {
+        self.as_inner_mut().append_and_extract(chunk)
     }
 }
 
@@ -143,6 +168,9 @@ pub(crate) fn owned_from_bytes(
     receive_fragments(kind, bytes, bytes.len())
 }
 
+/// Synchronous chunk feeding is used by benchmarks and byte-fixture adapters;
+/// it calls the same receiving state and extraction operation as the async
+/// production reader, rather than rebuilding a frame from decoder metadata.
 fn receive_fragments(
     kind: RequestKind,
     response: &[u8],
@@ -159,12 +187,7 @@ fn receive_fragments(
         decoder: ResponseDecoder::new(kind),
     });
     for chunk in response.chunks(chunk_bytes.max(1)) {
-        pending
-            .as_inner_mut()
-            .receiver
-            .pending
-            .extend_from_slice(chunk);
-        if let Some(response) = pending.extract()? {
+        if let Some(response) = pending.append_and_extract(chunk)? {
             return Ok(response);
         }
     }
@@ -175,15 +198,12 @@ fn receive_fragments(
 /// wire frame before an article layout can be exposed. The extracted bytes and
 /// the status-line boundary travel together; no decoder borrow or detached
 /// range can be supplied by a caller.
-struct FramedResponse {
-    framed: ArticleState<FramedArticleState<Bytes>>,
-}
+type FramedResponse = ArticleState<FramedArticleState<Bytes>>;
 
-impl FramedResponse {
-    fn validate(self) -> Result<OwnedResponse, ClientError> {
-        let Self { framed } = self;
-        let kind = framed.kind();
-        let status = framed.status();
+impl ArticleState<FramedArticleState<Bytes>> {
+    fn into_owned_response(self) -> Result<OwnedResponse, ClientError> {
+        let kind = self.kind();
+        let status = self.status();
         let article_response = matches!(
             (kind, status.as_u16()),
             (RequestKind::Article, 220)
@@ -192,17 +212,31 @@ impl FramedResponse {
                 | (RequestKind::Stat, 223)
         );
         if article_response {
-            let article = framed
-                .validate_article()
-                .map_err(|_| ClientError::InvalidStatusLine)?;
             return Ok(OwnedResponse {
-                content: OwnedResponseContent::Article(article),
+                content: OwnedResponseContent::Article(self),
             });
         }
-        let content = ResponseFrameDecoder::new(kind)
-            .validate_generic_framed_after_initial(&framed, framed.initial())
+        let status_line_end = self.status_line_end().get();
+        let content_end = self.content_end().get();
+        let bytes = self.as_bytes();
+        let status_line = bytes
+            .get(..status_line_end)
             .ok_or(ClientError::InvalidStatusLine)?;
-        let bytes = framed.into_inner().into_bytes();
+        let content = bytes
+            .get(status_line_end..content_end)
+            .ok_or(ClientError::InvalidStatusLine)?;
+        if !crate::protocol::validate_framed_non_article_response_content(
+            kind,
+            status,
+            status_line,
+            content,
+        ) {
+            return Err(ClientError::InvalidStatusLine);
+        }
+        let content = self
+            .generic_content_range()
+            .ok_or(ClientError::InvalidStatusLine)?;
+        let bytes = self.into_inner().into_bytes();
         Ok(OwnedResponse {
             content: OwnedResponseContent::Generic {
                 kind,
@@ -459,22 +493,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn malformed_article_never_becomes_a_validated_owned_response() {
+    async fn malformed_article_is_framed_but_not_validated_at_receive() {
         let wire = b"222 1 <body@test> body follows\r\nbo\0dy\r\n.\r\n";
         for split in 1..wire.len() {
             let input = FragmentedInput([&wire[..split], &wire[split..]].into());
             let mut receiver = BufferedResponseReceiver::new(input);
-            assert!(
-                matches!(
-                    receiver.receive(RequestKind::Body, 4096).await,
-                    Err(ClientError::InvalidStatusLine)
-                ),
+            let response = receiver
+                .receive(RequestKind::Body, 4096)
+                .await
+                .unwrap_or_else(|error| panic!("split={split}: {error:?}"));
+            assert_eq!(
+                response.parse_article(),
+                Err(ArticleParseError::InvalidBody),
                 "split={split}"
             );
-            assert!(matches!(
-                receiver.receive(RequestKind::Body, 4096).await,
-                Err(ClientError::ConnectionClosed)
-            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_generic_multiline_is_rejected_at_the_receive_boundary() {
+        let wire = b"100 help text follows\r\nok\0bad\r\n.\r\n";
+        assert!(matches!(
+            crate::protocol::ResponseFrame::parse(RequestKind::Help, wire),
+            crate::protocol::ResponseFrameParse::Invalid
+        ));
+
+        for chunk_bytes in 1..=wire.len() {
+            let input = FragmentedInput(wire.chunks(chunk_bytes).collect());
+            let mut receiver = BufferedResponseReceiver::new(input);
+            assert!(
+                matches!(
+                    receiver.receive(RequestKind::Help, chunk_bytes).await,
+                    Err(ClientError::InvalidStatusLine)
+                ),
+                "chunk_bytes={chunk_bytes}"
+            );
         }
     }
 
@@ -495,10 +548,21 @@ mod tests {
 }
 
 /// Owned response bytes for the client path.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct OwnedResponse {
     content: OwnedResponseContent,
 }
+
+impl PartialEq for OwnedResponse {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind() == other.kind()
+            && self.status() == other.status()
+            && self.as_bytes() == other.as_bytes()
+            && self.content() == other.content()
+    }
+}
+
+impl Eq for OwnedResponse {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum OwnedResponseContent {
@@ -508,14 +572,16 @@ enum OwnedResponseContent {
         bytes: Bytes,
         content: ResponseContentRange,
     },
-    Article(ValidatedOwnedArticle),
+    Article(FramedResponse),
+    ValidatedArticle(ValidatedOwnedArticle),
 }
 
 impl OwnedResponseContent {
     fn bytes(&self) -> &[u8] {
         match self {
             Self::Generic { bytes, .. } => bytes,
-            Self::Article(article) => article.bytes(),
+            Self::Article(article) => article.as_bytes(),
+            Self::ValidatedArticle(article) => article.bytes(),
         }
     }
 
@@ -523,6 +589,7 @@ impl OwnedResponseContent {
         match self {
             Self::Generic { bytes, content, .. } => content.slice(bytes),
             Self::Article(article) => article.content(),
+            Self::ValidatedArticle(article) => article.content(),
         }
     }
 }
@@ -534,6 +601,7 @@ impl OwnedResponse {
         match &self.content {
             OwnedResponseContent::Generic { kind, .. } => *kind,
             OwnedResponseContent::Article(article) => article.kind(),
+            OwnedResponseContent::ValidatedArticle(article) => article.kind(),
         }
     }
 
@@ -543,6 +611,7 @@ impl OwnedResponse {
         match &self.content {
             OwnedResponseContent::Generic { status, .. } => *status,
             OwnedResponseContent::Article(article) => article.status(),
+            OwnedResponseContent::ValidatedArticle(article) => article.status(),
         }
     }
 
@@ -558,12 +627,26 @@ impl OwnedResponse {
         self.content.content()
     }
 
-    /// Parse the response as an ARTICLE/HEAD/BODY/STAT article-style frame.
+    /// Borrow a parsed ARTICLE/HEAD/BODY/STAT view.
+    ///
+    /// This is the compatibility projection for callers that need a borrowed
+    /// view immediately. If the response is still in the framed typestate,
+    /// each call establishes semantic validation for that projection. Call
+    /// [`Self::into_article`] once when the view will be reused; the returned
+    /// [`OwnedArticle`] retains the validated layout and its immutable bytes.
     pub fn parse_article(&self) -> Result<Article<'_>, ArticleParseError> {
         match &self.content {
-            OwnedResponseContent::Article(article) => Ok(article.materialize()),
-            OwnedResponseContent::Generic { bytes, .. } => Article::parse(bytes),
+            OwnedResponseContent::Article(article) => article
+                .validate_borrowed()
+                .map(ValidatedArticleView::materialize),
+            OwnedResponseContent::ValidatedArticle(article) => Ok(article.materialize()),
+            OwnedResponseContent::Generic { .. } => Err(ArticleParseError::NotArticleResponse),
         }
+    }
+
+    /// Consume this response and retain its validated article typestate.
+    pub fn into_article(self) -> Result<OwnedArticle, ClientError> {
+        self.try_into()
     }
 }
 
@@ -606,7 +689,7 @@ impl OwnedArticle {
     #[must_use]
     pub fn into_response(self) -> OwnedResponse {
         OwnedResponse {
-            content: OwnedResponseContent::Article(self.article),
+            content: OwnedResponseContent::ValidatedArticle(self.article),
         }
     }
 }
@@ -629,7 +712,12 @@ impl TryFrom<OwnedResponse> for OwnedArticle {
 
         let OwnedResponse { content } = response;
         match content {
-            OwnedResponseContent::Article(article) => Ok(Self { article }),
+            OwnedResponseContent::Article(article) => Ok(Self {
+                article: article
+                    .validate()
+                    .map_err(|_| ClientError::InvalidStatusLine)?,
+            }),
+            OwnedResponseContent::ValidatedArticle(article) => Ok(Self { article }),
             content @ OwnedResponseContent::Generic { .. } => {
                 Err(ClientError::UnexpectedArticleResponse {
                     response: OwnedResponse { content },
@@ -702,17 +790,14 @@ impl ResponseDecoder {
                     .ok_or(ClientError::InvalidStatusLine)
             })?;
 
-        Ok(Some(FramedResponse {
-            framed: ArticleState::new(FramedArticleState::new(
-                frame_end.extract(pending),
-                self.streaming.kind,
-                status,
-                bounds,
-                status_line_end,
-                ContentEnd::new(content_end),
-                initial,
-            )),
-        }))
+        Ok(Some(ArticleState::new(FramedArticleState::new(
+            frame_end.extract(pending),
+            self.streaming.kind,
+            status,
+            status_line_end,
+            ContentEnd::new(content_end),
+            initial,
+        ))))
     }
 }
 
@@ -909,6 +994,17 @@ mod response_contracts {
         let borrowed = &bytes[..];
         let _mutable = &mut bytes;
         std::hint::black_box(borrowed);
+    }
+
+    #[cfg(response_contract = "validated_rebind")]
+    fn validated_layout_must_remain_opaque() {
+        // A caller may use the validated view, but cannot manufacture or
+        // rebind its private layout to a different byte owner.
+        let layout = loop {};
+        let _ = ValidatedArticleView {
+            buffer: &[],
+            layout,
+        };
     }
 }
 
