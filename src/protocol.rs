@@ -273,17 +273,16 @@ impl ResponseFrameDecoder {
     /// Validate a non-article frame while retaining only its resource-bound
     /// content coordinates. The caller can then consume the framed owner
     /// without cloning its immutable byte storage.
-    pub(crate) fn validate_generic_framed_after_initial(
-        self,
+    pub(crate) fn validate_generic_framed(
         framed: &ArticleState<FramedArticleState<bytes::Bytes>>,
-        initial: ResponseInitial,
     ) -> Option<ResponseContentRange> {
-        let ResponseFrameParse::Complete(frame) = self.complete_with_metadata(
+        let decoder = Self::new(framed.kind());
+        let ResponseFrameParse::Complete(frame) = decoder.complete_with_metadata(
             framed.as_bytes(),
             framed.status(),
             framed.status_line_end(),
             framed.bounds(),
-            Some(initial),
+            Some(framed.initial()),
         ) else {
             return None;
         };

@@ -196,8 +196,7 @@ impl ArticleState<FramedArticleState<Bytes>> {
                 content: OwnedResponseContent::Article(article),
             });
         }
-        let content = ResponseFrameDecoder::new(kind)
-            .validate_generic_framed_after_initial(&self, self.initial())
+        let content = ResponseFrameDecoder::validate_generic_framed(&self)
             .ok_or(ClientError::InvalidStatusLine)?;
         let bytes = self.into_inner().into_bytes();
         Ok(OwnedResponse {
