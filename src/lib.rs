@@ -1958,7 +1958,7 @@ impl LoadSession {
             if was_draining {
                 outcome.drained_requests += 1;
             }
-            #[cfg(feature = "coz")]
+            #[cfg(all(feature = "coz", target_os = "linux"))]
             coz::progress!("client.response");
             match client_command_kind(command_id, self.command_mix) {
                 ClientCommandMix::Article => {
@@ -3354,7 +3354,7 @@ where
             )
             .await?;
             if batched != 0 {
-                #[cfg(feature = "coz")]
+                #[cfg(all(feature = "coz", target_os = "linux"))]
                 for _ in 0..batched {
                     coz::progress!("server.command");
                 }
@@ -3377,7 +3377,7 @@ where
             aux_response_buffer,
         )
         .await?;
-        #[cfg(feature = "coz")]
+        #[cfg(all(feature = "coz", target_os = "linux"))]
         coz::progress!("server.command");
         if should_close {
             flush_session_writer(writer, pending_write, config).await?;

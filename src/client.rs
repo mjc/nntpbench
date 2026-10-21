@@ -1783,7 +1783,7 @@ impl ClientConnection {
 
     /// Execute a client request on this connection.
     pub async fn execute(&self, request: Request<'static>) -> Result<OwnedResponse, ClientError> {
-        #[cfg(feature = "coz")]
+        #[cfg(all(feature = "coz", target_os = "linux"))]
         coz::scope!("client.execute");
         self.queue_request(request).await?.receive().await
     }
@@ -1897,7 +1897,7 @@ impl ClientConnection {
         &self,
         request: Request<'static>,
     ) -> Result<OwnedExchange, ClientError> {
-        #[cfg(feature = "coz")]
+        #[cfg(all(feature = "coz", target_os = "linux"))]
         coz::scope!("client.execute_exchange");
         self.queue_request_exchange(request).await?.receive().await
     }

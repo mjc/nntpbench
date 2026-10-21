@@ -73,10 +73,10 @@
           [
             rustToolchain
             pkgs.cargo-llvm-cov
-            pkgs.coz
             gungraunRunner
           ]
           ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+            pkgs.coz
             pkgs.heaptrack
             pkgs.inferno
             pkgs.perf
