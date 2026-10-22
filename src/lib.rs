@@ -17366,9 +17366,7 @@ mod tests {
                 .write_all(b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nSTARTTLS\r\n.\r\n")
                 .await
                 .unwrap();
-            let mut request = [0_u8; 256];
-            let read = stream.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], expected_request);
+            assert_read_request(stream, expected_request).await;
             stream.write_all(response).await.unwrap();
         }
 
