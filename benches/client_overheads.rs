@@ -575,6 +575,11 @@ mod public_client_experiments {
     }
 
     #[divan::bench(sample_count = 100, sample_size = 20)]
+    fn async_receive_encoded_1m_256k(bencher: Bencher) {
+        bench_async_receive_response(bencher, encoded_body_response(1024 * 1024), 256 * 1024);
+    }
+
+    #[divan::bench(sample_count = 100, sample_size = 20)]
     fn async_receive_stat(bencher: Bencher) {
         let rt = runtime();
         bencher.bench_local(|| {
@@ -699,6 +704,11 @@ mod public_client_experiments {
     #[divan::bench(sample_count = 100, sample_size = 20)]
     fn fragmented_decode_encoded_768k_256k(bencher: Bencher) {
         bench_fragmented_decode_response(bencher, encoded_body_response(BODY_768K), 256 * 1024);
+    }
+
+    #[divan::bench(sample_count = 100, sample_size = 20)]
+    fn fragmented_decode_encoded_1m_256k(bencher: Bencher) {
+        bench_fragmented_decode_response(bencher, encoded_body_response(1024 * 1024), 256 * 1024);
     }
 
     #[divan::bench(sample_count = 50, sample_size = 10)]
