@@ -17,9 +17,7 @@ fn main() {
     divan::main();
 }
 
-const ARTICLE_64K: usize = 64 * 1024;
 const ARTICLE_768K: usize = 768 * 1024;
-const BODY_64K: usize = 64 * 1024;
 const BODY_768K: usize = 768 * 1024;
 
 fn server_args(body_bytes: usize, article_bytes: usize) -> ServerArgs {
@@ -177,7 +175,7 @@ fn bench_connecting_command(
 
 fn bench_pipeline_mixed(bencher: Bencher) {
     let rt = Builder::new_current_thread().enable_all().build().unwrap();
-    let addr = rt.block_on(spawn_server(BODY_64K, ARTICLE_64K));
+    let addr = rt.block_on(spawn_server(BODY_768K, ARTICLE_768K));
     let request = b"BODY <body@nntpbench.local>\r\n\
 ARTICLE <article@nntpbench.local>\r\n\
 CAPABILITIES\r\n\
@@ -191,9 +189,9 @@ QUIT\r\n";
         .counter(divan::counter::ItemsCount::new(8usize))
         .bench_local(|| {
             black_box(rt.block_on(async {
-                let mut client = BenchClient::connect(addr, BODY_64K + ARTICLE_64K + 4096).await;
+                let mut client = BenchClient::connect(addr, BODY_768K + ARTICLE_768K + 4096).await;
                 client.stream.write_all(request).await.unwrap();
-                let mut response = Vec::with_capacity(BODY_64K + ARTICLE_64K + 4096);
+                let mut response = Vec::with_capacity(BODY_768K + ARTICLE_768K + 4096);
                 client.stream.read_to_end(&mut response).await.unwrap();
                 response.len()
             }))
@@ -201,20 +199,8 @@ QUIT\r\n";
 }
 
 mod article_roundtrip {
-    use super::{ARTICLE_64K, ARTICLE_768K, BODY_64K, BODY_768K};
+    use super::{ARTICLE_768K, BODY_768K};
     use super::{Bencher, bench_persistent_roundtrip};
-
-    #[divan::bench(sample_count = 100, sample_size = 20)]
-    fn article_64k(bencher: Bencher) {
-        bench_persistent_roundtrip(
-            bencher,
-            b"ARTICLE <bench@nntpbench.local>\r\n",
-            true,
-            BODY_64K,
-            ARTICLE_64K,
-            ARTICLE_64K,
-        );
-    }
 
     #[divan::bench(sample_count = 100, sample_size = 10)]
     fn article_768k(bencher: Bencher) {
@@ -230,20 +216,8 @@ mod article_roundtrip {
 }
 
 mod body_roundtrip {
-    use super::{ARTICLE_64K, ARTICLE_768K, BODY_64K, BODY_768K};
+    use super::{ARTICLE_768K, BODY_768K};
     use super::{Bencher, bench_persistent_roundtrip};
-
-    #[divan::bench(sample_count = 100, sample_size = 20)]
-    fn body_64k(bencher: Bencher) {
-        bench_persistent_roundtrip(
-            bencher,
-            b"BODY <bench@nntpbench.local>\r\n",
-            true,
-            BODY_64K,
-            ARTICLE_64K,
-            BODY_64K,
-        );
-    }
 
     #[divan::bench(sample_count = 100, sample_size = 10)]
     fn body_768k(bencher: Bencher) {
@@ -259,7 +233,7 @@ mod body_roundtrip {
 }
 
 mod command_roundtrip {
-    use super::{ARTICLE_64K, BODY_64K};
+    use super::{ARTICLE_768K, BODY_768K};
     use super::{Bencher, bench_connecting_command, bench_persistent_roundtrip};
 
     #[divan::bench(sample_count = 100, sample_size = 100)]
@@ -268,20 +242,20 @@ mod command_roundtrip {
             bencher,
             b"CAPABILITIES\r\n",
             true,
-            BODY_64K,
-            ARTICLE_64K,
+            BODY_768K,
+            ARTICLE_768K,
             128,
         );
     }
 
     #[divan::bench(sample_count = 100, sample_size = 100)]
     fn unknown(bencher: Bencher) {
-        bench_persistent_roundtrip(bencher, b"XYZZY 1\r\n", false, BODY_64K, ARTICLE_64K, 64);
+        bench_persistent_roundtrip(bencher, b"XYZZY 1\r\n", false, BODY_768K, ARTICLE_768K, 64);
     }
 
     #[divan::bench(sample_count = 100, sample_size = 100)]
     fn date(bencher: Bencher) {
-        bench_persistent_roundtrip(bencher, b"DATE\r\n", false, BODY_64K, ARTICLE_64K, 64);
+        bench_persistent_roundtrip(bencher, b"DATE\r\n", false, BODY_768K, ARTICLE_768K, 64);
     }
 
     #[divan::bench(sample_count = 100, sample_size = 100)]
@@ -290,15 +264,15 @@ mod command_roundtrip {
             bencher,
             b"MODE READER\r\n",
             false,
-            BODY_64K,
-            ARTICLE_64K,
+            BODY_768K,
+            ARTICLE_768K,
             64,
         );
     }
 
     #[divan::bench(sample_count = 100, sample_size = 20)]
     fn quit(bencher: Bencher) {
-        bench_connecting_command(bencher, b"QUIT\r\n", BODY_64K, ARTICLE_64K, 64);
+        bench_connecting_command(bencher, b"QUIT\r\n", BODY_768K, ARTICLE_768K, 64);
     }
 }
 

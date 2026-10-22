@@ -28,14 +28,8 @@ supported! {
     use std::hint::black_box;
     use std::sync::Arc;
 
-    const ARTICLE_64K: usize = 64 * 1024;
     const ARTICLE_768K: usize = 768 * 1024;
-    const BODY_64K: usize = 64 * 1024;
     const BODY_768K: usize = 768 * 1024;
-    const BODY_RESPONSE: &[u8] = b"222 42 <bench@example.com> body follows\r\n\
-This is the benchmark body.\r\n\
-It has multiple lines.\r\n\
-.\r\n";
 
     fn server_args(body_bytes: usize, article_bytes: usize) -> ServerArgs {
         ServerArgs {
@@ -64,15 +58,6 @@ It has multiple lines.\r\n\
         stats: Stats,
         response_buffer: Vec<u8>,
         output: Vec<u8>,
-    }
-
-    fn setup_64k() -> ProcessHarness {
-        ProcessHarness {
-            config: Arc::new(ServerConfig::from_args(server_args(BODY_64K, ARTICLE_64K))),
-            stats: Stats::new(),
-            response_buffer: Vec::with_capacity(BODY_64K + ARTICLE_64K + 1024),
-            output: Vec::with_capacity(BODY_64K + ARTICLE_64K + 1024),
-        }
     }
 
     fn setup_768k() -> ProcessHarness {
@@ -115,36 +100,40 @@ It has multiple lines.\r\n\
 
     fn setup_pipeline() -> PipelineHarness {
         PipelineHarness {
-            config: Arc::new(ServerConfig::from_args(server_args(BODY_64K, ARTICLE_64K))),
+            config: Arc::new(ServerConfig::from_args(server_args(BODY_768K, ARTICLE_768K))),
             stats: Stats::new(),
-            response_buffer: Vec::with_capacity(BODY_64K + ARTICLE_64K + 2048),
+            response_buffer: Vec::with_capacity(BODY_768K + ARTICLE_768K + 2048),
             commands: Vec::with_capacity(8),
-            output: Vec::with_capacity(BODY_64K + ARTICLE_64K + 2048),
+            output: Vec::with_capacity(BODY_768K + ARTICLE_768K + 2048),
         }
     }
 
     fn setup_body_response() -> Vec<u8> {
-        BODY_RESPONSE.to_vec()
+        ServerConfig::from_args(server_args(BODY_768K, ARTICLE_768K))
+            .body_response()
+            .to_vec()
     }
 
     #[library_benchmark]
     #[bench::framing_only(setup = setup_body_response)]
     fn consume_body_response(mut response: Vec<u8>) -> usize {
+        let expected_len = response.len();
         let consumed = bench_load_response_scan_in_place(&mut response, RequestKind::Body).unwrap();
-        assert_eq!(consumed, BODY_RESPONSE.len());
+        assert_eq!(consumed, expected_len);
         black_box(consumed)
     }
 
     #[library_benchmark]
     #[bench::full_identity_verification(setup = setup_body_response)]
     fn verify_body_response(mut response: Vec<u8>) -> usize {
+        let expected_len = response.len();
         let consumed = bench_load_response_verify_in_place(
             &mut response,
             RequestKind::Body,
-            "<bench@example.com>",
+            "<article.1@nntpbench.local>",
         )
         .unwrap();
-        assert_eq!(consumed, BODY_RESPONSE.len());
+        assert_eq!(consumed, expected_len);
         black_box(consumed)
     }
 
@@ -161,7 +150,6 @@ It has multiple lines.\r\n\
     }
 
     #[library_benchmark]
-    #[bench::article_64k(setup = setup_64k)]
     #[bench::article_768k(setup = setup_768k)]
     fn process_article(mut harness: ProcessHarness) -> usize {
         harness.response_buffer.clear();
@@ -177,7 +165,6 @@ It has multiple lines.\r\n\
     }
 
     #[library_benchmark]
-    #[bench::body_64k(setup = setup_64k)]
     #[bench::body_768k(setup = setup_768k)]
     fn process_body(mut harness: ProcessHarness) -> usize {
         harness.response_buffer.clear();
@@ -193,7 +180,7 @@ It has multiple lines.\r\n\
     }
 
     #[library_benchmark]
-    #[bench::capabilities(setup = setup_64k)]
+    #[bench::capabilities(setup = setup_768k)]
     fn process_capabilities(mut harness: ProcessHarness) -> usize {
         harness.response_buffer.clear();
         harness.output.clear();
@@ -208,7 +195,7 @@ It has multiple lines.\r\n\
     }
 
     #[library_benchmark]
-    #[bench::unknown(setup = setup_64k)]
+    #[bench::unknown(setup = setup_768k)]
     fn process_unknown(mut harness: ProcessHarness) -> usize {
         harness.response_buffer.clear();
         harness.output.clear();
@@ -223,7 +210,7 @@ It has multiple lines.\r\n\
     }
 
     #[library_benchmark]
-    #[bench::date(setup = setup_64k)]
+    #[bench::date(setup = setup_768k)]
     fn process_date(mut harness: ProcessHarness) -> usize {
         harness.response_buffer.clear();
         harness.output.clear();
@@ -238,7 +225,7 @@ It has multiple lines.\r\n\
     }
 
     #[library_benchmark]
-    #[bench::mode_reader(setup = setup_64k)]
+    #[bench::mode_reader(setup = setup_768k)]
     fn process_mode_reader(mut harness: ProcessHarness) -> usize {
         harness.response_buffer.clear();
         harness.output.clear();
@@ -274,7 +261,7 @@ It has multiple lines.\r\n\
     }
 
     #[library_benchmark]
-    #[bench::quit(setup = setup_64k)]
+    #[bench::quit(setup = setup_768k)]
     fn process_quit(mut harness: ProcessHarness) -> bool {
         harness.response_buffer.clear();
         harness.output.clear();

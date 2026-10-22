@@ -19,8 +19,8 @@ fn main() {
     divan::main();
 }
 
-const ARTICLE_64K: usize = 64 * 1024;
-const BODY_64K: usize = 64 * 1024;
+const ARTICLE_768K: usize = 768 * 1024;
+const BODY_768K: usize = 768 * 1024;
 
 fn server_args(body_bytes: usize, article_bytes: usize) -> ServerArgs {
     ServerArgs {
@@ -90,10 +90,10 @@ impl ClientHarness {
     }
 }
 
-fn bench_public_article_roundtrip(bencher: Bencher) {
-    let harness = ClientHarness::start(BODY_64K, ARTICLE_64K, 1);
+fn bench_public_article_roundtrip(bencher: Bencher, size: usize) {
+    let harness = ClientHarness::start(size, size, 1);
     bencher
-        .counter(divan::counter::BytesCount::new(ARTICLE_64K))
+        .counter(divan::counter::BytesCount::new(size))
         .bench_local(|| {
             black_box(harness.rt.block_on(async {
                 harness
@@ -108,7 +108,7 @@ fn bench_public_article_roundtrip(bencher: Bencher) {
 }
 
 fn bench_raw_capabilities_roundtrip(bencher: Bencher) {
-    let harness = ClientHarness::start(BODY_64K, ARTICLE_64K, 1);
+    let harness = ClientHarness::start(BODY_768K, ARTICLE_768K, 1);
     bencher
         .counter(divan::counter::ItemsCount::new(1usize))
         .bench_local(|| {
@@ -125,7 +125,7 @@ fn bench_raw_capabilities_roundtrip(bencher: Bencher) {
 }
 
 fn bench_pipelined_body_burst(bencher: Bencher) {
-    let harness = ClientHarness::start(BODY_64K, ARTICLE_64K, 4);
+    let harness = ClientHarness::start(BODY_768K, ARTICLE_768K, 4);
     bencher
         .counter(divan::counter::ItemsCount::new(4usize))
         .bench_local(|| {
@@ -144,7 +144,7 @@ fn bench_pipelined_body_burst(bencher: Bencher) {
 }
 
 fn bench_pipelined_mixed_requests(bencher: Bencher) {
-    let harness = ClientHarness::start(BODY_64K, ARTICLE_64K, 4);
+    let harness = ClientHarness::start(BODY_768K, ARTICLE_768K, 4);
     bencher
         .counter(divan::counter::ItemsCount::new(4usize))
         .bench_local(|| {
@@ -166,7 +166,7 @@ fn bench_pipelined_mixed_requests(bencher: Bencher) {
 }
 
 fn bench_pipelined_rfc_grammar_requests(bencher: Bencher) {
-    let harness = ClientHarness::start(BODY_64K, ARTICLE_64K, 4);
+    let harness = ClientHarness::start(BODY_768K, ARTICLE_768K, 4);
     bencher
         .counter(divan::counter::ItemsCount::new(4usize))
         .bench_local(|| {
@@ -188,7 +188,7 @@ fn bench_pipelined_rfc_grammar_requests(bencher: Bencher) {
 }
 
 fn bench_negotiated_session_setup(bencher: Bencher) {
-    let harness = ClientHarness::start(BODY_64K, ARTICLE_64K, 1);
+    let harness = ClientHarness::start(BODY_768K, ARTICLE_768K, 1);
     bencher
         .counter(divan::counter::ItemsCount::new(3usize))
         .bench_local(|| {
@@ -209,8 +209,13 @@ mod sequential_roundtrip {
     };
 
     #[divan::bench(sample_count = 100, sample_size = 20)]
-    fn article_64k(bencher: Bencher) {
-        bench_public_article_roundtrip(bencher);
+    fn article_768k(bencher: Bencher) {
+        bench_public_article_roundtrip(bencher, 768 * 1024);
+    }
+
+    #[divan::bench(sample_count = 100, sample_size = 20)]
+    fn article_1m(bencher: Bencher) {
+        bench_public_article_roundtrip(bencher, 1024 * 1024);
     }
 
     #[divan::bench(sample_count = 100, sample_size = 100)]
