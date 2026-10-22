@@ -31,8 +31,7 @@ use tokio::task::JoinSet;
 use tokio::time;
 
 use crate::terminator::{
-    BoundedResponseLineStatus, DOT_TERMINATOR, EmptyMultilineTerminator, EmptyTerminatorStatus,
-    MultilineTerminatorDetector, ResponseLineStatus, TerminatorStatus, append_dot_terminator,
+    BoundedResponseLineStatus, DOT_TERMINATOR, ResponseLineStatus, append_dot_terminator,
     detect_bounded_response_line_end, detect_response_line_end_from, find_crlf_line_end,
     find_dot_terminated_block, strip_complete_crlf_line,
 };
@@ -2172,9 +2171,7 @@ impl LoadResponseReader {
     where
         R: AsyncRead + Unpin,
     {
-        let mut empty_detector = EmptyMultilineTerminator::default();
-        let mut content_started = false;
-        let mut detector = MultilineTerminatorDetector::default();
+        let mut framer = terminator::MultilineFramer::default();
         let mut response_len = 0_usize;
         let mut multiline = false;
 
@@ -2194,51 +2191,21 @@ impl LoadResponseReader {
 
             if multiline {
                 let data = &self.buffer[self.start..];
-                if !content_started {
-                    match empty_detector.detect(data) {
-                        EmptyTerminatorStatus::FoundAt(consumed) => {
-                            let frame_len = bounded_response_len(
-                                response_len,
-                                consumed,
-                                self.max_response_bytes,
-                            )?;
-                            self.start += consumed;
-                            return Ok(frame_len);
-                        }
-                        EmptyTerminatorStatus::NeedMore => {
-                            response_len = bounded_response_len(
-                                response_len,
-                                data.len(),
-                                self.max_response_bytes,
-                            )?;
-                            self.start = self.buffer.len();
-                        }
-                        EmptyTerminatorStatus::NotFound { .. } => {
-                            content_started = true;
-                        }
+                match framer.push(data) {
+                    terminator::MultilineFrameProgress::Complete(bounds) => {
+                        let consumed = bounds.chunk_consumed().get();
+                        let frame_len =
+                            bounded_response_len(response_len, consumed, self.max_response_bytes)?;
+                        self.start += consumed;
+                        return Ok(frame_len);
                     }
-                }
-
-                if content_started {
-                    match detector.detect_terminator(data) {
-                        TerminatorStatus::FoundAt(consumed) => {
-                            let frame_len = bounded_response_len(
-                                response_len,
-                                consumed,
-                                self.max_response_bytes,
-                            )?;
-                            self.start += consumed;
-                            return Ok(frame_len);
-                        }
-                        TerminatorStatus::NotFound => {
-                            response_len = bounded_response_len(
-                                response_len,
-                                data.len(),
-                                self.max_response_bytes,
-                            )?;
-                            detector.update(data);
-                            self.start = self.buffer.len();
-                        }
+                    terminator::MultilineFrameProgress::NeedMore => {
+                        response_len = bounded_response_len(
+                            response_len,
+                            data.len(),
+                            self.max_response_bytes,
+                        )?;
+                        self.start = self.buffer.len();
                     }
                 }
             }

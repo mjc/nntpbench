@@ -243,14 +243,9 @@ impl MultilineTerminatorDetector {
     /// Returns the earliest complete terminator touching the current chunk.
     #[must_use]
     pub fn detect_terminator(&self, chunk: &[u8]) -> TerminatorStatus {
-        match (
-            self.find_spanning_terminator(chunk),
-            find_terminator_end(chunk),
-        ) {
-            (Some(spanning), Some(in_chunk)) => TerminatorStatus::FoundAt(spanning.min(in_chunk)),
-            (Some(spanning), None) => TerminatorStatus::FoundAt(spanning),
-            (None, Some(in_chunk)) => TerminatorStatus::FoundAt(in_chunk),
-            (None, None) => TerminatorStatus::NotFound,
+        match detect_streaming_terminator(self, chunk) {
+            Some(end) => TerminatorStatus::FoundAt(end),
+            None => TerminatorStatus::NotFound,
         }
     }
 }
@@ -468,7 +463,7 @@ fn find_streaming_terminator_end(data: &[u8]) -> Option<usize> {
 
 #[inline]
 fn find_terminator_end(data: &[u8]) -> Option<usize> {
-    memchr::memmem::find(data, crate::TERMINATOR).map(|start| start + crate::TERMINATOR.len())
+    find_streaming_terminator_end(data)
 }
 
 /// Find the content end for a complete multiline response frame.
