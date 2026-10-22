@@ -243,14 +243,14 @@ impl MultilineTerminatorDetector {
     /// Returns the earliest complete terminator touching the current chunk.
     #[must_use]
     pub fn detect_terminator(&self, chunk: &[u8]) -> TerminatorStatus {
-        // The direct TCP load reader uses memchr's packed-pair SIMD finder.
-        // Keep its searcher cached across partial reads and responses.
-        let end = self
-            .find_spanning_terminator(chunk)
-            .or_else(|| find_cached_terminator_end(chunk));
-        match end {
-            Some(end) => TerminatorStatus::FoundAt(end),
-            None => TerminatorStatus::NotFound,
+        match (
+            self.find_spanning_terminator(chunk),
+            find_terminator_end(chunk),
+        ) {
+            (Some(spanning), Some(in_chunk)) => TerminatorStatus::FoundAt(spanning.min(in_chunk)),
+            (Some(spanning), None) => TerminatorStatus::FoundAt(spanning),
+            (None, Some(in_chunk)) => TerminatorStatus::FoundAt(in_chunk),
+            (None, None) => TerminatorStatus::NotFound,
         }
     }
 }
@@ -430,21 +430,14 @@ fn detect_streaming_terminator(tail: &MultilineTerminatorDetector, chunk: &[u8])
     // Spanning matches end within the first four bytes; an in-chunk match
     // cannot end before byte five, so a spanning match is always first.
     tail.find_spanning_terminator(chunk)
-        .or_else(|| find_terminator_end(chunk))
-}
-
-#[inline]
-fn find_cached_terminator_end(data: &[u8]) -> Option<usize> {
-    TERMINATOR_FINDER
-        .find(data)
-        .map(|start| start + crate::TERMINATOR.len())
+        .or_else(|| find_streaming_terminator_end(chunk))
 }
 
 /// Find the position of the NNTP multiline terminator in data.
 ///
 /// Returns the position after the terminator, or None if not found.
 #[inline]
-fn find_terminator_end(data: &[u8]) -> Option<usize> {
+fn find_streaming_terminator_end(data: &[u8]) -> Option<usize> {
     // Generic x86 keeps memchr's runtime dispatch. Native ARM64 and AVX2
     // builds use the fixed-pattern vector scanner from nntp-proxy.
     #[cfg(any(
@@ -454,7 +447,9 @@ fn find_terminator_end(data: &[u8]) -> Option<usize> {
     let start = {
         // Use the shared SIMD substring finder for short fragmented reads.
         if data.len() < 512 {
-            return find_cached_terminator_end(data);
+            return TERMINATOR_FINDER
+                .find(data)
+                .map(|start| start + crate::TERMINATOR.len());
         }
         // Dot-free prefixes are common in generated/plain-text bodies. Skip
         // them with memchr before paying for a full vector-pattern scan.
@@ -469,6 +464,11 @@ fn find_terminator_end(data: &[u8]) -> Option<usize> {
     let start = TERMINATOR_FINDER.find(data);
 
     start.map(|start| start + crate::TERMINATOR.len())
+}
+
+#[inline]
+fn find_terminator_end(data: &[u8]) -> Option<usize> {
+    memchr::memmem::find(data, crate::TERMINATOR).map(|start| start + crate::TERMINATOR.len())
 }
 
 /// Find the content end for a complete multiline response frame.
