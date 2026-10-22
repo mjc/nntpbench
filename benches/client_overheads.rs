@@ -379,7 +379,39 @@ mod public_client_experiments {
         bench_article_parse_passes(bencher, BODY_768K, ArticleVariant::FoldedHeaders);
     }
 
+    /// Varied printable payload from nntp-proxy's scanner benchmark model.
+    /// Lines contain ordinary dots and use NNTP dot stuffing at content start.
+    fn varied_body_response(body_len: usize) -> Vec<u8> {
+        let mut response = b"222 42 <bench@example.com> body follows\r\n".to_vec();
+        let mut random = 0x7ac3_85d1u32;
+        let mut written = 0;
+        while written < body_len {
+            let line_len = (body_len - written).min(128);
+            for column in 0..line_len {
+                random ^= random << 13;
+                random ^= random >> 17;
+                random ^= random << 5;
+                let byte = if column == 0 && written % 4096 == 0 {
+                    b'.'
+                } else {
+                    33 + u8::try_from(random % 94).unwrap()
+                };
+                if column == 0 && byte == b'.' {
+                    response.push(b'.');
+                }
+                response.push(byte);
+            }
+            response.extend_from_slice(b"\r\n");
+            written += line_len;
+        }
+        response.extend_from_slice(b".\r\n");
+        response
+    }
+
     fn bench_fragmented_decode_response(bencher: Bencher, response: Vec<u8>, chunk_bytes: usize) {
+        let (status, consumed) =
+            bench_public_response_decode_chunks(RequestKind::Body, &response, chunk_bytes).unwrap();
+        assert_eq!((status.as_u16(), consumed), (222, response.len()),);
         bencher.bench(|| {
             black_box(bench_public_response_decode_chunks(
                 black_box(RequestKind::Body),
@@ -403,8 +435,42 @@ mod public_client_experiments {
         bench_fragmented_decode_response(bencher, response, chunk_bytes);
     }
 
+    fn encoded_body_response(decoded_len: usize) -> Vec<u8> {
+        let mut random = 0x7ac3_85d1u32;
+        let decoded: Vec<u8> = (0..decoded_len)
+            .map(|_| {
+                random ^= random << 13;
+                random ^= random >> 17;
+                random ^= random << 5;
+                random.to_le_bytes()[0]
+            })
+            .collect();
+        let mut response = b"222 42 <bench@example.com> body follows\r\n".to_vec();
+        let length = u64::try_from(decoded_len).unwrap();
+        yenc::EncodeOptions::new()
+            .begin(1)
+            .end(length)
+            .encode_stream(
+                std::io::Cursor::new(&decoded),
+                &mut response,
+                length,
+                "scanner.bin",
+            )
+            .unwrap();
+        response.extend_from_slice(b".\r\n");
+        response
+    }
+
     fn bench_async_receive_response(bencher: Bencher, response: Vec<u8>, chunk_bytes: usize) {
         let rt = runtime();
+        let (status, consumed) = rt
+            .block_on(bench_public_response_receive(
+                RequestKind::Body,
+                &response,
+                chunk_bytes,
+            ))
+            .unwrap();
+        assert_eq!((status.as_u16(), consumed), (222, response.len()));
         bencher.bench_local(|| {
             black_box(rt.block_on(bench_public_response_receive(
                 black_box(RequestKind::Body),
@@ -442,6 +508,26 @@ mod public_client_experiments {
     #[divan::bench(sample_count = 20, sample_size = 5)]
     fn async_receive_768k_whole_read(bencher: Bencher) {
         bench_async_receive_whole_read(bencher, BODY_768K);
+    }
+
+    #[divan::bench(sample_count = 100, sample_size = 20)]
+    fn async_receive_varied_64k_256_bytes(bencher: Bencher) {
+        bench_async_receive_response(bencher, varied_body_response(BODY_64K), 256);
+    }
+
+    #[divan::bench(sample_count = 100, sample_size = 20)]
+    fn async_receive_varied_768k_256k(bencher: Bencher) {
+        bench_async_receive_response(bencher, varied_body_response(BODY_768K), 256 * 1024);
+    }
+
+    #[divan::bench(sample_count = 100, sample_size = 20)]
+    fn async_receive_encoded_64k_256_bytes(bencher: Bencher) {
+        bench_async_receive_response(bencher, encoded_body_response(BODY_64K), 256);
+    }
+
+    #[divan::bench(sample_count = 100, sample_size = 20)]
+    fn async_receive_encoded_768k_256k(bencher: Bencher) {
+        bench_async_receive_response(bencher, encoded_body_response(BODY_768K), 256 * 1024);
     }
 
     #[divan::bench(sample_count = 100, sample_size = 20)]
@@ -549,6 +635,26 @@ mod public_client_experiments {
     #[divan::bench(sample_count = 20, sample_size = 5)]
     fn fragmented_decode_768k_whole_read(bencher: Bencher) {
         bench_fragmented_decode_whole_read(bencher, BODY_768K);
+    }
+
+    #[divan::bench(sample_count = 100, sample_size = 20)]
+    fn fragmented_decode_varied_64k_256_bytes(bencher: Bencher) {
+        bench_fragmented_decode_response(bencher, varied_body_response(BODY_64K), 256);
+    }
+
+    #[divan::bench(sample_count = 100, sample_size = 20)]
+    fn fragmented_decode_varied_768k_256k(bencher: Bencher) {
+        bench_fragmented_decode_response(bencher, varied_body_response(BODY_768K), 256 * 1024);
+    }
+
+    #[divan::bench(sample_count = 100, sample_size = 20)]
+    fn fragmented_decode_encoded_64k_256_bytes(bencher: Bencher) {
+        bench_fragmented_decode_response(bencher, encoded_body_response(BODY_64K), 256);
+    }
+
+    #[divan::bench(sample_count = 100, sample_size = 20)]
+    fn fragmented_decode_encoded_768k_256k(bencher: Bencher) {
+        bench_fragmented_decode_response(bencher, encoded_body_response(BODY_768K), 256 * 1024);
     }
 
     #[divan::bench(sample_count = 50, sample_size = 10)]

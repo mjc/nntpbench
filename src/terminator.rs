@@ -1,5 +1,19 @@
 //! CRLF line and multiline terminator helpers for NNTP protocol frames.
 
+use std::sync::LazyLock;
+
+#[cfg(test)]
+pub(crate) mod proxy_tests;
+
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_feature = "avx2")
+))]
+mod vector_scanner;
+
+static TERMINATOR_FINDER: LazyLock<memchr::memmem::Finder<'static>> =
+    LazyLock::new(|| memchr::memmem::Finder::new(crate::TERMINATOR));
+
 pub const TERMINATOR_TAIL_SIZE: usize = 4;
 pub const DOT_TERMINATOR: &[u8] = b".\r\n";
 
@@ -229,14 +243,9 @@ impl MultilineTerminatorDetector {
     /// Returns the earliest complete terminator touching the current chunk.
     #[must_use]
     pub fn detect_terminator(&self, chunk: &[u8]) -> TerminatorStatus {
-        match (
-            self.find_spanning_terminator(chunk),
-            find_terminator_end(chunk),
-        ) {
-            (Some(spanning), Some(in_chunk)) => TerminatorStatus::FoundAt(spanning.min(in_chunk)),
-            (Some(spanning), None) => TerminatorStatus::FoundAt(spanning),
-            (None, Some(in_chunk)) => TerminatorStatus::FoundAt(in_chunk),
-            (None, None) => TerminatorStatus::NotFound,
+        match detect_streaming_terminator(self, chunk) {
+            Some(end) => TerminatorStatus::FoundAt(end),
+            None => TerminatorStatus::NotFound,
         }
     }
 }
@@ -413,26 +422,20 @@ impl MultilineFramer {
 }
 
 fn detect_streaming_terminator(tail: &MultilineTerminatorDetector, chunk: &[u8]) -> Option<usize> {
-    match (
-        tail.find_spanning_terminator(chunk),
-        find_in_chunk_terminator(chunk),
-    ) {
-        (Some(spanning), Some(in_chunk)) => Some(spanning.min(in_chunk)),
-        (Some(spanning), None) => Some(spanning),
-        (None, Some(in_chunk)) => Some(in_chunk),
-        (None, None) => None,
-    }
+    // Spanning matches end within the first four bytes; an in-chunk match
+    // cannot end before byte five, so a spanning match is always first.
+    tail.find_spanning_terminator(chunk)
+        .or_else(|| find_terminator_end(chunk))
 }
 
-fn find_in_chunk_terminator(chunk: &[u8]) -> Option<usize> {
-    memchr::memchr_iter(b'.', chunk).find_map(|dot| {
-        if dot >= crate::CRLF.len()
-            && dot + crate::CRLF.len() < chunk.len()
-            && chunk[dot - 2] == b'\r'
-            && chunk[dot - 1] == b'\n'
-            && chunk[dot + 1] == b'\r'
-            && chunk[dot + 2] == b'\n'
-        {
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_feature = "avx2")
+))]
+#[inline]
+fn find_short_terminator_end(data: &[u8]) -> Option<usize> {
+    memchr::memchr_iter(b'.', data).find_map(|dot| {
+        if dot >= 2 && dot + 2 < data.len() && data[dot - 2..dot + 3] == *crate::TERMINATOR {
             Some(dot + DOT_TERMINATOR.len())
         } else {
             None
@@ -445,7 +448,30 @@ fn find_in_chunk_terminator(chunk: &[u8]) -> Option<usize> {
 /// Returns the position after the terminator, or None if not found.
 #[inline]
 fn find_terminator_end(data: &[u8]) -> Option<usize> {
-    memchr::memmem::find(data, crate::TERMINATOR).map(|start| start + crate::TERMINATOR.len())
+    // Generic x86 keeps memchr's runtime dispatch. Native ARM64 and AVX2
+    // builds use the fixed-pattern vector scanner from nntp-proxy.
+    #[cfg(any(
+        target_arch = "aarch64",
+        all(target_arch = "x86_64", target_feature = "avx2")
+    ))]
+    let start = {
+        // Short fragmented reads are faster with the sparse-dot scan.
+        if data.len() < 512 {
+            return find_short_terminator_end(data);
+        }
+        // Dot-free prefixes are common in generated/plain-text bodies. Skip
+        // them with memchr before paying for a full vector-pattern scan.
+        let dot = memchr::memchr(b'.', data)?;
+        let offset = dot.saturating_sub(2);
+        vector_scanner::find(&data[offset..]).map(|start| offset + start)
+    };
+    #[cfg(not(any(
+        target_arch = "aarch64",
+        all(target_arch = "x86_64", target_feature = "avx2")
+    )))]
+    let start = TERMINATOR_FINDER.find(data);
+
+    start.map(|start| start + crate::TERMINATOR.len())
 }
 
 /// Find the content end for a complete multiline response frame.
@@ -528,8 +554,7 @@ impl<'a> Iterator for DotTerminatedBlocks<'a> {
         let (content_end, block_end) = if slice.starts_with(DOT_TERMINATOR) {
             (start, start + DOT_TERMINATOR.len())
         } else {
-            let relative = memchr::memmem::find(slice, crate::TERMINATOR)?;
-            let block_end = start + relative + crate::TERMINATOR.len();
+            let block_end = start + find_terminator_end(slice)?;
             (block_end - DOT_TERMINATOR.len(), block_end)
         };
 
@@ -769,6 +794,17 @@ mod tests {
         }
 
         None
+    }
+
+    #[test]
+    fn vector_scanner_rejects_or_collisions_before_the_first_packed_terminator() {
+        // These unequal byte pairs pass the CR or LF OR filter.
+        let mut input = b"\x04\n.\x09\n\r\x02.\r\x08".repeat(512);
+        assert_eq!(find_terminator_end(&input), None);
+        input.extend_from_slice(crate::TERMINATOR);
+        let first_end = input.len();
+        input.extend_from_slice(b"222 next response\r\nnext body\r\n.\r\n");
+        assert_eq!(find_terminator_end(&input), Some(first_end));
     }
 
     fn dot_terminated_block_end_oracle(buffer: &[u8], start: usize) -> Option<usize> {
@@ -1476,6 +1512,15 @@ mod tests {
 
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(1024))]
+
+        #[test]
+        fn vector_scanner_matches_rfc_oracle_on_large_dense_inputs(
+            input in vec(prop::sample::select(vec![
+                0, 1, 2, 4, 5, 8, 9, b'\r', b'\n', b'.', b'x', 255,
+            ]), 0..4096),
+        ) {
+            prop_assert_eq!(find_terminator_end(&input), terminator_end_oracle(&input));
+        }
 
         #[test]
         fn crlf_line_helpers_match_independent_oracles(

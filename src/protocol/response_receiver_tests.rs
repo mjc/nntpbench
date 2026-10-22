@@ -51,6 +51,35 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, ReadBuf};
 
+#[tokio::test]
+async fn proxy_encoded_mixed_responses_keep_request_order_across_read_sizes() {
+    use crate::terminator::proxy_tests::ScannerBenchmarkInput;
+
+    for decoded_len in [1, 128, 716_800, 768_000] {
+        let input = ScannerBenchmarkInput::mixed_yenc(decoded_len, 2);
+        let requests = input.requests.as_ref().unwrap();
+        for chunk_bytes in [1, 31, 16 * 1024, 1024 * 1024] {
+            for delivered in [input.bytes().len(), input.bytes().len() / 2] {
+                let mut receiver = BufferedResponseReceiver::new(&input.bytes()[..delivered]);
+                let mut previous_end = 0;
+                for &(kind, end) in requests {
+                    if end > delivered {
+                        assert!(matches!(
+                            receiver.receive(kind, chunk_bytes).await,
+                            Err(ClientError::UnexpectedEof)
+                        ));
+                        break;
+                    }
+                    let response = receiver.receive(kind, chunk_bytes).await.unwrap();
+                    assert_eq!(response.kind(), kind);
+                    assert_eq!(response.as_bytes(), &input.bytes()[previous_end..end]);
+                    previous_end = end;
+                }
+            }
+        }
+    }
+}
+
 thread_local! {
     static RUNTIME: RefCell<Option<tokio::runtime::Runtime>> = const { RefCell::new(None) };
 }

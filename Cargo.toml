@@ -24,6 +24,7 @@ coz = ["dep:coz"]
 divan = "0.1.21"
 proptest = "1.9.0"
 serde_json = "1.0.149"
+yenc = "0.2.2"
 
 [target.'cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))'.dev-dependencies]
 gungraun = "0.19.4"
