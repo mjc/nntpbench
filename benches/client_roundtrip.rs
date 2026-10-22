@@ -3,8 +3,8 @@
 //! These benches drive the request/future client surface against the real
 //! mock NNTP server over localhost TCP. The one-shot extension paths remain
 //! raw probes unless the benchmark explicitly negotiates capabilities first.
-//! Throughput cases receive framed responses without promoting them to validated
-//! articles. Full article validation is available in the ignored validated cases.
+//! Throughput cases use the typed client with its default framing-only policy.
+//! Full article validation is available in the ignored validated cases.
 //!
 //! Run with: `cargo bench --bench client_roundtrip`
 
@@ -13,7 +13,8 @@ use std::sync::Arc;
 
 use divan::{Bencher, black_box};
 use nntpbench::{
-    Client, ClientOptions, Request, ServerArgs, ServerConfig, Stats, bind_listener, serve_session,
+    ArticleValidation, Client, ClientOptions, ServerArgs, ServerConfig, Stats, bind_listener,
+    serve_session,
 };
 use tokio::runtime::Builder;
 
@@ -77,6 +78,20 @@ struct ClientHarness {
 
 impl ClientHarness {
     fn start(body_bytes: usize, article_bytes: usize, pipeline_depth: usize) -> Self {
+        Self::start_with_validation(
+            body_bytes,
+            article_bytes,
+            pipeline_depth,
+            ArticleValidation::default(),
+        )
+    }
+
+    fn start_with_validation(
+        body_bytes: usize,
+        article_bytes: usize,
+        pipeline_depth: usize,
+        article_validation: ArticleValidation,
+    ) -> Self {
         let rt = Builder::new_current_thread().enable_all().build().unwrap();
         let addr = rt.block_on(spawn_server(body_bytes, article_bytes));
         let client = rt
@@ -84,6 +99,7 @@ impl ClientHarness {
                 addr,
                 ClientOptions {
                     pipeline_depth,
+                    article_validation,
                     ..ClientOptions::default()
                 },
             ))
@@ -92,34 +108,19 @@ impl ClientHarness {
     }
 }
 
-#[derive(Clone, Copy)]
-enum ArticleValidation {
-    FramingOnly,
-    FullArticle,
-}
-
 fn bench_public_article_roundtrip(bencher: Bencher, size: usize, validation: ArticleValidation) {
-    let harness = ClientHarness::start(size, size, 1);
+    let harness = ClientHarness::start_with_validation(size, size, 1, validation);
     bencher
         .counter(divan::counter::BytesCount::new(size))
         .bench_local(|| {
             black_box(harness.rt.block_on(async {
-                match validation {
-                    ArticleValidation::FramingOnly => harness
-                        .client
-                        .execute_raw(Request::article("bench.1@nntpbench.local").unwrap())
-                        .await
-                        .unwrap()
-                        .as_bytes()
-                        .len(),
-                    ArticleValidation::FullArticle => harness
-                        .client
-                        .article("bench.1@nntpbench.local")
-                        .await
-                        .unwrap()
-                        .as_bytes()
-                        .len(),
-                }
+                harness
+                    .client
+                    .article("bench.1@nntpbench.local")
+                    .await
+                    .unwrap()
+                    .as_bytes()
+                    .len()
             }))
         });
 }
@@ -148,18 +149,10 @@ fn bench_pipelined_body_burst(bencher: Bencher) {
         .bench_local(|| {
             black_box(harness.rt.block_on(async {
                 let (a, b, c, d) = tokio::try_join!(
-                    harness
-                        .client
-                        .execute_raw(Request::body("bench.1@nntpbench.local").unwrap()),
-                    harness
-                        .client
-                        .execute_raw(Request::body("bench.2@nntpbench.local").unwrap()),
-                    harness
-                        .client
-                        .execute_raw(Request::body("bench.3@nntpbench.local").unwrap()),
-                    harness
-                        .client
-                        .execute_raw(Request::body("bench.4@nntpbench.local").unwrap()),
+                    harness.client.body("bench.1@nntpbench.local"),
+                    harness.client.body("bench.2@nntpbench.local"),
+                    harness.client.body("bench.3@nntpbench.local"),
+                    harness.client.body("bench.4@nntpbench.local"),
                 )
                 .unwrap();
 
@@ -175,12 +168,8 @@ fn bench_pipelined_mixed_requests(bencher: Bencher) {
         .bench_local(|| {
             black_box(harness.rt.block_on(async {
                 let (body, article, capabilities, date) = tokio::try_join!(
-                    harness
-                        .client
-                        .execute_raw(Request::body("bench.body@nntpbench.local").unwrap()),
-                    harness
-                        .client
-                        .execute_raw(Request::article("bench.article@nntpbench.local").unwrap()),
+                    harness.client.body("bench.body@nntpbench.local"),
+                    harness.client.article("bench.article@nntpbench.local"),
                     harness.client.capabilities(),
                     harness.client.date(),
                 )
@@ -201,12 +190,8 @@ fn bench_pipelined_rfc_grammar_requests(bencher: Bencher) {
         .bench_local(|| {
             black_box(harness.rt.block_on(async {
                 let (body, article, over, listgroup) = tokio::try_join!(
-                    harness
-                        .client
-                        .execute_raw(Request::body("bench.body@nntpbench.local").unwrap()),
-                    harness
-                        .client
-                        .execute_raw(Request::article("bench.article@nntpbench.local").unwrap()),
+                    harness.client.body("bench.body@nntpbench.local"),
+                    harness.client.article("bench.article@nntpbench.local"),
                     harness.client.over("<overview@nntpbench.local>"),
                     harness.client.listgroup_group_range("alt.test", "1-3"),
                 )
@@ -254,13 +239,13 @@ mod sequential_roundtrip {
     #[divan::bench(sample_count = 100, sample_size = 20)]
     #[ignore]
     fn article_validated_768k(bencher: Bencher) {
-        bench_public_article_roundtrip(bencher, 768 * 1024, ArticleValidation::FullArticle);
+        bench_public_article_roundtrip(bencher, 768 * 1024, ArticleValidation::Full);
     }
 
     #[divan::bench(sample_count = 100, sample_size = 20)]
     #[ignore]
     fn article_validated_1m(bencher: Bencher) {
-        bench_public_article_roundtrip(bencher, 1024 * 1024, ArticleValidation::FullArticle);
+        bench_public_article_roundtrip(bencher, 1024 * 1024, ArticleValidation::Full);
     }
 
     #[divan::bench(sample_count = 100, sample_size = 100)]

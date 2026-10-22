@@ -276,7 +276,7 @@ fn generic_owned_response_does_not_reparse_as_an_article() {
 }
 
 #[test]
-fn owned_article_access_is_infallible_after_promotion() {
+fn owned_article_access_succeeds_after_promotion() {
     let response = response_from_bytes(
         RequestKind::Body,
         StatusCode::parse(b"222").unwrap(),
@@ -284,8 +284,32 @@ fn owned_article_access_is_infallible_after_promotion() {
     );
     let article = OwnedArticle::try_from(response).unwrap();
 
-    let parsed: Article<'_> = article.article();
+    let parsed: Article<'_> = article.article().unwrap();
     assert_eq!(parsed.body.as_deref(), Some(&b"body\r\n"[..]));
+}
+
+#[test]
+fn explicit_article_validation_preserves_bytes_metadata_and_value_equality() {
+    let wire = b"222 1 <body@test> body follows\r\nbody\r\n.\r\n";
+    let response = receive_response(RequestKind::Body, wire, 1).unwrap();
+    let framed =
+        OwnedArticle::from_response(response.clone(), crate::ArticleValidation::default()).unwrap();
+    assert!(matches!(&framed.article, OwnedArticleContent::Framed(_)));
+    let validated = framed.clone().validate().unwrap();
+    assert!(matches!(
+        &validated.article,
+        OwnedArticleContent::Validated(_)
+    ));
+    assert_eq!(framed, validated);
+    assert_eq!(framed.as_bytes().as_ptr(), validated.as_bytes().as_ptr());
+    assert_eq!(framed.content(), validated.content());
+    assert_eq!(framed.into_response(), response);
+    assert_eq!(
+        validated.article().unwrap().body.as_deref(),
+        Some(&b"body\r\n"[..])
+    );
+    assert_eq!(validated.clone().validate().unwrap(), validated);
+    assert_eq!(validated.into_response(), response);
 }
 
 #[test]
@@ -642,8 +666,8 @@ fn production_receiver_split_article_family_promotes_and_reuses_typed_access() {
         let article = OwnedArticle::try_from(response)
             .unwrap_or_else(|error| panic!("{kind:?} article promotion failed: {error:?}"));
 
-        let first = article.article();
-        let second = article.article();
+        let first = article.article().unwrap();
+        let second = article.article().unwrap();
         assert_eq!(first, second, "{kind:?} typed access changed between calls");
         assert_eq!(first.message_id.as_str(), expected_message_id);
     }

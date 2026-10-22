@@ -93,8 +93,8 @@ use article_store::{ArticleStoreKey, open_article_response_into};
 use article_store::{article_id_tree_path, message_id_tree_path};
 
 pub use client::{
-    Client, ClientConnection, ClientError, ClientOptions, OwnedArticle, OwnedArticleExchange,
-    OwnedExchange, OwnedResponse,
+    ArticleValidation, Client, ClientConnection, ClientError, ClientOptions, OwnedArticle,
+    OwnedArticleExchange, OwnedExchange, OwnedResponse,
 };
 pub use protocol::{
     Article, ArticleNumber, ArticleParseError, ArticleRef, ArticleSelector, ArticleTransfer,
@@ -1122,6 +1122,7 @@ pub async fn fetch_response(args: &FetchArgs) -> Result<OwnedResponse, ClientErr
             socket_recv_buffer: args.socket_recv_buffer,
             socket_send_buffer: args.socket_send_buffer,
             pipeline_depth: args.pipeline_depth.clamp(1, 4096),
+            ..ClientOptions::default()
         },
     )
     .await?;

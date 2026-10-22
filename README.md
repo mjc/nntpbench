@@ -47,8 +47,19 @@ On macOS, the CLI requests user-initiated QoS for the runtime's calling thread
 and worker threads. This gives benchmark work a consistent requested priority
 on Apple Silicon; macOS controls which cores execute each thread.
 
-The public-client TCP throughput benchmarks receive framed responses without
-full article/body validation. To include the validation scan explicitly:
+`Client::connect` defaults to `ArticleValidation::FramingOnly`: typed article
+and body calls check framing and the expected success status without scanning
+all headers or body lines. Set `ClientOptions::article_validation` to
+`ArticleValidation::Full` to validate before each typed response is returned.
+Raw request methods always return framed responses.
+
+`OwnedArticle::article()` now returns `Result<Article, ArticleParseError>` and
+validates when a parsed view is requested. `OwnedArticle::validate()` and
+`OwnedResponse::into_article()` retain a validated layout for repeated access;
+`as_bytes()` and `content()` do not trigger semantic validation.
+
+The public-client TCP benchmarks use normal typed calls with the default policy.
+To include the full validation scan explicitly:
 
 ```bash
 cargo bench --bench client_roundtrip -- --ignored article_validated
@@ -70,11 +81,10 @@ Its private `ChunkConsumed` counts bytes from the latest scanner push;
 Coordinate translation and split/freeze remain inside this boundary; callers do
 not reconstruct them from scanner results.
 
-`OwnedResponse` and `OwnedArticle` keep their existing client API paths.
-Article layouts remain private and associated with immutable bytes. Validation
-retains parsed metadata and transformation requirements; repeated plain-body
-access borrows without semantic revalidation or a discovery scan. Equality
-compares values, not allocation addresses.
+Article layouts remain private and associated with immutable bytes. Full
+validation retains parsed metadata and transformation requirements; subsequent
+plain-body access borrows without semantic revalidation or a discovery scan.
+Framing-only responses validate on each parsed access until explicitly promoted.
 
 The equivalent proxy operation borrows a pooled window and streams it; it does
 not need whole-article ownership. Mutable operations consume their permission;

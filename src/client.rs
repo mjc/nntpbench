@@ -30,6 +30,16 @@ use crate::{
 pub(crate) const OWNED_RESPONSE_PREALLOC_BYTES: usize = 8 * 1024 * 1024;
 const MIN_PENDING_READ_SPARE_BYTES: usize = 256;
 
+/// Article semantics checked by the typed client before returning a response.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum ArticleValidation {
+    /// Check response framing; validate headers and body only when parsed.
+    #[default]
+    FramingOnly,
+    /// Validate the complete article, headers, and body before returning it.
+    Full,
+}
+
 /// Options for the client one-connection client prototype.
 #[derive(Debug, Clone, Copy)]
 pub struct ClientOptions {
@@ -38,6 +48,8 @@ pub struct ClientOptions {
     pub socket_recv_buffer: usize,
     pub socket_send_buffer: usize,
     pub pipeline_depth: usize,
+    /// Eager validation for typed ARTICLE/HEAD/BODY/STAT calls. Raw calls only frame.
+    pub article_validation: ArticleValidation,
 }
 
 impl Default for ClientOptions {
@@ -48,6 +60,7 @@ impl Default for ClientOptions {
             socket_recv_buffer: 0,
             socket_send_buffer: 0,
             pipeline_depth: 64,
+            article_validation: ArticleValidation::default(),
         }
     }
 }
@@ -56,6 +69,7 @@ impl Default for ClientOptions {
 #[derive(Debug, Clone)]
 pub struct Client {
     connection: ClientConnection,
+    article_validation: ArticleValidation,
 }
 
 impl Client {
@@ -71,13 +85,14 @@ impl Client {
     ) -> Result<Self, ClientError> {
         Ok(Self {
             connection: ClientConnection::connect_with_options(addr, options).await?,
+            article_validation: options.article_validation,
         })
     }
 
     /// Execute a client article-style request directly and return a client owned article-style response.
     pub async fn execute(&self, request: Request<'static>) -> Result<OwnedArticle, ClientError> {
         let response = self.connection.execute(request).await?;
-        OwnedArticle::try_from(response)
+        OwnedArticle::from_response(response, self.article_validation)
     }
 
     /// Execute a client request directly and return the completed request/response pair.
@@ -86,7 +101,10 @@ impl Client {
         request: Request<'static>,
     ) -> Result<OwnedArticleExchange, ClientError> {
         let exchange = self.connection.execute_exchange(request).await?;
-        OwnedArticleExchange::try_from(exchange)
+        Ok(OwnedArticleExchange {
+            request: exchange.request,
+            article: OwnedArticle::from_response(exchange.response, self.article_validation)?,
+        })
     }
 
     /// Execute a client request directly and return the owned raw response frame.
@@ -2216,7 +2234,9 @@ pub fn bench_owned_response_from_bytes(
 /// response-frame validation has already completed.
 #[doc(hidden)]
 pub fn bench_owned_article_accessor_parse(article: &OwnedArticle) -> Result<usize, ClientError> {
-    let parsed = article.article();
+    let parsed = article
+        .article()
+        .map_err(|_| ClientError::InvalidStatusLine)?;
     Ok(parsed
         .body
         .as_ref()
@@ -4115,6 +4135,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn client_defaults_to_framing_only_for_article_and_body() {
+        assert_eq!(
+            ClientOptions::default().article_validation,
+            ArticleValidation::FramingOnly
+        );
+        for (kind, command, wire) in [
+            (
+                RequestKind::Article,
+                &b"ARTICLE <validation@test>\r\n"[..],
+                &b"220 1 <validation@test> follows\r\nSubject: Test\r\n\r\nbad\0body\r\n.\r\n"[..],
+            ),
+            (
+                RequestKind::Body,
+                &b"BODY <validation@test>\r\n"[..],
+                &b"222 1 <validation@test> follows\r\nbad\0body\r\n.\r\n"[..],
+            ),
+        ] {
+            for exchange in [false, true] {
+                let listener =
+                    crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+                let addr = listener.local_addr().unwrap();
+                let server = tokio::spawn(async move {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    stream.write_all(b"201 ready\r\n").await.unwrap();
+                    assert_read_request(&mut stream, command).await;
+                    stream.write_all(wire).await.unwrap();
+                    assert_read_request(&mut stream, b"STAT <next@test>\r\n").await;
+                    stream
+                        .write_all(b"223 2 <next@test> exists\r\n")
+                        .await
+                        .unwrap();
+                });
+                let client = Client::connect(addr).await.unwrap();
+                let request = match kind {
+                    RequestKind::Article => Request::article("validation@test").unwrap(),
+                    RequestKind::Body => Request::body("validation@test").unwrap(),
+                    _ => unreachable!(),
+                };
+                let article = if exchange {
+                    client
+                        .execute_exchange(request)
+                        .await
+                        .unwrap()
+                        .into_parts()
+                        .1
+                } else {
+                    client.execute(request).await.unwrap()
+                };
+                assert_eq!(article.as_bytes(), wire);
+                assert!(article.content().contains(&0));
+                assert_eq!(
+                    article.article(),
+                    Err(crate::ArticleParseError::InvalidBody)
+                );
+                assert!(article.clone().validate().is_err());
+                assert_eq!(article.into_response().as_bytes(), wire);
+                let next = client.stat("next@test").await.unwrap();
+                assert_eq!(next.article().unwrap().message_id.as_str(), "<next@test>");
+                server.await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn client_full_validation_rejects_malformed_article_and_body() {
+        for (request, wire) in [
+            (
+                Request::article("validation@test").unwrap(),
+                &b"220 1 <validation@test> follows\r\nSubject: Test\r\n\r\nbad\0body\r\n.\r\n"[..],
+            ),
+            (
+                Request::body("validation@test").unwrap(),
+                &b"222 1 <validation@test> follows\r\nbad\0body\r\n.\r\n"[..],
+            ),
+        ] {
+            for exchange in [false, true] {
+                let listener =
+                    crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+                let addr = listener.local_addr().unwrap();
+                let mut command = Vec::new();
+                request.write_wire_to(&mut command);
+                let server = tokio::spawn(async move {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    stream.write_all(b"201 ready\r\n").await.unwrap();
+                    assert_read_request(&mut stream, &command).await;
+                    stream.write_all(wire).await.unwrap();
+                });
+                let client = Client::connect_with_options(
+                    addr,
+                    ClientOptions {
+                        article_validation: ArticleValidation::Full,
+                        ..ClientOptions::default()
+                    },
+                )
+                .await
+                .unwrap();
+                let error = if exchange {
+                    client.execute_exchange(request.clone()).await.unwrap_err()
+                } else {
+                    client.execute(request.clone()).await.unwrap_err()
+                };
+                assert!(matches!(error, ClientError::InvalidStatusLine));
+                server.await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn client_article_returns_owned_article_surface() {
         let listener = crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
         let addr = listener.local_addr().unwrap();
@@ -4133,7 +4261,7 @@ mod tests {
 
         let client = Client::connect(addr).await.unwrap();
         let article = client.article("surface@test").await.unwrap();
-        let parsed = article.article();
+        let parsed = article.article().unwrap();
 
         assert_eq!(article.kind(), RequestKind::Article);
         assert_eq!(article.status().as_u16(), 220);
@@ -4166,7 +4294,7 @@ mod tests {
 
         let client = Client::connect(addr).await.unwrap();
         let exchange = client.article_exchange("exchange@test").await.unwrap();
-        let parsed = exchange.article().article();
+        let parsed = exchange.article().article().unwrap();
 
         assert_eq!(
             exchange.request(),
@@ -4214,7 +4342,10 @@ mod tests {
         );
         assert_eq!(article.status().as_u16(), 220);
         assert_eq!(raw.kind(), RequestKind::Article);
-        assert_eq!(article.article().message_id.as_str(), "<pair-surface@test>");
+        assert_eq!(
+            article.article().unwrap().message_id.as_str(),
+            "<pair-surface@test>"
+        );
 
         server.await.unwrap();
     }
@@ -4247,12 +4378,15 @@ mod tests {
         assert_eq!(current.kind(), RequestKind::Article);
         assert_eq!(current.status().as_u16(), 220);
         assert_eq!(
-            current.article().message_id.as_str(),
+            current.article().unwrap().message_id.as_str(),
             "<surface-current@test>"
         );
         assert_eq!(stat.kind(), RequestKind::Stat);
         assert_eq!(stat.status().as_u16(), 223);
-        assert_eq!(stat.article().message_id.as_str(), "<surface-42@test>");
+        assert_eq!(
+            stat.article().unwrap().message_id.as_str(),
+            "<surface-42@test>"
+        );
 
         server.await.unwrap();
     }
@@ -4672,13 +4806,16 @@ mod tests {
         assert_eq!(head.kind(), RequestKind::Head);
         assert_eq!(head.status().as_u16(), 221);
         assert_eq!(
-            head.article().headers.unwrap().get("Subject"),
+            head.article().unwrap().headers.unwrap().get("Subject"),
             Some(&b"Surface Head"[..])
         );
 
         assert_eq!(stat.kind(), RequestKind::Stat);
         assert_eq!(stat.status().as_u16(), 223);
-        assert_eq!(stat.article().message_id.as_str(), "<stat-surface@test>");
+        assert_eq!(
+            stat.article().unwrap().message_id.as_str(),
+            "<stat-surface@test>"
+        );
 
         server.await.unwrap();
     }
@@ -4707,7 +4844,7 @@ mod tests {
         assert_eq!(exchange.request(), &request);
         assert_eq!(exchange.article().status().as_u16(), 222);
         assert_eq!(
-            exchange.article().article().body.as_deref(),
+            exchange.article().article().unwrap().body.as_deref(),
             Some(&b"direct body\r\n"[..])
         );
 
