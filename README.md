@@ -12,6 +12,14 @@ Run the mock server:
 nix develop -c cargo run -- server --listen 127.0.0.1:2119
 ```
 
+The server generates deterministic yEnc-encoded binary payloads by default.
+`--body-bytes` and `--article-bytes` set the decoded payload size in this mode;
+encoded responses include yEnc headers, escaping, checksums, and NNTP framing.
+Payloads are encoded once at startup and reused during transfers.
+
+Use `--payload-mode plain` for the repeated-text payload. In plain mode the
+size options retain their approximate response wire-size meaning.
+
 Send one request and print the raw NNTP response. `client` is the supported
 request/future client command; `fetch` remains as a compatibility alias for the
 same one-request path. Extension requests use the client capability preflight

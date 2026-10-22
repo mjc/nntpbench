@@ -27,6 +27,7 @@ fn server_args(body_bytes: usize, article_bytes: usize) -> ServerArgs {
         listen: "127.0.0.1:0".parse().unwrap(),
         body_bytes,
         article_bytes,
+        payload_mode: nntpbench::PayloadMode::Yenc,
         article_dir: None,
         max_connections: 4096,
         threads: 1,

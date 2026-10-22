@@ -83,8 +83,10 @@ unsafe impl GlobalAlloc for CountingAllocator {
 
 mod article_store;
 pub mod client;
+mod payload;
 pub mod protocol;
 pub mod terminator;
+pub use payload::PayloadMode;
 
 use article_store::{ArticleStoreKey, open_article_response_into};
 #[cfg(test)]
@@ -564,13 +566,17 @@ pub struct ServerArgs {
     #[arg(long, default_value = "127.0.0.1:1199")]
     pub listen: SocketAddr,
 
-    /// Approximate body bytes returned for BODY.
+    /// Decoded yEnc payload bytes, or approximate BODY response wire bytes in plain mode.
     #[arg(long, default_value_t = 64 * 1024)]
     pub body_bytes: usize,
 
-    /// Approximate full article bytes returned for ARTICLE, including headers.
+    /// Decoded yEnc payload bytes, or approximate ARTICLE response wire bytes in plain mode.
     #[arg(long, default_value_t = 68 * 1024)]
     pub article_bytes: usize,
+
+    /// Payload generated for ARTICLE and BODY responses.
+    #[arg(long, value_enum, default_value_t = PayloadMode::Yenc)]
+    pub payload_mode: PayloadMode,
 
     /// Directory tree containing complete ARTICLE response frames keyed by ARTICLE selector.
     #[arg(long)]
@@ -1516,7 +1522,7 @@ fn render_server_manifest(
             "{{\"schema_version\":1,\"tool\":\"nntpbench\",\"version\":{},\"mode\":\"server\",",
             "\"host\":{{\"os\":{},\"arch\":{},\"cpu_model\":{},\"loopback\":{}}},",
             "\"config\":{{\"listen\":{},\"body_bytes\":{},\"article_bytes\":{},",
-            "\"article_dir\":{},\"max_connections\":{},\"max_pipeline_depth\":{},",
+            "\"payload_mode\":{},\"article_dir\":{},\"max_connections\":{},\"max_pipeline_depth\":{},",
             "\"stats_interval_secs\":{},\"flush\":{},\"pending_write_bytes\":{},",
             "\"nodelay\":{},\"socket_recv_buffer\":{},\"socket_send_buffer\":{}}},",
             "\"results\":{{\"accepted_connections\":{},\"refused_connections\":{},",
@@ -1536,6 +1542,7 @@ fn render_server_manifest(
         json_string(&config.listen.to_string()),
         config.body_bytes,
         config.article_bytes,
+        json_debug(&config.payload_mode),
         json_option_string(
             config
                 .article_dir
@@ -3481,11 +3488,8 @@ where
                 )
                 .await?;
             } else {
-                let response = build_selected_article_response_into(
-                    response_buffer,
-                    article_id,
-                    config.article_bytes,
-                );
+                let response =
+                    build_selected_article_response_into(response_buffer, article_id, config);
                 write_response(writer, pending_write, response, session_stats).await?;
             }
             Ok(false)
@@ -3744,11 +3748,8 @@ where
                     .await?;
                     return Ok(false);
                 }
-                let response = build_message_id_body_response_into(
-                    response_buffer,
-                    &message_id,
-                    config.body_bytes,
-                );
+                let response =
+                    build_message_id_body_response_into(response_buffer, &message_id, config);
                 write_response(writer, pending_write, response, session_stats).await?;
                 return Ok(false);
             }
@@ -3797,11 +3798,8 @@ where
                     session_state.current_article = Some(article_id);
                     return Ok(false);
                 }
-                let response = build_selected_body_response_into(
-                    response_buffer,
-                    article_id,
-                    config.body_bytes,
-                );
+                let response =
+                    build_selected_body_response_into(response_buffer, article_id, config);
                 write_response(writer, pending_write, response, session_stats).await?;
             }
             session_state.current_article = Some(article_id);
@@ -4463,6 +4461,35 @@ fn build_generated_response(prefix: &[u8], target_bytes: usize) -> Box<[u8]> {
     buffer.into_boxed_slice()
 }
 
+fn build_server_payload(mode: PayloadMode, size: usize) -> Box<[u8]> {
+    match mode {
+        PayloadMode::Plain => build_repeated_payload(size),
+        PayloadMode::Yenc => payload::encode_yenc_payload(size),
+    }
+}
+
+fn frame_prebuilt_payload(prefix: &[u8], payload: &[u8]) -> Box<[u8]> {
+    let mut response = Vec::with_capacity(prefix.len() + payload.len() + DOT_TERMINATOR.len());
+    response.extend_from_slice(prefix);
+    response.extend_from_slice(payload);
+    append_dot_terminator(&mut response);
+    response.into_boxed_slice()
+}
+
+fn prepared_payload_slice(
+    mode: PayloadMode,
+    payload: &[u8],
+    target_bytes: usize,
+    header_len: usize,
+) -> &[u8] {
+    match mode {
+        PayloadMode::Yenc => payload,
+        PayloadMode::Plain => {
+            &payload[..repeated_payload_len_at_least(target_bytes.saturating_sub(header_len))]
+        }
+    }
+}
+
 fn build_repeated_payload(target_bytes: usize) -> Box<[u8]> {
     let mut buffer = Vec::with_capacity(target_bytes.saturating_add(BODY_LINE.len()));
     append_repeated_payload_at_least(&mut buffer, BODY_LINE, target_bytes);
@@ -4527,88 +4554,86 @@ fn append_message_id_article_response_header(buffer: &mut Vec<u8>, message_id: &
     buffer.extend_from_slice(CRLF);
 }
 
-fn build_selected_article_response_into(
-    buffer: &mut Vec<u8>,
+fn build_selected_article_response_into<'a>(
+    buffer: &'a mut Vec<u8>,
     article_id: u64,
-    target_bytes: usize,
-) -> &[u8] {
+    config: &ServerConfig,
+) -> &'a [u8] {
     let mut message_id = arrayvec::ArrayString::<64>::new();
     write!(&mut message_id, "<article.{article_id}@nntpbench.local>")
         .expect("write to ArrayString cannot fail");
-    build_article_response_into(buffer, article_id, &message_id, target_bytes)
+    build_article_response_into(buffer, article_id, &message_id, config)
 }
 
 fn build_message_id_article_response_into<'a>(
     buffer: &'a mut Vec<u8>,
     message_id: &MessageId<'_>,
-    target_bytes: usize,
+    config: &ServerConfig,
 ) -> &'a [u8] {
-    build_article_response_into(buffer, 0, message_id.as_str(), target_bytes)
+    build_article_response_into(buffer, 0, message_id.as_str(), config)
 }
 
 fn build_article_response_into<'a>(
     buffer: &'a mut Vec<u8>,
     article_id: u64,
     message_id: &str,
-    target_bytes: usize,
+    config: &ServerConfig,
 ) -> &'a [u8] {
     buffer.clear();
     ensure_vec_capacity(
         buffer,
-        target_bytes
+        config
+            .article_response
+            .len()
             .max(ARTICLE_RESPONSE_PREFIX.len())
             .saturating_add(GENERATED_RESPONSE_EXTRA_CAPACITY),
     );
     build_article_response_header_into(buffer, article_id, message_id);
 
-    if buffer.len() < target_bytes {
-        let missing = target_bytes - buffer.len();
-        append_repeated_payload_at_least(buffer, BODY_LINE, missing);
-    }
+    buffer.extend_from_slice(config.article_payload_for_header(buffer.len()));
 
     append_dot_terminator(buffer);
     buffer.as_slice()
 }
 
-fn build_selected_body_response_into(
-    buffer: &mut Vec<u8>,
+fn build_selected_body_response_into<'a>(
+    buffer: &'a mut Vec<u8>,
     article_id: u64,
-    target_bytes: usize,
-) -> &[u8] {
+    config: &ServerConfig,
+) -> &'a [u8] {
     let mut message_id = arrayvec::ArrayString::<64>::new();
     write!(&mut message_id, "<article.{article_id}@nntpbench.local>")
         .expect("write to ArrayString cannot fail");
-    build_body_response_into(buffer, article_id, &message_id, target_bytes)
+    build_body_response_into(buffer, article_id, &message_id, config)
 }
 
 fn build_message_id_body_response_into<'a>(
     buffer: &'a mut Vec<u8>,
     message_id: &MessageId<'_>,
-    target_bytes: usize,
+    config: &ServerConfig,
 ) -> &'a [u8] {
-    build_body_response_into(buffer, 0, message_id.as_str(), target_bytes)
+    build_body_response_into(buffer, 0, message_id.as_str(), config)
 }
 
 fn build_body_response_into<'a>(
     buffer: &'a mut Vec<u8>,
     article_id: u64,
     message_id: &str,
-    target_bytes: usize,
+    config: &ServerConfig,
 ) -> &'a [u8] {
     buffer.clear();
     ensure_vec_capacity(
         buffer,
-        target_bytes
+        config
+            .body_response
+            .len()
             .max(BODY_RESPONSE_PREFIX.len())
             .saturating_add(GENERATED_RESPONSE_EXTRA_CAPACITY),
     );
     write!(buffer, "222 {article_id} {message_id} body follows\r\n")
         .expect("write to Vec cannot fail");
 
-    if buffer.len() < target_bytes {
-        let missing = target_bytes - buffer.len();
-        append_repeated_payload_at_least(buffer, BODY_LINE, missing);
-    }
+    buffer.extend_from_slice(config.body_payload_for_header(buffer.len()));
 
     append_dot_terminator(buffer);
     buffer.as_slice()
@@ -4978,11 +5003,8 @@ where
                 return false;
             }
             if let Some(message_id) = request.message_id() {
-                let response = build_message_id_article_response_into(
-                    response_buffer,
-                    &message_id,
-                    config.article_bytes,
-                );
+                let response =
+                    build_message_id_article_response_into(response_buffer, &message_id, config);
                 stats
                     .bytes_sent
                     .fetch_add(response.len() as u64, Ordering::Relaxed);
@@ -4990,11 +5012,8 @@ where
                 return false;
             }
             if let Some(article_id) = parse_article_id_arg(request.args()).filter(|id| *id != 1) {
-                let response = build_selected_article_response_into(
-                    response_buffer,
-                    article_id,
-                    config.article_bytes,
-                );
+                let response =
+                    build_selected_article_response_into(response_buffer, article_id, config);
                 stats
                     .bytes_sent
                     .fetch_add(response.len() as u64, Ordering::Relaxed);
@@ -5092,11 +5111,8 @@ where
         RequestKind::Body => {
             stats.body_requests.fetch_add(1, Ordering::Relaxed);
             if let Some(message_id) = request.message_id() {
-                let response = build_message_id_body_response_into(
-                    response_buffer,
-                    &message_id,
-                    config.body_bytes,
-                );
+                let response =
+                    build_message_id_body_response_into(response_buffer, &message_id, config);
                 stats
                     .bytes_sent
                     .fetch_add(response.len() as u64, Ordering::Relaxed);
@@ -5118,11 +5134,8 @@ where
                 return false;
             }
             if article_id != 1 {
-                let response = build_selected_body_response_into(
-                    response_buffer,
-                    article_id,
-                    config.body_bytes,
-                );
+                let response =
+                    build_selected_body_response_into(response_buffer, article_id, config);
                 stats
                     .bytes_sent
                     .fetch_add(response.len() as u64, Ordering::Relaxed);
@@ -5314,9 +5327,7 @@ where
     W: AsyncWrite + Unpin,
 {
     let header = build_article_response_header_into(response_buffer, 0, message_id.as_str());
-    let payload_len =
-        repeated_payload_len_at_least(config.article_bytes.saturating_sub(header.len()));
-    let payload = &config.article_payload[..payload_len];
+    let payload = config.article_payload_for_header(header.len());
     session_stats.bytes_sent +=
         header.len() as u64 + payload.len() as u64 + DOT_TERMINATOR.len() as u64;
 
@@ -5358,11 +5369,9 @@ where
         let header_start = response_buffer.len();
         append_message_id_article_response_header(response_buffer, message_id);
         let header_end = response_buffer.len();
-        let payload_len = repeated_payload_len_at_least(
-            config
-                .article_bytes
-                .saturating_sub(header_end - header_start),
-        );
+        let payload_len = config
+            .article_payload_for_header(header_end - header_start)
+            .len();
         let response_len = (header_end - header_start) + payload_len + DOT_TERMINATOR.len();
         if !ranges.is_empty()
             && batch_bytes.saturating_add(response_len) > MAX_BATCHED_ARTICLE_RESPONSE_BYTES
@@ -5958,6 +5967,8 @@ pub struct ServerConfig {
     pub listen: SocketAddr,
     pub body_bytes: usize,
     pub article_bytes: usize,
+    pub payload_mode: PayloadMode,
+    body_payload: Box<[u8]>,
     body_response: Box<[u8]>,
     article_response: Box<[u8]>,
     article_payload: Box<[u8]>,
@@ -5983,10 +5994,20 @@ impl ServerConfig {
     }
 
     fn from_bound_args(args: ServerArgs, listen: SocketAddr) -> Self {
-        let body_response = build_generated_response(BODY_RESPONSE_PREFIX, args.body_bytes);
-        let article_response =
-            build_generated_response(ARTICLE_RESPONSE_PREFIX, args.article_bytes);
-        let article_payload = build_repeated_payload(args.article_bytes);
+        let body_payload = build_server_payload(args.payload_mode, args.body_bytes);
+        let article_payload = build_server_payload(args.payload_mode, args.article_bytes);
+        let (body_response, article_response) = match args.payload_mode {
+            PayloadMode::Plain => (
+                build_generated_response(BODY_RESPONSE_PREFIX, args.body_bytes),
+                build_generated_response(ARTICLE_RESPONSE_PREFIX, args.article_bytes),
+            ),
+            PayloadMode::Yenc => (
+                frame_prebuilt_payload(BODY_RESPONSE_PREFIX, &body_payload),
+                frame_prebuilt_payload(ARTICLE_RESPONSE_PREFIX, &article_payload),
+            ),
+        };
+        let response_capacity =
+            generated_response_buffer_capacity(article_response.len(), body_response.len());
         let (article_index, article_index_error) = match args.article_dir.as_deref() {
             Some(root) => match ArticleStoreIndex::build(root) {
                 Ok(index) => (Some(Arc::new(index)), None),
@@ -5998,6 +6019,8 @@ impl ServerConfig {
             listen,
             body_bytes: args.body_bytes,
             article_bytes: args.article_bytes,
+            payload_mode: args.payload_mode,
+            body_payload,
             body_response,
             article_response,
             article_payload,
@@ -6016,7 +6039,7 @@ impl ServerConfig {
                     .clamp(1, DEFAULT_PENDING_WRITE_POOL_BUFFERS),
             ),
             generated_response_buffer_pool: GeneratedResponseBufferPool::new(
-                generated_response_buffer_capacity(args.article_bytes, args.body_bytes),
+                response_capacity,
                 args.max_connections
                     .max(1)
                     .clamp(1, DEFAULT_PENDING_WRITE_POOL_BUFFERS),
@@ -6041,6 +6064,24 @@ impl ServerConfig {
 
     pub fn article_response(&self) -> &[u8] {
         &self.article_response
+    }
+
+    fn article_payload_for_header(&self, header_len: usize) -> &[u8] {
+        prepared_payload_slice(
+            self.payload_mode,
+            &self.article_payload,
+            self.article_bytes,
+            header_len,
+        )
+    }
+
+    fn body_payload_for_header(&self, header_len: usize) -> &[u8] {
+        prepared_payload_slice(
+            self.payload_mode,
+            &self.body_payload,
+            self.body_bytes,
+            header_len,
+        )
     }
 
     fn article_index(&self) -> Option<&ArticleStoreIndex> {
@@ -8667,6 +8708,7 @@ mod tests {
             listen: "127.0.0.1:0".parse().unwrap(),
             body_bytes: 1024,
             article_bytes: 2048,
+            payload_mode: PayloadMode::Plain,
             article_dir: None,
             max_connections: 16,
             threads: 1,
@@ -8685,6 +8727,141 @@ mod tests {
 
     fn test_config() -> Arc<ServerConfig> {
         Arc::new(ServerConfig::from_args(test_args()))
+    }
+
+    #[test]
+    fn server_defaults_to_yenc_payload() {
+        let args = ServerArgs::parse_from(["server", "--body-bytes", "4096"]);
+        let config = ServerConfig::from_args(args);
+        let article = Article::parse(config.body_response()).unwrap();
+        assert!(article.body.unwrap().starts_with(b"=ybegin "));
+    }
+
+    fn decode_yenc_response(response: &[u8]) -> Vec<u8> {
+        let directory = unique_temp_dir("yenc-roundtrip");
+        let path = yenc::DecodeOptions::new(&directory)
+            .decode_stream(response)
+            .expect("generated yEnc must pass size and checksum validation");
+        let decoded = fs::read(path).unwrap();
+        fs::remove_dir_all(directory).unwrap();
+        decoded
+    }
+
+    #[test]
+    fn yenc_payload_roundtrips_empty_small_and_large_bodies() {
+        for size in [0, 1, 127, 128, 4096, 768 * 1024] {
+            let mut args = test_args();
+            args.payload_mode = PayloadMode::Yenc;
+            args.body_bytes = size;
+            args.article_bytes = size;
+            let config = ServerConfig::from_args(args);
+            let body = decode_yenc_response(config.body_response());
+            let article = decode_yenc_response(config.article_response());
+            assert_eq!(body.len(), size);
+            assert_eq!(article, body);
+            Article::parse(config.body_response()).unwrap();
+            Article::parse(config.article_response()).unwrap();
+            if size >= 4096 {
+                assert!(body.iter().any(|byte| *byte < 32));
+                assert!(body.iter().any(|byte| *byte > 127));
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_plain_payload_preserves_existing_wire_responses() {
+        let args = ServerArgs::parse_from(["server", "--payload-mode", "plain"]);
+        let config = ServerConfig::from_args(args);
+        assert_eq!(config.payload_mode, PayloadMode::Plain);
+        assert_eq!(
+            config.body_response(),
+            build_generated_response(BODY_RESPONSE_PREFIX, config.body_bytes).as_ref()
+        );
+        assert_eq!(
+            config.article_response(),
+            build_generated_response(ARTICLE_RESPONSE_PREFIX, config.article_bytes).as_ref()
+        );
+    }
+
+    #[test]
+    fn yenc_selector_builders_preserve_payload_and_response_identity() {
+        let mut args = test_args();
+        args.payload_mode = PayloadMode::Yenc;
+        let config = ServerConfig::from_args(args);
+        let message_id = MessageId::from_borrowed("<encoded@test>").unwrap();
+        let mut buffer = Vec::new();
+        let expected_article = decode_yenc_response(config.article_response());
+        let expected_body = decode_yenc_response(config.body_response());
+        for response in [
+            build_selected_article_response_into(&mut buffer, 2, &config).to_vec(),
+            build_message_id_article_response_into(&mut buffer, &message_id, &config).to_vec(),
+        ] {
+            assert_eq!(decode_yenc_response(&response), expected_article);
+            Article::parse(&response).unwrap();
+        }
+        for response in [
+            build_selected_body_response_into(&mut buffer, 2, &config).to_vec(),
+            build_message_id_body_response_into(&mut buffer, &message_id, &config).to_vec(),
+        ] {
+            assert_eq!(decode_yenc_response(&response), expected_body);
+            Article::parse(&response).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn yenc_batched_and_selected_tcp_responses_match_prebuilt_payloads() {
+        let mut args = test_args();
+        args.payload_mode = PayloadMode::Yenc;
+        let config = Arc::new(ServerConfig::from_args(args));
+        let first = MessageId::from_borrowed("<first@test>").unwrap();
+        let second = MessageId::from_borrowed("<second@test>").unwrap();
+        let mut response = Vec::new();
+        let mut expected = GREETING.to_vec();
+        for message_id in [&first, &second] {
+            expected.extend_from_slice(build_message_id_article_response_into(
+                &mut response,
+                message_id,
+                &config,
+            ));
+        }
+        expected.extend_from_slice(build_message_id_body_response_into(
+            &mut response,
+            &first,
+            &config,
+        ));
+        expected.extend_from_slice(QUIT_RESPONSE);
+        let (output, _) = run_session_with_input(
+            config,
+            b"ARTICLE <first@test>\r\nARTICLE <second@test>\r\nBODY <first@test>\r\nQUIT\r\n",
+        )
+        .await;
+        assert_eq!(output, expected);
+    }
+
+    #[test]
+    fn yenc_vectored_article_and_pooled_body_paths_do_not_allocate() {
+        let mut args = test_args();
+        args.payload_mode = PayloadMode::Yenc;
+        args.body_bytes = 768 * 1024;
+        args.article_bytes = 768 * 1024;
+        let config = ServerConfig::from_args(args);
+        let message_id = MessageId::from_borrowed("<allocation@test>").unwrap();
+        let mut response = config.generated_response_buffer_pool.acquire();
+        let mut pending = PendingWrite::new(DEFAULT_PENDING_WRITE_BYTES);
+        let mut sink = tokio::io::sink();
+        let mut stats = SessionStats::default();
+        assert_no_allocations("prepared yEnc responses", || {
+            poll_to_completion(write_message_id_article_response(
+                &mut sink,
+                &mut pending,
+                &mut response,
+                &message_id,
+                &config,
+                &mut stats,
+            ))
+            .unwrap();
+            build_message_id_body_response_into(&mut response, &message_id, &config);
+        });
     }
 
     fn assert_date_response(response: &[u8]) {
@@ -15670,12 +15847,9 @@ mod tests {
         let config = ServerConfig::from_args(test_args());
         let message_id = MessageId::from_borrowed("<bench.123@nntpbench.local>").unwrap();
         let mut expected_buffer = Vec::new();
-        let expected = build_message_id_article_response_into(
-            &mut expected_buffer,
-            &message_id,
-            config.article_bytes,
-        )
-        .to_vec();
+        let expected =
+            build_message_id_article_response_into(&mut expected_buffer, &message_id, &config)
+                .to_vec();
 
         let mut writer = VectoredWriter::default();
         let mut pending = PendingWrite::new(DEFAULT_PENDING_WRITE_BYTES);
@@ -18362,7 +18536,7 @@ mod tests {
             config.body_bytes,
         ));
         let article_response =
-            build_selected_article_response_into(&mut article_response, 2, config.article_bytes);
+            build_selected_article_response_into(&mut article_response, 2, &config);
         let (output, stats) = run_session_with_input(
             config,
             b"GROUP alt.test\r\nLISTGROUP\r\nLISTGROUP alt.test\r\nLISTGROUP 1-\r\nLISTGROUP 2-3\r\nLISTGROUP alt.test 1-10\r\nARTICLE 2\r\nLAST\r\nNEXT\r\n",
@@ -19327,7 +19501,8 @@ mod tests {
                     Some("<segment@test>")
                 );
 
-                let response = build_selected_article_response_into(&mut response_buffer, 2, 1024);
+                let response =
+                    build_selected_article_response_into(&mut response_buffer, 2, &config);
                 assert!(
                     response.starts_with(b"220 2 <article.2@nntpbench.local> article follows\r\n")
                 );

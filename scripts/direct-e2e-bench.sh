@@ -79,6 +79,7 @@ done
 
 LISTEN="${LISTEN:-127.0.0.1:21211}"
 BODY_BYTES="${BODY_BYTES:-786432}"
+PAYLOAD_MODE="${PAYLOAD_MODE:-yenc}"
 ARTICLE_BYTES="${ARTICLE_BYTES:-786432}"
 PENDING_WRITE_BYTES="${PENDING_WRITE_BYTES:-65536}"
 SERVER_THREADS="${SERVER_THREADS:-4}"
@@ -320,6 +321,7 @@ for pending_write_bytes in "${PENDING_WRITE_BYTES_SET[@]}"; do
                 server_command=("$TARGET_DIR/profiling/nntpbench" server \
                     --listen "$LISTEN" \
                     --body-bytes "$BODY_BYTES" \
+                    --payload-mode "$PAYLOAD_MODE" \
                     --article-bytes "$ARTICLE_BYTES" \
                     --threads "$SERVER_THREADS" \
                     --max-pipeline-depth "$MAX_PIPELINE_DEPTH" \
