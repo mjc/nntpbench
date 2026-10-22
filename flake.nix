@@ -75,7 +75,7 @@
             pkgs.cargo-llvm-cov
             gungraunRunner
           ]
-          ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+          ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
             pkgs.coz
             pkgs.heaptrack
             pkgs.inferno
