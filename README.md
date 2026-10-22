@@ -47,6 +47,13 @@ On macOS, the CLI requests user-initiated QoS for the runtime's calling thread
 and worker threads. This gives benchmark work a consistent requested priority
 on Apple Silicon; macOS controls which cores execute each thread.
 
+The public-client TCP throughput benchmarks receive framed responses without
+full article/body validation. To include the validation scan explicitly:
+
+```bash
+cargo bench --bench client_roundtrip -- --ignored article_validated
+```
+
 ## Response ownership
 
 The public client's `BufferedResponseReceiver::receive` owns pending input and
