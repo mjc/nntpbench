@@ -10,7 +10,12 @@ fn check(data: &[u8]) {
         .windows(crate::TERMINATOR.len())
         .position(|bytes| bytes == crate::TERMINATOR)
         .map(|start| start + crate::TERMINATOR.len());
-    assert_eq!(find_terminator_end(data), expected, "input: {data:?}");
+    assert_eq!(find_terminator_end(data), expected, "raw input: {data:?}");
+    assert_eq!(
+        find_streaming_terminator_end(data),
+        expected,
+        "streaming input: {data:?}"
+    );
     #[cfg(any(
         target_arch = "aarch64",
         all(target_arch = "x86_64", target_feature = "avx2")
@@ -26,7 +31,7 @@ fn scan(data: &[u8]) -> (usize, usize) {
     let mut remaining = data;
     let mut count = 0;
     let mut checksum = 0usize;
-    while let Some(end) = find_terminator_end(remaining) {
+    while let Some(end) = find_streaming_terminator_end(remaining) {
         remaining = &remaining[end..];
         count += 1;
         checksum = checksum.wrapping_add(data.len() - remaining.len());

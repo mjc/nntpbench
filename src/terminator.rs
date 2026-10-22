@@ -797,11 +797,11 @@ mod tests {
     fn vector_scanner_rejects_or_collisions_before_the_first_packed_terminator() {
         // These unequal byte pairs pass the CR or LF OR filter.
         let mut input = b"\x04\n.\x09\n\r\x02.\r\x08".repeat(512);
-        assert_eq!(find_terminator_end(&input), None);
+        assert_eq!(find_streaming_terminator_end(&input), None);
         input.extend_from_slice(crate::TERMINATOR);
         let first_end = input.len();
         input.extend_from_slice(b"222 next response\r\nnext body\r\n.\r\n");
-        assert_eq!(find_terminator_end(&input), Some(first_end));
+        assert_eq!(find_streaming_terminator_end(&input), Some(first_end));
     }
 
     fn dot_terminated_block_end_oracle(buffer: &[u8], start: usize) -> Option<usize> {
@@ -1516,7 +1516,7 @@ mod tests {
                 0, 1, 2, 4, 5, 8, 9, b'\r', b'\n', b'.', b'x', 255,
             ]), 0..4096),
         ) {
-            prop_assert_eq!(find_terminator_end(&input), terminator_end_oracle(&input));
+            prop_assert_eq!(find_streaming_terminator_end(&input), terminator_end_oracle(&input));
         }
 
         #[test]
