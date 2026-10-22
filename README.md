@@ -30,6 +30,15 @@ nix develop -c cargo run -- client --connect 127.0.0.1:2119 --request article --
 nix develop -c cargo run -- fetch --connect 127.0.0.1:2119 --request body --selector 1
 ```
 
+Load mode pipelines requests on each connection. `--command-mix mixed` cycles
+ARTICLE, BODY, and STAT, combining multiline payloads with single-line status
+responses. Use `article`, `body`, or `stat` for one command, or `alternate` for
+ARTICLE/BODY. JSON output includes each command's response count.
+
+```bash
+nix develop -c cargo run --release -- client --connect 127.0.0.1:2119 --requests 98304 --connections 16 --command-mix mixed
+```
+
 For repeatable client throughput work, use the Divan benchmarks:
 
 ```bash

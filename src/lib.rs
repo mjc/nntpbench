@@ -671,6 +671,8 @@ mod proptests {
             mix in prop_oneof![
                 Just(ClientCommandMix::Article),
                 Just(ClientCommandMix::Body),
+                Just(ClientCommandMix::Stat),
+                Just(ClientCommandMix::Mixed),
                 Just(ClientCommandMix::Alternate),
             ],
         ) {
@@ -686,8 +688,12 @@ mod proptests {
                     prop_assert_eq!(request.kind(), RequestKind::Body);
                     prop_assert_eq!(request.article_ref(), Some(&ArticleRef::Number(command_id)));
                 }
-                ClientCommandMix::Alternate => {
-                    unreachable!("client_command_kind should normalize Alternate")
+                ClientCommandMix::Stat => {
+                    prop_assert_eq!(request.kind(), RequestKind::Stat);
+                    prop_assert_eq!(request.article_ref(), Some(&ArticleRef::Number(command_id)));
+                }
+                ClientCommandMix::Alternate | ClientCommandMix::Mixed => {
+                    unreachable!("client_command_kind should normalize command mixes")
                 }
             }
             prop_assert!(request.message_id().is_none());
@@ -698,6 +704,8 @@ mod proptests {
             mix in prop_oneof![
                 Just(ClientCommandMix::Article),
                 Just(ClientCommandMix::Body),
+                Just(ClientCommandMix::Stat),
+                Just(ClientCommandMix::Mixed),
                 Just(ClientCommandMix::Alternate),
             ],
             request_index in 0_u64..32,
@@ -837,7 +845,11 @@ pub async fn run_server(args: ServerArgs) -> io::Result<()> {
 pub enum ClientCommandMix {
     Article,
     Body,
+    /// Request single-line article status responses.
+    Stat,
     Alternate,
+    /// Cycle ARTICLE, BODY, and STAT on each connection.
+    Mixed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -1364,6 +1376,8 @@ fn workload_identity(config: &LoadConfig) -> String {
             ClientCommandMix::Article => 0,
             ClientCommandMix::Body => 1,
             ClientCommandMix::Alternate => 2,
+            ClientCommandMix::Stat => 3,
+            ClientCommandMix::Mixed => 4,
         }],
     );
     update_workload_identity(&mut hasher, 10, &config.start_id.to_le_bytes());
@@ -1440,7 +1454,7 @@ fn render_load_manifest(
             "\"phases\":{{\"setup_secs\":{:.9},\"measurement_secs\":{:.9},",
             "\"drain_secs\":{:.9},\"total_elapsed_secs\":{:.9}}},",
             "\"results\":{{\"commands\":{},\"article_responses\":{},\"body_responses\":{},",
-            "\"response_wire_bytes\":{},\"errors\":{},\"accepted_connections\":{},",
+            "\"stat_responses\":{},\"response_wire_bytes\":{},\"errors\":{},\"accepted_connections\":{},",
             "\"outcomes\":{{\"scheduled\":{},\"issued\":{},\"completed\":{},",
             "\"drained\":{},\"incomplete\":{},\"timed_out_connections\":{},",
             "\"missed_issue_deadlines\":{},\"peak_backlog\":{}}},",
@@ -1490,6 +1504,7 @@ fn render_load_manifest(
         snapshot.commands,
         snapshot.article_requests,
         snapshot.body_requests,
+        snapshot.commands - snapshot.article_requests - snapshot.body_requests,
         snapshot.bytes_sent,
         snapshot.errors,
         snapshot.accepted_connections,
@@ -1974,8 +1989,9 @@ impl LoadSession {
                 ClientCommandMix::Body => {
                     session_stats.body_requests = session_stats.body_requests.wrapping_add(1);
                 }
-                ClientCommandMix::Alternate => {
-                    unreachable!("client_command_kind should normalize Alternate")
+                ClientCommandMix::Stat => {}
+                ClientCommandMix::Alternate | ClientCommandMix::Mixed => {
+                    unreachable!("client_command_kind should normalize command mixes")
                 }
             }
             if session_stats.commands >= LOAD_STATS_FLUSH_COMMANDS {
@@ -2579,8 +2595,10 @@ fn client_request_for_command(
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid article number")),
             ClientCommandMix::Body => Request::body_number(command_id)
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid body number")),
-            ClientCommandMix::Alternate => {
-                unreachable!("client_command_kind should normalize Alternate")
+            ClientCommandMix::Stat => Request::stat_number(command_id)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid article number")),
+            ClientCommandMix::Alternate | ClientCommandMix::Mixed => {
+                unreachable!("client_command_kind should normalize command mixes")
             }
         };
     }
@@ -2600,8 +2618,11 @@ fn client_request_for_command(
         ClientCommandMix::Body => Ok(Request::Body {
             article_ref: ArticleRef::MessageId(message_id),
         }),
-        ClientCommandMix::Alternate => {
-            unreachable!("client_command_kind should normalize Alternate")
+        ClientCommandMix::Stat => Ok(Request::Stat {
+            article_ref: ArticleRef::MessageId(message_id),
+        }),
+        ClientCommandMix::Alternate | ClientCommandMix::Mixed => {
+            unreachable!("client_command_kind should normalize command mixes")
         }
     }
 }
@@ -2633,8 +2654,9 @@ fn append_load_workload_request(
     match kind {
         ClientCommandMix::Article => buffer.extend_from_slice(b"ARTICLE "),
         ClientCommandMix::Body => buffer.extend_from_slice(b"BODY "),
-        ClientCommandMix::Alternate => {
-            unreachable!("client_command_kind should normalize Alternate")
+        ClientCommandMix::Stat => buffer.extend_from_slice(b"STAT "),
+        ClientCommandMix::Alternate | ClientCommandMix::Mixed => {
+            unreachable!("client_command_kind should normalize command mixes")
         }
     }
 
@@ -2760,8 +2782,9 @@ fn request_kind_for_normalized_client_command(kind: ClientCommandMix) -> Request
     match kind {
         ClientCommandMix::Article => RequestKind::Article,
         ClientCommandMix::Body => RequestKind::Body,
-        ClientCommandMix::Alternate => {
-            unreachable!("client_command_kind should normalize Alternate")
+        ClientCommandMix::Stat => RequestKind::Stat,
+        ClientCommandMix::Alternate | ClientCommandMix::Mixed => {
+            unreachable!("client_command_kind should normalize command mixes")
         }
     }
 }
@@ -2788,8 +2811,11 @@ pub fn bench_client_segment_request_for_command(
         ClientCommandMix::Body => Ok(Request::Body {
             article_ref: ArticleRef::MessageId(segment_message_id),
         }),
-        ClientCommandMix::Alternate => {
-            unreachable!("client_command_kind should normalize Alternate")
+        ClientCommandMix::Stat => Ok(Request::Stat {
+            article_ref: ArticleRef::MessageId(segment_message_id),
+        }),
+        ClientCommandMix::Alternate | ClientCommandMix::Mixed => {
+            unreachable!("client_command_kind should normalize command mixes")
         }
     }
 }
@@ -2812,9 +2838,9 @@ fn request_message_id_for_command(
     }
 
     match kind {
-        ClientCommandMix::Article | ClientCommandMix::Body => {}
-        ClientCommandMix::Alternate => {
-            unreachable!("client_command_kind should normalize Alternate")
+        ClientCommandMix::Article | ClientCommandMix::Body | ClientCommandMix::Stat => {}
+        ClientCommandMix::Alternate | ClientCommandMix::Mixed => {
+            unreachable!("client_command_kind should normalize command mixes")
         }
     };
     let mut message_id = arrayvec::ArrayString::<64>::new();
@@ -3048,6 +3074,11 @@ fn client_command_kind(id: u64, mix: ClientCommandMix) -> ClientCommandMix {
     match mix {
         ClientCommandMix::Alternate if id.is_multiple_of(2) => ClientCommandMix::Body,
         ClientCommandMix::Alternate => ClientCommandMix::Article,
+        ClientCommandMix::Mixed => match id % 3 {
+            0 => ClientCommandMix::Article,
+            1 => ClientCommandMix::Body,
+            _ => ClientCommandMix::Stat,
+        },
         command => command,
     }
 }
@@ -19843,6 +19874,129 @@ mod tests {
         assert!(measurements[0].0 <= 16);
         assert!(measurements[1].0 <= 16);
         assert!(measurements[1].1 <= measurements[0].1 + 8);
+    }
+
+    #[test]
+    fn mixed_load_requests_cycle_article_body_and_stat() {
+        let mut buffer = Vec::new();
+        for (id, verb, expected_kind) in [
+            (0, "ARTICLE", RequestKind::Article),
+            (1, "BODY", RequestKind::Body),
+            (2, "STAT", RequestKind::Stat),
+            (3, "ARTICLE", RequestKind::Article),
+            (4, "BODY", RequestKind::Body),
+            (5, "STAT", RequestKind::Stat),
+        ] {
+            buffer.clear();
+            bench_append_load_workload_request(&mut buffer, id, id, ClientCommandMix::Mixed)
+                .unwrap();
+            assert_eq!(
+                buffer,
+                format!("{verb} <bench.{id}@nntpbench.local>\r\n").as_bytes()
+            );
+            assert_eq!(
+                request_kind_for_client_command(id, ClientCommandMix::Mixed),
+                expected_kind
+            );
+            let request =
+                client_request_for_command(id, id, ClientCommandMix::Mixed, false, None, 0, 1)
+                    .unwrap();
+            assert_eq!(request.kind(), expected_kind);
+        }
+        let args = FetchArgs::try_parse_from(["nntpbench", "--command-mix", "mixed"]).unwrap();
+        assert_eq!(args.command_mix, ClientCommandMix::Mixed);
+    }
+
+    #[tokio::test]
+    async fn load_mixed_yenc_pipeline_counts_multiline_and_single_line_responses() {
+        for size in [768 * 1024, 1024 * 1024] {
+            for (start_id, verification) in [
+                (0, LoadVerificationPolicy::None),
+                (1, LoadVerificationPolicy::Sampled),
+                (2, LoadVerificationPolicy::Full),
+            ] {
+                let mut server_args = test_args();
+                server_args.payload_mode = PayloadMode::Yenc;
+                server_args.article_bytes = size;
+                server_args.body_bytes = size;
+                let server_config = Arc::new(ServerConfig::from_args(server_args));
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let server = tokio::spawn(async move {
+                    let (stream, peer) = listener.accept().await.unwrap();
+                    serve_session(stream, peer, server_config, Arc::new(Stats::new()))
+                        .await
+                        .unwrap();
+                });
+                let mut args = test_fetch_args();
+                args.connect = address;
+                args.requests = 12;
+                args.command_mix = ClientCommandMix::Mixed;
+                args.start_id = start_id;
+                args.workload_policy = LoadWorkloadPolicy::Repeat;
+                args.verification_policy = verification;
+                args.pipeline_depth = 7;
+                let config = LoadConfig::from_args(args).unwrap();
+                let stats = Arc::new(Stats::new());
+                let outcome = LoadSession::new(&config, 0, start_id, config.requests)
+                    .run(stats.clone(), Arc::new(AtomicBool::new(false)))
+                    .await
+                    .unwrap();
+                server.await.unwrap();
+                let snapshot = stats.snapshot();
+                assert_eq!(snapshot.commands, 12);
+                assert_eq!(snapshot.article_requests, 4);
+                assert_eq!(snapshot.body_requests, 4);
+                assert_eq!(snapshot.errors, 0);
+                assert_eq!(outcome.incomplete_requests, 0);
+                assert_eq!(outcome.timed_out_connections, 0);
+                let manifest: serde_json::Value = serde_json::from_str(&render_load_manifest(
+                    &config,
+                    snapshot,
+                    &outcome,
+                    Duration::from_secs(1),
+                    0.0,
+                    0,
+                ))
+                .unwrap();
+                assert_eq!(manifest["results"]["stat_responses"], 4);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn load_mixed_yenc_reader_preserves_packed_status_and_body_boundaries() {
+        for size in [768 * 1024, 1024 * 1024] {
+            let mut args = test_args();
+            args.payload_mode = PayloadMode::Yenc;
+            args.article_bytes = size;
+            args.body_bytes = size;
+            let config = ServerConfig::from_args(args);
+            let status = b"223 1 <article.1@nntpbench.local> article retrieved\r\n";
+            let frames = [
+                (RequestKind::Stat, status.as_slice()),
+                (RequestKind::Article, config.article_response()),
+                (RequestKind::Stat, status.as_slice()),
+                (RequestKind::Body, config.body_response()),
+                (RequestKind::Stat, status.as_slice()),
+            ];
+            let packed: Vec<u8> = frames
+                .iter()
+                .flat_map(|(_, bytes)| bytes.iter().copied())
+                .collect();
+            for read_bytes in [64 * 1024, 256 * 1024, packed.len()] {
+                let mut stream = packed.as_slice();
+                let mut reader = LoadResponseReader::new(read_bytes, packed.len());
+                for (kind, frame) in frames {
+                    assert_eq!(
+                        reader.read_response(&mut stream, kind, None).await.unwrap(),
+                        frame.len()
+                    );
+                }
+                assert!(stream.is_empty());
+                assert_eq!(reader.start, reader.buffer.len());
+            }
+        }
     }
 
     #[tokio::test]
