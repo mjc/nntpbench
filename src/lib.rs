@@ -2736,6 +2736,35 @@ pub async fn bench_load_read_capacity_in_place(
     Ok((read, buffer.capacity()))
 }
 
+/// Measure the streaming receive path used by the TCP load client.
+#[doc(hidden)]
+pub async fn bench_load_streaming_responses(
+    source: &[u8],
+    buffer: &mut Vec<u8>,
+    read_chunk_bytes: usize,
+    kind: RequestKind,
+    responses: usize,
+) -> io::Result<usize> {
+    let mut source = io::Cursor::new(source);
+    let mut reader = LoadResponseReader {
+        buffer: std::mem::take(buffer),
+        start: 0,
+        read_buffer_bytes: read_chunk_bytes.max(1),
+        max_response_bytes: usize::MAX,
+    };
+    reader.buffer.clear();
+    let mut consumed = 0;
+    let result = async {
+        for _ in 0..responses {
+            consumed += reader.read_response(&mut source, kind, None).await?;
+        }
+        Ok(consumed)
+    }
+    .await;
+    *buffer = reader.buffer;
+    result
+}
+
 fn bench_load_response_verify_inner(
     buffer: &mut Vec<u8>,
     kind: RequestKind,
@@ -19846,6 +19875,43 @@ mod tests {
         assert!(measurements[0].0 <= 16);
         assert!(measurements[1].0 <= 16);
         assert!(measurements[1].1 <= measurements[0].1 + 8);
+    }
+
+    #[tokio::test]
+    async fn load_streaming_yenc_preserves_packed_responses_and_reuses_capacity() {
+        for size in [768 * 1024, 1024 * 1024] {
+            let mut args = test_args();
+            args.payload_mode = PayloadMode::Yenc;
+            args.article_bytes = size;
+            let config = ServerConfig::from_args(args);
+            let source = config.article_response().repeat(3);
+            for chunk_bytes in [256, 16 * 1024, 64 * 1024, 256 * 1024] {
+                let mut buffer = Vec::with_capacity(chunk_bytes);
+                let consumed = bench_load_streaming_responses(
+                    &source,
+                    &mut buffer,
+                    chunk_bytes,
+                    RequestKind::Article,
+                    3,
+                )
+                .await
+                .unwrap();
+                assert_eq!(consumed, source.len());
+                let capacity = buffer.capacity();
+                assert!(capacity <= chunk_bytes * 2);
+                let consumed = bench_load_streaming_responses(
+                    &source,
+                    &mut buffer,
+                    chunk_bytes,
+                    RequestKind::Article,
+                    3,
+                )
+                .await
+                .unwrap();
+                assert_eq!(consumed, source.len());
+                assert_eq!(buffer.capacity(), capacity);
+            }
+        }
     }
 
     #[tokio::test]

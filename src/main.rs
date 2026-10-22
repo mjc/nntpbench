@@ -37,6 +37,9 @@ fn main() -> io::Result<()> {
 }
 
 fn build_runtime(threads: usize) -> io::Result<Runtime> {
+    #[cfg(target_os = "macos")]
+    request_benchmark_qos()?;
+
     let threads = threads.max(1);
     let mut builder = if threads == 1 {
         Builder::new_current_thread()
@@ -46,7 +49,30 @@ fn build_runtime(threads: usize) -> io::Result<Runtime> {
         builder
     };
 
+    #[cfg(target_os = "macos")]
+    builder.on_thread_start(|| {
+        if let Err(error) = request_benchmark_qos() {
+            eprintln!("cannot request benchmark worker QoS: {error}");
+        }
+    });
+
     builder.enable_all().build()
+}
+
+#[cfg(target_os = "macos")]
+fn request_benchmark_qos() -> io::Result<()> {
+    // Keep benchmark work at a consistent requested priority on Apple Silicon;
+    // macOS still decides which cores run each thread.
+    // SAFETY: UserInitiated and relative priority zero are valid API values.
+    // The call affects only the calling thread and takes no pointers.
+    let status = unsafe {
+        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INITIATED, 0)
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::from_raw_os_error(status))
+    }
 }
 
 #[cfg(test)]
@@ -68,6 +94,46 @@ mod tests {
     fn builds_multi_thread_runtime_when_threads_exceeds_one() {
         let runtime = build_runtime(2).unwrap();
         assert_eq!(runtime.block_on(async { 13 }), 13);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn requested_qos_class() -> libc::qos_class_t {
+        let mut class = libc::qos_class_t::QOS_CLASS_UNSPECIFIED;
+        let mut priority = 0;
+        // SAFETY: pthread_self identifies this live thread and both output
+        // pointers refer to initialized values owned by this call.
+        let status = unsafe {
+            libc::pthread_get_qos_class_np(libc::pthread_self(), &mut class, &mut priority)
+        };
+        assert_eq!(status, 0);
+        class
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn runtime_requests_user_initiated_qos_for_current_thread() {
+        // SAFETY: Utility is a valid QoS class and zero is a valid relative
+        // priority. This changes only this test's calling thread.
+        let status =
+            unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0) };
+        assert_eq!(status, 0);
+        let runtime = build_runtime(1).unwrap();
+        assert_eq!(
+            runtime.block_on(async { requested_qos_class() }) as u32,
+            libc::qos_class_t::QOS_CLASS_USER_INITIATED as u32,
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn runtime_workers_request_user_initiated_qos() {
+        let runtime = build_runtime(2).unwrap();
+        let class = runtime.block_on(async {
+            tokio::spawn(async { requested_qos_class() as u32 })
+                .await
+                .unwrap()
+        });
+        assert_eq!(class, libc::qos_class_t::QOS_CLASS_USER_INITIATED as u32);
     }
 
     #[test]

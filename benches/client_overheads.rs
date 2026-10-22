@@ -39,6 +39,50 @@ fn runtime() -> tokio::runtime::Runtime {
     Builder::new_current_thread().enable_all().build().unwrap()
 }
 
+mod load_streaming {
+    use super::{Bencher, RequestKind, black_box, runtime};
+    use clap::Parser;
+    use nntpbench::{ServerArgs, ServerConfig, bench_load_streaming_responses};
+    use std::cell::RefCell;
+
+    #[divan::bench(
+        consts = [786432, 1048576],
+        args = [16384, 65536, 262144],
+        sample_count = 100,
+        sample_size = 10
+    )]
+    fn packed_yenc<const SIZE: usize>(bencher: Bencher, chunk_bytes: usize) {
+        let size = SIZE.to_string();
+        let config =
+            ServerConfig::from_args(ServerArgs::parse_from(["server", "--article-bytes", &size]));
+        let source = config.article_response().repeat(3);
+        let buffer = RefCell::new(Vec::with_capacity(chunk_bytes));
+        let rt = runtime();
+        let consumed = rt
+            .block_on(bench_load_streaming_responses(
+                &source,
+                &mut buffer.borrow_mut(),
+                chunk_bytes,
+                RequestKind::Article,
+                3,
+            ))
+            .unwrap();
+        assert_eq!(consumed, source.len());
+        bencher.bench_local(|| {
+            black_box(
+                rt.block_on(bench_load_streaming_responses(
+                    black_box(&source),
+                    &mut buffer.borrow_mut(),
+                    chunk_bytes,
+                    RequestKind::Article,
+                    3,
+                ))
+                .unwrap(),
+            )
+        });
+    }
+}
+
 mod request_construction {
     use super::{
         Arc, Bencher, ClientCommandMix, MessageId, bench_client_request_for_command,

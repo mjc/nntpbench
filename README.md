@@ -43,6 +43,10 @@ native build:
 BUILD=0 RUNS=10 ./scripts/direct-e2e-bench.sh
 ```
 
+On macOS, the CLI requests user-initiated QoS for the runtime's calling thread
+and worker threads. This gives benchmark work a consistent requested priority
+on Apple Silicon; macOS controls which cores execute each thread.
+
 ## Response ownership
 
 The public client's `BufferedResponseReceiver::receive` owns pending input and

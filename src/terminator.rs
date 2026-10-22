@@ -428,21 +428,6 @@ fn detect_streaming_terminator(tail: &MultilineTerminatorDetector, chunk: &[u8])
         .or_else(|| find_terminator_end(chunk))
 }
 
-#[cfg(any(
-    target_arch = "aarch64",
-    all(target_arch = "x86_64", target_feature = "avx2")
-))]
-#[inline]
-fn find_short_terminator_end(data: &[u8]) -> Option<usize> {
-    memchr::memchr_iter(b'.', data).find_map(|dot| {
-        if dot >= 2 && dot + 2 < data.len() && data[dot - 2..dot + 3] == *crate::TERMINATOR {
-            Some(dot + DOT_TERMINATOR.len())
-        } else {
-            None
-        }
-    })
-}
-
 /// Find the position of the NNTP multiline terminator in data.
 ///
 /// Returns the position after the terminator, or None if not found.
@@ -455,9 +440,11 @@ fn find_terminator_end(data: &[u8]) -> Option<usize> {
         all(target_arch = "x86_64", target_feature = "avx2")
     ))]
     let start = {
-        // Short fragmented reads are faster with the sparse-dot scan.
+        // Use the shared SIMD substring finder for short fragmented reads.
         if data.len() < 512 {
-            return find_short_terminator_end(data);
+            return TERMINATOR_FINDER
+                .find(data)
+                .map(|start| start + crate::TERMINATOR.len());
         }
         // Dot-free prefixes are common in generated/plain-text bodies. Skip
         // them with memchr before paying for a full vector-pattern scan.
