@@ -789,6 +789,31 @@ mod tests {
     }
 
     #[test]
+    fn vector_scanner_preserves_folded_lane_candidates_and_block_overlap() {
+        for size in [768 * 1024, 1024 * 1024] {
+            let mut storage = vec![b'x'; size + 124 + 31 + crate::TERMINATOR.len() * 2];
+            for ending in 0..124 {
+                let alignment = ending % 32;
+                let body_len = size + ending;
+                let frame_end = body_len + crate::TERMINATOR.len();
+                let input = &mut storage[alignment..alignment + frame_end + 5];
+                input.fill(b'x');
+                input[0] = b'.';
+                // These CRs collide after folding four vector lanes, but do
+                // not form a terminator. The verifier must continue scanning.
+                let block = 124 * 64;
+                for lane in [32, 67, 96, 99] {
+                    input[block + lane] = b'\r';
+                }
+                assert_eq!(find_streaming_terminator_end(&input[..body_len]), None);
+                input[body_len..frame_end].copy_from_slice(crate::TERMINATOR);
+                input[frame_end..].copy_from_slice(crate::TERMINATOR);
+                assert_eq!(find_streaming_terminator_end(input), Some(frame_end));
+            }
+        }
+    }
+
+    #[test]
     fn vector_scanner_rejects_or_collisions_before_the_first_packed_terminator() {
         // These unequal byte pairs pass the CR or LF OR filter.
         let mut input = b"\x04\n.\x09\n\r\x02.\r\x08".repeat(512);
