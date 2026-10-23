@@ -439,19 +439,7 @@ fn find_streaming_terminator_end(data: &[u8]) -> Option<usize> {
         target_arch = "aarch64",
         all(target_arch = "x86_64", target_feature = "avx2")
     ))]
-    let start = {
-        // Use the shared SIMD substring finder for short fragmented reads.
-        if data.len() < 512 {
-            return TERMINATOR_FINDER
-                .find(data)
-                .map(|start| start + crate::TERMINATOR.len());
-        }
-        // Dot-free prefixes are common in generated/plain-text bodies. Skip
-        // them with memchr before paying for a full vector-pattern scan.
-        let dot = memchr::memchr(b'.', data)?;
-        let offset = dot.saturating_sub(2);
-        vector_scanner::find(&data[offset..]).map(|start| offset + start)
-    };
+    let start = vector_scanner::find(data);
     #[cfg(not(any(
         target_arch = "aarch64",
         all(target_arch = "x86_64", target_feature = "avx2")
