@@ -3184,6 +3184,11 @@ async fn serve_session_inner(
             break;
         }
 
+        // Keep short response prefixes and tails in the batch's TCP packets.
+        #[cfg(target_os = "linux")]
+        if !config.flush {
+            SockRef::from(writer.as_ref()).set_tcp_cork(true)?;
+        }
         let should_close = process_command_batch(
             &command_batch,
             command_lines.as_ref(),
@@ -3198,6 +3203,10 @@ async fn serve_session_inner(
         )
         .await?
         .should_close();
+        #[cfg(target_os = "linux")]
+        if !config.flush {
+            SockRef::from(writer.as_ref()).set_tcp_cork(false)?;
+        }
         stats.publish_session_delta(session_stats);
         if should_close {
             return Ok(());
@@ -19925,6 +19934,61 @@ mod tests {
         }
         let args = FetchArgs::try_parse_from(["nntpbench", "--command-mix", "mixed"]).unwrap();
         assert_eq!(args.command_mix, ClientCommandMix::Mixed);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn server_uncorks_final_article_and_status_before_reading_next_batch() {
+        for size in [768 * 1024, 1024 * 1024] {
+            for flush in [false, true] {
+                let mut args = test_args();
+                args.payload_mode = PayloadMode::Yenc;
+                args.article_bytes = size;
+                args.flush = flush;
+                let config = Arc::new(ServerConfig::from_args(args));
+                let message_id = MessageId::from_borrowed("<article.1@nntpbench.local>").unwrap();
+                let mut expected = Vec::new();
+                build_message_id_article_response_into(&mut expected, &message_id, &config);
+                expected
+                    .extend_from_slice(b"223 0 <article.1@nntpbench.local> article retrieved\r\n");
+
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let (probe_tx, probe_rx) = tokio::sync::oneshot::channel();
+                let server = tokio::spawn(async move {
+                    let (stream, peer) = listener.accept().await.unwrap();
+                    probe_tx
+                        .send(SockRef::from(&stream).try_clone().unwrap())
+                        .unwrap();
+                    serve_session(stream, peer, config, Arc::new(Stats::new()))
+                        .await
+                        .unwrap();
+                });
+                let mut client = TcpStream::connect(address).await.unwrap();
+                read_greeting(&mut client).await.unwrap();
+                let probe = probe_rx.await.unwrap();
+                client
+                    .write_all(
+                        b"ARTICLE <article.1@nntpbench.local>\r\nSTAT <article.1@nntpbench.local>\r\n",
+                    )
+                    .await
+                    .unwrap();
+                let mut received = vec![0; expected.len()];
+                time::timeout(Duration::from_secs(5), client.read_exact(&mut received))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    received == expected,
+                    "batch bytes differ at {:?}",
+                    received.iter().zip(&expected).position(|(a, b)| a != b)
+                );
+                // A timer flush can deliver bytes while TCP_CORK is still set.
+                assert!(!probe.tcp_cork().unwrap());
+                drop(client);
+                server.await.unwrap();
+            }
+        }
     }
 
     #[tokio::test]
