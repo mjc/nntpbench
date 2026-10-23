@@ -6290,12 +6290,17 @@ pub fn rate(count: u64, seconds: f64) -> f64 {
 #[cfg_attr(coverage_nightly, coverage(off))]
 fn process_cpu_ticks() -> Option<u64> {
     let stat = fs::read_to_string("/proc/self/stat").ok()?;
+    parse_process_cpu_ticks(&stat)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_process_cpu_ticks(stat: &str) -> Option<u64> {
     let after_comm = stat.rsplit_once(") ")?.1;
     let mut fields = after_comm.split_whitespace();
-    fields.next()?;
+    // The suffix starts at field 3 (state); utime and stime are fields 14 and 15.
     let utime = fields.nth(11)?.parse::<u64>().ok()?;
     let stime = fields.next()?.parse::<u64>().ok()?;
-    Some(utime + stime)
+    utime.checked_add(stime)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -9088,6 +9093,21 @@ mod tests {
             }
             Poll::Ready(Ok(()))
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_cpu_ticks_include_user_and_system_time_only() {
+        let stat = "123 (client ) with spaces) R 1 2 3 4 5 6 7 8 9 10 123 456 999 888";
+        assert_eq!(parse_process_cpu_ticks(stat), Some(579));
+        assert_eq!(parse_process_cpu_ticks("123 (client) R 1"), None);
+        assert_eq!(parse_process_cpu_ticks("missing command suffix"), None);
+        assert_eq!(
+            parse_process_cpu_ticks(
+                "123 (client) R 1 2 3 4 5 6 7 8 9 10 18446744073709551615 1 0 0"
+            ),
+            None
+        );
     }
 
     #[test]
