@@ -225,12 +225,16 @@ impl ArticleState<FramedArticleState<Bytes>> {
         let content = bytes
             .get(status_line_end..content_end)
             .ok_or(ClientError::InvalidStatusLine)?;
-        if !crate::protocol::validate_framed_non_article_response_content(
+        let valid = crate::protocol::validate_framed_non_article_response_content(
             kind,
             status,
             status_line,
             content,
-        ) {
+        );
+        // A complete 101 whose capability lines are unusable is still one frame.
+        // The client reports CapabilitiesUnavailable and keeps reading. Poisoning
+        // here would discard a frame the socket has already consumed.
+        if !valid && !(kind == RequestKind::Capabilities && status.as_u16() == 101) {
             return Err(ClientError::InvalidStatusLine);
         }
         let content = self

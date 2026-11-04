@@ -953,6 +953,7 @@ impl ClientConnection {
             .max(crate::terminator::TERMINATOR_TAIL_SIZE);
 
         let gate = Arc::new(PipelineGate::new());
+        let capability_list = Arc::new(Mutex::new(None));
         let writer_task = tokio::spawn(run_writer_task(
             writer,
             request_rx,
@@ -968,13 +969,14 @@ impl ClientConnection {
             poisoned.clone(),
             writer_abort,
             Arc::clone(&gate),
+            Arc::clone(&capability_list),
         ));
 
         Ok(Self {
             inner: Arc::new(ConnectionHandle {
                 request_tx,
                 poisoned,
-                capability_list: Arc::new(Mutex::new(None)),
+                capability_list,
                 capabilities_probe: Arc::new(Mutex::new(())),
                 send_barrier: Arc::new(Mutex::new(())),
                 gate,
@@ -1859,13 +1861,17 @@ impl ClientConnection {
         mark_capabilities_on_success: bool,
         invalidate_capabilities_on_success: bool,
     ) -> Result<PendingResponse, ClientError> {
-        let response_rx = self.enqueue_request(request).await?;
+        let response_rx = self
+            .send_request(
+                request,
+                mark_capabilities_on_success,
+                invalidate_capabilities_on_success,
+            )
+            .await?;
 
         Ok(PendingResponse {
             inner: self.inner.clone(),
             response_rx,
-            mark_capabilities_on_success,
-            invalidate_capabilities_on_success,
         })
     }
 
@@ -1892,25 +1898,79 @@ impl ClientConnection {
         mark_capabilities_on_success: bool,
         invalidate_capabilities_on_success: bool,
     ) -> Result<PendingExchange, ClientError> {
-        let response_rx = self.enqueue_request(request).await?;
+        let response_rx = self
+            .enqueue_request(
+                request,
+                mark_capabilities_on_success,
+                invalidate_capabilities_on_success,
+            )
+            .await?;
 
         Ok(PendingExchange {
             inner: self.inner.clone(),
             response_rx,
-            mark_capabilities_on_success,
-            invalidate_capabilities_on_success,
         })
     }
 
     async fn enqueue_request(
         &self,
         request: Request<'static>,
+        mark_capabilities_on_success: bool,
+        invalidate_capabilities_on_success: bool,
     ) -> Result<oneshot::Receiver<Result<CompletedRequest, SharedEngineError>>, ClientError> {
-        let hold_pipeline = request_kind_requires_barrier(request.kind());
+        loop {
+            let barrier_guard = self.inner.send_barrier.clone().lock_owned().await;
+            if self.inner.gate.closed.load(Ordering::Acquire) {
+                return Err(ClientError::ConnectionClosed);
+            }
+            // The list can be cleared while this task waits for the barrier.
+            // Recheck after the lock, and drop it before probing: the probe
+            // takes the same mutex.
+            if request_kind_requires_capabilities(request.kind())
+                && self.inner.capability_list.lock().await.is_none()
+            {
+                drop(barrier_guard);
+                self.ensure_capabilities_negotiated(request.kind()).await?;
+                continue;
+            }
+            return self
+                .send_request_with_barrier(
+                    request,
+                    mark_capabilities_on_success,
+                    invalidate_capabilities_on_success,
+                    barrier_guard,
+                )
+                .await;
+        }
+    }
+
+    async fn send_request(
+        &self,
+        request: Request<'static>,
+        mark_capabilities_on_success: bool,
+        invalidate_capabilities_on_success: bool,
+    ) -> Result<oneshot::Receiver<Result<CompletedRequest, SharedEngineError>>, ClientError> {
         let barrier_guard = self.inner.send_barrier.clone().lock_owned().await;
         if self.inner.gate.closed.load(Ordering::Acquire) {
             return Err(ClientError::ConnectionClosed);
         }
+        self.send_request_with_barrier(
+            request,
+            mark_capabilities_on_success,
+            invalidate_capabilities_on_success,
+            barrier_guard,
+        )
+        .await
+    }
+
+    async fn send_request_with_barrier(
+        &self,
+        request: Request<'static>,
+        mark_capabilities_on_success: bool,
+        invalidate_capabilities_on_success: bool,
+        barrier_guard: OwnedMutexGuard<()>,
+    ) -> Result<oneshot::Receiver<Result<CompletedRequest, SharedEngineError>>, ClientError> {
+        let hold_pipeline = request_kind_requires_barrier(request.kind());
         let (retained_barrier_guard, enqueue_barrier_guard) = if hold_pipeline {
             (Some(barrier_guard), None)
         } else {
@@ -1925,6 +1985,8 @@ impl ClientConnection {
                 request,
                 response_tx,
                 barrier_guard: retained_barrier_guard,
+                mark_capabilities_on_success,
+                invalidate_capabilities_on_success,
             })
             .await;
         drop(enqueue_barrier_guard);
@@ -2223,6 +2285,7 @@ impl From<SharedEngineError> for ClientError {
         match value {
             SharedEngineError::UnexpectedEof => Self::UnexpectedEof,
             SharedEngineError::InvalidStatusLine => Self::InvalidStatusLine,
+            SharedEngineError::CapabilitiesUnavailable => Self::CapabilitiesUnavailable,
             SharedEngineError::ConnectionClosed => Self::ConnectionClosed,
             SharedEngineError::Io { kind, message } => Self::Io(io::Error::new(kind, message)),
         }
@@ -2425,14 +2488,14 @@ struct QueuedRequest {
     request: Request<'static>,
     response_tx: oneshot::Sender<Result<CompletedRequest, SharedEngineError>>,
     barrier_guard: Option<OwnedMutexGuard<()>>,
+    mark_capabilities_on_success: bool,
+    invalidate_capabilities_on_success: bool,
 }
 
 #[derive(Debug)]
 pub(crate) struct PendingResponse {
     inner: Arc<ConnectionHandle>,
     response_rx: oneshot::Receiver<Result<CompletedRequest, SharedEngineError>>,
-    mark_capabilities_on_success: bool,
-    invalidate_capabilities_on_success: bool,
 }
 
 impl PendingResponse {
@@ -2452,19 +2515,8 @@ impl PendingResponse {
         };
 
         let completed = response.map_err(ClientError::from)?;
-        let request_kind = completed.request.kind();
         match completed.response {
-            CompletedResponse::Owned(response) => {
-                let mut capability_list = self.inner.capability_list.lock().await;
-                store_capability_transition(
-                    &mut capability_list,
-                    request_kind,
-                    &response,
-                    self.mark_capabilities_on_success,
-                    self.invalidate_capabilities_on_success,
-                )?;
-                Ok(response)
-            }
+            CompletedResponse::Owned(response) => Ok(response),
         }
     }
 }
@@ -2473,8 +2525,6 @@ impl PendingResponse {
 pub(crate) struct PendingExchange {
     inner: Arc<ConnectionHandle>,
     response_rx: oneshot::Receiver<Result<CompletedRequest, SharedEngineError>>,
-    mark_capabilities_on_success: bool,
-    invalidate_capabilities_on_success: bool,
 }
 
 impl PendingExchange {
@@ -2494,22 +2544,11 @@ impl PendingExchange {
         };
 
         let completed = response.map_err(ClientError::from)?;
-        let request_kind = completed.request.kind();
         match completed.response {
-            CompletedResponse::Owned(response) => {
-                let mut capability_list = self.inner.capability_list.lock().await;
-                store_capability_transition(
-                    &mut capability_list,
-                    request_kind,
-                    &response,
-                    self.mark_capabilities_on_success,
-                    self.invalidate_capabilities_on_success,
-                )?;
-                Ok(OwnedExchange {
-                    request: completed.request,
-                    response,
-                })
-            }
+            CompletedResponse::Owned(response) => Ok(OwnedExchange {
+                request: completed.request,
+                response,
+            }),
         }
     }
 }
@@ -2555,6 +2594,8 @@ struct InFlightRequest {
     kind: RequestKind,
     response_tx: oneshot::Sender<Result<CompletedRequest, SharedEngineError>>,
     barrier_guard: Option<OwnedMutexGuard<()>>,
+    mark_capabilities_on_success: bool,
+    invalidate_capabilities_on_success: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -2565,6 +2606,7 @@ enum SharedEngineError {
     },
     UnexpectedEof,
     InvalidStatusLine,
+    CapabilitiesUnavailable,
     ConnectionClosed,
 }
 
@@ -2651,6 +2693,8 @@ async fn run_writer_task(
                 kind,
                 response_tx: queued.response_tx,
                 barrier_guard: queued.barrier_guard,
+                mark_capabilities_on_success: queued.mark_capabilities_on_success,
+                invalidate_capabilities_on_success: queued.invalidate_capabilities_on_success,
             };
             gate.begin_inflight();
             if let Err(err) = inflight_tx.send(inflight).await {
@@ -3187,6 +3231,7 @@ async fn run_reader_task(
     poisoned: Arc<Mutex<Option<SharedEngineError>>>,
     writer_abort: tokio::task::AbortHandle,
     gate: Arc<PipelineGate>,
+    capability_list: Arc<Mutex<Option<CapabilityList>>>,
 ) {
     let read_chunk_bytes = read_chunk_bytes.max(1);
     let mut inflight_rx = inflight_rx;
@@ -3198,9 +3243,27 @@ async fn run_reader_task(
             kind,
             response_tx,
             barrier_guard,
+            mark_capabilities_on_success,
+            invalidate_capabilities_on_success,
         } = inflight_request;
         match receiver.receive(kind, read_chunk_bytes).await {
             Ok(response) => {
+                let transition = {
+                    let mut capability_list = capability_list.lock().await;
+                    store_capability_transition(
+                        &mut capability_list,
+                        kind,
+                        &response,
+                        mark_capabilities_on_success,
+                        invalidate_capabilities_on_success,
+                    )
+                };
+                if let Err(err) = transition {
+                    let _ = response_tx.send(Err(shared_engine_error_from_client(err)));
+                    drop(barrier_guard);
+                    gate.end_inflight();
+                    continue;
+                }
                 if kind == RequestKind::Quit && response.status().as_u16() == 205 {
                     gate.closed.store(true, Ordering::Release);
                 }
@@ -3300,6 +3363,7 @@ fn shared_engine_error_from_client(err: ClientError) -> SharedEngineError {
         ClientError::UnexpectedEof => SharedEngineError::UnexpectedEof,
         ClientError::InvalidStatusLine => SharedEngineError::InvalidStatusLine,
         ClientError::ConnectionClosed => SharedEngineError::ConnectionClosed,
+        ClientError::CapabilitiesUnavailable => SharedEngineError::CapabilitiesUnavailable,
         ClientError::InvalidMessageId
         | ClientError::MissingMessageId
         | ClientError::InvalidGroupName
@@ -3318,7 +3382,6 @@ fn shared_engine_error_from_client(err: ClientError) -> SharedEngineError {
         | ClientError::InvalidArticleSelector
         | ClientError::MissingArticleSelector
         | ClientError::InvalidListGroupRange
-        | ClientError::CapabilitiesUnavailable
         | ClientError::UnexpectedArticleResponse { .. } => SharedEngineError::ConnectionClosed,
     }
 }
@@ -4605,6 +4668,86 @@ mod tests {
         assert_eq!(starttls.kind(), RequestKind::StartTls);
         assert_eq!(starttls.status().as_u16(), 382);
 
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn malformed_capability_list_stays_on_the_connection() {
+        let listener = crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"201 client ready\r\n").await.unwrap();
+            assert_read_request(&mut stream, b"CAPABILITIES\r\n").await;
+            stream
+                .write_all(b"101 Capability list:\r\nVERSION 2\r\nOVER EXTRA\r\n.\r\n")
+                .await
+                .unwrap();
+            assert_read_request(&mut stream, b"DATE\r\n").await;
+            stream.write_all(crate::DATE_RESPONSE).await.unwrap();
+        });
+
+        let connection = ClientConnection::connect(addr).await.unwrap();
+        assert!(matches!(
+            connection.capabilities().await,
+            Err(ClientError::CapabilitiesUnavailable)
+        ));
+        assert!(connection.capability_state().await.is_none());
+        assert_eq!(
+            connection.date().await.unwrap().as_bytes(),
+            crate::DATE_RESPONSE
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropped_mode_reader_clears_capabilities_before_the_next_command() {
+        let listener = crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"201 client ready\r\n").await.unwrap();
+            assert_read_request(&mut stream, b"CAPABILITIES\r\n").await;
+            stream
+                .write_all(b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nHDR\r\n.\r\n")
+                .await
+                .unwrap();
+            assert_read_request(&mut stream, b"MODE READER\r\n").await;
+            stream.write_all(crate::MODE_READER_RESPONSE).await.unwrap();
+            assert_read_request(&mut stream, b"CAPABILITIES\r\n").await;
+            stream
+                .write_all(b"101 Capability list:\r\nVERSION 2\r\nHDR\r\n.\r\n")
+                .await
+                .unwrap();
+            assert_read_request(&mut stream, b"HDR Subject 1-10\r\n").await;
+            stream.write_all(crate::HDR_RESPONSE).await.unwrap();
+        });
+
+        let connection = ClientConnection::connect(addr).await.unwrap();
+        connection.capabilities().await.unwrap();
+        drop(
+            connection
+                .queue_request(Request::mode_reader())
+                .await
+                .unwrap(),
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if connection.capability_state().await.is_none() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropped MODE READER left the stored capability list");
+        connection
+            .hdr(
+                HeaderName::from_owned("Subject").unwrap(),
+                ArticleSelector::from_owned("1-10").unwrap(),
+            )
+            .await
+            .unwrap();
         server.await.unwrap();
     }
 

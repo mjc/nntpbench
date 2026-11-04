@@ -5776,6 +5776,22 @@ mod tests {
     }
 
     #[test]
+    fn capability_list_omits_validated_non_keyword_lines() {
+        let content = b"VERSION 2\r\n1RESERVED future-token\r\nHDR\r\n";
+        let list = CapabilityList::parse(content).unwrap();
+
+        assert_eq!(
+            list.entries()
+                .iter()
+                .map(CapabilityEntry::label)
+                .collect::<Vec<_>>(),
+            ["VERSION", "HDR"]
+        );
+        assert!(list.get("1RESERVED").is_none());
+        assert_eq!(list.get("HDR").unwrap().arguments(), &[] as &[&str]);
+    }
+
+    #[test]
     fn capability_list_rejects_invalid_payloads() {
         assert!(CapabilityList::parse(b"READER\r\n").is_none());
         assert!(CapabilityList::parse(b"VERSION 2\r\nVERSION 2\r\n").is_none());
