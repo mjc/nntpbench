@@ -97,9 +97,9 @@ pub use client::{
 };
 pub use protocol::{
     Article, ArticleNumber, ArticleParseError, ArticleRef, ArticleSelector, ArticleTransfer,
-    AuthInfoKind, AuthInfoValue, GroupName, HeaderIter, HeaderName, Headers, ListGroupRange,
-    ListKind, MessageId, NntpDate, NntpTime, Request, RequestKind, RequestLine, StatusCode,
-    Wildmat,
+    AuthInfoKind, AuthInfoValue, CommandCoordination, GroupName, HeaderIter, HeaderName, Headers,
+    ListGroupRange, ListKind, MessageId, NntpDate, NntpTime, Request, RequestKind, RequestLine,
+    StatusCode, Wildmat,
 };
 
 pub const CRLF: &[u8] = b"\r\n";
@@ -2651,6 +2651,13 @@ fn append_load_workload_request(
         total_clients,
     } = workload;
     let kind = client_command_kind(command_id, mix);
+    let request_kind = request_kind_for_normalized_client_command(kind);
+    if !request_kind.coordination().allows_throughput_pipeline() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "throughput pipeline cannot include a barrier or session-changing command",
+        ));
+    }
     match kind {
         ClientCommandMix::Article => buffer.extend_from_slice(b"ARTICLE "),
         ClientCommandMix::Body => buffer.extend_from_slice(b"BODY "),
@@ -19934,6 +19941,44 @@ mod tests {
         }
         let args = FetchArgs::try_parse_from(["nntpbench", "--command-mix", "mixed"]).unwrap();
         assert_eq!(args.command_mix, ClientCommandMix::Mixed);
+    }
+
+    #[test]
+    fn throughput_command_mixes_stay_pipelinable() {
+        for mix in [
+            ClientCommandMix::Article,
+            ClientCommandMix::Body,
+            ClientCommandMix::Stat,
+            ClientCommandMix::Alternate,
+            ClientCommandMix::Mixed,
+        ] {
+            for id in 0..6 {
+                let kind = request_kind_for_client_command(id, mix);
+                assert!(
+                    kind.coordination().allows_throughput_pipeline(),
+                    "{mix:?} id {id} produced {kind:?}"
+                );
+                let mut buffer = Vec::new();
+                bench_append_load_workload_request(&mut buffer, id, id, mix).unwrap();
+                assert!(!buffer.is_empty());
+            }
+        }
+
+        for kind in [
+            RequestKind::Quit,
+            RequestKind::ModeReader,
+            RequestKind::StartTls,
+            RequestKind::Post,
+            RequestKind::Ihave,
+            RequestKind::AuthInfo,
+            RequestKind::Group,
+            RequestKind::Next,
+        ] {
+            assert!(
+                !kind.coordination().allows_throughput_pipeline(),
+                "{kind:?} must stay out of a throughput pipeline"
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]

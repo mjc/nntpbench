@@ -14,7 +14,7 @@ The server is a reader benchmark peer. These commands run as real session behavi
 - `OVER`, `HDR`, `XOVER`, and `XHDR`.
 - `NEWGROUPS` and `NEWNEWS`.
 - `MODE READER`, answered with `201 posting not permitted`.
-- Pipelined commands. Commands that can change connection state take a send barrier so later commands wait.
+- Pipelined commands. `RequestKind::coordination` records whether a later command may be written before the response, whether the command requires the connection alone, whether it changes session or transport state, and whether it enters continuation mode. The client waits until earlier responses finish before writing an exclusive command, and it holds the send barrier until the response when a later command must not follow. After `QUIT` returns 205, further commands are rejected.
 
 `CAPABILITIES` advertises that reader set and nothing else. The fixed body is `CAPABILITIES_RESPONSE` in `src/lib.rs`. It lists `VERSION 2`, `READER`, the `LIST` keywords above, `OVER MSGID`, `HDR`, and `NEWNEWS`. It does not list `STARTTLS`, `AUTHINFO`, `SASL`, `STREAMING`, or `MODE-READER`.
 
@@ -68,7 +68,7 @@ Benchmark shortcut. `MODE STREAM` does not enable streaming.
 
 `HELP` lists `CHECK` while that command returns 502. That help line is a benchmark shortcut.
 
-The client sends `MODE STREAM` through `ClientConnection::execute` without the capability preflight and without the send barrier (`request_kind_requires_capabilities` and `request_kind_requires_barrier` in `src/client.rs`).
+The client sends `MODE STREAM` through `ClientConnection::execute` without the capability preflight and without the send barrier (`request_kind_requires_capabilities` and `request_kind_requires_barrier` in `src/client.rs`). `CHECK` and `TAKETHIS` also allow a following command before their responses. `POST`, `IHAVE`, `AUTHINFO`, `MODE READER`, `STARTTLS`, and `QUIT` do not. The load command mixes (`Article`, `Body`, `Stat`, `Alternate`, `Mixed`) only emit commands whose coordination allows a throughput pipeline.
 
 ### Capability state
 

@@ -6,11 +6,12 @@ use std::io::IoSlice;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use bytes::{BufMut, BytesMut};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::sync::{Mutex, OwnedMutexGuard, mpsc, oneshot};
+use tokio::sync::{Mutex, Notify, OwnedMutexGuard, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::protocol::response_receiver::{self, BufferedResponseReceiver};
@@ -938,11 +939,13 @@ impl ClientConnection {
             .read_buffer_bytes
             .max(crate::terminator::TERMINATOR_TAIL_SIZE);
 
+        let gate = Arc::new(PipelineGate::new());
         let writer_task = tokio::spawn(run_writer_task(
             writer,
             request_rx,
             inflight_tx,
             poisoned.clone(),
+            Arc::clone(&gate),
         ));
         let writer_abort = writer_task.abort_handle();
         let reader_task = tokio::spawn(run_reader_task(
@@ -951,6 +954,7 @@ impl ClientConnection {
             inflight_rx,
             poisoned.clone(),
             writer_abort,
+            Arc::clone(&gate),
         ));
 
         Ok(Self {
@@ -960,6 +964,7 @@ impl ClientConnection {
                 capabilities_negotiated: Arc::new(Mutex::new(false)),
                 capabilities_probe: Arc::new(Mutex::new(())),
                 send_barrier: Arc::new(Mutex::new(())),
+                gate,
                 writer_task,
                 reader_task,
             }),
@@ -1830,26 +1835,7 @@ impl ClientConnection {
         mark_capabilities_on_success: bool,
         invalidate_capabilities_on_success: bool,
     ) -> Result<PendingResponse, ClientError> {
-        let barrier_guard = self.inner.send_barrier.clone().lock_owned().await;
-        let (retained_barrier_guard, enqueue_barrier_guard) =
-            if request_kind_requires_barrier(request.kind()) {
-                (Some(barrier_guard), None)
-            } else {
-                (None, Some(barrier_guard))
-            };
-
-        let (response_tx, response_rx) = oneshot::channel();
-        let send_result = self
-            .inner
-            .request_tx
-            .send(QueuedRequest {
-                request,
-                response_tx,
-                barrier_guard: retained_barrier_guard,
-            })
-            .await;
-        drop(enqueue_barrier_guard);
-        send_result.map_err(|_| ClientError::ConnectionClosed)?;
+        let response_rx = self.enqueue_request(request).await?;
 
         Ok(PendingResponse {
             inner: self.inner.clone(),
@@ -1882,13 +1868,30 @@ impl ClientConnection {
         mark_capabilities_on_success: bool,
         invalidate_capabilities_on_success: bool,
     ) -> Result<PendingExchange, ClientError> {
+        let response_rx = self.enqueue_request(request).await?;
+
+        Ok(PendingExchange {
+            inner: self.inner.clone(),
+            response_rx,
+            mark_capabilities_on_success,
+            invalidate_capabilities_on_success,
+        })
+    }
+
+    async fn enqueue_request(
+        &self,
+        request: Request<'static>,
+    ) -> Result<oneshot::Receiver<Result<CompletedRequest, SharedEngineError>>, ClientError> {
+        let hold_pipeline = request_kind_requires_barrier(request.kind());
         let barrier_guard = self.inner.send_barrier.clone().lock_owned().await;
-        let (retained_barrier_guard, enqueue_barrier_guard) =
-            if request_kind_requires_barrier(request.kind()) {
-                (Some(barrier_guard), None)
-            } else {
-                (None, Some(barrier_guard))
-            };
+        if self.inner.gate.closed.load(Ordering::Acquire) {
+            return Err(ClientError::ConnectionClosed);
+        }
+        let (retained_barrier_guard, enqueue_barrier_guard) = if hold_pipeline {
+            (Some(barrier_guard), None)
+        } else {
+            (None, Some(barrier_guard))
+        };
 
         let (response_tx, response_rx) = oneshot::channel();
         let send_result = self
@@ -1902,13 +1905,7 @@ impl ClientConnection {
             .await;
         drop(enqueue_barrier_guard);
         send_result.map_err(|_| ClientError::ConnectionClosed)?;
-
-        Ok(PendingExchange {
-            inner: self.inner.clone(),
-            response_rx,
-            mark_capabilities_on_success,
-            invalidate_capabilities_on_success,
-        })
+        Ok(response_rx)
     }
 
     /// Execute a client request and return the completed request/response pair.
@@ -1978,19 +1975,7 @@ fn request_kind_invalidates_capabilities(kind: RequestKind) -> bool {
 }
 
 fn request_kind_requires_barrier(kind: RequestKind) -> bool {
-    matches!(
-        kind,
-        RequestKind::AuthInfoUser
-            | RequestKind::AuthInfoPass
-            | RequestKind::AuthInfo
-            | RequestKind::ModeReader
-            | RequestKind::StartTls
-            | RequestKind::Post
-            | RequestKind::Ihave
-            | RequestKind::Check
-            | RequestKind::TakeThis
-            | RequestKind::Quit
-    )
+    !kind.coordination().allows_following_pipeline()
 }
 
 fn response_invalidates_capabilities(kind: RequestKind, status: StatusCode) -> bool {
@@ -2020,8 +2005,49 @@ struct ConnectionHandle {
     capabilities_negotiated: Arc<Mutex<bool>>,
     capabilities_probe: Arc<Mutex<()>>,
     send_barrier: Arc<Mutex<()>>,
+    gate: Arc<PipelineGate>,
     writer_task: JoinHandle<()>,
     reader_task: JoinHandle<()>,
+}
+
+#[derive(Debug)]
+struct PipelineGate {
+    inflight: AtomicUsize,
+    idle: Notify,
+    closed: AtomicBool,
+}
+
+impl PipelineGate {
+    fn new() -> Self {
+        Self {
+            inflight: AtomicUsize::new(0),
+            idle: Notify::new(),
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    async fn wait_until_idle(&self) {
+        loop {
+            let notified = self.idle.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.inflight.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    fn begin_inflight(&self) {
+        self.inflight.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn end_inflight(&self) {
+        let remaining = self.inflight.fetch_sub(1, Ordering::AcqRel);
+        if remaining == 1 {
+            self.idle.notify_one();
+        }
+    }
 }
 
 /// Owned request/response pair for the client connection surface.
@@ -2501,9 +2527,13 @@ async fn run_writer_task(
     mut request_rx: mpsc::Receiver<QueuedRequest>,
     inflight_tx: mpsc::Sender<InFlightRequest>,
     poisoned: Arc<Mutex<Option<SharedEngineError>>>,
+    gate: Arc<PipelineGate>,
 ) {
     while let Some(queued) = request_rx.recv().await {
         let kind = queued.request.kind();
+        if kind.coordination().requires_exclusive_connection() {
+            gate.wait_until_idle().await;
+        }
         if let Err(err) = write_request_wire(&mut writer, &queued.request).await {
             let error = SharedEngineError::Io {
                 kind: err.kind(),
@@ -2520,7 +2550,9 @@ async fn run_writer_task(
             response_tx: queued.response_tx,
             barrier_guard: queued.barrier_guard,
         };
+        gate.begin_inflight();
         if let Err(err) = inflight_tx.send(inflight).await {
+            gate.end_inflight();
             let error = SharedEngineError::ConnectionClosed;
             let _ = err.0.response_tx.send(Err(error.clone()));
             poison_writer_engine(&poisoned, &mut request_rx, error).await;
@@ -2995,6 +3027,7 @@ async fn run_reader_task(
     inflight_rx: mpsc::Receiver<InFlightRequest>,
     poisoned: Arc<Mutex<Option<SharedEngineError>>>,
     writer_abort: tokio::task::AbortHandle,
+    gate: Arc<PipelineGate>,
 ) {
     let read_chunk_bytes = read_chunk_bytes.max(1);
     let mut inflight_rx = inflight_rx;
@@ -3009,13 +3042,18 @@ async fn run_reader_task(
         } = inflight_request;
         match receiver.receive(kind, read_chunk_bytes).await {
             Ok(response) => {
+                if kind == RequestKind::Quit && response.status().as_u16() == 205 {
+                    gate.closed.store(true, Ordering::Release);
+                }
                 let response = CompletedResponse::Owned(response);
                 let _ = response_tx.send(Ok(CompletedRequest { request, response }));
                 drop(barrier_guard);
+                gate.end_inflight();
             }
             Err(err) => {
                 let error = shared_engine_error_from_client(err);
                 let _ = response_tx.send(Err(error.clone()));
+                gate.end_inflight();
                 writer_abort.abort();
                 poison_reader_engine(&poisoned, &mut inflight_rx, error).await;
                 return;
@@ -3913,6 +3951,203 @@ mod tests {
         assert_eq!(quit.status().as_u16(), 205);
 
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn client_connection_rejects_commands_after_quit_205() {
+        use std::time::Duration;
+
+        let listener = crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"201 client ready\r\n").await.unwrap();
+            assert_read_request(&mut stream, b"QUIT\r\n").await;
+            stream.write_all(crate::QUIT_RESPONSE).await.unwrap();
+            let extra = tokio::time::timeout(Duration::from_millis(150), async {
+                let mut buf = [0_u8; 16];
+                stream.read(&mut buf).await
+            })
+            .await;
+            assert!(
+                extra.is_err(),
+                "a command after QUIT 205 must not be written"
+            );
+        });
+
+        let connection = ClientConnection::connect(addr).await.unwrap();
+        let quit = connection.quit().await.unwrap();
+        assert_eq!(quit.status().as_u16(), 205);
+        let next = connection.date().await;
+        assert!(
+            matches!(next, Err(ClientError::ConnectionClosed)),
+            "QUIT 205 leaves the connection unusable, got {next:?}"
+        );
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn client_connection_pipelines_check_commands() {
+        use std::time::Duration;
+
+        let listener = crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"201 client ready\r\n").await.unwrap();
+            assert_read_request(&mut stream, b"CAPABILITIES\r\n").await;
+            stream
+                .write_all(b"101 Capability list:\r\nVERSION 2\r\nSTREAMING\r\n.\r\n")
+                .await
+                .unwrap();
+            assert_read_request(&mut stream, b"CHECK <one@test>\r\n").await;
+            let second = tokio::time::timeout(Duration::from_millis(200), async {
+                assert_read_request(&mut stream, b"CHECK <two@test>\r\n").await;
+            })
+            .await;
+            assert!(
+                second.is_ok(),
+                "CHECK may be pipelined before the previous CHECK response"
+            );
+            stream
+                .write_all(b"238 <one@test> send article to be transferred\r\n")
+                .await
+                .unwrap();
+            stream
+                .write_all(b"438 <two@test> article not wanted\r\n")
+                .await
+                .unwrap();
+        });
+
+        let connection = ClientConnection::connect(addr).await.unwrap();
+        connection.capabilities().await.unwrap();
+        let (first, second) = tokio::join!(
+            connection.check(MessageId::from_str_or_wrap("one@test").unwrap()),
+            connection.check(MessageId::from_str_or_wrap("two@test").unwrap()),
+        );
+        assert_eq!(first.unwrap().status().as_u16(), 238);
+        assert_eq!(second.unwrap().status().as_u16(), 438);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn client_connection_drains_earlier_responses_before_quit() {
+        use std::time::Duration;
+
+        let listener = crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"201 client ready\r\n").await.unwrap();
+            assert_read_request(&mut stream, b"DATE\r\n").await;
+            let quit = tokio::time::timeout(Duration::from_millis(100), async {
+                assert_read_request(&mut stream, b"QUIT\r\n").await;
+            })
+            .await;
+            assert!(
+                quit.is_err(),
+                "QUIT waits until the earlier DATE response is finished"
+            );
+            stream.write_all(crate::DATE_RESPONSE).await.unwrap();
+            assert_read_request(&mut stream, b"QUIT\r\n").await;
+            stream.write_all(crate::QUIT_RESPONSE).await.unwrap();
+        });
+
+        let connection = ClientConnection::connect(addr).await.unwrap();
+        let (date, quit) = tokio::join!(connection.date(), connection.quit());
+        assert_eq!(date.unwrap().status().as_u16(), 111);
+        assert_eq!(quit.unwrap().status().as_u16(), 205);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn client_connection_blocks_following_requests_behind_mode_reader() {
+        use std::time::Duration;
+
+        let listener = crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"201 client ready\r\n").await.unwrap();
+            assert_read_request(&mut stream, b"MODE READER\r\n").await;
+            let following = tokio::time::timeout(Duration::from_millis(100), async {
+                assert_read_request(&mut stream, b"DATE\r\n").await;
+            })
+            .await;
+            assert!(
+                following.is_err(),
+                "DATE must wait until MODE READER completes"
+            );
+            stream.write_all(crate::MODE_READER_RESPONSE).await.unwrap();
+            assert_read_request(&mut stream, b"DATE\r\n").await;
+            stream.write_all(crate::DATE_RESPONSE).await.unwrap();
+        });
+
+        let connection = ClientConnection::connect(addr).await.unwrap();
+        let (mode_reader, date) = tokio::join!(connection.mode_reader(), connection.date());
+        assert_eq!(mode_reader.unwrap().status().as_u16(), 201);
+        assert_eq!(date.unwrap().status().as_u16(), 111);
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn command_coordination_separates_pipeline_session_and_continuation() {
+        let article = RequestKind::Article.coordination();
+        assert!(article.allows_throughput_pipeline());
+        assert!(article.allows_following_pipeline());
+
+        let group = RequestKind::Group.coordination();
+        assert!(group.allows_following_pipeline());
+        assert!(group.changes_session_state());
+        assert!(!group.allows_throughput_pipeline());
+
+        let mode_reader = RequestKind::ModeReader.coordination();
+        assert!(!mode_reader.allows_following_pipeline());
+        assert!(!mode_reader.requires_exclusive_connection());
+        assert!(mode_reader.changes_session_state());
+        assert!(request_kind_requires_barrier(RequestKind::ModeReader));
+
+        let post = RequestKind::Post.coordination();
+        assert!(post.enters_continuation());
+        assert!(post.requires_exclusive_connection());
+        assert!(!post.changes_session_state());
+
+        let authinfo = RequestKind::AuthInfo.coordination();
+        assert!(authinfo.enters_continuation());
+        assert!(authinfo.requires_exclusive_connection());
+        assert!(
+            !RequestKind::AuthInfoUser
+                .coordination()
+                .enters_continuation()
+        );
+
+        let starttls = RequestKind::StartTls.coordination();
+        assert!(starttls.requires_exclusive_connection());
+        assert!(starttls.changes_session_state());
+        assert!(!starttls.enters_continuation());
+
+        let quit = RequestKind::Quit.coordination();
+        assert!(quit.requires_exclusive_connection());
+        assert!(!quit.allows_following_pipeline());
+
+        assert!(
+            RequestKind::Check
+                .coordination()
+                .allows_throughput_pipeline()
+        );
+        assert!(
+            RequestKind::TakeThis
+                .coordination()
+                .allows_throughput_pipeline()
+        );
+        assert!(
+            RequestKind::ModeStream
+                .coordination()
+                .allows_throughput_pipeline()
+        );
+        assert!(!request_kind_requires_barrier(RequestKind::Check));
+        assert!(!request_kind_requires_barrier(RequestKind::ModeStream));
     }
 
     #[test]

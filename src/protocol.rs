@@ -2293,6 +2293,154 @@ impl RequestKind {
     pub fn expects_multiline_response(self, status: StatusCode) -> bool {
         ResponseFraming::for_request_status(self, status).is_multiline()
     }
+
+    /// Pipeline and session rules for this command.
+    ///
+    /// `allows_following_pipeline` is false when the command must end a pipeline
+    /// (RFC 3977 section 3.5). `requires_exclusive_connection` means no other
+    /// command may be outstanding while it runs. `changes_session_state` covers
+    /// transport, authentication, reader mode, and the selected article pointer.
+    /// `enters_continuation` covers a 3xx pause for more client data.
+    #[must_use]
+    pub const fn coordination(self) -> CommandCoordination {
+        match self {
+            Self::Article
+            | Self::Body
+            | Self::Head
+            | Self::Stat
+            | Self::ListActive
+            | Self::ListActiveTimes
+            | Self::ListNewsgroups
+            | Self::ListOverviewFmt
+            | Self::ListHeaders
+            | Self::ListDistribPats
+            | Self::List
+            | Self::Help
+            | Self::Capabilities
+            | Self::Date
+            | Self::Over
+            | Self::Xover
+            | Self::Hdr
+            | Self::Xhdr
+            | Self::NewGroups
+            | Self::NewNews
+            | Self::Check
+            | Self::TakeThis
+            | Self::ModeStream => CommandCoordination::PIPELINED,
+            Self::Group | Self::ListGroup | Self::Last | Self::Next => {
+                CommandCoordination::SESSION_POINTER
+            }
+            Self::Post | Self::Ihave => CommandCoordination::CONTINUATION,
+            Self::AuthInfo => CommandCoordination::AUTH_CONTINUATION,
+            Self::AuthInfoUser | Self::AuthInfoPass => CommandCoordination::AUTH_STEP,
+            Self::StartTls => CommandCoordination::TRANSPORT,
+            Self::ModeReader => CommandCoordination::READER_MODE,
+            Self::Quit => CommandCoordination::SESSION_END,
+            Self::Unknown => CommandCoordination::UNKNOWN,
+        }
+    }
+}
+
+/// How a command shares a connection with the commands around it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommandCoordination {
+    allows_following_pipeline: bool,
+    requires_exclusive_connection: bool,
+    changes_session_state: bool,
+    enters_continuation: bool,
+}
+
+impl CommandCoordination {
+    const PIPELINED: Self = Self {
+        allows_following_pipeline: true,
+        requires_exclusive_connection: false,
+        changes_session_state: false,
+        enters_continuation: false,
+    };
+    const SESSION_POINTER: Self = Self {
+        allows_following_pipeline: true,
+        requires_exclusive_connection: false,
+        changes_session_state: true,
+        enters_continuation: false,
+    };
+    const CONTINUATION: Self = Self {
+        allows_following_pipeline: false,
+        requires_exclusive_connection: true,
+        changes_session_state: false,
+        enters_continuation: true,
+    };
+    const AUTH_CONTINUATION: Self = Self {
+        allows_following_pipeline: false,
+        requires_exclusive_connection: true,
+        changes_session_state: true,
+        enters_continuation: true,
+    };
+    const AUTH_STEP: Self = Self {
+        allows_following_pipeline: false,
+        requires_exclusive_connection: true,
+        changes_session_state: true,
+        enters_continuation: false,
+    };
+    const TRANSPORT: Self = Self {
+        allows_following_pipeline: false,
+        requires_exclusive_connection: true,
+        changes_session_state: true,
+        enters_continuation: false,
+    };
+    const READER_MODE: Self = Self {
+        allows_following_pipeline: false,
+        requires_exclusive_connection: false,
+        changes_session_state: true,
+        enters_continuation: false,
+    };
+    const SESSION_END: Self = Self {
+        allows_following_pipeline: false,
+        requires_exclusive_connection: true,
+        changes_session_state: true,
+        enters_continuation: false,
+    };
+    const UNKNOWN: Self = Self {
+        allows_following_pipeline: false,
+        requires_exclusive_connection: false,
+        changes_session_state: false,
+        enters_continuation: false,
+    };
+
+    /// Later commands may be written before this command's response arrives.
+    #[must_use]
+    pub const fn allows_following_pipeline(self) -> bool {
+        self.allows_following_pipeline
+    }
+
+    /// The connection cannot carry another outstanding command during this one.
+    #[must_use]
+    pub const fn requires_exclusive_connection(self) -> bool {
+        self.requires_exclusive_connection
+    }
+
+    /// Success changes transport, authentication, reader mode, or the article pointer.
+    #[must_use]
+    pub const fn changes_session_state(self) -> bool {
+        self.changes_session_state
+    }
+
+    /// The exchange can pause for a continuation before its final response.
+    #[must_use]
+    pub const fn enters_continuation(self) -> bool {
+        self.enters_continuation
+    }
+
+    /// Safe to place in a throughput pipeline.
+    ///
+    /// A command that changes session state can still be pipelined when its RFC
+    /// text allows it. Throughput batches leave those commands out.
+    #[must_use]
+    pub const fn allows_throughput_pipeline(self) -> bool {
+        self.allows_following_pipeline
+            && !self.requires_exclusive_connection
+            && !self.changes_session_state
+            && !self.enters_continuation
+    }
 }
 
 /// Protocol framing for a response after its status line has been parsed.
