@@ -1,5 +1,19 @@
 //! CRLF line and multiline terminator helpers for NNTP protocol frames.
 
+use std::sync::LazyLock;
+
+#[cfg(test)]
+pub(crate) mod proxy_tests;
+
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_feature = "avx2")
+))]
+mod vector_scanner;
+
+static TERMINATOR_FINDER: LazyLock<memchr::memmem::Finder<'static>> =
+    LazyLock::new(|| memchr::memmem::Finder::new(crate::TERMINATOR));
+
 pub const TERMINATOR_TAIL_SIZE: usize = 4;
 pub const DOT_TERMINATOR: &[u8] = b".\r\n";
 
@@ -229,14 +243,9 @@ impl MultilineTerminatorDetector {
     /// Returns the earliest complete terminator touching the current chunk.
     #[must_use]
     pub fn detect_terminator(&self, chunk: &[u8]) -> TerminatorStatus {
-        match (
-            self.find_spanning_terminator(chunk),
-            find_terminator_end(chunk),
-        ) {
-            (Some(spanning), Some(in_chunk)) => TerminatorStatus::FoundAt(spanning.min(in_chunk)),
-            (Some(spanning), None) => TerminatorStatus::FoundAt(spanning),
-            (None, Some(in_chunk)) => TerminatorStatus::FoundAt(in_chunk),
-            (None, None) => TerminatorStatus::NotFound,
+        match detect_streaming_terminator(self, chunk) {
+            Some(end) => TerminatorStatus::FoundAt(end),
+            None => TerminatorStatus::NotFound,
         }
     }
 }
@@ -413,39 +422,36 @@ impl MultilineFramer {
 }
 
 fn detect_streaming_terminator(tail: &MultilineTerminatorDetector, chunk: &[u8]) -> Option<usize> {
-    match (
-        tail.find_spanning_terminator(chunk),
-        find_in_chunk_terminator(chunk),
-    ) {
-        (Some(spanning), Some(in_chunk)) => Some(spanning.min(in_chunk)),
-        (Some(spanning), None) => Some(spanning),
-        (None, Some(in_chunk)) => Some(in_chunk),
-        (None, None) => None,
-    }
-}
-
-fn find_in_chunk_terminator(chunk: &[u8]) -> Option<usize> {
-    memchr::memchr_iter(b'.', chunk).find_map(|dot| {
-        if dot >= crate::CRLF.len()
-            && dot + crate::CRLF.len() < chunk.len()
-            && chunk[dot - 2] == b'\r'
-            && chunk[dot - 1] == b'\n'
-            && chunk[dot + 1] == b'\r'
-            && chunk[dot + 2] == b'\n'
-        {
-            Some(dot + DOT_TERMINATOR.len())
-        } else {
-            None
-        }
-    })
+    // Spanning matches end within the first four bytes; an in-chunk match
+    // cannot end before byte five, so a spanning match is always first.
+    tail.find_spanning_terminator(chunk)
+        .or_else(|| find_streaming_terminator_end(chunk))
 }
 
 /// Find the position of the NNTP multiline terminator in data.
 ///
 /// Returns the position after the terminator, or None if not found.
 #[inline]
+fn find_streaming_terminator_end(data: &[u8]) -> Option<usize> {
+    // Generic x86 keeps memchr's runtime dispatch. Native ARM64 and AVX2
+    // builds use the fixed-pattern vector scanner from nntp-proxy.
+    #[cfg(any(
+        target_arch = "aarch64",
+        all(target_arch = "x86_64", target_feature = "avx2")
+    ))]
+    let start = vector_scanner::find(data);
+    #[cfg(not(any(
+        target_arch = "aarch64",
+        all(target_arch = "x86_64", target_feature = "avx2")
+    )))]
+    let start = TERMINATOR_FINDER.find(data);
+
+    start.map(|start| start + crate::TERMINATOR.len())
+}
+
+#[inline]
 fn find_terminator_end(data: &[u8]) -> Option<usize> {
-    memchr::memmem::find(data, crate::TERMINATOR).map(|start| start + crate::TERMINATOR.len())
+    find_streaming_terminator_end(data)
 }
 
 /// Find the content end for a complete multiline response frame.
@@ -528,8 +534,7 @@ impl<'a> Iterator for DotTerminatedBlocks<'a> {
         let (content_end, block_end) = if slice.starts_with(DOT_TERMINATOR) {
             (start, start + DOT_TERMINATOR.len())
         } else {
-            let relative = memchr::memmem::find(slice, crate::TERMINATOR)?;
-            let block_end = start + relative + crate::TERMINATOR.len();
+            let block_end = start + find_terminator_end(slice)?;
             (block_end - DOT_TERMINATOR.len(), block_end)
         };
 
@@ -769,6 +774,42 @@ mod tests {
         }
 
         None
+    }
+
+    #[test]
+    fn vector_scanner_preserves_folded_lane_candidates_and_block_overlap() {
+        for size in [768 * 1024, 1024 * 1024] {
+            let mut storage = vec![b'x'; size + 124 + 31 + crate::TERMINATOR.len() * 2];
+            for ending in 0..124 {
+                let alignment = ending % 32;
+                let body_len = size + ending;
+                let frame_end = body_len + crate::TERMINATOR.len();
+                let input = &mut storage[alignment..alignment + frame_end + 5];
+                input.fill(b'x');
+                input[0] = b'.';
+                // These CRs collide after folding four vector lanes, but do
+                // not form a terminator. The verifier must continue scanning.
+                let block = 124 * 64;
+                for lane in [32, 67, 96, 99] {
+                    input[block + lane] = b'\r';
+                }
+                assert_eq!(find_streaming_terminator_end(&input[..body_len]), None);
+                input[body_len..frame_end].copy_from_slice(crate::TERMINATOR);
+                input[frame_end..].copy_from_slice(crate::TERMINATOR);
+                assert_eq!(find_streaming_terminator_end(input), Some(frame_end));
+            }
+        }
+    }
+
+    #[test]
+    fn vector_scanner_rejects_or_collisions_before_the_first_packed_terminator() {
+        // These unequal byte pairs pass the CR or LF OR filter.
+        let mut input = b"\x04\n.\x09\n\r\x02.\r\x08".repeat(512);
+        assert_eq!(find_streaming_terminator_end(&input), None);
+        input.extend_from_slice(crate::TERMINATOR);
+        let first_end = input.len();
+        input.extend_from_slice(b"222 next response\r\nnext body\r\n.\r\n");
+        assert_eq!(find_streaming_terminator_end(&input), Some(first_end));
     }
 
     fn dot_terminated_block_end_oracle(buffer: &[u8], start: usize) -> Option<usize> {
@@ -1476,6 +1517,15 @@ mod tests {
 
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(1024))]
+
+        #[test]
+        fn vector_scanner_matches_rfc_oracle_on_large_dense_inputs(
+            input in vec(prop::sample::select(vec![
+                0, 1, 2, 4, 5, 8, 9, b'\r', b'\n', b'.', b'x', 255,
+            ]), 0..4096),
+        ) {
+            prop_assert_eq!(find_streaming_terminator_end(&input), terminator_end_oracle(&input));
+        }
 
         #[test]
         fn crlf_line_helpers_match_independent_oracles(

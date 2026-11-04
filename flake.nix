@@ -45,6 +45,11 @@
         inherit cargoToml rustPlatform;
       };
 
+      cargoLlvmCov =
+        if pkgs.stdenv.hostPlatform.isDarwin
+        then pkgs.cargo-llvm-cov.overrideAttrs (_: {doCheck = false;})
+        else pkgs.cargo-llvm-cov;
+
       gungraunRunner = rustPlatform.buildRustPackage rec {
         pname = "gungraun-runner";
         version = "0.19.4";
@@ -72,11 +77,11 @@
         packages =
           [
             rustToolchain
-            pkgs.cargo-llvm-cov
-            pkgs.coz
+            cargoLlvmCov
             gungraunRunner
           ]
-          ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+          ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+            pkgs.coz
             pkgs.heaptrack
             pkgs.inferno
             pkgs.perf

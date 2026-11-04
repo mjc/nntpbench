@@ -12,6 +12,14 @@ Run the mock server:
 nix develop -c cargo run -- server --listen 127.0.0.1:2119
 ```
 
+The server generates deterministic yEnc-encoded binary payloads by default.
+`--body-bytes` and `--article-bytes` set the decoded payload size in this mode;
+encoded responses include yEnc headers, escaping, checksums, and NNTP framing.
+Payloads are encoded once at startup and reused during transfers.
+
+Use `--payload-mode plain` for the repeated-text payload. In plain mode the
+size options retain their approximate response wire-size meaning.
+
 Send one request and print the raw NNTP response. `client` is the supported
 request/future client command; `fetch` remains as a compatibility alias for the
 same one-request path. Capability-gated extension commands send `CAPABILITIES`
@@ -21,6 +29,15 @@ page names which builders are only the wire shape.
 ```bash
 nix develop -c cargo run -- client --connect 127.0.0.1:2119 --request article --message-id '<article.1@nntpbench.local>'
 nix develop -c cargo run -- fetch --connect 127.0.0.1:2119 --request body --selector 1
+```
+
+Load mode pipelines requests on each connection. `--command-mix mixed` cycles
+ARTICLE, BODY, and STAT, combining multiline payloads with single-line status
+responses. Use `article`, `body`, or `stat` for one command, or `alternate` for
+ARTICLE/BODY. JSON output includes each command's response count.
+
+```bash
+nix develop -c cargo run --release -- client --connect 127.0.0.1:2119 --requests 98304 --connections 16 --command-mix mixed
 ```
 
 For repeatable client throughput work, use the Divan benchmarks:
@@ -34,6 +51,28 @@ native build:
 
 ```bash
 BUILD=0 RUNS=10 ./scripts/direct-e2e-bench.sh
+```
+
+On macOS, the CLI requests user-initiated QoS for the runtime's calling thread
+and worker threads. This gives benchmark work a consistent requested priority
+on Apple Silicon; macOS controls which cores execute each thread.
+
+`Client::connect` defaults to `ArticleValidation::FramingOnly`: typed article
+and body calls check framing and the expected success status without scanning
+all headers or body lines. Set `ClientOptions::article_validation` to
+`ArticleValidation::Full` to validate before each typed response is returned.
+Raw request methods always return framed responses.
+
+`OwnedArticle::article()` now returns `Result<Article, ArticleParseError>` and
+validates when a parsed view is requested. `OwnedArticle::validate()` and
+`OwnedResponse::into_article()` retain a validated layout for repeated access;
+`as_bytes()` and `content()` do not trigger semantic validation.
+
+The public-client TCP benchmarks use normal typed calls with the default policy.
+To include the full validation scan explicitly:
+
+```bash
+cargo bench --bench client_roundtrip -- --ignored article_validated
 ```
 
 ## Response ownership
@@ -52,11 +91,10 @@ Its private `ChunkConsumed` counts bytes from the latest scanner push;
 Coordinate translation and split/freeze remain inside this boundary; callers do
 not reconstruct them from scanner results.
 
-`OwnedResponse` and `OwnedArticle` keep their existing client API paths.
-Article layouts remain private and associated with immutable bytes. Validation
-retains parsed metadata and transformation requirements; repeated plain-body
-access borrows without semantic revalidation or a discovery scan. Equality
-compares values, not allocation addresses.
+Article layouts remain private and associated with immutable bytes. Full
+validation retains parsed metadata and transformation requirements; subsequent
+plain-body access borrows without semantic revalidation or a discovery scan.
+Framing-only responses validate on each parsed access until explicitly promoted.
 
 The equivalent proxy operation borrows a pooled window and streams it; it does
 not need whole-article ownership. Mutable operations consume their permission;

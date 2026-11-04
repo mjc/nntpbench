@@ -3,6 +3,8 @@
 //! These benches drive the request/future client surface against the real
 //! mock NNTP server over localhost TCP. The one-shot extension paths remain
 //! raw probes unless the benchmark explicitly negotiates capabilities first.
+//! Throughput cases use the typed client with its default framing-only policy.
+//! Full article validation is available in the ignored validated cases.
 //!
 //! Run with: `cargo bench --bench client_roundtrip`
 
@@ -11,7 +13,8 @@ use std::sync::Arc;
 
 use divan::{Bencher, black_box};
 use nntpbench::{
-    Client, ClientOptions, ServerArgs, ServerConfig, Stats, bind_listener, serve_session,
+    ArticleValidation, Client, ClientOptions, ServerArgs, ServerConfig, Stats, bind_listener,
+    serve_session,
 };
 use tokio::runtime::Builder;
 
@@ -19,14 +22,15 @@ fn main() {
     divan::main();
 }
 
-const ARTICLE_64K: usize = 64 * 1024;
-const BODY_64K: usize = 64 * 1024;
+const ARTICLE_768K: usize = 768 * 1024;
+const BODY_768K: usize = 768 * 1024;
 
 fn server_args(body_bytes: usize, article_bytes: usize) -> ServerArgs {
     ServerArgs {
         listen: "127.0.0.1:0".parse().unwrap(),
         body_bytes,
         article_bytes,
+        payload_mode: nntpbench::PayloadMode::Yenc,
         article_dir: None,
         max_connections: 4096,
         threads: 1,
@@ -74,6 +78,20 @@ struct ClientHarness {
 
 impl ClientHarness {
     fn start(body_bytes: usize, article_bytes: usize, pipeline_depth: usize) -> Self {
+        Self::start_with_validation(
+            body_bytes,
+            article_bytes,
+            pipeline_depth,
+            ArticleValidation::default(),
+        )
+    }
+
+    fn start_with_validation(
+        body_bytes: usize,
+        article_bytes: usize,
+        pipeline_depth: usize,
+        article_validation: ArticleValidation,
+    ) -> Self {
         let rt = Builder::new_current_thread().enable_all().build().unwrap();
         let addr = rt.block_on(spawn_server(body_bytes, article_bytes));
         let client = rt
@@ -81,6 +99,7 @@ impl ClientHarness {
                 addr,
                 ClientOptions {
                     pipeline_depth,
+                    article_validation,
                     ..ClientOptions::default()
                 },
             ))
@@ -89,10 +108,10 @@ impl ClientHarness {
     }
 }
 
-fn bench_public_article_roundtrip(bencher: Bencher) {
-    let harness = ClientHarness::start(BODY_64K, ARTICLE_64K, 1);
+fn bench_public_article_roundtrip(bencher: Bencher, size: usize, validation: ArticleValidation) {
+    let harness = ClientHarness::start_with_validation(size, size, 1, validation);
     bencher
-        .counter(divan::counter::BytesCount::new(ARTICLE_64K))
+        .counter(divan::counter::BytesCount::new(size))
         .bench_local(|| {
             black_box(harness.rt.block_on(async {
                 harness
@@ -107,7 +126,7 @@ fn bench_public_article_roundtrip(bencher: Bencher) {
 }
 
 fn bench_raw_capabilities_roundtrip(bencher: Bencher) {
-    let harness = ClientHarness::start(BODY_64K, ARTICLE_64K, 1);
+    let harness = ClientHarness::start(BODY_768K, ARTICLE_768K, 1);
     bencher
         .counter(divan::counter::ItemsCount::new(1usize))
         .bench_local(|| {
@@ -124,7 +143,7 @@ fn bench_raw_capabilities_roundtrip(bencher: Bencher) {
 }
 
 fn bench_pipelined_body_burst(bencher: Bencher) {
-    let harness = ClientHarness::start(BODY_64K, ARTICLE_64K, 4);
+    let harness = ClientHarness::start(BODY_768K, ARTICLE_768K, 4);
     bencher
         .counter(divan::counter::ItemsCount::new(4usize))
         .bench_local(|| {
@@ -143,7 +162,7 @@ fn bench_pipelined_body_burst(bencher: Bencher) {
 }
 
 fn bench_pipelined_mixed_requests(bencher: Bencher) {
-    let harness = ClientHarness::start(BODY_64K, ARTICLE_64K, 4);
+    let harness = ClientHarness::start(BODY_768K, ARTICLE_768K, 4);
     bencher
         .counter(divan::counter::ItemsCount::new(4usize))
         .bench_local(|| {
@@ -165,7 +184,7 @@ fn bench_pipelined_mixed_requests(bencher: Bencher) {
 }
 
 fn bench_pipelined_rfc_grammar_requests(bencher: Bencher) {
-    let harness = ClientHarness::start(BODY_64K, ARTICLE_64K, 4);
+    let harness = ClientHarness::start(BODY_768K, ARTICLE_768K, 4);
     bencher
         .counter(divan::counter::ItemsCount::new(4usize))
         .bench_local(|| {
@@ -187,7 +206,7 @@ fn bench_pipelined_rfc_grammar_requests(bencher: Bencher) {
 }
 
 fn bench_negotiated_session_setup(bencher: Bencher) {
-    let harness = ClientHarness::start(BODY_64K, ARTICLE_64K, 1);
+    let harness = ClientHarness::start(BODY_768K, ARTICLE_768K, 1);
     bencher
         .counter(divan::counter::ItemsCount::new(3usize))
         .bench_local(|| {
@@ -203,13 +222,30 @@ fn bench_negotiated_session_setup(bencher: Bencher) {
 
 mod sequential_roundtrip {
     use super::{
-        Bencher, bench_negotiated_session_setup, bench_public_article_roundtrip,
+        ArticleValidation, Bencher, bench_negotiated_session_setup, bench_public_article_roundtrip,
         bench_raw_capabilities_roundtrip,
     };
 
     #[divan::bench(sample_count = 100, sample_size = 20)]
-    fn article_64k(bencher: Bencher) {
-        bench_public_article_roundtrip(bencher);
+    fn article_768k(bencher: Bencher) {
+        bench_public_article_roundtrip(bencher, 768 * 1024, ArticleValidation::FramingOnly);
+    }
+
+    #[divan::bench(sample_count = 100, sample_size = 20)]
+    fn article_1m(bencher: Bencher) {
+        bench_public_article_roundtrip(bencher, 1024 * 1024, ArticleValidation::FramingOnly);
+    }
+
+    #[divan::bench(sample_count = 100, sample_size = 20)]
+    #[ignore]
+    fn article_validated_768k(bencher: Bencher) {
+        bench_public_article_roundtrip(bencher, 768 * 1024, ArticleValidation::Full);
+    }
+
+    #[divan::bench(sample_count = 100, sample_size = 20)]
+    #[ignore]
+    fn article_validated_1m(bencher: Bencher) {
+        bench_public_article_roundtrip(bencher, 1024 * 1024, ArticleValidation::Full);
     }
 
     #[divan::bench(sample_count = 100, sample_size = 100)]

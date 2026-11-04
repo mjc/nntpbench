@@ -31,8 +31,7 @@ use tokio::task::JoinSet;
 use tokio::time;
 
 use crate::terminator::{
-    BoundedResponseLineStatus, DOT_TERMINATOR, EmptyMultilineTerminator, EmptyTerminatorStatus,
-    MultilineTerminatorDetector, ResponseLineStatus, TerminatorStatus, append_dot_terminator,
+    BoundedResponseLineStatus, DOT_TERMINATOR, ResponseLineStatus, append_dot_terminator,
     detect_bounded_response_line_end, detect_response_line_end_from, find_crlf_line_end,
     find_dot_terminated_block, strip_complete_crlf_line,
 };
@@ -83,16 +82,18 @@ unsafe impl GlobalAlloc for CountingAllocator {
 
 mod article_store;
 pub mod client;
+mod payload;
 pub mod protocol;
 pub mod terminator;
+pub use payload::PayloadMode;
 
 use article_store::{ArticleStoreKey, open_article_response_into};
 #[cfg(test)]
 use article_store::{article_id_tree_path, message_id_tree_path};
 
 pub use client::{
-    Client, ClientConnection, ClientError, ClientOptions, OwnedArticle, OwnedArticleExchange,
-    OwnedExchange, OwnedResponse,
+    ArticleValidation, Client, ClientConnection, ClientError, ClientOptions, OwnedArticle,
+    OwnedArticleExchange, OwnedExchange, OwnedResponse,
 };
 pub use protocol::{
     Article, ArticleNumber, ArticleParseError, ArticleRef, ArticleSelector, ArticleTransfer,
@@ -564,13 +565,17 @@ pub struct ServerArgs {
     #[arg(long, default_value = "127.0.0.1:1199")]
     pub listen: SocketAddr,
 
-    /// Approximate body bytes returned for BODY.
+    /// Decoded yEnc payload bytes, or approximate BODY response wire bytes in plain mode.
     #[arg(long, default_value_t = 64 * 1024)]
     pub body_bytes: usize,
 
-    /// Approximate full article bytes returned for ARTICLE, including headers.
+    /// Decoded yEnc payload bytes, or approximate ARTICLE response wire bytes in plain mode.
     #[arg(long, default_value_t = 68 * 1024)]
     pub article_bytes: usize,
+
+    /// Payload generated for ARTICLE and BODY responses.
+    #[arg(long, value_enum, default_value_t = PayloadMode::Yenc)]
+    pub payload_mode: PayloadMode,
 
     /// Directory tree containing complete ARTICLE response frames keyed by ARTICLE selector.
     #[arg(long)]
@@ -666,6 +671,8 @@ mod proptests {
             mix in prop_oneof![
                 Just(ClientCommandMix::Article),
                 Just(ClientCommandMix::Body),
+                Just(ClientCommandMix::Stat),
+                Just(ClientCommandMix::Mixed),
                 Just(ClientCommandMix::Alternate),
             ],
         ) {
@@ -681,8 +688,12 @@ mod proptests {
                     prop_assert_eq!(request.kind(), RequestKind::Body);
                     prop_assert_eq!(request.article_ref(), Some(&ArticleRef::Number(command_id)));
                 }
-                ClientCommandMix::Alternate => {
-                    unreachable!("client_command_kind should normalize Alternate")
+                ClientCommandMix::Stat => {
+                    prop_assert_eq!(request.kind(), RequestKind::Stat);
+                    prop_assert_eq!(request.article_ref(), Some(&ArticleRef::Number(command_id)));
+                }
+                ClientCommandMix::Alternate | ClientCommandMix::Mixed => {
+                    unreachable!("client_command_kind should normalize command mixes")
                 }
             }
             prop_assert!(request.message_id().is_none());
@@ -693,6 +704,8 @@ mod proptests {
             mix in prop_oneof![
                 Just(ClientCommandMix::Article),
                 Just(ClientCommandMix::Body),
+                Just(ClientCommandMix::Stat),
+                Just(ClientCommandMix::Mixed),
                 Just(ClientCommandMix::Alternate),
             ],
             request_index in 0_u64..32,
@@ -832,7 +845,11 @@ pub async fn run_server(args: ServerArgs) -> io::Result<()> {
 pub enum ClientCommandMix {
     Article,
     Body,
+    /// Request single-line article status responses.
+    Stat,
     Alternate,
+    /// Cycle ARTICLE, BODY, and STAT on each connection.
+    Mixed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -1116,6 +1133,7 @@ pub async fn fetch_response(args: &FetchArgs) -> Result<OwnedResponse, ClientErr
             socket_recv_buffer: args.socket_recv_buffer,
             socket_send_buffer: args.socket_send_buffer,
             pipeline_depth: args.pipeline_depth.clamp(1, 4096),
+            ..ClientOptions::default()
         },
     )
     .await?;
@@ -1358,6 +1376,8 @@ fn workload_identity(config: &LoadConfig) -> String {
             ClientCommandMix::Article => 0,
             ClientCommandMix::Body => 1,
             ClientCommandMix::Alternate => 2,
+            ClientCommandMix::Stat => 3,
+            ClientCommandMix::Mixed => 4,
         }],
     );
     update_workload_identity(&mut hasher, 10, &config.start_id.to_le_bytes());
@@ -1434,7 +1454,7 @@ fn render_load_manifest(
             "\"phases\":{{\"setup_secs\":{:.9},\"measurement_secs\":{:.9},",
             "\"drain_secs\":{:.9},\"total_elapsed_secs\":{:.9}}},",
             "\"results\":{{\"commands\":{},\"article_responses\":{},\"body_responses\":{},",
-            "\"response_wire_bytes\":{},\"errors\":{},\"accepted_connections\":{},",
+            "\"stat_responses\":{},\"response_wire_bytes\":{},\"errors\":{},\"accepted_connections\":{},",
             "\"outcomes\":{{\"scheduled\":{},\"issued\":{},\"completed\":{},",
             "\"drained\":{},\"incomplete\":{},\"timed_out_connections\":{},",
             "\"missed_issue_deadlines\":{},\"peak_backlog\":{}}},",
@@ -1484,6 +1504,7 @@ fn render_load_manifest(
         snapshot.commands,
         snapshot.article_requests,
         snapshot.body_requests,
+        snapshot.commands - snapshot.article_requests - snapshot.body_requests,
         snapshot.bytes_sent,
         snapshot.errors,
         snapshot.accepted_connections,
@@ -1516,7 +1537,7 @@ fn render_server_manifest(
             "{{\"schema_version\":1,\"tool\":\"nntpbench\",\"version\":{},\"mode\":\"server\",",
             "\"host\":{{\"os\":{},\"arch\":{},\"cpu_model\":{},\"loopback\":{}}},",
             "\"config\":{{\"listen\":{},\"body_bytes\":{},\"article_bytes\":{},",
-            "\"article_dir\":{},\"max_connections\":{},\"max_pipeline_depth\":{},",
+            "\"payload_mode\":{},\"article_dir\":{},\"max_connections\":{},\"max_pipeline_depth\":{},",
             "\"stats_interval_secs\":{},\"flush\":{},\"pending_write_bytes\":{},",
             "\"nodelay\":{},\"socket_recv_buffer\":{},\"socket_send_buffer\":{}}},",
             "\"results\":{{\"accepted_connections\":{},\"refused_connections\":{},",
@@ -1536,6 +1557,7 @@ fn render_server_manifest(
         json_string(&config.listen.to_string()),
         config.body_bytes,
         config.article_bytes,
+        json_debug(&config.payload_mode),
         json_option_string(
             config
                 .article_dir
@@ -1958,7 +1980,7 @@ impl LoadSession {
             if was_draining {
                 outcome.drained_requests += 1;
             }
-            #[cfg(feature = "coz")]
+            #[cfg(all(feature = "coz", target_os = "linux"))]
             coz::progress!("client.response");
             match client_command_kind(command_id, self.command_mix) {
                 ClientCommandMix::Article => {
@@ -1967,8 +1989,9 @@ impl LoadSession {
                 ClientCommandMix::Body => {
                     session_stats.body_requests = session_stats.body_requests.wrapping_add(1);
                 }
-                ClientCommandMix::Alternate => {
-                    unreachable!("client_command_kind should normalize Alternate")
+                ClientCommandMix::Stat => {}
+                ClientCommandMix::Alternate | ClientCommandMix::Mixed => {
+                    unreachable!("client_command_kind should normalize command mixes")
                 }
             }
             if session_stats.commands >= LOAD_STATS_FLUSH_COMMANDS {
@@ -2164,9 +2187,7 @@ impl LoadResponseReader {
     where
         R: AsyncRead + Unpin,
     {
-        let mut empty_detector = EmptyMultilineTerminator::default();
-        let mut content_started = false;
-        let mut detector = MultilineTerminatorDetector::default();
+        let mut framer = terminator::MultilineFramer::default();
         let mut response_len = 0_usize;
         let mut multiline = false;
 
@@ -2186,51 +2207,21 @@ impl LoadResponseReader {
 
             if multiline {
                 let data = &self.buffer[self.start..];
-                if !content_started {
-                    match empty_detector.detect(data) {
-                        EmptyTerminatorStatus::FoundAt(consumed) => {
-                            let frame_len = bounded_response_len(
-                                response_len,
-                                consumed,
-                                self.max_response_bytes,
-                            )?;
-                            self.start += consumed;
-                            return Ok(frame_len);
-                        }
-                        EmptyTerminatorStatus::NeedMore => {
-                            response_len = bounded_response_len(
-                                response_len,
-                                data.len(),
-                                self.max_response_bytes,
-                            )?;
-                            self.start = self.buffer.len();
-                        }
-                        EmptyTerminatorStatus::NotFound { .. } => {
-                            content_started = true;
-                        }
+                match framer.push(data) {
+                    terminator::MultilineFrameProgress::Complete(bounds) => {
+                        let consumed = bounds.chunk_consumed().get();
+                        let frame_len =
+                            bounded_response_len(response_len, consumed, self.max_response_bytes)?;
+                        self.start += consumed;
+                        return Ok(frame_len);
                     }
-                }
-
-                if content_started {
-                    match detector.detect_terminator(data) {
-                        TerminatorStatus::FoundAt(consumed) => {
-                            let frame_len = bounded_response_len(
-                                response_len,
-                                consumed,
-                                self.max_response_bytes,
-                            )?;
-                            self.start += consumed;
-                            return Ok(frame_len);
-                        }
-                        TerminatorStatus::NotFound => {
-                            response_len = bounded_response_len(
-                                response_len,
-                                data.len(),
-                                self.max_response_bytes,
-                            )?;
-                            detector.update(data);
-                            self.start = self.buffer.len();
-                        }
+                    terminator::MultilineFrameProgress::NeedMore => {
+                        response_len = bounded_response_len(
+                            response_len,
+                            data.len(),
+                            self.max_response_bytes,
+                        )?;
+                        self.start = self.buffer.len();
                     }
                 }
             }
@@ -2604,8 +2595,10 @@ fn client_request_for_command(
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid article number")),
             ClientCommandMix::Body => Request::body_number(command_id)
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid body number")),
-            ClientCommandMix::Alternate => {
-                unreachable!("client_command_kind should normalize Alternate")
+            ClientCommandMix::Stat => Request::stat_number(command_id)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid article number")),
+            ClientCommandMix::Alternate | ClientCommandMix::Mixed => {
+                unreachable!("client_command_kind should normalize command mixes")
             }
         };
     }
@@ -2625,8 +2618,11 @@ fn client_request_for_command(
         ClientCommandMix::Body => Ok(Request::Body {
             article_ref: ArticleRef::MessageId(message_id),
         }),
-        ClientCommandMix::Alternate => {
-            unreachable!("client_command_kind should normalize Alternate")
+        ClientCommandMix::Stat => Ok(Request::Stat {
+            article_ref: ArticleRef::MessageId(message_id),
+        }),
+        ClientCommandMix::Alternate | ClientCommandMix::Mixed => {
+            unreachable!("client_command_kind should normalize command mixes")
         }
     }
 }
@@ -2658,8 +2654,9 @@ fn append_load_workload_request(
     match kind {
         ClientCommandMix::Article => buffer.extend_from_slice(b"ARTICLE "),
         ClientCommandMix::Body => buffer.extend_from_slice(b"BODY "),
-        ClientCommandMix::Alternate => {
-            unreachable!("client_command_kind should normalize Alternate")
+        ClientCommandMix::Stat => buffer.extend_from_slice(b"STAT "),
+        ClientCommandMix::Alternate | ClientCommandMix::Mixed => {
+            unreachable!("client_command_kind should normalize command mixes")
         }
     }
 
@@ -2729,6 +2726,35 @@ pub async fn bench_load_read_capacity_in_place(
     Ok((read, buffer.capacity()))
 }
 
+/// Measure the streaming receive path used by the TCP load client.
+#[doc(hidden)]
+pub async fn bench_load_streaming_responses(
+    source: &[u8],
+    buffer: &mut Vec<u8>,
+    read_chunk_bytes: usize,
+    kind: RequestKind,
+    responses: usize,
+) -> io::Result<usize> {
+    let mut source = io::Cursor::new(source);
+    let mut reader = LoadResponseReader {
+        buffer: std::mem::take(buffer),
+        start: 0,
+        read_buffer_bytes: read_chunk_bytes.max(1),
+        max_response_bytes: usize::MAX,
+    };
+    reader.buffer.clear();
+    let mut consumed = 0;
+    let result = async {
+        for _ in 0..responses {
+            consumed += reader.read_response(&mut source, kind, None).await?;
+        }
+        Ok(consumed)
+    }
+    .await;
+    *buffer = reader.buffer;
+    result
+}
+
 fn bench_load_response_verify_inner(
     buffer: &mut Vec<u8>,
     kind: RequestKind,
@@ -2756,8 +2782,9 @@ fn request_kind_for_normalized_client_command(kind: ClientCommandMix) -> Request
     match kind {
         ClientCommandMix::Article => RequestKind::Article,
         ClientCommandMix::Body => RequestKind::Body,
-        ClientCommandMix::Alternate => {
-            unreachable!("client_command_kind should normalize Alternate")
+        ClientCommandMix::Stat => RequestKind::Stat,
+        ClientCommandMix::Alternate | ClientCommandMix::Mixed => {
+            unreachable!("client_command_kind should normalize command mixes")
         }
     }
 }
@@ -2784,8 +2811,11 @@ pub fn bench_client_segment_request_for_command(
         ClientCommandMix::Body => Ok(Request::Body {
             article_ref: ArticleRef::MessageId(segment_message_id),
         }),
-        ClientCommandMix::Alternate => {
-            unreachable!("client_command_kind should normalize Alternate")
+        ClientCommandMix::Stat => Ok(Request::Stat {
+            article_ref: ArticleRef::MessageId(segment_message_id),
+        }),
+        ClientCommandMix::Alternate | ClientCommandMix::Mixed => {
+            unreachable!("client_command_kind should normalize command mixes")
         }
     }
 }
@@ -2808,9 +2838,9 @@ fn request_message_id_for_command(
     }
 
     match kind {
-        ClientCommandMix::Article | ClientCommandMix::Body => {}
-        ClientCommandMix::Alternate => {
-            unreachable!("client_command_kind should normalize Alternate")
+        ClientCommandMix::Article | ClientCommandMix::Body | ClientCommandMix::Stat => {}
+        ClientCommandMix::Alternate | ClientCommandMix::Mixed => {
+            unreachable!("client_command_kind should normalize command mixes")
         }
     };
     let mut message_id = arrayvec::ArrayString::<64>::new();
@@ -3044,6 +3074,11 @@ fn client_command_kind(id: u64, mix: ClientCommandMix) -> ClientCommandMix {
     match mix {
         ClientCommandMix::Alternate if id.is_multiple_of(2) => ClientCommandMix::Body,
         ClientCommandMix::Alternate => ClientCommandMix::Article,
+        ClientCommandMix::Mixed => match id % 3 {
+            0 => ClientCommandMix::Article,
+            1 => ClientCommandMix::Body,
+            _ => ClientCommandMix::Stat,
+        },
         command => command,
     }
 }
@@ -3149,6 +3184,11 @@ async fn serve_session_inner(
             break;
         }
 
+        // Keep short response prefixes and tails in the batch's TCP packets.
+        #[cfg(target_os = "linux")]
+        if !config.flush {
+            SockRef::from(writer.as_ref()).set_tcp_cork(true)?;
+        }
         let should_close = process_command_batch(
             &command_batch,
             command_lines.as_ref(),
@@ -3163,6 +3203,10 @@ async fn serve_session_inner(
         )
         .await?
         .should_close();
+        #[cfg(target_os = "linux")]
+        if !config.flush {
+            SockRef::from(writer.as_ref()).set_tcp_cork(false)?;
+        }
         stats.publish_session_delta(session_stats);
         if should_close {
             return Ok(());
@@ -3354,7 +3398,7 @@ where
             )
             .await?;
             if batched != 0 {
-                #[cfg(feature = "coz")]
+                #[cfg(all(feature = "coz", target_os = "linux"))]
                 for _ in 0..batched {
                     coz::progress!("server.command");
                 }
@@ -3377,7 +3421,7 @@ where
             aux_response_buffer,
         )
         .await?;
-        #[cfg(feature = "coz")]
+        #[cfg(all(feature = "coz", target_os = "linux"))]
         coz::progress!("server.command");
         if should_close {
             flush_session_writer(writer, pending_write, config).await?;
@@ -3481,11 +3525,8 @@ where
                 )
                 .await?;
             } else {
-                let response = build_selected_article_response_into(
-                    response_buffer,
-                    article_id,
-                    config.article_bytes,
-                );
+                let response =
+                    build_selected_article_response_into(response_buffer, article_id, config);
                 write_response(writer, pending_write, response, session_stats).await?;
             }
             Ok(false)
@@ -3744,11 +3785,8 @@ where
                     .await?;
                     return Ok(false);
                 }
-                let response = build_message_id_body_response_into(
-                    response_buffer,
-                    &message_id,
-                    config.body_bytes,
-                );
+                let response =
+                    build_message_id_body_response_into(response_buffer, &message_id, config);
                 write_response(writer, pending_write, response, session_stats).await?;
                 return Ok(false);
             }
@@ -3797,11 +3835,8 @@ where
                     session_state.current_article = Some(article_id);
                     return Ok(false);
                 }
-                let response = build_selected_body_response_into(
-                    response_buffer,
-                    article_id,
-                    config.body_bytes,
-                );
+                let response =
+                    build_selected_body_response_into(response_buffer, article_id, config);
                 write_response(writer, pending_write, response, session_stats).await?;
             }
             session_state.current_article = Some(article_id);
@@ -4463,6 +4498,35 @@ fn build_generated_response(prefix: &[u8], target_bytes: usize) -> Box<[u8]> {
     buffer.into_boxed_slice()
 }
 
+fn build_server_payload(mode: PayloadMode, size: usize) -> Box<[u8]> {
+    match mode {
+        PayloadMode::Plain => build_repeated_payload(size),
+        PayloadMode::Yenc => payload::encode_yenc_payload(size),
+    }
+}
+
+fn frame_prebuilt_payload(prefix: &[u8], payload: &[u8]) -> Box<[u8]> {
+    let mut response = Vec::with_capacity(prefix.len() + payload.len() + DOT_TERMINATOR.len());
+    response.extend_from_slice(prefix);
+    response.extend_from_slice(payload);
+    append_dot_terminator(&mut response);
+    response.into_boxed_slice()
+}
+
+fn prepared_payload_slice(
+    mode: PayloadMode,
+    payload: &[u8],
+    target_bytes: usize,
+    header_len: usize,
+) -> &[u8] {
+    match mode {
+        PayloadMode::Yenc => payload,
+        PayloadMode::Plain => {
+            &payload[..repeated_payload_len_at_least(target_bytes.saturating_sub(header_len))]
+        }
+    }
+}
+
 fn build_repeated_payload(target_bytes: usize) -> Box<[u8]> {
     let mut buffer = Vec::with_capacity(target_bytes.saturating_add(BODY_LINE.len()));
     append_repeated_payload_at_least(&mut buffer, BODY_LINE, target_bytes);
@@ -4527,88 +4591,86 @@ fn append_message_id_article_response_header(buffer: &mut Vec<u8>, message_id: &
     buffer.extend_from_slice(CRLF);
 }
 
-fn build_selected_article_response_into(
-    buffer: &mut Vec<u8>,
+fn build_selected_article_response_into<'a>(
+    buffer: &'a mut Vec<u8>,
     article_id: u64,
-    target_bytes: usize,
-) -> &[u8] {
+    config: &ServerConfig,
+) -> &'a [u8] {
     let mut message_id = arrayvec::ArrayString::<64>::new();
     write!(&mut message_id, "<article.{article_id}@nntpbench.local>")
         .expect("write to ArrayString cannot fail");
-    build_article_response_into(buffer, article_id, &message_id, target_bytes)
+    build_article_response_into(buffer, article_id, &message_id, config)
 }
 
 fn build_message_id_article_response_into<'a>(
     buffer: &'a mut Vec<u8>,
     message_id: &MessageId<'_>,
-    target_bytes: usize,
+    config: &ServerConfig,
 ) -> &'a [u8] {
-    build_article_response_into(buffer, 0, message_id.as_str(), target_bytes)
+    build_article_response_into(buffer, 0, message_id.as_str(), config)
 }
 
 fn build_article_response_into<'a>(
     buffer: &'a mut Vec<u8>,
     article_id: u64,
     message_id: &str,
-    target_bytes: usize,
+    config: &ServerConfig,
 ) -> &'a [u8] {
     buffer.clear();
     ensure_vec_capacity(
         buffer,
-        target_bytes
+        config
+            .article_response
+            .len()
             .max(ARTICLE_RESPONSE_PREFIX.len())
             .saturating_add(GENERATED_RESPONSE_EXTRA_CAPACITY),
     );
     build_article_response_header_into(buffer, article_id, message_id);
 
-    if buffer.len() < target_bytes {
-        let missing = target_bytes - buffer.len();
-        append_repeated_payload_at_least(buffer, BODY_LINE, missing);
-    }
+    buffer.extend_from_slice(config.article_payload_for_header(buffer.len()));
 
     append_dot_terminator(buffer);
     buffer.as_slice()
 }
 
-fn build_selected_body_response_into(
-    buffer: &mut Vec<u8>,
+fn build_selected_body_response_into<'a>(
+    buffer: &'a mut Vec<u8>,
     article_id: u64,
-    target_bytes: usize,
-) -> &[u8] {
+    config: &ServerConfig,
+) -> &'a [u8] {
     let mut message_id = arrayvec::ArrayString::<64>::new();
     write!(&mut message_id, "<article.{article_id}@nntpbench.local>")
         .expect("write to ArrayString cannot fail");
-    build_body_response_into(buffer, article_id, &message_id, target_bytes)
+    build_body_response_into(buffer, article_id, &message_id, config)
 }
 
 fn build_message_id_body_response_into<'a>(
     buffer: &'a mut Vec<u8>,
     message_id: &MessageId<'_>,
-    target_bytes: usize,
+    config: &ServerConfig,
 ) -> &'a [u8] {
-    build_body_response_into(buffer, 0, message_id.as_str(), target_bytes)
+    build_body_response_into(buffer, 0, message_id.as_str(), config)
 }
 
 fn build_body_response_into<'a>(
     buffer: &'a mut Vec<u8>,
     article_id: u64,
     message_id: &str,
-    target_bytes: usize,
+    config: &ServerConfig,
 ) -> &'a [u8] {
     buffer.clear();
     ensure_vec_capacity(
         buffer,
-        target_bytes
+        config
+            .body_response
+            .len()
             .max(BODY_RESPONSE_PREFIX.len())
             .saturating_add(GENERATED_RESPONSE_EXTRA_CAPACITY),
     );
     write!(buffer, "222 {article_id} {message_id} body follows\r\n")
         .expect("write to Vec cannot fail");
 
-    if buffer.len() < target_bytes {
-        let missing = target_bytes - buffer.len();
-        append_repeated_payload_at_least(buffer, BODY_LINE, missing);
-    }
+    buffer.extend_from_slice(config.body_payload_for_header(buffer.len()));
 
     append_dot_terminator(buffer);
     buffer.as_slice()
@@ -4978,11 +5040,8 @@ where
                 return false;
             }
             if let Some(message_id) = request.message_id() {
-                let response = build_message_id_article_response_into(
-                    response_buffer,
-                    &message_id,
-                    config.article_bytes,
-                );
+                let response =
+                    build_message_id_article_response_into(response_buffer, &message_id, config);
                 stats
                     .bytes_sent
                     .fetch_add(response.len() as u64, Ordering::Relaxed);
@@ -4990,11 +5049,8 @@ where
                 return false;
             }
             if let Some(article_id) = parse_article_id_arg(request.args()).filter(|id| *id != 1) {
-                let response = build_selected_article_response_into(
-                    response_buffer,
-                    article_id,
-                    config.article_bytes,
-                );
+                let response =
+                    build_selected_article_response_into(response_buffer, article_id, config);
                 stats
                     .bytes_sent
                     .fetch_add(response.len() as u64, Ordering::Relaxed);
@@ -5092,11 +5148,8 @@ where
         RequestKind::Body => {
             stats.body_requests.fetch_add(1, Ordering::Relaxed);
             if let Some(message_id) = request.message_id() {
-                let response = build_message_id_body_response_into(
-                    response_buffer,
-                    &message_id,
-                    config.body_bytes,
-                );
+                let response =
+                    build_message_id_body_response_into(response_buffer, &message_id, config);
                 stats
                     .bytes_sent
                     .fetch_add(response.len() as u64, Ordering::Relaxed);
@@ -5118,11 +5171,8 @@ where
                 return false;
             }
             if article_id != 1 {
-                let response = build_selected_body_response_into(
-                    response_buffer,
-                    article_id,
-                    config.body_bytes,
-                );
+                let response =
+                    build_selected_body_response_into(response_buffer, article_id, config);
                 stats
                     .bytes_sent
                     .fetch_add(response.len() as u64, Ordering::Relaxed);
@@ -5314,9 +5364,7 @@ where
     W: AsyncWrite + Unpin,
 {
     let header = build_article_response_header_into(response_buffer, 0, message_id.as_str());
-    let payload_len =
-        repeated_payload_len_at_least(config.article_bytes.saturating_sub(header.len()));
-    let payload = &config.article_payload[..payload_len];
+    let payload = config.article_payload_for_header(header.len());
     session_stats.bytes_sent +=
         header.len() as u64 + payload.len() as u64 + DOT_TERMINATOR.len() as u64;
 
@@ -5358,11 +5406,9 @@ where
         let header_start = response_buffer.len();
         append_message_id_article_response_header(response_buffer, message_id);
         let header_end = response_buffer.len();
-        let payload_len = repeated_payload_len_at_least(
-            config
-                .article_bytes
-                .saturating_sub(header_end - header_start),
-        );
+        let payload_len = config
+            .article_payload_for_header(header_end - header_start)
+            .len();
         let response_len = (header_end - header_start) + payload_len + DOT_TERMINATOR.len();
         if !ranges.is_empty()
             && batch_bytes.saturating_add(response_len) > MAX_BATCHED_ARTICLE_RESPONSE_BYTES
@@ -5958,6 +6004,8 @@ pub struct ServerConfig {
     pub listen: SocketAddr,
     pub body_bytes: usize,
     pub article_bytes: usize,
+    pub payload_mode: PayloadMode,
+    body_payload: Box<[u8]>,
     body_response: Box<[u8]>,
     article_response: Box<[u8]>,
     article_payload: Box<[u8]>,
@@ -5983,10 +6031,20 @@ impl ServerConfig {
     }
 
     fn from_bound_args(args: ServerArgs, listen: SocketAddr) -> Self {
-        let body_response = build_generated_response(BODY_RESPONSE_PREFIX, args.body_bytes);
-        let article_response =
-            build_generated_response(ARTICLE_RESPONSE_PREFIX, args.article_bytes);
-        let article_payload = build_repeated_payload(args.article_bytes);
+        let body_payload = build_server_payload(args.payload_mode, args.body_bytes);
+        let article_payload = build_server_payload(args.payload_mode, args.article_bytes);
+        let (body_response, article_response) = match args.payload_mode {
+            PayloadMode::Plain => (
+                build_generated_response(BODY_RESPONSE_PREFIX, args.body_bytes),
+                build_generated_response(ARTICLE_RESPONSE_PREFIX, args.article_bytes),
+            ),
+            PayloadMode::Yenc => (
+                frame_prebuilt_payload(BODY_RESPONSE_PREFIX, &body_payload),
+                frame_prebuilt_payload(ARTICLE_RESPONSE_PREFIX, &article_payload),
+            ),
+        };
+        let response_capacity =
+            generated_response_buffer_capacity(article_response.len(), body_response.len());
         let (article_index, article_index_error) = match args.article_dir.as_deref() {
             Some(root) => match ArticleStoreIndex::build(root) {
                 Ok(index) => (Some(Arc::new(index)), None),
@@ -5998,6 +6056,8 @@ impl ServerConfig {
             listen,
             body_bytes: args.body_bytes,
             article_bytes: args.article_bytes,
+            payload_mode: args.payload_mode,
+            body_payload,
             body_response,
             article_response,
             article_payload,
@@ -6016,7 +6076,7 @@ impl ServerConfig {
                     .clamp(1, DEFAULT_PENDING_WRITE_POOL_BUFFERS),
             ),
             generated_response_buffer_pool: GeneratedResponseBufferPool::new(
-                generated_response_buffer_capacity(args.article_bytes, args.body_bytes),
+                response_capacity,
                 args.max_connections
                     .max(1)
                     .clamp(1, DEFAULT_PENDING_WRITE_POOL_BUFFERS),
@@ -6041,6 +6101,24 @@ impl ServerConfig {
 
     pub fn article_response(&self) -> &[u8] {
         &self.article_response
+    }
+
+    fn article_payload_for_header(&self, header_len: usize) -> &[u8] {
+        prepared_payload_slice(
+            self.payload_mode,
+            &self.article_payload,
+            self.article_bytes,
+            header_len,
+        )
+    }
+
+    fn body_payload_for_header(&self, header_len: usize) -> &[u8] {
+        prepared_payload_slice(
+            self.payload_mode,
+            &self.body_payload,
+            self.body_bytes,
+            header_len,
+        )
     }
 
     fn article_index(&self) -> Option<&ArticleStoreIndex> {
@@ -6221,12 +6299,17 @@ pub fn rate(count: u64, seconds: f64) -> f64 {
 #[cfg_attr(coverage_nightly, coverage(off))]
 fn process_cpu_ticks() -> Option<u64> {
     let stat = fs::read_to_string("/proc/self/stat").ok()?;
+    parse_process_cpu_ticks(&stat)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_process_cpu_ticks(stat: &str) -> Option<u64> {
     let after_comm = stat.rsplit_once(") ")?.1;
     let mut fields = after_comm.split_whitespace();
-    fields.next()?;
+    // The suffix starts at field 3 (state); utime and stime are fields 14 and 15.
     let utime = fields.nth(11)?.parse::<u64>().ok()?;
     let stime = fields.next()?.parse::<u64>().ok()?;
-    Some(utime + stime)
+    utime.checked_add(stime)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -8667,6 +8750,7 @@ mod tests {
             listen: "127.0.0.1:0".parse().unwrap(),
             body_bytes: 1024,
             article_bytes: 2048,
+            payload_mode: PayloadMode::Plain,
             article_dir: None,
             max_connections: 16,
             threads: 1,
@@ -8685,6 +8769,141 @@ mod tests {
 
     fn test_config() -> Arc<ServerConfig> {
         Arc::new(ServerConfig::from_args(test_args()))
+    }
+
+    #[test]
+    fn server_defaults_to_yenc_payload() {
+        let args = ServerArgs::parse_from(["server", "--body-bytes", "4096"]);
+        let config = ServerConfig::from_args(args);
+        let article = Article::parse(config.body_response()).unwrap();
+        assert!(article.body.unwrap().starts_with(b"=ybegin "));
+    }
+
+    fn decode_yenc_response(response: &[u8]) -> Vec<u8> {
+        let directory = unique_temp_dir("yenc-roundtrip");
+        let path = yenc::DecodeOptions::new(&directory)
+            .decode_stream(response)
+            .expect("generated yEnc must pass size and checksum validation");
+        let decoded = fs::read(path).unwrap();
+        fs::remove_dir_all(directory).unwrap();
+        decoded
+    }
+
+    #[test]
+    fn yenc_payload_roundtrips_empty_small_and_large_bodies() {
+        for size in [0, 1, 127, 128, 4096, 768 * 1024] {
+            let mut args = test_args();
+            args.payload_mode = PayloadMode::Yenc;
+            args.body_bytes = size;
+            args.article_bytes = size;
+            let config = ServerConfig::from_args(args);
+            let body = decode_yenc_response(config.body_response());
+            let article = decode_yenc_response(config.article_response());
+            assert_eq!(body.len(), size);
+            assert_eq!(article, body);
+            Article::parse(config.body_response()).unwrap();
+            Article::parse(config.article_response()).unwrap();
+            if size >= 4096 {
+                assert!(body.iter().any(|byte| *byte < 32));
+                assert!(body.iter().any(|byte| *byte > 127));
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_plain_payload_preserves_existing_wire_responses() {
+        let args = ServerArgs::parse_from(["server", "--payload-mode", "plain"]);
+        let config = ServerConfig::from_args(args);
+        assert_eq!(config.payload_mode, PayloadMode::Plain);
+        assert_eq!(
+            config.body_response(),
+            build_generated_response(BODY_RESPONSE_PREFIX, config.body_bytes).as_ref()
+        );
+        assert_eq!(
+            config.article_response(),
+            build_generated_response(ARTICLE_RESPONSE_PREFIX, config.article_bytes).as_ref()
+        );
+    }
+
+    #[test]
+    fn yenc_selector_builders_preserve_payload_and_response_identity() {
+        let mut args = test_args();
+        args.payload_mode = PayloadMode::Yenc;
+        let config = ServerConfig::from_args(args);
+        let message_id = MessageId::from_borrowed("<encoded@test>").unwrap();
+        let mut buffer = Vec::new();
+        let expected_article = decode_yenc_response(config.article_response());
+        let expected_body = decode_yenc_response(config.body_response());
+        for response in [
+            build_selected_article_response_into(&mut buffer, 2, &config).to_vec(),
+            build_message_id_article_response_into(&mut buffer, &message_id, &config).to_vec(),
+        ] {
+            assert_eq!(decode_yenc_response(&response), expected_article);
+            Article::parse(&response).unwrap();
+        }
+        for response in [
+            build_selected_body_response_into(&mut buffer, 2, &config).to_vec(),
+            build_message_id_body_response_into(&mut buffer, &message_id, &config).to_vec(),
+        ] {
+            assert_eq!(decode_yenc_response(&response), expected_body);
+            Article::parse(&response).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn yenc_batched_and_selected_tcp_responses_match_prebuilt_payloads() {
+        let mut args = test_args();
+        args.payload_mode = PayloadMode::Yenc;
+        let config = Arc::new(ServerConfig::from_args(args));
+        let first = MessageId::from_borrowed("<first@test>").unwrap();
+        let second = MessageId::from_borrowed("<second@test>").unwrap();
+        let mut response = Vec::new();
+        let mut expected = GREETING.to_vec();
+        for message_id in [&first, &second] {
+            expected.extend_from_slice(build_message_id_article_response_into(
+                &mut response,
+                message_id,
+                &config,
+            ));
+        }
+        expected.extend_from_slice(build_message_id_body_response_into(
+            &mut response,
+            &first,
+            &config,
+        ));
+        expected.extend_from_slice(QUIT_RESPONSE);
+        let (output, _) = run_session_with_input(
+            config,
+            b"ARTICLE <first@test>\r\nARTICLE <second@test>\r\nBODY <first@test>\r\nQUIT\r\n",
+        )
+        .await;
+        assert_eq!(output, expected);
+    }
+
+    #[test]
+    fn yenc_vectored_article_and_pooled_body_paths_do_not_allocate() {
+        let mut args = test_args();
+        args.payload_mode = PayloadMode::Yenc;
+        args.body_bytes = 768 * 1024;
+        args.article_bytes = 768 * 1024;
+        let config = ServerConfig::from_args(args);
+        let message_id = MessageId::from_borrowed("<allocation@test>").unwrap();
+        let mut response = config.generated_response_buffer_pool.acquire();
+        let mut pending = PendingWrite::new(DEFAULT_PENDING_WRITE_BYTES);
+        let mut sink = tokio::io::sink();
+        let mut stats = SessionStats::default();
+        assert_no_allocations("prepared yEnc responses", || {
+            poll_to_completion(write_message_id_article_response(
+                &mut sink,
+                &mut pending,
+                &mut response,
+                &message_id,
+                &config,
+                &mut stats,
+            ))
+            .unwrap();
+            build_message_id_body_response_into(&mut response, &message_id, &config);
+        });
     }
 
     fn assert_date_response(response: &[u8]) {
@@ -8883,6 +9102,21 @@ mod tests {
             }
             Poll::Ready(Ok(()))
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_cpu_ticks_include_user_and_system_time_only() {
+        let stat = "123 (client ) with spaces) R 1 2 3 4 5 6 7 8 9 10 123 456 999 888";
+        assert_eq!(parse_process_cpu_ticks(stat), Some(579));
+        assert_eq!(parse_process_cpu_ticks("123 (client) R 1"), None);
+        assert_eq!(parse_process_cpu_ticks("missing command suffix"), None);
+        assert_eq!(
+            parse_process_cpu_ticks(
+                "123 (client) R 1 2 3 4 5 6 7 8 9 10 18446744073709551615 1 0 0"
+            ),
+            None
+        );
     }
 
     #[test]
@@ -15670,12 +15904,9 @@ mod tests {
         let config = ServerConfig::from_args(test_args());
         let message_id = MessageId::from_borrowed("<bench.123@nntpbench.local>").unwrap();
         let mut expected_buffer = Vec::new();
-        let expected = build_message_id_article_response_into(
-            &mut expected_buffer,
-            &message_id,
-            config.article_bytes,
-        )
-        .to_vec();
+        let expected =
+            build_message_id_article_response_into(&mut expected_buffer, &message_id, &config)
+                .to_vec();
 
         let mut writer = VectoredWriter::default();
         let mut pending = PendingWrite::new(DEFAULT_PENDING_WRITE_BYTES);
@@ -17366,9 +17597,7 @@ mod tests {
                 .write_all(b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nSTARTTLS\r\n.\r\n")
                 .await
                 .unwrap();
-            let mut request = [0_u8; 256];
-            let read = stream.read(&mut request).await.unwrap();
-            assert_eq!(&request[..read], expected_request);
+            assert_read_request(stream, expected_request).await;
             stream.write_all(response).await.unwrap();
         }
 
@@ -18364,7 +18593,7 @@ mod tests {
             config.body_bytes,
         ));
         let article_response =
-            build_selected_article_response_into(&mut article_response, 2, config.article_bytes);
+            build_selected_article_response_into(&mut article_response, 2, &config);
         let (output, stats) = run_session_with_input(
             config,
             b"GROUP alt.test\r\nLISTGROUP\r\nLISTGROUP alt.test\r\nLISTGROUP 1-\r\nLISTGROUP 2-3\r\nLISTGROUP alt.test 1-10\r\nARTICLE 2\r\nLAST\r\nNEXT\r\n",
@@ -19329,7 +19558,8 @@ mod tests {
                     Some("<segment@test>")
                 );
 
-                let response = build_selected_article_response_into(&mut response_buffer, 2, 1024);
+                let response =
+                    build_selected_article_response_into(&mut response_buffer, 2, &config);
                 assert!(
                     response.starts_with(b"220 2 <article.2@nntpbench.local> article follows\r\n")
                 );
@@ -19673,6 +19903,221 @@ mod tests {
         assert!(measurements[0].0 <= 16);
         assert!(measurements[1].0 <= 16);
         assert!(measurements[1].1 <= measurements[0].1 + 8);
+    }
+
+    #[test]
+    fn mixed_load_requests_cycle_article_body_and_stat() {
+        let mut buffer = Vec::new();
+        for (id, verb, expected_kind) in [
+            (0, "ARTICLE", RequestKind::Article),
+            (1, "BODY", RequestKind::Body),
+            (2, "STAT", RequestKind::Stat),
+            (3, "ARTICLE", RequestKind::Article),
+            (4, "BODY", RequestKind::Body),
+            (5, "STAT", RequestKind::Stat),
+        ] {
+            buffer.clear();
+            bench_append_load_workload_request(&mut buffer, id, id, ClientCommandMix::Mixed)
+                .unwrap();
+            assert_eq!(
+                buffer,
+                format!("{verb} <bench.{id}@nntpbench.local>\r\n").as_bytes()
+            );
+            assert_eq!(
+                request_kind_for_client_command(id, ClientCommandMix::Mixed),
+                expected_kind
+            );
+            let request =
+                client_request_for_command(id, id, ClientCommandMix::Mixed, false, None, 0, 1)
+                    .unwrap();
+            assert_eq!(request.kind(), expected_kind);
+        }
+        let args = FetchArgs::try_parse_from(["nntpbench", "--command-mix", "mixed"]).unwrap();
+        assert_eq!(args.command_mix, ClientCommandMix::Mixed);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn server_uncorks_final_article_and_status_before_reading_next_batch() {
+        for size in [768 * 1024, 1024 * 1024] {
+            for flush in [false, true] {
+                let mut args = test_args();
+                args.payload_mode = PayloadMode::Yenc;
+                args.article_bytes = size;
+                args.flush = flush;
+                let config = Arc::new(ServerConfig::from_args(args));
+                let message_id = MessageId::from_borrowed("<article.1@nntpbench.local>").unwrap();
+                let mut expected = Vec::new();
+                build_message_id_article_response_into(&mut expected, &message_id, &config);
+                expected
+                    .extend_from_slice(b"223 0 <article.1@nntpbench.local> article retrieved\r\n");
+
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let (probe_tx, probe_rx) = tokio::sync::oneshot::channel();
+                let server = tokio::spawn(async move {
+                    let (stream, peer) = listener.accept().await.unwrap();
+                    probe_tx
+                        .send(SockRef::from(&stream).try_clone().unwrap())
+                        .unwrap();
+                    serve_session(stream, peer, config, Arc::new(Stats::new()))
+                        .await
+                        .unwrap();
+                });
+                let mut client = TcpStream::connect(address).await.unwrap();
+                read_greeting(&mut client).await.unwrap();
+                let probe = probe_rx.await.unwrap();
+                client
+                    .write_all(
+                        b"ARTICLE <article.1@nntpbench.local>\r\nSTAT <article.1@nntpbench.local>\r\n",
+                    )
+                    .await
+                    .unwrap();
+                let mut received = vec![0; expected.len()];
+                time::timeout(Duration::from_secs(5), client.read_exact(&mut received))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    received == expected,
+                    "batch bytes differ at {:?}",
+                    received.iter().zip(&expected).position(|(a, b)| a != b)
+                );
+                // A timer flush can deliver bytes while TCP_CORK is still set.
+                assert!(!probe.tcp_cork().unwrap());
+                drop(client);
+                server.await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn load_mixed_yenc_pipeline_counts_multiline_and_single_line_responses() {
+        for size in [768 * 1024, 1024 * 1024] {
+            for (start_id, verification) in [
+                (0, LoadVerificationPolicy::None),
+                (1, LoadVerificationPolicy::Sampled),
+                (2, LoadVerificationPolicy::Full),
+            ] {
+                let mut server_args = test_args();
+                server_args.payload_mode = PayloadMode::Yenc;
+                server_args.article_bytes = size;
+                server_args.body_bytes = size;
+                let server_config = Arc::new(ServerConfig::from_args(server_args));
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let server = tokio::spawn(async move {
+                    let (stream, peer) = listener.accept().await.unwrap();
+                    serve_session(stream, peer, server_config, Arc::new(Stats::new()))
+                        .await
+                        .unwrap();
+                });
+                let mut args = test_fetch_args();
+                args.connect = address;
+                args.requests = 12;
+                args.command_mix = ClientCommandMix::Mixed;
+                args.start_id = start_id;
+                args.workload_policy = LoadWorkloadPolicy::Repeat;
+                args.verification_policy = verification;
+                args.pipeline_depth = 7;
+                let config = LoadConfig::from_args(args).unwrap();
+                let stats = Arc::new(Stats::new());
+                let outcome = LoadSession::new(&config, 0, start_id, config.requests)
+                    .run(stats.clone(), Arc::new(AtomicBool::new(false)))
+                    .await
+                    .unwrap();
+                server.await.unwrap();
+                let snapshot = stats.snapshot();
+                assert_eq!(snapshot.commands, 12);
+                assert_eq!(snapshot.article_requests, 4);
+                assert_eq!(snapshot.body_requests, 4);
+                assert_eq!(snapshot.errors, 0);
+                assert_eq!(outcome.incomplete_requests, 0);
+                assert_eq!(outcome.timed_out_connections, 0);
+                let manifest: serde_json::Value = serde_json::from_str(&render_load_manifest(
+                    &config,
+                    snapshot,
+                    &outcome,
+                    Duration::from_secs(1),
+                    0.0,
+                    0,
+                ))
+                .unwrap();
+                assert_eq!(manifest["results"]["stat_responses"], 4);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn load_mixed_yenc_reader_preserves_packed_status_and_body_boundaries() {
+        for size in [768 * 1024, 1024 * 1024] {
+            let mut args = test_args();
+            args.payload_mode = PayloadMode::Yenc;
+            args.article_bytes = size;
+            args.body_bytes = size;
+            let config = ServerConfig::from_args(args);
+            let status = b"223 1 <article.1@nntpbench.local> article retrieved\r\n";
+            let frames = [
+                (RequestKind::Stat, status.as_slice()),
+                (RequestKind::Article, config.article_response()),
+                (RequestKind::Stat, status.as_slice()),
+                (RequestKind::Body, config.body_response()),
+                (RequestKind::Stat, status.as_slice()),
+            ];
+            let packed: Vec<u8> = frames
+                .iter()
+                .flat_map(|(_, bytes)| bytes.iter().copied())
+                .collect();
+            for read_bytes in [64 * 1024, 256 * 1024, packed.len()] {
+                let mut stream = packed.as_slice();
+                let mut reader = LoadResponseReader::new(read_bytes, packed.len());
+                for (kind, frame) in frames {
+                    assert_eq!(
+                        reader.read_response(&mut stream, kind, None).await.unwrap(),
+                        frame.len()
+                    );
+                }
+                assert!(stream.is_empty());
+                assert_eq!(reader.start, reader.buffer.len());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn load_streaming_yenc_preserves_packed_responses_and_reuses_capacity() {
+        for size in [768 * 1024, 1024 * 1024] {
+            let mut args = test_args();
+            args.payload_mode = PayloadMode::Yenc;
+            args.article_bytes = size;
+            let config = ServerConfig::from_args(args);
+            let source = config.article_response().repeat(3);
+            for chunk_bytes in [256, 16 * 1024, 64 * 1024, 256 * 1024] {
+                let mut buffer = Vec::with_capacity(chunk_bytes);
+                let consumed = bench_load_streaming_responses(
+                    &source,
+                    &mut buffer,
+                    chunk_bytes,
+                    RequestKind::Article,
+                    3,
+                )
+                .await
+                .unwrap();
+                assert_eq!(consumed, source.len());
+                let capacity = buffer.capacity();
+                assert!(capacity <= chunk_bytes * 2);
+                let consumed = bench_load_streaming_responses(
+                    &source,
+                    &mut buffer,
+                    chunk_bytes,
+                    RequestKind::Article,
+                    3,
+                )
+                .await
+                .unwrap();
+                assert_eq!(consumed, source.len());
+                assert_eq!(buffer.capacity(), capacity);
+            }
+        }
     }
 
     #[tokio::test]

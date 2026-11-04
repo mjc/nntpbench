@@ -385,7 +385,7 @@ mod tests {
             crate::TEST_ALLOCATIONS.store(0, Ordering::Relaxed);
             crate::COUNT_TEST_ALLOCATIONS.with(|enabled| enabled.set(true));
             for _ in 0..16 {
-                let parsed = article.article();
+                let parsed = article.article().unwrap();
                 match parsed.body {
                     Some(Cow::Borrowed(body)) => {
                         assert_eq!(body.len(), body_len);
@@ -415,7 +415,7 @@ mod tests {
         );
         let article = OwnedArticle::try_from(response).unwrap();
         assert_eq!(
-            article.article().body.as_deref(),
+            article.article().unwrap().body.as_deref(),
             Some(b"body\r\n".as_slice())
         );
         assert_eq!(article.clone(), article);
@@ -438,7 +438,7 @@ mod tests {
         );
         assert!(receiver.pending.is_empty());
         assert_eq!(
-            article.article().body.as_deref(),
+            article.article().unwrap().body.as_deref(),
             Some(b"body\r\n".as_slice())
         );
     }
@@ -650,46 +650,138 @@ impl OwnedResponse {
     }
 }
 
-/// Owned client article-style response backed by one validated article owner.
+/// Owned article-family response with framing or full semantic validation.
 ///
-/// The article bytes/layout are stored directly rather than nesting an
-/// `OwnedResponse` only to recover its article enum variant.  This keeps the
-/// typestate owner authoritative while retaining the response metadata needed
-/// by the public article surface.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Raw bytes and metadata are available without scanning the body. Parsing is
+/// fallible until full validation succeeds; [`Self::validate`] retains that
+/// validated layout for repeated access.
+#[derive(Debug, Clone)]
 pub struct OwnedArticle {
-    article: ValidatedOwnedArticle,
+    article: OwnedArticleContent,
+}
+
+impl PartialEq for OwnedArticle {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind() == other.kind()
+            && self.status() == other.status()
+            && self.as_bytes() == other.as_bytes()
+    }
+}
+
+impl Eq for OwnedArticle {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OwnedArticleContent {
+    Framed(FramedResponse),
+    Validated(ValidatedOwnedArticle),
 }
 
 impl OwnedArticle {
     /// Request kind that produced this article-style response.
     #[must_use]
     pub const fn kind(&self) -> RequestKind {
-        self.article.kind()
+        match &self.article {
+            OwnedArticleContent::Framed(article) => article.kind(),
+            OwnedArticleContent::Validated(article) => article.kind(),
+        }
     }
 
     /// Parsed status code from the response status line.
     #[must_use]
     pub const fn status(&self) -> StatusCode {
-        self.article.status()
+        match &self.article {
+            OwnedArticleContent::Framed(article) => article.status(),
+            OwnedArticleContent::Validated(article) => article.status(),
+        }
     }
 
-    /// Raw response bytes.
+    /// Raw response bytes, without triggering semantic validation.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
-        self.article.as_bytes()
+        match &self.article {
+            OwnedArticleContent::Framed(article) => article.as_bytes(),
+            OwnedArticleContent::Validated(article) => article.as_bytes(),
+        }
     }
 
-    /// Borrow the parsed article/body view from the owned wire bytes.
-    pub fn article(&self) -> Article<'_> {
-        self.article.article()
+    /// Response payload bytes, excluding the initial line and dot terminator.
+    #[must_use]
+    pub fn content(&self) -> &[u8] {
+        match &self.article {
+            OwnedArticleContent::Framed(article) => article.content(),
+            OwnedArticleContent::Validated(article) => article.content(),
+        }
     }
 
-    /// Consume the client article-style wrapper and return the raw response.
+    /// Parse and validate a borrowed article/body view.
+    ///
+    /// Framing-only responses are validated on each call. Call [`Self::validate`]
+    /// first, or select [`crate::ArticleValidation::Full`] when connecting, to
+    /// retain the validated layout and avoid repeated body scans.
+    pub fn article(&self) -> Result<Article<'_>, ArticleParseError> {
+        match &self.article {
+            OwnedArticleContent::Framed(article) => article
+                .validate_borrowed()
+                .map(ValidatedArticleView::materialize),
+            OwnedArticleContent::Validated(article) => Ok(article.article()),
+        }
+    }
+
+    /// Fully validate this response and retain its layout for subsequent access.
+    pub fn validate(self) -> Result<Self, ClientError> {
+        let article = match self.article {
+            OwnedArticleContent::Framed(article) => article
+                .validate()
+                .map_err(|_| ClientError::InvalidStatusLine)?,
+            OwnedArticleContent::Validated(article) => article,
+        };
+        Ok(Self {
+            article: OwnedArticleContent::Validated(article),
+        })
+    }
+
+    /// Consume the article wrapper and preserve its validation state.
     #[must_use]
     pub fn into_response(self) -> OwnedResponse {
         OwnedResponse {
-            content: OwnedResponseContent::ValidatedArticle(self.article),
+            content: match self.article {
+                OwnedArticleContent::Framed(article) => OwnedResponseContent::Article(article),
+                OwnedArticleContent::Validated(article) => {
+                    OwnedResponseContent::ValidatedArticle(article)
+                }
+            },
+        }
+    }
+
+    pub(crate) fn from_response(
+        response: OwnedResponse,
+        validation: crate::ArticleValidation,
+    ) -> Result<Self, ClientError> {
+        let expected_status = match response.kind() {
+            RequestKind::Article => 220,
+            RequestKind::Head => 221,
+            RequestKind::Body => 222,
+            RequestKind::Stat => 223,
+            _ => 0,
+        };
+        if response.status().as_u16() != expected_status {
+            return Err(ClientError::UnexpectedArticleResponse { response });
+        }
+        let article = match response.content {
+            OwnedResponseContent::Article(article) => OwnedArticleContent::Framed(article),
+            OwnedResponseContent::ValidatedArticle(article) => {
+                OwnedArticleContent::Validated(article)
+            }
+            content @ OwnedResponseContent::Generic { .. } => {
+                return Err(ClientError::UnexpectedArticleResponse {
+                    response: OwnedResponse { content },
+                });
+            }
+        };
+        let article = Self { article };
+        match validation {
+            crate::ArticleValidation::FramingOnly => Ok(article),
+            crate::ArticleValidation::Full => article.validate(),
         }
     }
 }
@@ -698,32 +790,7 @@ impl TryFrom<OwnedResponse> for OwnedArticle {
     type Error = ClientError;
 
     fn try_from(response: OwnedResponse) -> Result<Self, Self::Error> {
-        let expected_status = match response.kind() {
-            RequestKind::Article => 220,
-            RequestKind::Head => 221,
-            RequestKind::Body => 222,
-            RequestKind::Stat => 223,
-            _ => 0,
-        };
-        let status = response.status();
-        if status.as_u16() != expected_status {
-            return Err(ClientError::UnexpectedArticleResponse { response });
-        }
-
-        let OwnedResponse { content } = response;
-        match content {
-            OwnedResponseContent::Article(article) => Ok(Self {
-                article: article
-                    .validate()
-                    .map_err(|_| ClientError::InvalidStatusLine)?,
-            }),
-            OwnedResponseContent::ValidatedArticle(article) => Ok(Self { article }),
-            content @ OwnedResponseContent::Generic { .. } => {
-                Err(ClientError::UnexpectedArticleResponse {
-                    response: OwnedResponse { content },
-                })
-            }
-        }
+        Self::from_response(response, crate::ArticleValidation::Full)
     }
 }
 
