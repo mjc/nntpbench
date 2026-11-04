@@ -1843,16 +1843,18 @@ impl ClientConnection {
         request: Request<'static>,
     ) -> Result<PendingResponse, ClientError> {
         let kind = request.kind();
-        if kind != RequestKind::Capabilities {
-            self.ensure_capabilities_negotiated(kind).await?;
-        }
+        let response_rx = self
+            .enqueue_request(
+                request,
+                kind == RequestKind::Capabilities,
+                request_kind_invalidates_capabilities(kind),
+            )
+            .await?;
 
-        self.queue_request_unchecked(
-            request,
-            kind == RequestKind::Capabilities,
-            request_kind_invalidates_capabilities(kind),
-        )
-        .await
+        Ok(PendingResponse {
+            inner: self.inner.clone(),
+            response_rx,
+        })
     }
 
     async fn queue_request_unchecked(
