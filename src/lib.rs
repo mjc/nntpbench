@@ -97,9 +97,9 @@ pub use client::{
 };
 pub use protocol::{
     Article, ArticleNumber, ArticleParseError, ArticleRef, ArticleSelector, ArticleTransfer,
-    AuthInfoKind, AuthInfoValue, CommandCoordination, GroupName, HeaderIter, HeaderName, Headers,
-    ListGroupRange, ListKind, MessageId, NntpDate, NntpTime, Request, RequestKind, RequestLine,
-    StatusCode, Wildmat,
+    AuthInfoKind, AuthInfoValue, CapabilityEntry, CapabilityList, CommandCoordination, GroupName,
+    HeaderIter, HeaderName, Headers, ListGroupRange, ListKind, MessageId, NntpDate, NntpTime,
+    Request, RequestKind, RequestLine, StatusCode, Wildmat,
 };
 
 pub const CRLF: &[u8] = b"\r\n";

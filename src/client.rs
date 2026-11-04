@@ -21,7 +21,8 @@ pub use crate::protocol::response_receiver::{
 };
 
 use crate::protocol::{
-    ArticleRef, Request, ResponseFrame, ResponseFrameParse, ValidatedResponseContent,
+    ArticleRef, CapabilityList, Request, ResponseFrame, ResponseFrameParse,
+    ValidatedResponseContent,
 };
 use crate::terminator::{DOT_TERMINATOR, crlf_normalized_payload_lines};
 use crate::{
@@ -860,6 +861,17 @@ impl Client {
         self.execute_raw_exchange(Request::capabilities()).await
     }
 
+    /// Return the capability list stored for this connection.
+    ///
+    /// The call sends no command. `None` means no 101 list is stored:
+    /// `CAPABILITIES` has not completed, or `AUTHINFO` status 281 or 283,
+    /// `MODE READER`, or `STARTTLS` has cleared it. A command that requires a
+    /// capability preflight sends `CAPABILITIES` when this list is absent, and
+    /// a 101 response replaces it.
+    pub async fn capability_state(&self) -> Option<CapabilityList> {
+        self.connection.capability_state().await
+    }
+
     /// Send a DATE request and return the owned raw response frame.
     pub async fn date(&self) -> Result<OwnedResponse, ClientError> {
         self.execute_raw(Request::date()).await
@@ -962,7 +974,7 @@ impl ClientConnection {
             inner: Arc::new(ConnectionHandle {
                 request_tx,
                 poisoned,
-                capabilities_negotiated: Arc::new(Mutex::new(false)),
+                capability_list: Arc::new(Mutex::new(None)),
                 capabilities_probe: Arc::new(Mutex::new(())),
                 send_barrier: Arc::new(Mutex::new(())),
                 gate,
@@ -1766,6 +1778,17 @@ impl ClientConnection {
         self.execute_exchange(Request::Capabilities).await
     }
 
+    /// Return the capability list stored for this connection.
+    ///
+    /// The call sends no command. `None` means no 101 list is stored:
+    /// `CAPABILITIES` has not completed, or `AUTHINFO` status 281 or 283,
+    /// `MODE READER`, or `STARTTLS` has cleared it. A command that requires a
+    /// capability preflight sends `CAPABILITIES` when this list is absent, and
+    /// a 101 response replaces it.
+    pub async fn capability_state(&self) -> Option<CapabilityList> {
+        self.inner.capability_list.lock().await.clone()
+    }
+
     /// Send a DATE request and return the owned response frame.
     pub async fn date(&self) -> Result<OwnedResponse, ClientError> {
         self.execute(Request::Date).await
@@ -1919,6 +1942,10 @@ impl ClientConnection {
         self.queue_request_exchange(request).await?.receive().await
     }
 
+    /// Send `CAPABILITIES` when `request_kind` needs a stored list and this connection has none.
+    ///
+    /// Status 101 stores the parsed list. Any other status returns
+    /// [`ClientError::CapabilitiesUnavailable`] and leaves the stored list unchanged.
     async fn ensure_capabilities_negotiated(
         &self,
         request_kind: RequestKind,
@@ -1928,7 +1955,7 @@ impl ClientConnection {
         }
 
         let _probe_guard = self.inner.capabilities_probe.lock().await;
-        if *self.inner.capabilities_negotiated.lock().await {
+        if self.inner.capability_list.lock().await.is_some() {
             return Ok(());
         }
 
@@ -1939,8 +1966,6 @@ impl ClientConnection {
         if response.status().as_u16() != 101 {
             return Err(ClientError::CapabilitiesUnavailable);
         }
-
-        *self.inner.capabilities_negotiated.lock().await = true;
         Ok(())
     }
 }
@@ -2003,7 +2028,7 @@ impl Drop for ConnectionHandle {
 struct ConnectionHandle {
     request_tx: mpsc::Sender<QueuedRequest>,
     poisoned: Arc<Mutex<Option<SharedEngineError>>>,
-    capabilities_negotiated: Arc<Mutex<bool>>,
+    capability_list: Arc<Mutex<Option<CapabilityList>>>,
     capabilities_probe: Arc<Mutex<()>>,
     send_barrier: Arc<Mutex<()>>,
     gate: Arc<PipelineGate>,
@@ -2430,16 +2455,14 @@ impl PendingResponse {
         let request_kind = completed.request.kind();
         match completed.response {
             CompletedResponse::Owned(response) => {
-                if self.mark_capabilities_on_success && response.status().as_u16() == 101 {
-                    *self.inner.capabilities_negotiated.lock().await = true;
-                } else if self.mark_capabilities_on_success {
-                    return Err(ClientError::CapabilitiesUnavailable);
-                }
-                if self.invalidate_capabilities_on_success
-                    && response_invalidates_capabilities(request_kind, response.status())
-                {
-                    *self.inner.capabilities_negotiated.lock().await = false;
-                }
+                let mut capability_list = self.inner.capability_list.lock().await;
+                store_capability_transition(
+                    &mut capability_list,
+                    request_kind,
+                    &response,
+                    self.mark_capabilities_on_success,
+                    self.invalidate_capabilities_on_success,
+                )?;
                 Ok(response)
             }
         }
@@ -2474,16 +2497,14 @@ impl PendingExchange {
         let request_kind = completed.request.kind();
         match completed.response {
             CompletedResponse::Owned(response) => {
-                if self.mark_capabilities_on_success && response.status().as_u16() == 101 {
-                    *self.inner.capabilities_negotiated.lock().await = true;
-                } else if self.mark_capabilities_on_success {
-                    return Err(ClientError::CapabilitiesUnavailable);
-                }
-                if self.invalidate_capabilities_on_success
-                    && response_invalidates_capabilities(request_kind, response.status())
-                {
-                    *self.inner.capabilities_negotiated.lock().await = false;
-                }
+                let mut capability_list = self.inner.capability_list.lock().await;
+                store_capability_transition(
+                    &mut capability_list,
+                    request_kind,
+                    &response,
+                    self.mark_capabilities_on_success,
+                    self.invalidate_capabilities_on_success,
+                )?;
                 Ok(OwnedExchange {
                     request: completed.request,
                     response,
@@ -2491,6 +2512,30 @@ impl PendingExchange {
             }
         }
     }
+}
+
+fn store_capability_transition(
+    capability_list: &mut Option<CapabilityList>,
+    request_kind: RequestKind,
+    response: &OwnedResponse,
+    mark_capabilities_on_success: bool,
+    invalidate_capabilities_on_success: bool,
+) -> Result<(), ClientError> {
+    if request_kind == RequestKind::Capabilities && response.status().as_u16() == 101 {
+        let Some(list) = CapabilityList::parse(response.content()) else {
+            return Err(ClientError::CapabilitiesUnavailable);
+        };
+        *capability_list = Some(list);
+    } else if mark_capabilities_on_success {
+        return Err(ClientError::CapabilitiesUnavailable);
+    }
+
+    if invalidate_capabilities_on_success
+        && response_invalidates_capabilities(request_kind, response.status())
+    {
+        *capability_list = None;
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -4323,6 +4368,207 @@ mod tests {
                 .as_u16(),
             281
         );
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn client_connection_refreshes_capability_list_after_mode_reader() {
+        let listener = crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"201 client ready\r\n").await.unwrap();
+            assert_read_request(&mut stream, b"CAPABILITIES\r\n").await;
+            stream
+                .write_all(b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n")
+                .await
+                .unwrap();
+            assert_read_request(&mut stream, b"HDR Subject 1-10\r\n").await;
+            stream.write_all(crate::HDR_RESPONSE).await.unwrap();
+            assert_read_request(&mut stream, b"MODE READER\r\n").await;
+            stream.write_all(crate::MODE_READER_RESPONSE).await.unwrap();
+            assert_read_request(&mut stream, b"CAPABILITIES\r\n").await;
+            stream
+                .write_all(b"101 Capability list:\r\nVERSION 2\r\nOVER MSGID\r\nHDR\r\n.\r\n")
+                .await
+                .unwrap();
+            assert_read_request(&mut stream, b"HDR Subject 1-10\r\n").await;
+            stream.write_all(crate::HDR_RESPONSE).await.unwrap();
+        });
+
+        let connection = ClientConnection::connect(addr).await.unwrap();
+        assert!(connection.capability_state().await.is_none());
+        connection.capabilities().await.unwrap();
+        let initial = connection.capability_state().await.unwrap();
+        assert!(initial.get("READER").is_some());
+        assert!(initial.get("OVER").is_none());
+
+        connection
+            .hdr(
+                HeaderName::from_owned("Subject").unwrap(),
+                ArticleSelector::from_owned("1-10").unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            connection
+                .capability_state()
+                .await
+                .unwrap()
+                .get("READER")
+                .is_some()
+        );
+
+        assert_eq!(
+            connection.mode_reader().await.unwrap().status().as_u16(),
+            201
+        );
+        assert!(connection.capability_state().await.is_none());
+
+        connection
+            .hdr(
+                HeaderName::from_owned("Subject").unwrap(),
+                ArticleSelector::from_owned("1-10").unwrap(),
+            )
+            .await
+            .unwrap();
+        let refreshed = connection.capability_state().await.unwrap();
+        assert!(refreshed.get("READER").is_none());
+        assert_eq!(refreshed.get("HDR").unwrap().arguments(), &[] as &[&str]);
+        assert_eq!(refreshed.get("over").unwrap().arguments(), ["MSGID"]);
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn client_connection_keeps_capabilities_until_authinfo_succeeds() {
+        let listener = crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"201 client ready\r\n").await.unwrap();
+            assert_read_request(&mut stream, b"CAPABILITIES\r\n").await;
+            stream
+                .write_all(b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nAUTHINFO USER\r\n.\r\n")
+                .await
+                .unwrap();
+            assert_read_request(&mut stream, b"AUTHINFO USER bench-user\r\n").await;
+            stream
+                .write_all(b"381 password required\r\n")
+                .await
+                .unwrap();
+            assert_read_request(&mut stream, b"AUTHINFO PASS bench-pass\r\n").await;
+            stream.write_all(crate::AUTHINFO_RESPONSE).await.unwrap();
+            assert_read_request(&mut stream, b"CAPABILITIES\r\n").await;
+            stream
+                .write_all(b"101 Capability list:\r\nVERSION 2\r\nHDR\r\n.\r\n")
+                .await
+                .unwrap();
+            assert_read_request(&mut stream, b"HDR Subject 1-10\r\n").await;
+            stream.write_all(crate::HDR_RESPONSE).await.unwrap();
+        });
+
+        let connection = ClientConnection::connect(addr).await.unwrap();
+        connection.capabilities().await.unwrap();
+        assert!(
+            connection
+                .capability_state()
+                .await
+                .unwrap()
+                .get("AUTHINFO")
+                .is_some()
+        );
+        assert_eq!(
+            connection
+                .authinfo_user(AuthInfoValue::from_owned("bench-user").unwrap())
+                .await
+                .unwrap()
+                .status()
+                .as_u16(),
+            381
+        );
+        assert_eq!(
+            connection
+                .capability_state()
+                .await
+                .unwrap()
+                .get("AUTHINFO")
+                .unwrap()
+                .arguments(),
+            ["USER"]
+        );
+        assert_eq!(
+            connection
+                .authinfo_pass(AuthInfoValue::from_owned("bench-pass").unwrap())
+                .await
+                .unwrap()
+                .status()
+                .as_u16(),
+            281
+        );
+        assert!(connection.capability_state().await.is_none());
+        connection
+            .hdr(
+                HeaderName::from_owned("Subject").unwrap(),
+                ArticleSelector::from_owned("1-10").unwrap(),
+            )
+            .await
+            .unwrap();
+        let refreshed = connection.capability_state().await.unwrap();
+        assert!(refreshed.get("AUTHINFO").is_none());
+        assert!(refreshed.get("HDR").is_some());
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn client_connection_clears_capabilities_after_starttls_and_stays_plaintext() {
+        let listener = crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"201 client ready\r\n").await.unwrap();
+            assert_read_request(&mut stream, b"CAPABILITIES\r\n").await;
+            stream
+                .write_all(b"101 Capability list:\r\nVERSION 2\r\nSTARTTLS\r\n.\r\n")
+                .await
+                .unwrap();
+            assert_read_request(&mut stream, b"STARTTLS\r\n").await;
+            stream.write_all(crate::STARTTLS_RESPONSE).await.unwrap();
+            assert_read_request(&mut stream, b"CAPABILITIES\r\n").await;
+            stream
+                .write_all(b"101 Capability list:\r\nVERSION 2\r\nHDR\r\n.\r\n")
+                .await
+                .unwrap();
+            assert_read_request(&mut stream, b"HDR Subject 1-10\r\n").await;
+            stream.write_all(crate::HDR_RESPONSE).await.unwrap();
+        });
+
+        let client = Client::connect(addr).await.unwrap();
+        client.capabilities().await.unwrap();
+        assert!(
+            client
+                .capability_state()
+                .await
+                .unwrap()
+                .get("STARTTLS")
+                .is_some()
+        );
+        assert_eq!(client.starttls().await.unwrap().status().as_u16(), 382);
+        assert!(client.capability_state().await.is_none());
+        assert_eq!(
+            client
+                .hdr("Subject", "1-10")
+                .await
+                .unwrap()
+                .status()
+                .as_u16(),
+            225
+        );
+        let refreshed = client.capability_state().await.unwrap();
+        assert!(refreshed.get("STARTTLS").is_none());
+        assert!(refreshed.get("HDR").is_some());
 
         server.await.unwrap();
     }

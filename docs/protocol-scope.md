@@ -16,9 +16,9 @@ The server is a reader benchmark peer. These commands run as real session behavi
 - `MODE READER`, answered with `201 posting not permitted`.
 - Pipelined commands. `RequestKind::coordination` records whether a later command may be written before the response, whether the command requires the connection alone, whether it changes session or transport state, and whether it enters continuation mode. The client waits until earlier responses finish before writing an exclusive command, and it holds the send barrier until the response when a later command must not follow. After `QUIT` returns 205, further commands are rejected.
 
-`CAPABILITIES` advertises that reader set and nothing else. The fixed body is `CAPABILITIES_RESPONSE` in `src/lib.rs`. It lists `VERSION 2`, `READER`, the `LIST` keywords above, `OVER MSGID`, `HDR`, and `NEWNEWS`. It does not list `STARTTLS`, `AUTHINFO`, `SASL`, `STREAMING`, or `MODE-READER`.
+`CAPABILITIES` advertises that reader set and nothing else. The fixed body is `CAPABILITIES_RESPONSE` in `src/lib.rs`. It lists `VERSION 2`, `READER`, the `LIST` keywords above, `OVER MSGID`, `HDR`, and `NEWNEWS`. It does not list `STARTTLS`, `AUTHINFO`, `SASL`, `STREAMING`, or `MODE-READER`. An unknown keyword argument still returns 101 and that same body. A non-keyword argument, including a one- or two-character token, a numeric token, an underscore, or a second argument, returns `501 command syntax error`.
 
-`ClientConnection` sends `CAPABILITIES` before `POST`, `IHAVE`, `CHECK`, `TAKETHIS`, `AUTHINFO USER`, `AUTHINFO PASS`, `STARTTLS`, `OVER`, `XOVER`, `HDR`, `XHDR`, `NEWGROUPS`, and `NEWNEWS` (`request_kind_requires_capabilities` in `src/client.rs`). It stores a boolean after status 101. It does not store the keyword list. `MODE STREAM` is not in that set, so the client can send it without that preflight.
+`ClientConnection` sends `CAPABILITIES` before `POST`, `IHAVE`, `CHECK`, `TAKETHIS`, `AUTHINFO USER`, `AUTHINFO PASS`, `STARTTLS`, `OVER`, `XOVER`, `HDR`, `XHDR`, `NEWGROUPS`, and `NEWNEWS` when it has no stored capability list (`request_kind_requires_capabilities` and `ensure_capabilities_negotiated` in `src/client.rs`). That send is a convenience preflight. The stored list is described under [Capability state](#capability-state). `MODE STREAM` is not in that set, so the client can send it without that preflight.
 
 `--article-dir` replaces generated retrieval, list, overview, and discovery bytes with stored response frames when an index is built. Without that directory, retrieval uses the generated payloads below, and group, overview, header, and discovery replies use fixed rows.
 
@@ -72,11 +72,13 @@ The client sends `MODE STREAM` through `ClientConnection::execute` without the c
 
 ### Capability state
 
-The client cache is a one-shot success flag, not a capability state machine.
+`ClientConnection` stores the last accepted `CAPABILITIES` 101 body as a `CapabilityList` (`src/protocol.rs`). `Client::capability_state` and `ClientConnection::capability_state` return that list and send no command. `None` means the connection has not stored a list, or a later command cleared it.
 
-`ClientConnection` keeps `capabilities_negotiated` as a `bool` (`src/client.rs`). `ensure_capabilities_negotiated` sets it after `CAPABILITIES` returns 101. `response_invalidates_capabilities` clears it after `STARTTLS`, after `MODE READER`, and after `AUTHINFO` status 281 or 283. `MODE STREAM` does not clear it. The flag does not record which keywords were advertised.
+`ensure_capabilities_negotiated` sends `CAPABILITIES` when a command in `request_kind_requires_capabilities` runs and the stored list is absent. Status 101 replaces the stored list with the parsed body. Any other status leaves the stored list unchanged, and that command returns `ClientError::CapabilitiesUnavailable`. `capabilities` and `capabilities_exchange` also store a 101 list. A 101 body that fails capability-list validation does not replace the stored list.
 
-The server capability body stays `CAPABILITIES_RESPONSE` after those commands. It does not grow or shrink when the client clears its flag.
+`response_invalidates_capabilities` clears the stored list after `STARTTLS`, after `MODE READER`, and after `AUTHINFO` status 281 or 283. `AUTHINFO` status 381 or 383 leaves the list in place, so `AUTHINFO PASS` does not send another `CAPABILITIES` before the password response. `MODE STREAM` does not clear the list.
+
+The server capability body stays `CAPABILITIES_RESPONSE` after those commands. It does not grow or shrink when the client clears its list. `STARTTLS` remains the disabled command described above: the server answers 502, and the client still clears the stored list before continuing on the same plaintext connection.
 
 ### Benchmark workload realism
 
