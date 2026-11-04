@@ -6571,7 +6571,7 @@ where
     if let Some(command_lines) = command_lines {
         command_lines.copy_line(line_slot, line);
     }
-    if should_read_transfer_body(reader, line, &command).await? {
+    if should_read_transfer_body(reader, line, &command) {
         read_dot_terminated_body(reader).await?;
         command.has_transfer_body = true;
     }
@@ -6579,30 +6579,33 @@ where
     Ok(())
 }
 
-async fn should_read_transfer_body<R>(
-    reader: &mut BufReader<R>,
+fn should_read_transfer_body<R>(
+    reader: &BufReader<R>,
     line: &[u8],
     command: &ParsedCommand,
-) -> io::Result<bool>
+) -> bool
 where
-    R: tokio::io::AsyncRead + Unpin,
+    R: AsyncRead,
 {
     if matches!(command.kind, RequestKind::TakeThis) || is_known_transfer_command(line, b"TAKETHIS")
     {
-        return Ok(true);
+        return true;
     }
     if !(matches!(command.kind, RequestKind::Post | RequestKind::Ihave)
         || is_known_transfer_command(line, b"POST")
         || is_known_transfer_command(line, b"IHAVE"))
     {
-        return Ok(false);
+        return false;
     }
-    let available = reader.fill_buf().await?;
-    let next_line = available
+    // Only bytes already in the BufReader count. fill_buf would wait for the
+    // next socket read, and a client that holds the article until 340 or 335
+    // never sends those bytes after 440 or 435.
+    let next_line = reader
+        .buffer()
         .split(|byte| *byte == b'\n')
         .next()
         .unwrap_or_default();
-    Ok(next_line.contains(&b':'))
+    next_line.contains(&b':')
 }
 
 fn next_batch_line_contains_colon(input: &[u8], start: usize) -> bool {
@@ -18557,6 +18560,73 @@ mod tests {
         assert_eq!(snapshot.bytes_sent, output.len() as u64);
 
         fs::remove_dir_all(article_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn post_and_ihave_reject_on_an_open_connection_without_a_buffered_body() {
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (stream, peer) = listener.accept().await.unwrap();
+                serve_session(stream, peer, test_config(), Arc::new(Stats::new()))
+                    .await
+                    .unwrap();
+            }
+        });
+
+        async fn read_crlf_line(stream: &mut TcpStream) -> Vec<u8> {
+            let mut line = Vec::new();
+            let mut byte = [0_u8; 1];
+            loop {
+                stream.read_exact(&mut byte).await.unwrap();
+                line.push(byte[0]);
+                if line.ends_with(b"\n") {
+                    return line;
+                }
+            }
+        }
+
+        let mut raw = TcpStream::connect(addr).await.unwrap();
+        let greeting = read_crlf_line(&mut raw).await;
+        assert_eq!(greeting, GREETING);
+        raw.write_all(b"POST\r\n").await.unwrap();
+        let rejected = tokio::time::timeout(Duration::from_secs(2), read_crlf_line(&mut raw))
+            .await
+            .expect("open POST waited for a body");
+        assert_eq!(rejected, b"440 posting not permitted\r\n");
+        raw.write_all(b"IHAVE <one@test>\r\n").await.unwrap();
+        let rejected = tokio::time::timeout(Duration::from_secs(2), read_crlf_line(&mut raw))
+            .await
+            .expect("open IHAVE waited for a body");
+        assert_eq!(rejected, b"435 article not wanted\r\n");
+        raw.write_all(b"QUIT\r\n").await.unwrap();
+        let closed = read_crlf_line(&mut raw).await;
+        assert_eq!(closed, QUIT_RESPONSE);
+        drop(raw);
+
+        let connection = ClientConnection::connect(addr).await.unwrap();
+        let post = tokio::time::timeout(
+            Duration::from_secs(2),
+            connection.post_article(ArticleTransfer::from_owned(b"Subject: one\r\n\r\nbody\r\n")),
+        )
+        .await
+        .expect("post_article waited for a body the server did not offer")
+        .unwrap();
+        assert_eq!(post.as_bytes(), b"440 posting not permitted\r\n");
+        let ihave = tokio::time::timeout(
+            Duration::from_secs(2),
+            connection.ihave_article(
+                MessageId::from_borrowed("<one@test>").unwrap(),
+                ArticleTransfer::from_owned(b"Subject: one\r\n\r\nbody\r\n"),
+            ),
+        )
+        .await
+        .expect("ihave_article waited for a body the server did not offer")
+        .unwrap();
+        assert_eq!(ihave.as_bytes(), b"435 article not wanted\r\n");
+        connection.quit().await.unwrap();
+        server.await.unwrap();
     }
 
     #[tokio::test]
