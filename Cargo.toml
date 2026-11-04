@@ -59,6 +59,10 @@ harness = false
 name = "client_overheads"
 harness = false
 
+[[bench]]
+name = "client_coordination"
+harness = false
+
 [profile.release]
 debug = false
 strip = true
