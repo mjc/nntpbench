@@ -20,7 +20,7 @@ The server is a reader benchmark peer. These commands run as real session behavi
 
 `ClientConnection` sends `CAPABILITIES` before `POST`, `IHAVE`, `CHECK`, `TAKETHIS`, `AUTHINFO USER`, `AUTHINFO PASS`, `STARTTLS`, `OVER`, `XOVER`, `HDR`, `XHDR`, `NEWGROUPS`, and `NEWNEWS` (`request_kind_requires_capabilities` in `src/client.rs`). It stores a boolean after status 101. It does not store the keyword list. `MODE STREAM` is not in that set, so the client can send it without that preflight.
 
-`--article-dir` replaces generated retrieval, list, overview, and discovery bytes with stored response frames when an index is built. Without that directory, those commands use the synthetic responses below.
+`--article-dir` replaces generated retrieval, list, overview, and discovery bytes with stored response frames when an index is built. Without that directory, retrieval uses the generated payloads below, and group, overview, header, and discovery replies use fixed rows.
 
 ## Benchmark-only
 
@@ -80,10 +80,12 @@ The server capability body stays `CAPABILITIES_RESPONSE` after those commands. I
 
 ### Benchmark workload realism
 
-Default article bytes are synthetic. That repeated text is a benchmark shortcut.
+Default ARTICLE and BODY payloads are generated yEnc. That generated encoding is a benchmark shortcut.
 
-`build_article_response_into` in `src/lib.rs` writes a fixed header, `Subject: nntpbench synthetic article`, and repeats `BODY_LINE` until `--article-bytes` or `--body-bytes` is filled. `BODY_LINE` is the sentence `This is synthetic NNTP article payload for throughput and latency benchmarking`. Message-ids look like `<article.N@nntpbench.local>`. The default date is `Fri, 15 May 2026 00:00:00 +0000`.
+`ServerArgs.payload_mode` defaults to `PayloadMode::Yenc`. `build_server_payload` calls `payload::encode_yenc_payload`, and `ServerConfig::from_bound_args` frames that payload once under the fixed header `Subject: nntpbench synthetic article`. `--body-bytes` and `--article-bytes` are the decoded sizes. The file name in the yEnc header is `nntpbench.bin`. Message-ids look like `<article.N@nntpbench.local>`. The default date is `Fri, 15 May 2026 00:00:00 +0000`.
 
-Without `--article-dir`, group, overview, header, and discovery replies use the fixed tables in `src/lib.rs`. Those fixed rows are a benchmark shortcut. They are not a news spool, a yEnc corpus, or a transit feed.
+`--payload-mode plain` uses `build_repeated_payload` instead. That path repeats `BODY_LINE`, the sentence `This is synthetic NNTP article payload for throughput and latency benchmarking`. The repeated line is a benchmark shortcut.
+
+Without `--article-dir`, group, overview, header, and discovery replies use the fixed tables in `src/lib.rs`. Those fixed rows are a benchmark shortcut. The default workload is not a captured news spool or a transit feed.
 
 `--article-dir` points at stored `ARTICLE` response frames keyed by selector. It changes retrieval bytes. It does not add TLS, authentication, posting, or streaming.
