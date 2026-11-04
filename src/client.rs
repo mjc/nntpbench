@@ -1875,12 +1875,12 @@ impl ClientConnection {
 
     /// Send a CAPABILITIES request and return the owned response frame.
     pub async fn capabilities(&self) -> Result<OwnedResponse, ClientError> {
-        self.execute(Request::Capabilities).await
+        self.execute(Request::capabilities()).await
     }
 
     /// Send a CAPABILITIES request and return the completed request/response pair.
     pub async fn capabilities_exchange(&self) -> Result<OwnedExchange, ClientError> {
-        self.execute_exchange(Request::Capabilities).await
+        self.execute_exchange(Request::capabilities()).await
     }
 
     /// Return the capability list stored for this connection.
@@ -2182,7 +2182,7 @@ impl ClientConnection {
         }
 
         let pending = self
-            .queue_request_unchecked(Request::Capabilities, false, false)
+            .queue_request_unchecked(Request::capabilities(), false, false)
             .await?;
         let response = pending.receive().await?;
         if response.status().as_u16() != 101 {
@@ -2388,6 +2388,9 @@ pub enum ClientError {
     InvalidArticleSelector,
     MissingArticleSelector,
     InvalidListGroupRange,
+    InvalidCapabilityKeyword,
+    ConflictingArguments,
+    InvalidSession { line: usize },
     CapabilitiesUnavailable,
     ConnectionClosed,
     UnexpectedArticleResponse { response: OwnedResponse },
@@ -2419,6 +2422,12 @@ impl fmt::Display for ClientError {
                 write!(f, "article selector is required for this request")
             }
             Self::InvalidListGroupRange => write!(f, "invalid LISTGROUP range"),
+            Self::InvalidCapabilityKeyword => write!(f, "invalid capability keyword"),
+            Self::ConflictingArguments => write!(f, "conflicting arguments"),
+            Self::InvalidSession { line: 0 } => write!(f, "session file has no commands"),
+            Self::InvalidSession { line } => {
+                write!(f, "invalid session command on line {line}")
+            }
             Self::CapabilitiesUnavailable => {
                 write!(f, "CAPABILITIES did not return a capability list")
             }
@@ -3058,7 +3067,12 @@ where
         Request::StartTls => write_simple_request_wire(writer, b"STARTTLS").await,
         Request::List => write_simple_request_wire(writer, b"LIST").await,
         Request::Help => write_simple_request_wire(writer, b"HELP").await,
-        Request::Capabilities => write_simple_request_wire(writer, b"CAPABILITIES").await,
+        Request::Capabilities { keyword: None } => {
+            write_simple_request_wire(writer, b"CAPABILITIES").await
+        }
+        Request::Capabilities {
+            keyword: Some(keyword),
+        } => write_one_arg_request_wire(writer, b"CAPABILITIES ", keyword).await,
         Request::Date => write_simple_request_wire(writer, b"DATE").await,
         Request::ModeReader => write_simple_request_wire(writer, b"MODE READER").await,
         Request::ModeStream => write_simple_request_wire(writer, b"MODE STREAM").await,
@@ -3618,6 +3632,9 @@ fn shared_engine_error_from_client(err: ClientError) -> SharedEngineError {
         | ClientError::InvalidArticleSelector
         | ClientError::MissingArticleSelector
         | ClientError::InvalidListGroupRange
+        | ClientError::InvalidCapabilityKeyword
+        | ClientError::ConflictingArguments
+        | ClientError::InvalidSession { .. }
         | ClientError::UnexpectedArticleResponse { .. } => SharedEngineError::ConnectionClosed,
     }
 }

@@ -16,7 +16,9 @@ The server is a reader benchmark peer. These commands run as real session behavi
 - `MODE READER`, answered with `201 posting not permitted`.
 - Pipelined commands. `RequestKind::coordination` records whether a later command may be written before the response, whether the command requires the connection alone, whether it changes session or transport state, and whether it enters continuation mode. The client waits until earlier responses finish before writing an exclusive command, and it holds the send barrier until the response when a later command must not follow. After `QUIT` returns 205, further commands are rejected.
 
-`CAPABILITIES` advertises that reader set and nothing else. The fixed body is `CAPABILITIES_RESPONSE` in `src/lib.rs`. It lists `VERSION 2`, `READER`, the `LIST` keywords above, `OVER MSGID`, `HDR`, and `NEWNEWS`. It does not list `STARTTLS`, `AUTHINFO`, `SASL`, `STREAMING`, or `MODE-READER`. An unknown keyword argument still returns 101 and that same body. A non-keyword argument, including a one- or two-character token, a numeric token, an underscore, or a second argument, returns `501 command syntax error`.
+`HELP` lists that same reader set: `ARTICLE`, `BODY`, `CAPABILITIES`, `DATE`, `GROUP`, `HDR`, `HEAD`, `HELP`, `LAST`, `LIST`, `LISTGROUP`, `MODE READER`, `NEWGROUPS`, `NEWNEWS`, `NEXT`, `OVER`, `QUIT`, `STAT`, `XHDR`, and `XOVER`. It does not list `CHECK`, `TAKETHIS`, `POST`, `IHAVE`, `AUTHINFO`, `STARTTLS`, or `MODE STREAM`.
+
+`CAPABILITIES` advertises that reader set and nothing else. The fixed body is `CAPABILITIES_RESPONSE` in `src/lib.rs`. It lists `VERSION 2`, `READER`, the `LIST` keywords above, `OVER MSGID`, `HDR`, and `NEWNEWS`. It does not list `STARTTLS`, `AUTHINFO`, `SASL`, `STREAMING`, `POST`, `IHAVE`, `CHECK`, `TAKETHIS`, or `MODE-READER`. An `IMPLEMENTATION` line is not part of this body. If a later line names the program, that line is informational and does not advertise a capability. An unknown keyword argument still returns 101 and that same body. A non-keyword argument, including a one- or two-character token, a numeric token, an underscore, or a second argument, returns `501 command syntax error`.
 
 `ClientConnection` sends `CAPABILITIES` before `POST`, `IHAVE`, `CHECK`, `TAKETHIS`, `AUTHINFO USER`, `AUTHINFO PASS`, `STARTTLS`, `OVER`, `XOVER`, `HDR`, `XHDR`, `NEWGROUPS`, and `NEWNEWS` when it has no stored capability list (`request_kind_requires_capabilities` and `ensure_capabilities_negotiated` in `src/client.rs`). That send is a convenience preflight. The stored list is described under [Capability state](#capability-state). `MODE STREAM` is not in that set, so the client can send it without that preflight.
 
@@ -64,9 +66,7 @@ Benchmark-only. The server never accepts an article.
 
 The reader server does not offer streaming.
 
-`handle_command` and `process_request_to_buffer` answer `MODE STREAM` with `502 command unavailable`. That reply does not record a streaming session. `CAPABILITIES` omits `STREAMING`, and `HELP` does not list `MODE STREAM`. `CHECK` and `TAKETHIS` stay `502` whether or not `MODE STREAM` came first. A peer that answers 203 can still be parsed; this server does not send that status.
-
-`HELP` lists `CHECK` while that command returns 502. That help line is a benchmark shortcut.
+`handle_command` and `process_request_to_buffer` answer `MODE STREAM` with `502 command unavailable`. That reply does not record a streaming session. `CAPABILITIES` omits `STREAMING`, and `HELP` does not list `MODE STREAM`. `CHECK` and `TAKETHIS` stay `502` whether or not `MODE STREAM` came first. A peer that answers 203 can still be parsed; this server does not send that status. `HELP` does not list `CHECK`, `TAKETHIS`, or `MODE STREAM`.
 
 The client sends `MODE STREAM` through `ClientConnection::execute` without the capability preflight and without the send barrier (`request_kind_requires_capabilities` and `request_kind_requires_barrier` in `src/client.rs`). `CHECK` and `TAKETHIS` also allow a following command before their responses. `POST`, `IHAVE`, `AUTHINFO`, `MODE READER`, `STARTTLS`, and `QUIT` do not. The load command mixes (`Article`, `Body`, `Stat`, `Alternate`, `Mixed`) only emit commands whose coordination allows a throughput pipeline.
 
@@ -91,3 +91,5 @@ Default ARTICLE and BODY payloads are generated yEnc. That generated encoding is
 Without `--article-dir`, group, overview, header, and discovery replies use the fixed tables in `src/lib.rs`. Those fixed rows are a benchmark shortcut. The default workload is not a captured news spool or a transit feed.
 
 `--article-dir` points at stored `ARTICLE` response frames keyed by selector. It changes retrieval bytes. It does not add TLS, authentication, posting, or streaming.
+
+The one-shot client commands stay single requests. `--capability KEYWORD` adds the keyword argument to `CAPABILITIES`. `--article-file` supplies the bytes for `POST`, `IHAVE`, and `TAKETHIS`; `POST` and `IHAVE` still wait for 340 or 335 before writing that file. `--session FILE` runs the reader commands in that file on one connection, including `GROUP`, article retrieval, `CAPABILITIES`, `POST-ARTICLE`, and `IHAVE-ARTICLE`. A bare `POST` or `IHAVE` line is rejected, because those commands have no article to send after 340 or 335. The script rejects `STARTTLS`, `AUTHINFO SASL`, and `MODE STREAM`. `AUTHINFO USER` and `AUTHINFO PASS` keep the value text after the keyword, including spaces inside it. `--auth-value` remains the `AUTHINFO USER` and `AUTHINFO PASS` builder input.
