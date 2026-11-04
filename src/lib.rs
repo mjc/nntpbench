@@ -4416,7 +4416,7 @@ where
             write_response(
                 writer,
                 pending_write,
-                b"203 streaming enabled\r\n",
+                b"502 command unavailable\r\n",
                 session_stats,
             )
             .await?;
@@ -5285,7 +5285,7 @@ where
         RequestKind::Capabilities => CAPABILITIES_RESPONSE,
         RequestKind::Help => HELP_RESPONSE,
         RequestKind::ModeReader => MODE_READER_RESPONSE,
-        RequestKind::ModeStream => b"203 streaming enabled\r\n",
+        RequestKind::ModeStream => b"502 command unavailable\r\n",
         RequestKind::Quit => QUIT_RESPONSE,
         RequestKind::Unknown if is_known_request_syntax_error(request) => {
             if authinfo_sasl_initial_response_base64_error(request.verb(), request.args()) {
@@ -11038,6 +11038,30 @@ mod tests {
                 b"435 article not wanted\r\n205 closing connection\r\n",
                 "RFC 3977 rejected IHAVE should not invite transfer and should recover QUIT"
             );
+        }
+
+        #[tokio::test]
+        async fn mode_stream_stays_unavailable_and_does_not_change_check_or_takethis() {
+            let input = b"CHECK <one@test>\r\nTAKETHIS <one@test>\r\n.\r\nMODE STREAM\r\nCHECK <one@test>\r\nTAKETHIS <one@test>\r\n.\r\nCAPABILITIES\r\nHELP\r\nQUIT\r\n";
+            let (output, _) = run_session_with_input(test_config(), input).await;
+            let body = without_greeting(&output);
+            let unavailable = b"502 command unavailable\r\n";
+            let mut expected = Vec::new();
+            expected.extend_from_slice(unavailable);
+            expected.extend_from_slice(unavailable);
+            expected.extend_from_slice(unavailable);
+            expected.extend_from_slice(unavailable);
+            expected.extend_from_slice(unavailable);
+            expected.extend_from_slice(CAPABILITIES_RESPONSE);
+            expected.extend_from_slice(HELP_RESPONSE);
+            expected.extend_from_slice(b"205 closing connection\r\n");
+            assert_eq!(body, expected.as_slice());
+            assert!(
+                !body
+                    .windows(b"STREAMING".len())
+                    .any(|window| window.eq_ignore_ascii_case(b"STREAMING"))
+            );
+            assert!(!body.windows(b"203 ".len()).any(|window| window == b"203 "));
         }
 
         #[tokio::test]
