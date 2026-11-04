@@ -7,6 +7,7 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::task::{Context, Poll};
 
 use bytes::{BufMut, BytesMut};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -2529,35 +2530,148 @@ async fn run_writer_task(
     poisoned: Arc<Mutex<Option<SharedEngineError>>>,
     gate: Arc<PipelineGate>,
 ) {
-    while let Some(queued) = request_rx.recv().await {
-        let kind = queued.request.kind();
-        if kind.coordination().requires_exclusive_connection() {
+    // One TCP send for a run of small pipelined commands. Each writev otherwise
+    // transmits its own loopback segment.
+    let mut encode_buf = Vec::with_capacity(1024);
+    let mut batch = Vec::with_capacity(8);
+    let mut held = None;
+    loop {
+        // A held command is exclusive or large. Waiting here for another command
+        // cannot succeed: the following command is not queued until this one
+        // finishes.
+        let first = match held.take() {
+            Some(queued) => queued,
+            None => {
+                let Some(queued) = request_rx.recv().await else {
+                    break;
+                };
+                queued
+            }
+        };
+        let first_is_exclusive = first
+            .request
+            .kind()
+            .coordination()
+            .requires_exclusive_connection();
+        let first_is_large = request_has_large_payload(&first.request);
+        if first_is_exclusive {
             gate.wait_until_idle().await;
         }
-        if let Err(err) = write_request_wire(&mut writer, &queued.request).await {
+        batch.push(first);
+        if !first_is_exclusive && !first_is_large {
+            while batch.len() < 64 {
+                match request_rx.try_recv() {
+                    Ok(next)
+                        if next
+                            .request
+                            .kind()
+                            .coordination()
+                            .requires_exclusive_connection()
+                            || request_has_large_payload(&next.request) =>
+                    {
+                        held = Some(next);
+                        break;
+                    }
+                    Ok(next) => batch.push(next),
+                    Err(_) => break,
+                }
+            }
+        }
+
+        let write_result = if batch.len() == 1 {
+            write_request_wire(&mut writer, &batch[0].request).await
+        } else {
+            write_requests_buffered(&mut writer, &batch, &mut encode_buf).await
+        };
+        if let Err(err) = write_result {
             let error = SharedEngineError::Io {
                 kind: err.kind(),
                 message: err.to_string(),
             };
-            let _ = queued.response_tx.send(Err(error.clone()));
+            for queued in batch.drain(..) {
+                let _ = queued.response_tx.send(Err(error.clone()));
+            }
+            if let Some(queued) = held.take() {
+                let _ = queued.response_tx.send(Err(error.clone()));
+            }
             poison_writer_engine(&poisoned, &mut request_rx, error).await;
             return;
         }
 
-        let inflight = InFlightRequest {
-            request: queued.request,
-            kind,
-            response_tx: queued.response_tx,
-            barrier_guard: queued.barrier_guard,
-        };
-        gate.begin_inflight();
-        if let Err(err) = inflight_tx.send(inflight).await {
-            gate.end_inflight();
-            let error = SharedEngineError::ConnectionClosed;
-            let _ = err.0.response_tx.send(Err(error.clone()));
-            poison_writer_engine(&poisoned, &mut request_rx, error).await;
-            break;
+        let mut pending = std::mem::take(&mut batch).into_iter();
+        while let Some(queued) = pending.next() {
+            let kind = queued.request.kind();
+            let inflight = InFlightRequest {
+                request: queued.request,
+                kind,
+                response_tx: queued.response_tx,
+                barrier_guard: queued.barrier_guard,
+            };
+            gate.begin_inflight();
+            if let Err(err) = inflight_tx.send(inflight).await {
+                gate.end_inflight();
+                let error = SharedEngineError::ConnectionClosed;
+                let _ = err.0.response_tx.send(Err(error.clone()));
+                for queued in pending {
+                    let _ = queued.response_tx.send(Err(error.clone()));
+                }
+                if let Some(queued) = held.take() {
+                    let _ = queued.response_tx.send(Err(error.clone()));
+                }
+                poison_writer_engine(&poisoned, &mut request_rx, error).await;
+                return;
+            }
         }
+        batch.reserve(8);
+    }
+}
+
+fn request_has_large_payload(request: &Request<'static>) -> bool {
+    const LARGE_PAYLOAD_BYTES: usize = 8 * 1024;
+    match request {
+        Request::TakeThis { article, .. } => article.as_bytes().len() > LARGE_PAYLOAD_BYTES,
+        _ => false,
+    }
+}
+
+async fn write_requests_buffered<W>(
+    writer: &mut W,
+    batch: &[QueuedRequest],
+    encode_buf: &mut Vec<u8>,
+) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    encode_buf.clear();
+    {
+        let mut sink = VecSink { buf: encode_buf };
+        for queued in batch {
+            write_request_wire(&mut sink, &queued.request).await?;
+        }
+    }
+    writer.write_all(encode_buf).await
+}
+
+struct VecSink<'a> {
+    buf: &'a mut Vec<u8>,
+}
+
+impl AsyncWrite for VecSink<'_> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.get_mut().buf.extend_from_slice(data);
+        Poll::Ready(Ok(data.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
     }
 }
 
