@@ -308,7 +308,7 @@ const XHDR_LINES_2_PLUS_RESPONSE: &[u8] = b"221 headers follow\r\n2 8\r\n3 12\r\
 pub const HEAD_RESPONSE: &[u8] = b"221 1 <article.1@nntpbench.local> article retrieved\r\nPath: nntpbench.local!mock\r\nFrom: Bench User <bench@nntpbench.local>\r\nNewsgroups: alt.binaries.bench\r\nSubject: nntpbench synthetic article\r\nMessage-ID: <article.1@nntpbench.local>\r\nDate: Fri, 15 May 2026 00:00:00 +0000\r\n.\r\n";
 pub const STAT_RESPONSE: &[u8] = b"223 1 <article.1@nntpbench.local> article retrieved\r\n";
 pub const HELP_RESPONSE: &[u8] =
-    b"100 help text follows\r\nARTICLE\r\nBODY\r\nCAPABILITIES\r\nCHECK\r\nDATE\r\nGROUP\r\nHDR\r\nHEAD\r\nHELP\r\nLAST\r\nLIST\r\nLISTGROUP\r\nMODE READER\r\nNEWGROUPS\r\nNEWNEWS\r\nNEXT\r\nOVER\r\nQUIT\r\nSTAT\r\nXHDR\r\nXOVER\r\n.\r\n";
+    b"100 help text follows\r\nARTICLE\r\nBODY\r\nCAPABILITIES\r\nDATE\r\nGROUP\r\nHDR\r\nHEAD\r\nHELP\r\nLAST\r\nLIST\r\nLISTGROUP\r\nMODE READER\r\nNEWGROUPS\r\nNEWNEWS\r\nNEXT\r\nOVER\r\nQUIT\r\nSTAT\r\nXHDR\r\nXOVER\r\n.\r\n";
 pub const CAPABILITIES_RESPONSE: &[u8] =
     b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nLIST ACTIVE ACTIVE.TIMES DISTRIB.PATS NEWSGROUPS OVERVIEW.FMT HEADERS\r\nOVER MSGID\r\nHDR\r\nNEWNEWS\r\n.\r\n";
 pub const QUIT_RESPONSE: &[u8] = b"205 closing connection\r\n";
@@ -11208,7 +11208,6 @@ mod tests {
                 "ARTICLE",
                 "BODY",
                 "CAPABILITIES",
-                "CHECK",
                 "DATE",
                 "GROUP",
                 "HDR",
@@ -11230,6 +11229,59 @@ mod tests {
                 assert!(
                     text.contains(command),
                     "RFC 3977 HELP should list understood command {command}, got {text:?}"
+                );
+            }
+            for absent in [
+                "\nCHECK\r\n",
+                "\nTAKETHIS\r\n",
+                "\nPOST\r\n",
+                "\nIHAVE\r\n",
+                "\nAUTHINFO\r\n",
+                "\nSTARTTLS\r\n",
+                "\nMODE STREAM\r\n",
+            ] {
+                assert!(
+                    !text.contains(absent),
+                    "HELP lists a command the reader server does not run: {absent}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn reader_persona_help_and_capabilities_match_command_results() {
+            let input = b"HELP\r\nCAPABILITIES\r\nAUTHINFO USER name\r\nAUTHINFO PASS secret\r\nAUTHINFO SASL PLAIN\r\nSTARTTLS\r\nPOST\r\nIHAVE <one@test>\r\nCHECK <one@test>\r\nTAKETHIS <one@test>\r\n.\r\nMODE STREAM\r\nQUIT\r\n";
+            let (output, _) = run_session_with_input(test_config(), input).await;
+            let body = without_greeting(&output);
+            let mut expected = Vec::new();
+            expected.extend_from_slice(HELP_RESPONSE);
+            expected.extend_from_slice(CAPABILITIES_RESPONSE);
+            expected
+                .extend_from_slice(b"483 command unavailable until TLS has been negotiated\r\n");
+            expected
+                .extend_from_slice(b"483 command unavailable until TLS has been negotiated\r\n");
+            expected.extend_from_slice(b"502 command unavailable\r\n");
+            expected.extend_from_slice(b"502 command unavailable\r\n");
+            expected.extend_from_slice(b"440 posting not permitted\r\n");
+            expected.extend_from_slice(b"435 article not wanted\r\n");
+            expected.extend_from_slice(b"502 command unavailable\r\n");
+            expected.extend_from_slice(b"502 command unavailable\r\n");
+            expected.extend_from_slice(b"502 command unavailable\r\n");
+            expected.extend_from_slice(b"205 closing connection\r\n");
+            assert_eq!(body, expected.as_slice());
+            let capabilities = CAPABILITIES_RESPONSE;
+            for keyword in [
+                b"STARTTLS".as_slice(),
+                b"AUTHINFO".as_slice(),
+                b"SASL".as_slice(),
+                b"STREAMING".as_slice(),
+                b"IMPLEMENTATION".as_slice(),
+            ] {
+                assert!(
+                    !capabilities
+                        .windows(keyword.len())
+                        .any(|window| window.eq_ignore_ascii_case(keyword)),
+                    "capability list advertises {}",
+                    String::from_utf8_lossy(keyword)
                 );
             }
         }

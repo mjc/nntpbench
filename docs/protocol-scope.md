@@ -16,7 +16,9 @@ The server is a reader benchmark peer. These commands run as real session behavi
 - `MODE READER`, answered with `201 posting not permitted`.
 - Pipelined commands. `RequestKind::coordination` records whether a later command may be written before the response, whether the command requires the connection alone, whether it changes session or transport state, and whether it enters continuation mode. The client waits until earlier responses finish before writing an exclusive command, and it holds the send barrier until the response when a later command must not follow. After `QUIT` returns 205, further commands are rejected.
 
-`CAPABILITIES` advertises that reader set and nothing else. The fixed body is `CAPABILITIES_RESPONSE` in `src/lib.rs`. It lists `VERSION 2`, `READER`, the `LIST` keywords above, `OVER MSGID`, `HDR`, and `NEWNEWS`. It does not list `STARTTLS`, `AUTHINFO`, `SASL`, `STREAMING`, or `MODE-READER`. An unknown keyword argument still returns 101 and that same body. A non-keyword argument, including a one- or two-character token, a numeric token, an underscore, or a second argument, returns `501 command syntax error`.
+`HELP` lists that same reader set: `ARTICLE`, `BODY`, `CAPABILITIES`, `DATE`, `GROUP`, `HDR`, `HEAD`, `HELP`, `LAST`, `LIST`, `LISTGROUP`, `MODE READER`, `NEWGROUPS`, `NEWNEWS`, `NEXT`, `OVER`, `QUIT`, `STAT`, `XHDR`, and `XOVER`. It does not list `CHECK`, `TAKETHIS`, `POST`, `IHAVE`, `AUTHINFO`, `STARTTLS`, or `MODE STREAM`.
+
+`CAPABILITIES` advertises that reader set and nothing else. The fixed body is `CAPABILITIES_RESPONSE` in `src/lib.rs`. It lists `VERSION 2`, `READER`, the `LIST` keywords above, `OVER MSGID`, `HDR`, and `NEWNEWS`. It does not list `STARTTLS`, `AUTHINFO`, `SASL`, `STREAMING`, `POST`, `IHAVE`, `CHECK`, `TAKETHIS`, or `MODE-READER`. An `IMPLEMENTATION` line is not part of this body. If a later line names the program, that line is informational and does not advertise a capability. An unknown keyword argument still returns 101 and that same body. A non-keyword argument, including a one- or two-character token, a numeric token, an underscore, or a second argument, returns `501 command syntax error`.
 
 `ClientConnection` sends `CAPABILITIES` before `POST`, `IHAVE`, `CHECK`, `TAKETHIS`, `AUTHINFO USER`, `AUTHINFO PASS`, `STARTTLS`, `OVER`, `XOVER`, `HDR`, `XHDR`, `NEWGROUPS`, and `NEWNEWS` when it has no stored capability list (`request_kind_requires_capabilities` and `ensure_capabilities_negotiated` in `src/client.rs`). That send is a convenience preflight. The stored list is described under [Capability state](#capability-state). `MODE STREAM` is not in that set, so the client can send it without that preflight.
 
@@ -64,9 +66,7 @@ Benchmark-only. The server never accepts an article.
 
 The reader server does not offer streaming.
 
-`handle_command` and `process_request_to_buffer` answer `MODE STREAM` with `502 command unavailable`. That reply does not record a streaming session. `CAPABILITIES` omits `STREAMING`, and `HELP` does not list `MODE STREAM`. `CHECK` and `TAKETHIS` stay `502` whether or not `MODE STREAM` came first. A peer that answers 203 can still be parsed; this server does not send that status.
-
-`HELP` lists `CHECK` while that command returns 502. That help line is a benchmark shortcut.
+`handle_command` and `process_request_to_buffer` answer `MODE STREAM` with `502 command unavailable`. That reply does not record a streaming session. `CAPABILITIES` omits `STREAMING`, and `HELP` does not list `MODE STREAM`. `CHECK` and `TAKETHIS` stay `502` whether or not `MODE STREAM` came first. A peer that answers 203 can still be parsed; this server does not send that status. `HELP` does not list `CHECK`, `TAKETHIS`, or `MODE STREAM`.
 
 The client sends `MODE STREAM` through `ClientConnection::execute` without the capability preflight and without the send barrier (`request_kind_requires_capabilities` and `request_kind_requires_barrier` in `src/client.rs`). `CHECK` and `TAKETHIS` also allow a following command before their responses. `POST`, `IHAVE`, `AUTHINFO`, `MODE READER`, `STARTTLS`, and `QUIT` do not. The load command mixes (`Article`, `Body`, `Stat`, `Alternate`, `Mixed`) only emit commands whose coordination allows a throughput pipeline.
 
