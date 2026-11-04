@@ -2,7 +2,7 @@
 
 Small async mock NNTP server and client for throughput, latency, and profiling work.
 
-The current focus is hot-path throughput and protocol/client work, with the longer-term goal of growing this into a more fully featured NNTP implementation.
+The current focus is hot-path throughput and protocol/client work, with the longer-term goal of growing this into a more fully featured NNTP implementation. [Protocol scope](docs/protocol-scope.md) separates the reader benchmark this tree runs from the command builders that stop short of an RFC exchange.
 
 ## CLI
 
@@ -14,8 +14,9 @@ nix develop -c cargo run -- server --listen 127.0.0.1:2119
 
 Send one request and print the raw NNTP response. `client` is the supported
 request/future client command; `fetch` remains as a compatibility alias for the
-same one-request path. Extension requests use the client capability preflight
-before sending the selected command.
+same one-request path. Capability-gated extension commands send `CAPABILITIES`
+before the selected command. `MODE STREAM` does not. The [protocol scope](docs/protocol-scope.md)
+page names which builders are only the wire shape.
 
 ```bash
 nix develop -c cargo run -- client --connect 127.0.0.1:2119 --request article --message-id '<article.1@nntpbench.local>'
