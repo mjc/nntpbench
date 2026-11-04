@@ -62,9 +62,9 @@ Benchmark-only. The server never accepts an article.
 
 ### STREAMING and MODE STREAM
 
-Benchmark shortcut. `MODE STREAM` does not enable streaming.
+The reader server does not offer streaming.
 
-`RequestKind::ModeStream` writes the fixed line `203 streaming enabled` (`src/lib.rs`). The handler does not record a streaming session, and `CAPABILITIES` still omits `STREAMING`. `CHECK` stays `502`. `TAKETHIS` stays `502` after the body scan described above. The 203 line is a benchmark shortcut, not an RFC 4644 streaming mode.
+`handle_command` and `process_request_to_buffer` answer `MODE STREAM` with `502 command unavailable`. That reply does not record a streaming session. `CAPABILITIES` omits `STREAMING`, and `HELP` does not list `MODE STREAM`. `CHECK` and `TAKETHIS` stay `502` whether or not `MODE STREAM` came first. A peer that answers 203 can still be parsed; this server does not send that status.
 
 `HELP` lists `CHECK` while that command returns 502. That help line is a benchmark shortcut.
 
