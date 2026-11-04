@@ -914,9 +914,27 @@ pub struct FetchArgs {
     #[arg(long)]
     pub message_id: Option<String>,
 
-    /// Article body for TAKETHIS requests.
+    /// Article body for POST, IHAVE, and TAKETHIS requests.
     #[arg(long)]
     pub article_body: Option<String>,
+
+    /// Article file for POST, IHAVE, and TAKETHIS. The file is sent only after POST 340 or IHAVE 335.
+    #[arg(long)]
+    pub article_file: Option<PathBuf>,
+
+    /// Keyword argument for a one-shot CAPABILITIES request.
+    #[arg(long)]
+    pub capability: Option<String>,
+
+    /// Reader commands to run on one connection, one command per line.
+    ///
+    /// Blank lines and lines starting with `#` are ignored. `POST-ARTICLE path`
+    /// and `IHAVE-ARTICLE message-id path` send the file only after 340 or 335.
+    /// A bare `POST` or `IHAVE` line is rejected. `STARTTLS`, `AUTHINFO SASL`,
+    /// and `MODE STREAM` are rejected. `AUTHINFO USER` and `AUTHINFO PASS`
+    /// keep the value text after the keyword, including spaces inside it.
+    #[arg(long)]
+    pub session: Option<PathBuf>,
 
     /// AUTHINFO value for AUTHINFO USER/PASS requests.
     #[arg(long)]
@@ -1115,6 +1133,13 @@ impl SegmentSet {
 
 #[cfg_attr(coverage_nightly, coverage(off))]
 pub async fn run_fetch(args: FetchArgs) -> io::Result<()> {
+    validate_fetch_args(&args).map_err(map_client_error)?;
+    if args.session.is_some() {
+        let response = scripted_session_response(&args)
+            .await
+            .map_err(map_client_error)?;
+        return io::stdout().write_all(&response);
+    }
     if args.request.is_some() {
         let response = fetch_response(&args).await.map_err(map_client_error)?;
         io::stdout().write_all(response.as_bytes())
@@ -1124,8 +1149,81 @@ pub async fn run_fetch(args: FetchArgs) -> io::Result<()> {
 }
 
 pub async fn fetch_response(args: &FetchArgs) -> Result<OwnedResponse, ClientError> {
-    let request = fetch_request(args)?;
-    let connection = ClientConnection::connect_with_options(
+    let prepared = prepare_fetch(args)?;
+    let connection = connect_fetch_client(args).await?;
+    match prepared {
+        PreparedFetch::Post(article) => {
+            connection
+                .post_article(ArticleTransfer::from_owned(article))
+                .await
+        }
+        PreparedFetch::Ihave {
+            message_id,
+            article,
+        } => {
+            connection
+                .ihave_article(message_id, ArticleTransfer::from_owned(article))
+                .await
+        }
+        PreparedFetch::TakeThis {
+            message_id,
+            article,
+        } => {
+            connection
+                .takethis(message_id, ArticleTransfer::from_owned(article))
+                .await
+        }
+        PreparedFetch::Request(request) => connection.execute(request).await,
+    }
+}
+
+enum PreparedFetch {
+    Request(Request<'static>),
+    Post(Vec<u8>),
+    Ihave {
+        message_id: MessageId<'static>,
+        article: Vec<u8>,
+    },
+    TakeThis {
+        message_id: MessageId<'static>,
+        article: Vec<u8>,
+    },
+}
+
+fn prepare_fetch(args: &FetchArgs) -> Result<PreparedFetch, ClientError> {
+    validate_fetch_args(args)?;
+    let article = article_bytes_from_args(args)?;
+    match (args.request, article) {
+        (Some(FetchRequestKind::Post), Some(article)) => Ok(PreparedFetch::Post(article)),
+        (Some(FetchRequestKind::Ihave), Some(article)) => {
+            let message_id = args
+                .message_id
+                .as_deref()
+                .ok_or(ClientError::MissingMessageId)?;
+            Ok(PreparedFetch::Ihave {
+                message_id: MessageId::from_str_or_wrap(message_id)
+                    .map_err(|_| ClientError::InvalidMessageId)?,
+                article,
+            })
+        }
+        (Some(FetchRequestKind::Takethis), Some(article)) => {
+            let message_id = args
+                .message_id
+                .as_deref()
+                .ok_or(ClientError::MissingMessageId)?;
+            Ok(PreparedFetch::TakeThis {
+                message_id: MessageId::from_str_or_wrap(message_id)
+                    .map_err(|_| ClientError::InvalidMessageId)?,
+                article,
+            })
+        }
+        (Some(FetchRequestKind::Takethis), None) => Err(ClientError::MissingArticleBody),
+        _ => Ok(PreparedFetch::Request(fetch_request(args)?)),
+    }
+}
+
+async fn connect_fetch_client(args: &FetchArgs) -> Result<ClientConnection, ClientError> {
+    ClientConnection::connect_with_options(
         args.connect,
         ClientOptions {
             read_buffer_bytes: args.read_buffer_bytes.max(terminator::TERMINATOR_TAIL_SIZE),
@@ -1136,9 +1234,7 @@ pub async fn fetch_response(args: &FetchArgs) -> Result<OwnedResponse, ClientErr
             ..ClientOptions::default()
         },
     )
-    .await?;
-
-    connection.execute(request).await
+    .await
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -2446,7 +2542,11 @@ fn fetch_request(args: &FetchArgs) -> Result<Request<'static>, ClientError> {
         ),
         FetchRequestKind::List => Ok(Request::list()),
         FetchRequestKind::Help => Ok(Request::help()),
-        FetchRequestKind::Capabilities => Ok(Request::capabilities()),
+        FetchRequestKind::Capabilities => match args.capability.as_deref() {
+            Some(keyword) => Request::capabilities_keyword(keyword)
+                .map_err(|_| ClientError::InvalidCapabilityKeyword),
+            None => Ok(Request::capabilities()),
+        },
         FetchRequestKind::Date => Ok(Request::date()),
         FetchRequestKind::ModeReader => Ok(Request::mode_reader()),
         FetchRequestKind::ModeStream => Ok(Request::mode_stream()),
@@ -2555,11 +2655,319 @@ fn fetch_takethis_request(args: &FetchArgs) -> Result<Request<'static>, ClientEr
         .message_id
         .as_deref()
         .ok_or(ClientError::MissingMessageId)?;
-    let article = args
+    let article = article_bytes_from_args(args)?.ok_or(ClientError::MissingArticleBody)?;
+    Request::takethis(message_id, article).map_err(|_| ClientError::InvalidMessageId)
+}
+
+fn article_bytes_from_args(args: &FetchArgs) -> Result<Option<Vec<u8>>, ClientError> {
+    if let Some(path) = &args.article_file {
+        return fs::read(path).map(Some).map_err(ClientError::Io);
+    }
+    Ok(args
         .article_body
-        .as_deref()
-        .ok_or(ClientError::MissingArticleBody)?;
-    Request::takethis(message_id, article.as_bytes()).map_err(|_| ClientError::InvalidMessageId)
+        .as_ref()
+        .map(|body| body.as_bytes().to_vec()))
+}
+
+fn validate_fetch_args(args: &FetchArgs) -> Result<(), ClientError> {
+    if args.session.is_some()
+        && (args.request.is_some()
+            || args.capability.is_some()
+            || args.article_body.is_some()
+            || args.article_file.is_some())
+    {
+        return Err(ClientError::ConflictingArguments);
+    }
+    if args.article_body.is_some() && args.article_file.is_some() {
+        return Err(ClientError::ConflictingArguments);
+    }
+    let article_input = args.article_body.is_some() || args.article_file.is_some();
+    let article_command = matches!(
+        args.request,
+        Some(FetchRequestKind::Post | FetchRequestKind::Ihave | FetchRequestKind::Takethis)
+    );
+    if article_input && !article_command {
+        return Err(ClientError::ConflictingArguments);
+    }
+    if args.capability.is_some() && args.request != Some(FetchRequestKind::Capabilities) {
+        return Err(ClientError::ConflictingArguments);
+    }
+    if let Some(keyword) = args.capability.as_deref() {
+        Request::capabilities_keyword(keyword)
+            .map_err(|_| ClientError::InvalidCapabilityKeyword)?;
+    }
+    Ok(())
+}
+
+enum SessionCommand {
+    Execute(Request<'static>),
+    PostArticle(Vec<u8>),
+    IhaveArticle {
+        message_id: MessageId<'static>,
+        article: Vec<u8>,
+    },
+}
+
+async fn scripted_session_response(args: &FetchArgs) -> Result<Vec<u8>, ClientError> {
+    validate_fetch_args(args)?;
+    let path = args
+        .session
+        .as_ref()
+        .ok_or(ClientError::InvalidSession { line: 0 })?;
+    let text = fs::read_to_string(path).map_err(ClientError::Io)?;
+    let commands = parse_session_script(&text)?;
+    let connection = connect_fetch_client(args).await?;
+    let mut output = Vec::new();
+    for command in commands {
+        let response = match command {
+            SessionCommand::Execute(request) => connection.execute(request).await?,
+            SessionCommand::PostArticle(article) => {
+                connection
+                    .post_article(ArticleTransfer::from_owned(article))
+                    .await?
+            }
+            SessionCommand::IhaveArticle {
+                message_id,
+                article,
+            } => {
+                connection
+                    .ihave_article(message_id, ArticleTransfer::from_owned(article))
+                    .await?
+            }
+        };
+        output.extend_from_slice(response.as_bytes());
+    }
+    Ok(output)
+}
+
+fn parse_session_script(text: &str) -> Result<Vec<SessionCommand>, ClientError> {
+    let mut commands = Vec::new();
+    for (index, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let command = parse_session_line(line)
+            .map_err(|_| ClientError::InvalidSession { line: index + 1 })?;
+        commands.push(command);
+    }
+    if commands.is_empty() {
+        return Err(ClientError::InvalidSession { line: 0 });
+    }
+    Ok(commands)
+}
+
+fn parse_session_line(line: &str) -> Result<SessionCommand, ()> {
+    let mut parts = line.split_whitespace();
+    let verb = parts.next().ok_or(())?.to_ascii_uppercase();
+    let rest = parts.collect::<Vec<_>>();
+    match verb.as_str() {
+        "STARTTLS" => Err(()),
+        "MODE" => match rest.as_slice() {
+            ["READER"] | ["reader"] => Ok(SessionCommand::Execute(Request::mode_reader())),
+            [mode] if mode.eq_ignore_ascii_case("READER") => {
+                Ok(SessionCommand::Execute(Request::mode_reader()))
+            }
+            _ => Err(()),
+        },
+        "AUTHINFO" => parse_session_authinfo_line(line),
+        "POST-ARTICLE" => {
+            let [path] = rest.as_slice() else {
+                return Err(());
+            };
+            Ok(SessionCommand::PostArticle(fs::read(path).map_err(|_| ())?))
+        }
+        "IHAVE-ARTICLE" => {
+            let [message_id, path] = rest.as_slice() else {
+                return Err(());
+            };
+            Ok(SessionCommand::IhaveArticle {
+                message_id: MessageId::from_str_or_wrap(message_id).map_err(|_| ())?,
+                article: fs::read(path).map_err(|_| ())?,
+            })
+        }
+        "TAKETHIS" => {
+            let [message_id, path] = rest.as_slice() else {
+                return Err(());
+            };
+            let article = fs::read(path).map_err(|_| ())?;
+            Ok(SessionCommand::Execute(
+                Request::takethis(message_id, article).map_err(|_| ())?,
+            ))
+        }
+        "CHECK" => {
+            let [message_id] = rest.as_slice() else {
+                return Err(());
+            };
+            Ok(SessionCommand::Execute(
+                Request::check(message_id).map_err(|_| ())?,
+            ))
+        }
+        "GROUP" => {
+            let [group] = rest.as_slice() else {
+                return Err(());
+            };
+            Ok(SessionCommand::Execute(
+                Request::group(group).map_err(|_| ())?,
+            ))
+        }
+        "ARTICLE" | "BODY" | "HEAD" | "STAT" => Ok(SessionCommand::Execute(
+            session_article_command(&verb, &rest)?,
+        )),
+        "LAST" if rest.is_empty() => Ok(SessionCommand::Execute(Request::last())),
+        "NEXT" if rest.is_empty() => Ok(SessionCommand::Execute(Request::next())),
+        "DATE" if rest.is_empty() => Ok(SessionCommand::Execute(Request::date())),
+        "HELP" if rest.is_empty() => Ok(SessionCommand::Execute(Request::help())),
+        "QUIT" if rest.is_empty() => Ok(SessionCommand::Execute(Request::quit())),
+        "LIST" => Ok(SessionCommand::Execute(session_list_command(&rest)?)),
+        "LISTGROUP" => Ok(SessionCommand::Execute(session_listgroup_command(&rest)?)),
+        "OVER" => match rest.as_slice() {
+            [] => Ok(SessionCommand::Execute(Request::over_current())),
+            [selector] => Ok(SessionCommand::Execute(
+                Request::over(selector).map_err(|_| ())?,
+            )),
+            _ => Err(()),
+        },
+        "XOVER" => match rest.as_slice() {
+            [] => Ok(SessionCommand::Execute(Request::xover_current())),
+            [selector] => Ok(SessionCommand::Execute(
+                Request::xover(selector).map_err(|_| ())?,
+            )),
+            _ => Err(()),
+        },
+        "HDR" => match rest.as_slice() {
+            [header] => Ok(SessionCommand::Execute(
+                Request::hdr_current(header).map_err(|_| ())?,
+            )),
+            [header, selector] => Ok(SessionCommand::Execute(
+                Request::hdr(header, selector).map_err(|_| ())?,
+            )),
+            _ => Err(()),
+        },
+        "XHDR" => match rest.as_slice() {
+            [header] => Ok(SessionCommand::Execute(
+                Request::xhdr_current(header).map_err(|_| ())?,
+            )),
+            [header, selector] => Ok(SessionCommand::Execute(
+                Request::xhdr(header, selector).map_err(|_| ())?,
+            )),
+            _ => Err(()),
+        },
+        "CAPABILITIES" => match rest.as_slice() {
+            [] => Ok(SessionCommand::Execute(Request::capabilities())),
+            [keyword] => Ok(SessionCommand::Execute(
+                Request::capabilities_keyword(keyword).map_err(|_| ())?,
+            )),
+            _ => Err(()),
+        },
+        "NEWGROUPS" => Ok(SessionCommand::Execute(session_newgroups_command(&rest)?)),
+        "NEWNEWS" => Ok(SessionCommand::Execute(session_newnews_command(&rest)?)),
+        _ => Err(()),
+    }
+}
+
+fn parse_session_authinfo_line(line: &str) -> Result<SessionCommand, ()> {
+    let rest = line
+        .split_once(char::is_whitespace)
+        .map(|(_, rest)| rest.trim_start())
+        .filter(|rest| !rest.is_empty())
+        .ok_or(())?;
+    let (kind, value) = rest
+        .split_once(char::is_whitespace)
+        .map(|(kind, value)| (kind, value.trim_start()))
+        .ok_or(())?;
+    if value.is_empty() {
+        return Err(());
+    }
+    let request = match kind.to_ascii_uppercase().as_str() {
+        "USER" => Request::authinfo_user(value).map_err(|_| ())?,
+        "PASS" => Request::authinfo_pass(value).map_err(|_| ())?,
+        _ => return Err(()),
+    };
+    Ok(SessionCommand::Execute(request))
+}
+
+fn session_article_command(verb: &str, rest: &[&str]) -> Result<Request<'static>, ()> {
+    match (verb, rest) {
+        ("ARTICLE", []) => Ok(Request::article_current()),
+        ("BODY", []) => Ok(Request::body_current()),
+        ("HEAD", []) => Ok(Request::head_current()),
+        ("STAT", []) => Ok(Request::stat_current()),
+        ("ARTICLE", [arg]) if arg.starts_with('<') || arg.contains('@') => {
+            Request::article(arg).map_err(|_| ())
+        }
+        ("BODY", [arg]) if arg.starts_with('<') || arg.contains('@') => {
+            Request::body(arg).map_err(|_| ())
+        }
+        ("HEAD", [arg]) if arg.starts_with('<') || arg.contains('@') => {
+            Request::head(arg).map_err(|_| ())
+        }
+        ("STAT", [arg]) if arg.starts_with('<') || arg.contains('@') => {
+            Request::stat(arg).map_err(|_| ())
+        }
+        ("ARTICLE", [arg]) => Request::article_selector(arg).map_err(|_| ()),
+        ("BODY", [arg]) => Request::body_selector(arg).map_err(|_| ()),
+        ("HEAD", [arg]) => Request::head_selector(arg).map_err(|_| ()),
+        ("STAT", [arg]) => Request::stat_selector(arg).map_err(|_| ()),
+        _ => Err(()),
+    }
+}
+
+fn session_list_command(rest: &[&str]) -> Result<Request<'static>, ()> {
+    match rest {
+        [] => Ok(Request::list()),
+        [keyword] if keyword.eq_ignore_ascii_case("ACTIVE") => Ok(Request::list_active()),
+        [keyword, wildmat] if keyword.eq_ignore_ascii_case("ACTIVE") => {
+            Request::list_active_wildmat(wildmat).map_err(|_| ())
+        }
+        [keyword] if keyword.eq_ignore_ascii_case("ACTIVE.TIMES") => {
+            Ok(Request::list_active_times())
+        }
+        [keyword, wildmat] if keyword.eq_ignore_ascii_case("ACTIVE.TIMES") => {
+            Request::list_active_times_wildmat(wildmat).map_err(|_| ())
+        }
+        [keyword] if keyword.eq_ignore_ascii_case("NEWSGROUPS") => Ok(Request::list_newsgroups()),
+        [keyword, wildmat] if keyword.eq_ignore_ascii_case("NEWSGROUPS") => {
+            Request::list_newsgroups_wildmat(wildmat).map_err(|_| ())
+        }
+        [keyword] if keyword.eq_ignore_ascii_case("OVERVIEW.FMT") => {
+            Ok(Request::list_overview_fmt())
+        }
+        [keyword] if keyword.eq_ignore_ascii_case("HEADERS") => Ok(Request::list_headers()),
+        [keyword] if keyword.eq_ignore_ascii_case("DISTRIB.PATS") => {
+            Ok(Request::list_distrib_pats())
+        }
+        _ => Err(()),
+    }
+}
+
+fn session_listgroup_command(rest: &[&str]) -> Result<Request<'static>, ()> {
+    match rest {
+        [] => Ok(Request::listgroup_current()),
+        [group] => Request::listgroup(group).map_err(|_| ()),
+        [group, range] => Request::listgroup_group_range(group, range).map_err(|_| ()),
+        _ => Err(()),
+    }
+}
+
+fn session_newgroups_command(rest: &[&str]) -> Result<Request<'static>, ()> {
+    match rest {
+        [date, time] => Request::newgroups(date, time, false).map_err(|_| ()),
+        [date, time, gmt] if gmt.eq_ignore_ascii_case("GMT") => {
+            Request::newgroups(date, time, true).map_err(|_| ())
+        }
+        _ => Err(()),
+    }
+}
+
+fn session_newnews_command(rest: &[&str]) -> Result<Request<'static>, ()> {
+    match rest {
+        [wildmat, date, time] => Request::newnews(wildmat, date, time, false).map_err(|_| ()),
+        [wildmat, date, time, gmt] if gmt.eq_ignore_ascii_case("GMT") => {
+            Request::newnews(wildmat, date, time, true).map_err(|_| ())
+        }
+        _ => Err(()),
+    }
 }
 
 fn map_client_error(err: ClientError) -> io::Error {
@@ -6579,11 +6987,7 @@ where
     Ok(())
 }
 
-fn should_read_transfer_body<R>(
-    reader: &BufReader<R>,
-    line: &[u8],
-    command: &ParsedCommand,
-) -> bool
+fn should_read_transfer_body<R>(reader: &BufReader<R>, line: &[u8], command: &ParsedCommand) -> bool
 where
     R: AsyncRead,
 {
@@ -9060,6 +9464,9 @@ mod tests {
             request: Some(FetchRequestKind::Article),
             message_id: Some("bench@test".to_string()),
             article_body: None,
+            article_file: None,
+            capability: None,
+            session: None,
             auth_value: None,
             header: None,
             group: None,
@@ -9096,6 +9503,158 @@ mod tests {
             socket_recv_buffer: HIGH_THROUGHPUT_SOCKET_BUFFER,
             socket_send_buffer: HIGH_THROUGHPUT_SOCKET_BUFFER,
         }
+    }
+
+    #[test]
+    fn fetch_args_reject_conflicting_and_invalid_new_surfaces() {
+        let mut args = test_fetch_args();
+        args.request = Some(FetchRequestKind::Date);
+        args.capability = Some("READER".to_string());
+        assert!(matches!(
+            validate_fetch_args(&args),
+            Err(ClientError::ConflictingArguments)
+        ));
+
+        args.capability = None;
+        args.article_file = Some(PathBuf::from("article.txt"));
+        assert!(matches!(
+            validate_fetch_args(&args),
+            Err(ClientError::ConflictingArguments)
+        ));
+
+        args.request = Some(FetchRequestKind::Post);
+        args.article_body = Some("body".to_string());
+        assert!(matches!(
+            validate_fetch_args(&args),
+            Err(ClientError::ConflictingArguments)
+        ));
+
+        args.article_body = None;
+        args.article_file = None;
+        args.request = Some(FetchRequestKind::Capabilities);
+        args.capability = Some("NO_UNDER".to_string());
+        assert!(matches!(
+            validate_fetch_args(&args),
+            Err(ClientError::InvalidCapabilityKeyword)
+        ));
+        args.capability = Some("READER".to_string());
+        assert!(validate_fetch_args(&args).is_ok());
+
+        args.request = Some(FetchRequestKind::Capabilities);
+        args.session = Some(PathBuf::from("session.txt"));
+        assert!(matches!(
+            validate_fetch_args(&args),
+            Err(ClientError::ConflictingArguments)
+        ));
+    }
+
+    #[tokio::test]
+    async fn run_fetch_rejects_new_arguments_before_connecting() {
+        let mut args = test_fetch_args();
+        args.request = None;
+        args.capability = Some("READER".to_string());
+        args.connect = "127.0.0.1:1".parse().unwrap();
+        let err = run_fetch(args).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("conflicting arguments"));
+
+        let mut args = test_fetch_args();
+        args.request = None;
+        args.article_body = Some("body".to_string());
+        args.connect = "127.0.0.1:1".parse().unwrap();
+        let err = run_fetch(args).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("conflicting arguments"));
+    }
+
+    #[test]
+    fn session_script_accepts_reader_commands_and_rejects_disabled_flows() {
+        let script = "\n# comment\nGROUP alt.test\nARTICLE 1\nCAPABILITIES READER\nAUTHINFO USER name\nQUIT\n";
+        let commands = parse_session_script(script).unwrap();
+        assert_eq!(commands.len(), 5);
+        assert!(matches!(
+            &commands[2],
+            SessionCommand::Execute(Request::Capabilities { keyword: Some(keyword) })
+                if keyword == "READER"
+        ));
+
+        assert!(matches!(
+            parse_session_script("STARTTLS\n"),
+            Err(ClientError::InvalidSession { line: 1 })
+        ));
+        assert!(matches!(
+            parse_session_script("AUTHINFO SASL PLAIN\n"),
+            Err(ClientError::InvalidSession { line: 1 })
+        ));
+        assert!(matches!(
+            parse_session_script("MODE STREAM\n"),
+            Err(ClientError::InvalidSession { line: 1 })
+        ));
+        assert!(matches!(
+            parse_session_script("POST-ARTICLE\n"),
+            Err(ClientError::InvalidSession { line: 1 })
+        ));
+        assert!(matches!(
+            parse_session_script("POST\nDATE\n"),
+            Err(ClientError::InvalidSession { line: 1 })
+        ));
+        assert!(matches!(
+            parse_session_script("IHAVE <article@test>\nDATE\n"),
+            Err(ClientError::InvalidSession { line: 1 })
+        ));
+        let auth = parse_session_script("AUTHINFO PASS a  b\n").unwrap();
+        let SessionCommand::Execute(request) = &auth[0] else {
+            panic!("expected an AUTHINFO request");
+        };
+        let mut wire = Vec::new();
+        request.write_wire_to(&mut wire);
+        assert_eq!(wire, b"AUTHINFO PASS a  b\r\n");
+        assert!(matches!(
+            parse_session_script("# only a comment\n"),
+            Err(ClientError::InvalidSession { line: 0 })
+        ));
+
+        let request = Request::capabilities_keyword("READER").unwrap();
+        let mut wire = Vec::new();
+        request.write_wire_to(&mut wire);
+        assert_eq!(wire, b"CAPABILITIES READER\r\n");
+        assert!(Request::capabilities_keyword("A").is_err());
+    }
+
+    #[tokio::test]
+    async fn scripted_session_runs_group_and_article_on_one_connection() {
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stats = Arc::new(Stats::new());
+        let server = tokio::spawn(async move {
+            let (stream, peer) = listener.accept().await.unwrap();
+            serve_session(stream, peer, test_config(), stats).await
+        });
+        let path = std::env::temp_dir().join(format!(
+            "nntpbench-session-{}-{}.txt",
+            std::process::id(),
+            addr.port()
+        ));
+        std::fs::write(&path, "GROUP alt.test\nARTICLE 1\nQUIT\n").unwrap();
+        let mut args = test_fetch_args();
+        args.connect = addr;
+        args.request = None;
+        args.message_id = None;
+        args.session = Some(path.clone());
+        let output = scripted_session_response(&args).await.unwrap();
+        std::fs::remove_file(&path).ok();
+        assert!(
+            output
+                .windows(GROUP_RESPONSE.len())
+                .any(|window| window == GROUP_RESPONSE)
+        );
+        assert!(
+            output
+                .windows(b"220 ".len())
+                .any(|window| window == b"220 ")
+        );
+        assert!(output.ends_with(QUIT_RESPONSE));
+        server.await.unwrap().unwrap();
     }
 
     struct LoadProbeReader {
