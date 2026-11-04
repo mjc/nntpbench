@@ -50,13 +50,13 @@ The same response table can parse 381, 281, 283, and 383. Those parsers are not 
 
 Benchmark-only. The server never accepts an article.
 
-`Request::post` is the line `POST`. `Request::ihave` is `IHAVE` plus a message-id. Neither client builder carries an article. `handle_command` still answers `POST` with `440 posting not permitted` and `IHAVE` with `435 article not wanted`.
+`Request::post` is the line `POST`. `Request::ihave` is `IHAVE` plus a message-id. `Client::post_article`, `ClientConnection::post_article`, and the matching `ihave_article` calls keep the article until the interim status arrives. They write the dot-stuffed, CRLF-normalized body, then one `.\r\n`, only after `POST` 340 or `IHAVE` 335. Any other status, including the server's 440 and 435, returns that interim response and sends no article. The send barrier stays held from the command through the final response, so a later command is not written during the pause.
 
-The async session and the batch scanner do not treat a following article the same way.
+`handle_command` still answers `POST` with `440 posting not permitted` and `IHAVE` with `435 article not wanted`.
 
 `read_command_batch` calls `push_command`. `should_read_transfer_body` in `src/lib.rs` always reads a dot-terminated body after `TAKETHIS`. After `POST` or `IHAVE`, including the lower-case forms recognized by `is_known_transfer_command`, it reads that body only when the next buffered line contains `:`. `read_dot_terminated_body` discards the bytes. `has_transfer_body` is recorded and never read. The reply stays 440 or 435, so a pipelined `QUIT` after that discarded body still runs. A `POST` or `IHAVE` whose next line has no `:` is left as a single command line.
 
-`for_each_request_line_in_batch` scans a dot-terminated body only for `TAKETHIS`. In that scanner, `POST` and `IHAVE` stay single command lines even when an article follows.
+`for_each_request_line_in_batch` uses that same rule. It always scans a dot-terminated body after `TAKETHIS`. After `POST` or `IHAVE` it scans that body only when the next line contains `:`, and it leaves the command unconsumed until the terminator is complete. A following line with no `:` stays the next command.
 
 `Request::takethis` can attach a dot-stuffed article. Both readers can consume that body, and the server still answers `502 command unavailable`. `CHECK` also answers `502`. Consuming a body and then rejecting the command is a benchmark shortcut for keeping the read aligned, not an accepted transfer. The 340, 240, 335, and 235 response parsers are not posting or transit flows.
 

@@ -5321,7 +5321,14 @@ where
             ResponseLineStatus::NeedMore | ResponseLineStatus::Invalid => break,
         };
         let request = RequestLine::parse(&input[start..end]);
-        if matches!(request.kind(), RequestKind::TakeThis) {
+        let line = &input[start..end];
+        let takethis = matches!(request.kind(), RequestKind::TakeThis)
+            || is_known_transfer_command(line, b"TAKETHIS");
+        let posted_body = (matches!(request.kind(), RequestKind::Post | RequestKind::Ihave)
+            || is_known_transfer_command(line, b"POST")
+            || is_known_transfer_command(line, b"IHAVE"))
+            && next_batch_line_contains_colon(input, end);
+        if takethis || posted_body {
             let TransferBodyScan::Complete(body_end) = scan_dot_terminated_body(input, end) else {
                 break;
             };
@@ -6596,6 +6603,17 @@ where
         .next()
         .unwrap_or_default();
     Ok(next_line.contains(&b':'))
+}
+
+fn next_batch_line_contains_colon(input: &[u8], start: usize) -> bool {
+    let Some(rest) = input.get(start..) else {
+        return false;
+    };
+    let line_end = rest
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map_or(rest.len(), |index| index + 1);
+    rest[..line_end].contains(&b':')
 }
 
 fn is_known_transfer_command(line: &[u8], verb: &[u8]) -> bool {
@@ -18838,6 +18856,44 @@ mod tests {
             b"TAKETHIS <take@test>\r\nHeader: value\r\n\r\nbody\r\n.\r\nQUIT\r\n".len()
         );
         assert_eq!(batch, vec![RequestKind::TakeThis, RequestKind::Quit]);
+    }
+
+    #[test]
+    fn for_each_request_line_in_batch_discards_header_like_post_and_ihave_bodies() {
+        let mut batch = Vec::with_capacity(4);
+        let post = b"POST\r\nSubject: one\r\n\r\nbody\r\n.\r\nQUIT\r\n";
+        let consumed = for_each_request_line_in_batch(post, 8, |request| {
+            batch.push(request.kind());
+        });
+        assert_eq!(consumed, post.len());
+        assert_eq!(batch, vec![RequestKind::Post, RequestKind::Quit]);
+
+        batch.clear();
+        let ihave = b"IHAVE <article@test>\r\nSubject: one\r\n\r\nbody\r\n.\r\nQUIT\r\n";
+        let consumed = for_each_request_line_in_batch(ihave, 8, |request| {
+            batch.push(request.kind());
+        });
+        assert_eq!(consumed, ihave.len());
+        assert_eq!(batch, vec![RequestKind::Ihave, RequestKind::Quit]);
+
+        batch.clear();
+        let bare = b"POST\r\nQUIT\r\n";
+        let consumed = for_each_request_line_in_batch(bare, 8, |request| {
+            batch.push(request.kind());
+        });
+        assert_eq!(consumed, bare.len());
+        assert_eq!(batch, vec![RequestKind::Post, RequestKind::Quit]);
+    }
+
+    #[test]
+    fn for_each_request_line_in_batch_waits_for_a_complete_post_body() {
+        let mut batch = Vec::with_capacity(2);
+        let input = b"POST\r\nSubject: one\r\n\r\nbody\r\nQUIT\r\n";
+        let consumed = for_each_request_line_in_batch(input, 8, |request| {
+            batch.push(request.kind());
+        });
+        assert_eq!(consumed, 0);
+        assert!(batch.is_empty());
     }
 
     #[test]
