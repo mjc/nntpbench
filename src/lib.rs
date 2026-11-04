@@ -930,7 +930,9 @@ pub struct FetchArgs {
     ///
     /// Blank lines and lines starting with `#` are ignored. `POST-ARTICLE path`
     /// and `IHAVE-ARTICLE message-id path` send the file only after 340 or 335.
-    /// `STARTTLS`, `AUTHINFO SASL`, and `MODE STREAM` are rejected.
+    /// A bare `POST` or `IHAVE` line is rejected. `STARTTLS`, `AUTHINFO SASL`,
+    /// and `MODE STREAM` are rejected. `AUTHINFO USER` and `AUTHINFO PASS`
+    /// keep the value text after the keyword, including spaces inside it.
     #[arg(long)]
     pub session: Option<PathBuf>,
 
@@ -2768,7 +2770,7 @@ fn parse_session_line(line: &str) -> Result<SessionCommand, ()> {
             }
             _ => Err(()),
         },
-        "AUTHINFO" => parse_session_authinfo(&rest),
+        "AUTHINFO" => parse_session_authinfo_line(line),
         "POST-ARTICLE" => {
             let [path] = rest.as_slice() else {
                 return Err(());
@@ -2791,15 +2793,6 @@ fn parse_session_line(line: &str) -> Result<SessionCommand, ()> {
             let article = fs::read(path).map_err(|_| ())?;
             Ok(SessionCommand::Execute(
                 Request::takethis(message_id, article).map_err(|_| ())?,
-            ))
-        }
-        "POST" if rest.is_empty() => Ok(SessionCommand::Execute(Request::post())),
-        "IHAVE" => {
-            let [message_id] = rest.as_slice() else {
-                return Err(());
-            };
-            Ok(SessionCommand::Execute(
-                Request::ihave(message_id).map_err(|_| ())?,
             ))
         }
         "CHECK" => {
@@ -2873,14 +2866,19 @@ fn parse_session_line(line: &str) -> Result<SessionCommand, ()> {
     }
 }
 
-fn parse_session_authinfo(rest: &[&str]) -> Result<SessionCommand, ()> {
-    let [kind, value @ ..] = rest else {
-        return Err(());
-    };
+fn parse_session_authinfo_line(line: &str) -> Result<SessionCommand, ()> {
+    let rest = line
+        .split_once(char::is_whitespace)
+        .map(|(_, rest)| rest.trim_start())
+        .filter(|rest| !rest.is_empty())
+        .ok_or(())?;
+    let (kind, value) = rest
+        .split_once(char::is_whitespace)
+        .map(|(kind, value)| (kind, value.trim_start()))
+        .ok_or(())?;
     if value.is_empty() {
         return Err(());
     }
-    let value = value.join(" ");
     let request = match kind.to_ascii_uppercase().as_str() {
         "USER" => Request::authinfo_user(value).map_err(|_| ())?,
         "PASS" => Request::authinfo_pass(value).map_err(|_| ())?,
@@ -9596,6 +9594,21 @@ mod tests {
             parse_session_script("POST-ARTICLE\n"),
             Err(ClientError::InvalidSession { line: 1 })
         ));
+        assert!(matches!(
+            parse_session_script("POST\nDATE\n"),
+            Err(ClientError::InvalidSession { line: 1 })
+        ));
+        assert!(matches!(
+            parse_session_script("IHAVE <article@test>\nDATE\n"),
+            Err(ClientError::InvalidSession { line: 1 })
+        ));
+        let auth = parse_session_script("AUTHINFO PASS a  b\n").unwrap();
+        let SessionCommand::Execute(request) = &auth[0] else {
+            panic!("expected an AUTHINFO request");
+        };
+        let mut wire = Vec::new();
+        request.write_wire_to(&mut wire);
+        assert_eq!(wire, b"AUTHINFO PASS a  b\r\n");
         assert!(matches!(
             parse_session_script("# only a comment\n"),
             Err(ClientError::InvalidSession { line: 0 })
