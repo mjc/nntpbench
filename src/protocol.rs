@@ -3880,7 +3880,9 @@ pub enum Request<'a> {
     StartTls,
     List,
     Help,
-    Capabilities,
+    Capabilities {
+        keyword: Option<Cow<'a, str>>,
+    },
     Date,
     ModeReader,
     ModeStream,
@@ -3925,7 +3927,7 @@ impl<'a> Request<'a> {
             Self::StartTls => RequestKind::StartTls,
             Self::List => RequestKind::List,
             Self::Help => RequestKind::Help,
-            Self::Capabilities => RequestKind::Capabilities,
+            Self::Capabilities { .. } => RequestKind::Capabilities,
             Self::Date => RequestKind::Date,
             Self::ModeReader => RequestKind::ModeReader,
             Self::ModeStream => RequestKind::ModeStream,
@@ -4008,7 +4010,12 @@ impl<'a> Request<'a> {
             Self::StartTls => write_simple_request_wire(output, b"STARTTLS"),
             Self::List => write_simple_request_wire(output, b"LIST"),
             Self::Help => write_simple_request_wire(output, b"HELP"),
-            Self::Capabilities => write_simple_request_wire(output, b"CAPABILITIES"),
+            Self::Capabilities { keyword: None } => {
+                write_simple_request_wire(output, b"CAPABILITIES")
+            }
+            Self::Capabilities {
+                keyword: Some(keyword),
+            } => write_one_arg_request_wire(output, b"CAPABILITIES ", keyword),
             Self::Date => write_simple_request_wire(output, b"DATE"),
             Self::ModeReader => write_simple_request_wire(output, b"MODE READER"),
             Self::ModeStream => write_simple_request_wire(output, b"MODE STREAM"),
@@ -4043,7 +4050,7 @@ impl<'a> Request<'a> {
             | Self::StartTls => None,
             Self::List
             | Self::Help
-            | Self::Capabilities
+            | Self::Capabilities { .. }
             | Self::Date
             | Self::ModeReader
             | Self::ModeStream
@@ -4078,7 +4085,7 @@ impl<'a> Request<'a> {
             | Self::StartTls
             | Self::List
             | Self::Help
-            | Self::Capabilities
+            | Self::Capabilities { .. }
             | Self::Date
             | Self::ModeReader
             | Self::ModeStream
@@ -4114,7 +4121,7 @@ impl<'a> Request<'a> {
             | Self::StartTls
             | Self::List
             | Self::Help
-            | Self::Capabilities
+            | Self::Capabilities { .. }
             | Self::Date
             | Self::ModeReader
             | Self::ModeStream
@@ -4149,7 +4156,7 @@ impl<'a> Request<'a> {
             | Self::StartTls
             | Self::List
             | Self::Help
-            | Self::Capabilities
+            | Self::Capabilities { .. }
             | Self::Date
             | Self::ModeReader
             | Self::ModeStream
@@ -4184,7 +4191,7 @@ impl<'a> Request<'a> {
             | Self::StartTls
             | Self::List
             | Self::Help
-            | Self::Capabilities
+            | Self::Capabilities { .. }
             | Self::Date
             | Self::ModeReader
             | Self::ModeStream
@@ -4219,7 +4226,7 @@ impl<'a> Request<'a> {
             | Self::StartTls
             | Self::List
             | Self::Help
-            | Self::Capabilities
+            | Self::Capabilities { .. }
             | Self::Date
             | Self::ModeReader
             | Self::ModeStream
@@ -4256,7 +4263,7 @@ impl<'a> Request<'a> {
             | Self::StartTls
             | Self::List
             | Self::Help
-            | Self::Capabilities
+            | Self::Capabilities { .. }
             | Self::Date
             | Self::ModeReader
             | Self::ModeStream
@@ -4295,7 +4302,7 @@ impl<'a> Request<'a> {
             | Self::StartTls
             | Self::List
             | Self::Help
-            | Self::Capabilities
+            | Self::Capabilities { .. }
             | Self::Date
             | Self::ModeReader
             | Self::ModeStream
@@ -4330,7 +4337,7 @@ impl<'a> Request<'a> {
             | Self::StartTls
             | Self::List
             | Self::Help
-            | Self::Capabilities
+            | Self::Capabilities { .. }
             | Self::Date
             | Self::ModeReader
             | Self::ModeStream
@@ -4365,7 +4372,7 @@ impl<'a> Request<'a> {
             | Self::StartTls
             | Self::List
             | Self::Help
-            | Self::Capabilities
+            | Self::Capabilities { .. }
             | Self::Date
             | Self::ModeReader
             | Self::ModeStream
@@ -4400,7 +4407,7 @@ impl<'a> Request<'a> {
             | Self::StartTls
             | Self::List
             | Self::Help
-            | Self::Capabilities
+            | Self::Capabilities { .. }
             | Self::Date
             | Self::ModeReader
             | Self::ModeStream
@@ -4839,7 +4846,18 @@ impl Request<'static> {
     /// Build a CAPABILITIES request.
     #[must_use]
     pub const fn capabilities() -> Self {
-        Self::Capabilities
+        Self::Capabilities { keyword: None }
+    }
+
+    /// Build a CAPABILITIES request for one keyword argument.
+    pub fn capabilities_keyword(
+        keyword: impl AsRef<str>,
+    ) -> Result<Self, InvalidCapabilityKeyword> {
+        let keyword = keyword.as_ref();
+        validate_keyword(keyword).map_err(|_| InvalidCapabilityKeyword)?;
+        Ok(Self::Capabilities {
+            keyword: Some(Cow::Owned(keyword.to_owned())),
+        })
     }
 
     /// Build a DATE request.
@@ -4866,6 +4884,9 @@ impl Request<'static> {
         Self::Quit
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidCapabilityKeyword;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InvalidHeaderQuery {
@@ -7541,7 +7562,7 @@ mod tests {
             wildmat: None,
         };
         let help = Request::Help;
-        let capabilities = Request::Capabilities;
+        let capabilities = Request::capabilities();
         let date = Request::Date;
         let mode_reader = Request::ModeReader;
         let quit = Request::Quit;

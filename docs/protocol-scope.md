@@ -91,3 +91,5 @@ Default ARTICLE and BODY payloads are generated yEnc. That generated encoding is
 Without `--article-dir`, group, overview, header, and discovery replies use the fixed tables in `src/lib.rs`. Those fixed rows are a benchmark shortcut. The default workload is not a captured news spool or a transit feed.
 
 `--article-dir` points at stored `ARTICLE` response frames keyed by selector. It changes retrieval bytes. It does not add TLS, authentication, posting, or streaming.
+
+The one-shot client commands stay single requests. `--capability KEYWORD` adds the keyword argument to `CAPABILITIES`. `--article-file` supplies the bytes for `POST`, `IHAVE`, and `TAKETHIS`; `POST` and `IHAVE` still wait for 340 or 335 before writing that file. `--session FILE` runs the reader commands in that file on one connection, including `GROUP`, article retrieval, `CAPABILITIES`, `POST-ARTICLE`, and `IHAVE-ARTICLE`. The script rejects `STARTTLS`, `AUTHINFO SASL`, and `MODE STREAM`. `--auth-value` remains the `AUTHINFO USER` and `AUTHINFO PASS` builder input.
