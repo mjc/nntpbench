@@ -1131,6 +1131,7 @@ impl SegmentSet {
 
 #[cfg_attr(coverage_nightly, coverage(off))]
 pub async fn run_fetch(args: FetchArgs) -> io::Result<()> {
+    validate_fetch_args(&args).map_err(map_client_error)?;
     if args.session.is_some() {
         let response = scripted_session_response(&args)
             .await
@@ -9547,6 +9548,25 @@ mod tests {
             validate_fetch_args(&args),
             Err(ClientError::ConflictingArguments)
         ));
+    }
+
+    #[tokio::test]
+    async fn run_fetch_rejects_new_arguments_before_connecting() {
+        let mut args = test_fetch_args();
+        args.request = None;
+        args.capability = Some("READER".to_string());
+        args.connect = "127.0.0.1:1".parse().unwrap();
+        let err = run_fetch(args).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("conflicting arguments"));
+
+        let mut args = test_fetch_args();
+        args.request = None;
+        args.article_body = Some("body".to_string());
+        args.connect = "127.0.0.1:1".parse().unwrap();
+        let err = run_fetch(args).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("conflicting arguments"));
     }
 
     #[test]
