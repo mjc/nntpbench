@@ -3488,6 +3488,96 @@ fn validate_help_text_line(line: &[u8]) -> bool {
     validate_u_chars(line)
 }
 
+/// One capability label and its arguments from a `CAPABILITIES` 101 body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapabilityEntry {
+    label: String,
+    arguments: Vec<String>,
+}
+
+impl CapabilityEntry {
+    /// Capability label, in the case the server sent.
+    #[must_use]
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    /// Arguments that followed the label, in order.
+    #[must_use]
+    pub fn arguments(&self) -> &[String] {
+        &self.arguments
+    }
+}
+
+/// Labels from one accepted `CAPABILITIES` 101 payload.
+///
+/// [`CapabilityList::parse`] reads the multiline body after the status line and
+/// before the dot terminator. [`CapabilityList::get`] matches labels without
+/// regard to ASCII case. A connection keeps the list from the last accepted 101
+/// response until `AUTHINFO` 281 or 283, `MODE READER`, or `STARTTLS` clears it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapabilityList {
+    entries: Vec<CapabilityEntry>,
+}
+
+impl CapabilityList {
+    /// Parse a capability payload.
+    ///
+    /// `content` is the multiline body, excluding the status line and the
+    /// terminating dot line. Lines that the capability validator accepts but
+    /// that are not keywords are omitted; they are not capability labels.
+    #[must_use]
+    pub fn parse(content: &[u8]) -> Option<Self> {
+        if !validate_capabilities_response_content(content) {
+            return None;
+        }
+
+        let mut entries = Vec::new();
+        let mut offset = 0;
+        while offset < content.len() {
+            let line_end = strict_crlf_line_content_end_from(content, offset)?;
+            let line = &content[offset..line_end];
+            if let Some(entry) = capability_entry_from_line(line) {
+                entries.push(entry);
+            }
+            offset = line_end + crate::CRLF.len();
+        }
+        Some(Self { entries })
+    }
+
+    /// Capability entries in advertisement order.
+    #[must_use]
+    pub fn entries(&self) -> &[CapabilityEntry] {
+        &self.entries
+    }
+
+    /// Find a label, ignoring ASCII case.
+    #[must_use]
+    pub fn get(&self, label: &str) -> Option<&CapabilityEntry> {
+        self.entries
+            .iter()
+            .find(|entry| entry.label.eq_ignore_ascii_case(label))
+    }
+}
+
+fn capability_entry_from_line(line: &[u8]) -> Option<CapabilityEntry> {
+    let (label, mut rest) = split_response_ws_token(line)?;
+    if !validate_ascii_token(label, validate_keyword) {
+        return None;
+    }
+
+    let mut arguments = Vec::new();
+    while !rest.is_empty() {
+        let (token, next) = split_response_ws_token(rest)?;
+        arguments.push(std::str::from_utf8(token).ok()?.to_owned());
+        rest = next;
+    }
+    Some(CapabilityEntry {
+        label: std::str::from_utf8(label).ok()?.to_owned(),
+        arguments,
+    })
+}
+
 fn validate_capabilities_response_content(content: &[u8]) -> bool {
     let Some(version_line_end) = strict_crlf_line_content_end_from(content, 0) else {
         return false;
@@ -5660,6 +5750,53 @@ mod tests {
         );
         assert_eq!(StatusCode::parse(b"2x0 broken"), None);
         assert_eq!(StatusCode::parse(b""), None);
+    }
+
+    #[test]
+    fn capability_list_parses_advertised_labels_and_arguments() {
+        let content =
+            b"VERSION 2\r\nREADER\r\nLIST ACTIVE NEWSGROUPS\r\nOVER MSGID\r\nHDR\r\nNEWNEWS\r\n";
+        let list = CapabilityList::parse(content).unwrap();
+
+        assert_eq!(
+            list.entries()
+                .iter()
+                .map(CapabilityEntry::label)
+                .collect::<Vec<_>>(),
+            ["VERSION", "READER", "LIST", "OVER", "HDR", "NEWNEWS"]
+        );
+        assert_eq!(list.get("version").unwrap().arguments(), ["2"]);
+        assert_eq!(list.get("READER").unwrap().arguments(), &[] as &[&str]);
+        assert_eq!(
+            list.get("list").unwrap().arguments(),
+            ["ACTIVE", "NEWSGROUPS"]
+        );
+        assert_eq!(list.get("Over").unwrap().arguments(), ["MSGID"]);
+        assert!(list.get("STARTTLS").is_none());
+    }
+
+    #[test]
+    fn capability_list_omits_validated_non_keyword_lines() {
+        let content = b"VERSION 2\r\n1RESERVED future-token\r\nHDR\r\n";
+        let list = CapabilityList::parse(content).unwrap();
+
+        assert_eq!(
+            list.entries()
+                .iter()
+                .map(CapabilityEntry::label)
+                .collect::<Vec<_>>(),
+            ["VERSION", "HDR"]
+        );
+        assert!(list.get("1RESERVED").is_none());
+        assert_eq!(list.get("HDR").unwrap().arguments(), &[] as &[&str]);
+    }
+
+    #[test]
+    fn capability_list_rejects_invalid_payloads() {
+        assert!(CapabilityList::parse(b"READER\r\n").is_none());
+        assert!(CapabilityList::parse(b"VERSION 2\r\nVERSION 2\r\n").is_none());
+        assert!(CapabilityList::parse(b"VERSION 2\r\nOVER EXTRA\r\n").is_none());
+        assert!(CapabilityList::parse(b"VERSION 2\r\nX\r\n").is_none());
     }
 
     #[test]
