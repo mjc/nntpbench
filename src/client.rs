@@ -458,6 +458,58 @@ impl Client {
         self.execute_raw_exchange(request).await
     }
 
+    /// Send `POST`, then the article only if the peer answers 340.
+    pub async fn post_article(
+        &self,
+        article: impl AsRef<[u8]>,
+    ) -> Result<OwnedResponse, ClientError> {
+        self.connection
+            .post_article(ArticleTransfer::from_owned(article.as_ref()))
+            .await
+    }
+
+    /// Send `POST` and return the final response pair. The article is written only after 340.
+    pub async fn post_article_exchange(
+        &self,
+        article: impl AsRef<[u8]>,
+    ) -> Result<OwnedExchange, ClientError> {
+        self.connection
+            .post_article_exchange(ArticleTransfer::from_owned(article.as_ref()))
+            .await
+    }
+
+    /// Send `IHAVE`, then the article only if the peer answers 335.
+    pub async fn ihave_article(
+        &self,
+        message_id: impl AsRef<str>,
+        article: impl AsRef<[u8]>,
+    ) -> Result<OwnedResponse, ClientError> {
+        let Request::Ihave { message_id } =
+            Request::ihave(message_id).map_err(|_| ClientError::InvalidMessageId)?
+        else {
+            return Err(ClientError::InvalidMessageId);
+        };
+        self.connection
+            .ihave_article(message_id, ArticleTransfer::from_owned(article.as_ref()))
+            .await
+    }
+
+    /// Send `IHAVE` and return the final response pair. The article is written only after 335.
+    pub async fn ihave_article_exchange(
+        &self,
+        message_id: impl AsRef<str>,
+        article: impl AsRef<[u8]>,
+    ) -> Result<OwnedExchange, ClientError> {
+        let Request::Ihave { message_id } =
+            Request::ihave(message_id).map_err(|_| ClientError::InvalidMessageId)?
+        else {
+            return Err(ClientError::InvalidMessageId);
+        };
+        self.connection
+            .ihave_article_exchange(message_id, ArticleTransfer::from_owned(article.as_ref()))
+            .await
+    }
+
     /// Send a CHECK request and return the owned raw response frame.
     pub async fn check(&self, message_id: impl AsRef<str>) -> Result<OwnedResponse, ClientError> {
         let request = Request::check(message_id).map_err(|_| ClientError::InvalidMessageId)?;
@@ -1352,6 +1404,57 @@ impl ClientConnection {
         self.execute_exchange(Request::Ihave { message_id }).await
     }
 
+    /// Send `POST`, then the article only if the peer answers 340.
+    ///
+    /// Status 440, or any other non-340 response, is returned as-is and the article stays local.
+    /// The connection stays exclusive until that interim rejection or the final post response.
+    pub async fn post_article(
+        &self,
+        article: ArticleTransfer<'static>,
+    ) -> Result<OwnedResponse, ClientError> {
+        self.queue_continuation(Request::Post, article)
+            .await?
+            .receive()
+            .await
+    }
+
+    /// Send `POST` and return the final response pair. The article is written only after 340.
+    pub async fn post_article_exchange(
+        &self,
+        article: ArticleTransfer<'static>,
+    ) -> Result<OwnedExchange, ClientError> {
+        self.queue_continuation_exchange(Request::Post, article)
+            .await?
+            .receive()
+            .await
+    }
+
+    /// Send `IHAVE`, then the article only if the peer answers 335.
+    ///
+    /// Status 435, or any other non-335 response, is returned as-is and the article stays local.
+    pub async fn ihave_article(
+        &self,
+        message_id: MessageId<'static>,
+        article: ArticleTransfer<'static>,
+    ) -> Result<OwnedResponse, ClientError> {
+        self.queue_continuation(Request::Ihave { message_id }, article)
+            .await?
+            .receive()
+            .await
+    }
+
+    /// Send `IHAVE` and return the final response pair. The article is written only after 335.
+    pub async fn ihave_article_exchange(
+        &self,
+        message_id: MessageId<'static>,
+        article: ArticleTransfer<'static>,
+    ) -> Result<OwnedExchange, ClientError> {
+        self.queue_continuation_exchange(Request::Ihave { message_id }, article)
+            .await?
+            .receive()
+            .await
+    }
+
     /// Send a CHECK request and return the owned response frame.
     pub async fn check(
         &self,
@@ -1772,12 +1875,12 @@ impl ClientConnection {
 
     /// Send a CAPABILITIES request and return the owned response frame.
     pub async fn capabilities(&self) -> Result<OwnedResponse, ClientError> {
-        self.execute(Request::Capabilities).await
+        self.execute(Request::capabilities()).await
     }
 
     /// Send a CAPABILITIES request and return the completed request/response pair.
     pub async fn capabilities_exchange(&self) -> Result<OwnedExchange, ClientError> {
-        self.execute_exchange(Request::Capabilities).await
+        self.execute_exchange(Request::capabilities()).await
     }
 
     /// Return the capability list stored for this connection.
@@ -1848,6 +1951,7 @@ impl ClientConnection {
                 request,
                 kind == RequestKind::Capabilities,
                 request_kind_invalidates_capabilities(kind),
+                None,
             )
             .await?;
 
@@ -1905,9 +2009,50 @@ impl ClientConnection {
                 request,
                 mark_capabilities_on_success,
                 invalidate_capabilities_on_success,
+                None,
             )
             .await?;
 
+        Ok(PendingExchange {
+            inner: self.inner.clone(),
+            response_rx,
+        })
+    }
+
+    async fn queue_continuation(
+        &self,
+        request: Request<'static>,
+        article: ArticleTransfer<'static>,
+    ) -> Result<PendingResponse, ClientError> {
+        let kind = request.kind();
+        let response_rx = self
+            .enqueue_request(
+                request,
+                false,
+                request_kind_invalidates_capabilities(kind),
+                Some(article.as_bytes().to_vec()),
+            )
+            .await?;
+        Ok(PendingResponse {
+            inner: self.inner.clone(),
+            response_rx,
+        })
+    }
+
+    async fn queue_continuation_exchange(
+        &self,
+        request: Request<'static>,
+        article: ArticleTransfer<'static>,
+    ) -> Result<PendingExchange, ClientError> {
+        let kind = request.kind();
+        let response_rx = self
+            .enqueue_request(
+                request,
+                false,
+                request_kind_invalidates_capabilities(kind),
+                Some(article.as_bytes().to_vec()),
+            )
+            .await?;
         Ok(PendingExchange {
             inner: self.inner.clone(),
             response_rx,
@@ -1919,6 +2064,7 @@ impl ClientConnection {
         request: Request<'static>,
         mark_capabilities_on_success: bool,
         invalidate_capabilities_on_success: bool,
+        article: Option<Vec<u8>>,
     ) -> Result<oneshot::Receiver<Result<CompletedRequest, SharedEngineError>>, ClientError> {
         loop {
             let barrier_guard = self.inner.send_barrier.clone().lock_owned().await;
@@ -1941,6 +2087,7 @@ impl ClientConnection {
                     mark_capabilities_on_success,
                     invalidate_capabilities_on_success,
                     barrier_guard,
+                    article,
                 )
                 .await;
         }
@@ -1961,6 +2108,7 @@ impl ClientConnection {
             mark_capabilities_on_success,
             invalidate_capabilities_on_success,
             barrier_guard,
+            None,
         )
         .await
     }
@@ -1971,6 +2119,7 @@ impl ClientConnection {
         mark_capabilities_on_success: bool,
         invalidate_capabilities_on_success: bool,
         barrier_guard: OwnedMutexGuard<()>,
+        article: Option<Vec<u8>>,
     ) -> Result<oneshot::Receiver<Result<CompletedRequest, SharedEngineError>>, ClientError> {
         let hold_pipeline = request_kind_requires_barrier(request.kind());
         let (retained_barrier_guard, enqueue_barrier_guard) = if hold_pipeline {
@@ -1978,6 +2127,14 @@ impl ClientConnection {
         } else {
             (None, Some(barrier_guard))
         };
+        let continuation = article.map(|article| {
+            let (proceed_tx, proceed_rx) = oneshot::channel();
+            ArticleContinuation {
+                article,
+                proceed_tx,
+                proceed_rx,
+            }
+        });
 
         let (response_tx, response_rx) = oneshot::channel();
         let send_result = self
@@ -1989,6 +2146,7 @@ impl ClientConnection {
                 barrier_guard: retained_barrier_guard,
                 mark_capabilities_on_success,
                 invalidate_capabilities_on_success,
+                continuation,
             })
             .await;
         drop(enqueue_barrier_guard);
@@ -2024,7 +2182,7 @@ impl ClientConnection {
         }
 
         let pending = self
-            .queue_request_unchecked(Request::Capabilities, false, false)
+            .queue_request_unchecked(Request::capabilities(), false, false)
             .await?;
         let response = pending.receive().await?;
         if response.status().as_u16() != 101 {
@@ -2230,6 +2388,9 @@ pub enum ClientError {
     InvalidArticleSelector,
     MissingArticleSelector,
     InvalidListGroupRange,
+    InvalidCapabilityKeyword,
+    ConflictingArguments,
+    InvalidSession { line: usize },
     CapabilitiesUnavailable,
     ConnectionClosed,
     UnexpectedArticleResponse { response: OwnedResponse },
@@ -2261,6 +2422,12 @@ impl fmt::Display for ClientError {
                 write!(f, "article selector is required for this request")
             }
             Self::InvalidListGroupRange => write!(f, "invalid LISTGROUP range"),
+            Self::InvalidCapabilityKeyword => write!(f, "invalid capability keyword"),
+            Self::ConflictingArguments => write!(f, "conflicting arguments"),
+            Self::InvalidSession { line: 0 } => write!(f, "session file has no commands"),
+            Self::InvalidSession { line } => {
+                write!(f, "invalid session command on line {line}")
+            }
             Self::CapabilitiesUnavailable => {
                 write!(f, "CAPABILITIES did not return a capability list")
             }
@@ -2486,12 +2653,20 @@ pub async fn bench_pending_read_capacity(
 }
 
 #[derive(Debug)]
+struct ArticleContinuation {
+    article: Vec<u8>,
+    proceed_tx: oneshot::Sender<bool>,
+    proceed_rx: oneshot::Receiver<bool>,
+}
+
+#[derive(Debug)]
 struct QueuedRequest {
     request: Request<'static>,
     response_tx: oneshot::Sender<Result<CompletedRequest, SharedEngineError>>,
     barrier_guard: Option<OwnedMutexGuard<()>>,
     mark_capabilities_on_success: bool,
     invalidate_capabilities_on_success: bool,
+    continuation: Option<ArticleContinuation>,
 }
 
 #[derive(Debug)]
@@ -2598,6 +2773,7 @@ struct InFlightRequest {
     barrier_guard: Option<OwnedMutexGuard<()>>,
     mark_capabilities_on_success: bool,
     invalidate_capabilities_on_success: bool,
+    proceed_tx: Option<oneshot::Sender<bool>>,
 }
 
 #[derive(Debug, Clone)]
@@ -2690,13 +2866,30 @@ async fn run_writer_task(
         let mut pending = std::mem::take(&mut batch).into_iter();
         while let Some(queued) = pending.next() {
             let kind = queued.request.kind();
+            let QueuedRequest {
+                request,
+                response_tx,
+                barrier_guard,
+                mark_capabilities_on_success,
+                invalidate_capabilities_on_success,
+                continuation,
+            } = queued;
+            let (article, proceed_tx, proceed_rx) = match continuation {
+                Some(continuation) => (
+                    Some(continuation.article),
+                    Some(continuation.proceed_tx),
+                    Some(continuation.proceed_rx),
+                ),
+                None => (None, None, None),
+            };
             let inflight = InFlightRequest {
-                request: queued.request,
+                request,
                 kind,
-                response_tx: queued.response_tx,
-                barrier_guard: queued.barrier_guard,
-                mark_capabilities_on_success: queued.mark_capabilities_on_success,
-                invalidate_capabilities_on_success: queued.invalidate_capabilities_on_success,
+                response_tx,
+                barrier_guard,
+                mark_capabilities_on_success,
+                invalidate_capabilities_on_success,
+                proceed_tx,
             };
             gate.begin_inflight();
             if let Err(err) = inflight_tx.send(inflight).await {
@@ -2711,6 +2904,29 @@ async fn run_writer_task(
                 }
                 poison_writer_engine(&poisoned, &mut request_rx, error).await;
                 return;
+            }
+            if let Some(proceed_rx) = proceed_rx {
+                let proceed = proceed_rx.await.unwrap_or(false);
+                if proceed
+                    && let Err(err) = write_dot_stuffed_article(
+                        &mut writer,
+                        article.as_deref().unwrap_or_default(),
+                    )
+                    .await
+                {
+                    let error = SharedEngineError::Io {
+                        kind: err.kind(),
+                        message: err.to_string(),
+                    };
+                    for queued in pending {
+                        let _ = queued.response_tx.send(Err(error.clone()));
+                    }
+                    if let Some(queued) = held.take() {
+                        let _ = queued.response_tx.send(Err(error.clone()));
+                    }
+                    poison_writer_engine(&poisoned, &mut request_rx, error).await;
+                    return;
+                }
             }
         }
         batch.reserve(8);
@@ -2851,7 +3067,12 @@ where
         Request::StartTls => write_simple_request_wire(writer, b"STARTTLS").await,
         Request::List => write_simple_request_wire(writer, b"LIST").await,
         Request::Help => write_simple_request_wire(writer, b"HELP").await,
-        Request::Capabilities => write_simple_request_wire(writer, b"CAPABILITIES").await,
+        Request::Capabilities { keyword: None } => {
+            write_simple_request_wire(writer, b"CAPABILITIES").await
+        }
+        Request::Capabilities {
+            keyword: Some(keyword),
+        } => write_one_arg_request_wire(writer, b"CAPABILITIES ", keyword).await,
         Request::Date => write_simple_request_wire(writer, b"DATE").await,
         Request::ModeReader => write_simple_request_wire(writer, b"MODE READER").await,
         Request::ModeStream => write_simple_request_wire(writer, b"MODE STREAM").await,
@@ -3175,8 +3396,13 @@ where
     W: AsyncWrite + Unpin,
 {
     write_message_id_request_wire(writer, b"TAKETHIS ", message_id).await?;
+    write_dot_stuffed_article(writer, article.as_bytes()).await
+}
 
-    let payload = article.as_bytes();
+async fn write_dot_stuffed_article<W>(writer: &mut W, payload: &[u8]) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
     if payload.is_empty() {
         writer.write_all(DOT_TERMINATOR).await?;
         return Ok(());
@@ -3247,9 +3473,30 @@ async fn run_reader_task(
             barrier_guard,
             mark_capabilities_on_success,
             invalidate_capabilities_on_success,
+            proceed_tx,
         } = inflight_request;
         match receiver.receive(kind, read_chunk_bytes).await {
-            Ok(response) => {
+            Ok(mut response) => {
+                if let Some(proceed_tx) = proceed_tx {
+                    let proceed = matches!(
+                        (kind, response.status().as_u16()),
+                        (RequestKind::Post, 340) | (RequestKind::Ihave, 335)
+                    );
+                    let _ = proceed_tx.send(proceed);
+                    if proceed {
+                        match receiver.receive(kind, read_chunk_bytes).await {
+                            Ok(final_response) => response = final_response,
+                            Err(err) => {
+                                let error = shared_engine_error_from_client(err);
+                                let _ = response_tx.send(Err(error.clone()));
+                                gate.end_inflight();
+                                writer_abort.abort();
+                                poison_reader_engine(&poisoned, &mut inflight_rx, error).await;
+                                return;
+                            }
+                        }
+                    }
+                }
                 let transition = {
                     let mut capability_list = capability_list.lock().await;
                     store_capability_transition(
@@ -3275,6 +3522,7 @@ async fn run_reader_task(
                 gate.end_inflight();
             }
             Err(err) => {
+                drop(proceed_tx);
                 let error = shared_engine_error_from_client(err);
                 let _ = response_tx.send(Err(error.clone()));
                 gate.end_inflight();
@@ -3384,6 +3632,9 @@ fn shared_engine_error_from_client(err: ClientError) -> SharedEngineError {
         | ClientError::InvalidArticleSelector
         | ClientError::MissingArticleSelector
         | ClientError::InvalidListGroupRange
+        | ClientError::InvalidCapabilityKeyword
+        | ClientError::ConflictingArguments
+        | ClientError::InvalidSession { .. }
         | ClientError::UnexpectedArticleResponse { .. } => SharedEngineError::ConnectionClosed,
     }
 }
@@ -3890,6 +4141,179 @@ mod tests {
         assert_eq!(quit.status().as_u16(), 205);
         assert_eq!(quit.as_bytes(), crate::QUIT_RESPONSE);
 
+        server.await.unwrap();
+    }
+
+    fn expected_dot_stuffed_article(article: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        if article.is_empty() {
+            body.extend_from_slice(DOT_TERMINATOR);
+            return body;
+        }
+        for line in crlf_normalized_payload_lines(article) {
+            if line.starts_with(b".") {
+                body.extend_from_slice(b".");
+            }
+            body.extend_from_slice(line);
+            body.extend_from_slice(crate::CRLF);
+        }
+        body.extend_from_slice(DOT_TERMINATOR);
+        body
+    }
+
+    #[tokio::test]
+    async fn post_article_writes_dot_stuffed_body_only_after_340() {
+        let listener = crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let article = b".dot\nsecond\r\n";
+        let expected_body = expected_dot_stuffed_article(article);
+        let (posted_tx, posted_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"201 server ready\r\n").await.unwrap();
+            assert_read_request(&mut stream, b"CAPABILITIES\r\n").await;
+            stream
+                .write_all(b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n")
+                .await
+                .unwrap();
+            assert_read_request(&mut stream, b"POST\r\n").await;
+            posted_tx.send(()).unwrap();
+            stream
+                .write_all(b"340 send article to be posted\r\n")
+                .await
+                .unwrap();
+            let mut body = vec![0_u8; expected_body.len()];
+            stream.read_exact(&mut body).await.unwrap();
+            assert_eq!(body, expected_body);
+            assert!(body.ends_with(DOT_TERMINATOR));
+            assert!(body.windows(6).any(|window| window == b"..dot\r"));
+            stream
+                .write_all(b"240 article received ok\r\n")
+                .await
+                .unwrap();
+            assert_read_request(&mut stream, b"DATE\r\n").await;
+            stream.write_all(b"111 20260515120000\r\n").await.unwrap();
+        });
+
+        let connection = ClientConnection::connect(addr).await.unwrap();
+        let posting = connection.clone();
+        let post = tokio::spawn(async move {
+            posting
+                .post_article(ArticleTransfer::from_owned(article))
+                .await
+        });
+        posted_rx.await.unwrap();
+        let date = connection.date();
+        let (post, date) = tokio::join!(post, date);
+        assert_eq!(
+            post.unwrap().unwrap().as_bytes(),
+            b"240 article received ok\r\n"
+        );
+        assert_eq!(date.unwrap().status().as_u16(), 111);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn post_article_sends_nothing_after_440() {
+        let listener = crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"201 server ready\r\n").await.unwrap();
+            assert_read_request(&mut stream, b"CAPABILITIES\r\n").await;
+            stream
+                .write_all(b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n")
+                .await
+                .unwrap();
+            assert_read_request(&mut stream, b"POST\r\n").await;
+            let pending =
+                tokio::time::timeout(std::time::Duration::from_millis(100), stream.read_u8()).await;
+            assert!(pending.is_err(), "article bytes followed a 440 offer");
+            stream
+                .write_all(b"440 posting not permitted\r\n")
+                .await
+                .unwrap();
+            assert_read_request(&mut stream, b"QUIT\r\n").await;
+            stream.write_all(crate::QUIT_RESPONSE).await.unwrap();
+        });
+
+        let connection = ClientConnection::connect(addr).await.unwrap();
+        let post = connection
+            .post_article(ArticleTransfer::from_owned(b"Subject: one\r\n\r\nbody\r\n"))
+            .await
+            .unwrap();
+        assert_eq!(post.as_bytes(), b"440 posting not permitted\r\n");
+        connection.quit().await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ihave_article_writes_body_only_after_335() {
+        let listener = crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"201 server ready\r\n").await.unwrap();
+            assert_read_request(&mut stream, b"CAPABILITIES\r\n").await;
+            stream
+                .write_all(b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n")
+                .await
+                .unwrap();
+            assert_read_request(&mut stream, b"IHAVE <article@test>\r\n").await;
+            stream
+                .write_all(b"335 send article to be transferred\r\n")
+                .await
+                .unwrap();
+            assert_read_request(&mut stream, b"Subject: one\r\n\r\nbody\r\n.\r\n").await;
+            stream
+                .write_all(b"235 article transferred ok\r\n")
+                .await
+                .unwrap();
+        });
+
+        let connection = ClientConnection::connect(addr).await.unwrap();
+        let response = connection
+            .ihave_article_exchange(
+                MessageId::from_borrowed("<article@test>").unwrap(),
+                ArticleTransfer::from_owned(b"Subject: one\r\n\r\nbody\r\n"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.response().as_bytes(),
+            b"235 article transferred ok\r\n"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ihave_article_sends_nothing_after_435() {
+        let listener = crate::bind_listener("127.0.0.1:0".parse().unwrap(), 16, false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"201 server ready\r\n").await.unwrap();
+            assert_read_request(&mut stream, b"CAPABILITIES\r\n").await;
+            stream
+                .write_all(b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n")
+                .await
+                .unwrap();
+            assert_read_request(&mut stream, b"IHAVE <article@test>\r\n").await;
+            let pending =
+                tokio::time::timeout(std::time::Duration::from_millis(100), stream.read_u8()).await;
+            assert!(pending.is_err(), "article bytes followed a 435 offer");
+            stream
+                .write_all(b"435 article not wanted\r\n")
+                .await
+                .unwrap();
+        });
+
+        let client = Client::connect(addr).await.unwrap();
+        let response = client
+            .ihave_article("<article@test>", b"Subject: one\r\n\r\nbody\r\n")
+            .await
+            .unwrap();
+        assert_eq!(response.as_bytes(), b"435 article not wanted\r\n");
         server.await.unwrap();
     }
 
