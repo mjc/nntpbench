@@ -48,11 +48,17 @@ The same response table can parse 381, 281, 283, and 383. Those parsers are not 
 
 ### POST and IHAVE continuations
 
-Benchmark-only. There is no article submission.
+Benchmark-only. The server never accepts an article.
 
-`Request::post` is the line `POST`. `Request::ihave` is `IHAVE` plus a message-id. Neither builder carries an article. The server answers `POST` with `440 posting not permitted` and `IHAVE` with `435 article not wanted`, and it does not read a following article (`src/lib.rs`).
+`Request::post` is the line `POST`. `Request::ihave` is `IHAVE` plus a message-id. Neither client builder carries an article. `handle_command` still answers `POST` with `440 posting not permitted` and `IHAVE` with `435 article not wanted`.
 
-`Request::takethis` can attach a dot-stuffed article. The server reads that body so a pipelined batch stays aligned, then answers `502 command unavailable`. `CHECK` also answers `502`. Reading the `TAKETHIS` body and then rejecting the command is a benchmark shortcut for pipeline alignment, not an accepted transfer. The 340, 240, 335, and 235 response parsers are not posting or transit flows.
+The async session and the batch scanner do not treat a following article the same way.
+
+`read_command_batch` calls `push_command`. `should_read_transfer_body` in `src/lib.rs` always reads a dot-terminated body after `TAKETHIS`. After `POST` or `IHAVE`, including the lower-case forms recognized by `is_known_transfer_command`, it reads that body only when the next buffered line contains `:`. `read_dot_terminated_body` discards the bytes. `has_transfer_body` is recorded and never read. The reply stays 440 or 435, so a pipelined `QUIT` after that discarded body still runs. A `POST` or `IHAVE` whose next line has no `:` is left as a single command line.
+
+`for_each_request_line_in_batch` scans a dot-terminated body only for `TAKETHIS`. In that scanner, `POST` and `IHAVE` stay single command lines even when an article follows.
+
+`Request::takethis` can attach a dot-stuffed article. Both readers can consume that body, and the server still answers `502 command unavailable`. `CHECK` also answers `502`. Consuming a body and then rejecting the command is a benchmark shortcut for keeping the read aligned, not an accepted transfer. The 340, 240, 335, and 235 response parsers are not posting or transit flows.
 
 ### STREAMING and MODE STREAM
 
