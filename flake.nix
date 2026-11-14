@@ -48,7 +48,10 @@
       cargoLlvmCov =
         if pkgs.stdenv.hostPlatform.isDarwin
         then pkgs.cargo-llvm-cov.overrideAttrs (_: {doCheck = false;})
-        else pkgs.cargo-llvm-cov;
+        else pkgs.cargo-llvm-cov.override {
+          inherit rustPlatform;
+          llvmPackages_22 = pkgs.llvmPackages_23;
+        };
 
       gungraunRunner = rustPlatform.buildRustPackage rec {
         pname = "gungraun-runner";
