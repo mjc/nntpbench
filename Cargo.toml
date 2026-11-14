@@ -5,15 +5,15 @@ edition = "2024"
 license = "MIT"
 
 [dependencies]
-arrayvec = "0.7.6"
-bytes = "1.11.1"
-clap = { version = "4.6.1", features = ["derive"] }
-libc = "0.2.186"
-memchr = "2.8.0"
+arrayvec = "0.7.8"
+bytes = "1.12.1"
+clap = { version = "4.6.7", features = ["derive"] }
+libc = "0.2.191"
+memchr = "2.8.3"
 md5 = { package = "md-5", version = "0.11.0" }
-socket2 = { version = "0.6.3", features = ["all"] }
+socket2 = { version = "0.6.5", features = ["all"] }
 yenc = "0.2.2"
-tokio = { version = "1.52.3", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1.54.1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 coz = { version = "0.1.3", optional = true }
@@ -23,11 +23,11 @@ coz = ["dep:coz"]
 
 [dev-dependencies]
 divan = "0.1.21"
-proptest = "1.9.0"
-serde_json = "1.0.149"
+proptest = "1.12.0"
+serde_json = "1.0.154"
 
 [target.'cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))'.dev-dependencies]
-gungraun = "0.19.4"
+gungraun = "0.20.0"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = [
